@@ -1,0 +1,10 @@
+build_peano/
+build_chess/
+__pycache__/
+.kernel_cache/
+.debug/
+test_swiglu/
+test_swiglu_llama/
+test_swiglu_2048/
+*.pyc
+air_project/
