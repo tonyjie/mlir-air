@@ -582,7 +582,7 @@ def compile_all_kernels(cache, config, seq_len):
 
     cache.compile_and_cache(
         "add",
-        build_add(n_total, 1024, np.float32),
+        build_add(n_total, 2048, bfloat16, vector_size=16, herd_x=8, herd_y=1),
         {"verbose": cache.verbose, "omit_while_true_loop": False},
     )
 
@@ -852,16 +852,16 @@ def run_transformer_block(
     else:
         _compare("proj", proj)
 
-    # 9. Residual Add (use F32 residual to avoid compounding truncation)
+    # 9. Residual Add (BF16 vectorized on NPU)
     print(f"    Step 9: Residual add")
-    a_add = x_f32.flatten().astype(np.float32)
-    b_add = proj.flatten().astype(np.float32)
-    c_add = np.zeros(n_total, dtype=np.float32)
+    a_add = x_bf16.flatten().astype(bfloat16)
+    b_add = proj.flatten().astype(bfloat16)
+    c_add = np.zeros(n_total, dtype=bfloat16)
     results = _run_cached(cache, "add", _SIMPLE_BACKEND, a_add, b_add, c_add)
-    res1_f32 = results[-1].reshape(seq_len, emb_dim)
-    res1_bf16 = res1_f32.astype(bfloat16)
+    res1_bf16 = results[-1].reshape(seq_len, emb_dim).astype(bfloat16)
+    res1_f32 = res1_bf16.astype(np.float32)
     if verify:
-        ref = x_f32 + proj.astype(np.float32)
+        ref = x_bf16.astype(np.float32) + proj.astype(np.float32)
         _compare("res1", res1_bf16, ref)
     else:
         _compare("res1", res1_bf16)
@@ -941,16 +941,16 @@ def run_transformer_block(
     else:
         _compare("down", down)
 
-    # 15. Residual Add (use F32 residual to avoid compounding truncation)
+    # 15. Residual Add (BF16 vectorized on NPU)
     print(f"    Step 15: Residual add")
-    a_add2 = res1_f32.flatten().astype(np.float32)
-    b_add2 = down.flatten().astype(np.float32)
-    c_add2 = np.zeros(n_total, dtype=np.float32)
+    a_add2 = res1_bf16.flatten().astype(bfloat16)
+    b_add2 = down.flatten().astype(bfloat16)
+    c_add2 = np.zeros(n_total, dtype=bfloat16)
     results = _run_cached(cache, "add", _SIMPLE_BACKEND, a_add2, b_add2, c_add2)
-    output_f32 = results[-1].reshape(seq_len, emb_dim)
-    output_bf16 = output_f32.astype(bfloat16)
+    output_bf16 = results[-1].reshape(seq_len, emb_dim).astype(bfloat16)
+    output_f32 = output_bf16.astype(np.float32)
     if verify:
-        ref = res1_f32 + down.astype(np.float32)
+        ref = res1_bf16.astype(np.float32) + down.astype(np.float32)
         _compare("output", output_bf16, ref)
     else:
         _compare("output", output_bf16)

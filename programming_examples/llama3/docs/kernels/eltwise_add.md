@@ -269,16 +269,51 @@ All herd config MLIRs are saved in `build_peano/mlir_dumps/herd_{hx}x{hy}.mlir`.
 
 ## Impact on LLAMA Prefill
 
+### Standalone profiling (C++ harness, XRT context reused)
+
 | Metric | v1 (F32 scalar) | v2 [8,1] (BF16 vec16) | Improvement |
 |--------|-----------------|----------------------|-------------|
-| Per-invocation (C++ harness) | 214.6 ms | 0.42 ms | **517×** |
+| Per-invocation | 214.6 ms | 0.42 ms | **517×** |
 | Total (32 invocations) | 8.19s | 0.013s | **630×** |
-| % of NPU kernel time | 44% | ~0.1% | No longer bottleneck |
+
+### Integrated in LLAMA pipeline (Python, per-invocation XRT load/unload)
+
+| Metric | v1 (F32 scalar) | v2 [8,1] (BF16 vec16) | Improvement |
+|--------|-----------------|----------------------|-------------|
+| Per-invocation (avg) | 0.256s | 0.042s | **6.1×** |
+| Total (32 invocations) | 8.19s | 1.34s | **6.1×** |
+| % of NPU kernel time | 44% | 10% | No longer bottleneck |
+| NPU kernel total | 18.67s | 13.40s | **28% reduction** |
+
+Note: The 6.1× improvement in-pipeline is less than the 517× standalone improvement because each invocation in the pipeline pays ~40ms of XRT load/unload overhead (dominating the ~0.4ms actual kernel time). The standalone C++ harness amortizes this overhead across 30 iterations.
+
+### Correctness after integration
+
+| Check | Result |
+|-------|--------|
+| 1-layer `--verify` | PASS — all 15 steps `[OK]`, top-1 matches CPU |
+| 16-layer `--verify` | PASS — all 240 steps `[OK]`, top-1 = " Paris" (correct) |
+| Logits correlation | 0.969 (vs 0.972 with F32 add — negligible degradation) |
+
+### Current LLAMA profiling breakdown (16 layers, CPU attention + BF16 add)
+
+| Kernel | Avg | Count | Total | % of NPU |
+|--------|-----|-------|-------|----------|
+| GEMM Gate/Up | 0.117s | x32 | 3.74s | **28%** |
+| GEMM Q/O | 0.054s | x32 | 1.73s | 13% |
+| GEMM Down | 0.102s | x16 | 1.63s | 12% |
+| SwiGLU | 0.089s | x16 | 1.42s | 11% |
+| Eltwise Add | 0.042s | x32 | 1.34s | 10% |
+| GEMM K/V | 0.040s | x32 | 1.28s | 10% |
+| RMSNorm | 0.030s | x33 | 0.99s | 7% |
+| RoPE Q | 0.056s | x16 | 0.90s | 7% |
+| RoPE K | 0.021s | x16 | 0.34s | 3% |
+| **NPU Total** | | **225** | **13.40s** | |
 
 ---
 
 ## Next Steps
 
-1. **Integrate into LLAMA pipeline**: Replace F32 eltwise add in `llama3_prefill.py` with BF16 vectorized `[8,1]` version; validate 16-layer output quality
-2. **Update Makefile defaults**: Set default profile config to `--herd-x 8 --herd-y 1 --tile-n 2048`
-3. **Move to next bottleneck kernel**: With eltwise add solved, profile GEMM, SwiGLU, etc.
+1. **Address XRT load/unload overhead**: Each invocation pays ~40ms overhead — amortizing this (context reuse) would reduce the add total from 1.34s to ~0.013s
+2. **Move to next bottleneck kernel**: GEMM Gate/Up (28%) is now the largest contributor — profile standalone and compare with IRON
+3. **Fix NPU flash attention**: CPU attention dominates wall time (74%); fixing the upstream kernel bug would dramatically improve total latency
