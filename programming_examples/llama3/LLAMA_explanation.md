@@ -511,6 +511,9 @@ backend.unload()                               # Release
 ### Pitfall: Non-contiguous arrays
 **Any array passed to NPU must be C-contiguous.** NumPy operations like `.T`, slicing, or transpose create views with non-standard strides. The XRT DMA copies raw bytes without respecting strides, so non-contiguous data gets scrambled. Always use `np.ascontiguousarray()` before passing to NPU.
 
+### Pitfall: BF16 GEMM output truncation (FIXED)
+The GEMM kernel writes BF16 output, truncating the F32 accumulator at every tile write-back. With K=8192 this caused corr=0.948 per layer, compounding to garbage over 16 layers. **Fix**: Use F32 output type (`build_gemm(..., np.float32)`) so the accumulator stays F32 throughout. Down GEMM improved from corr=0.948 to 0.9998. See `LLAMA_gemm.md` for full analysis.
+
 ### Pitfall: air_project/ directory
 aircc uses a hardcoded `air_project/` working directory. When compiling multiple kernels sequentially, stale files from previous compilations can interfere. The `prepare_air_project()` function wipes and recreates this directory before each compilation.
 

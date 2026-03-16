@@ -27,7 +27,7 @@ Each transformer block runs 15 kernel invocations:
 | 4 | V Projection | (2048, 2048) @ W(2048, 512) | matrix_multiplication/bf16 | VALIDATED |
 | 5 | RoPE on Q | (2048*32, 64) with LUT | rope_lut | VALIDATED (seq_len=65536) |
 | 6 | RoPE on K | (2048*8, 64) with LUT | rope_lut | VALIDATED |
-| 7 | Flash Attention GQA | Q(2048,32,64), K(2048,8,64), V(2048,8,64) | flash_attention/kernel_fusion | VALIDATED (LQ=2048,LK=2048,LKP=64,LQP=256) |
+| 7 | Flash Attention GQA | Q(2048,32,64), K(2048,8,64), V(2048,8,64) | flash_attention/kernel_fusion | **BUGGY** — CPU fallback via `attention_reference()` |
 | 8 | O Projection | (2048, 2048) @ W(2048, 2048) | matrix_multiplication/bf16 | VALIDATED |
 | 9 | Residual Add | (2048*2048) + (2048*2048) | eltwise_add | VALIDATED (n=4194304) |
 | 10 | RMSNorm (pre-FFN) | (2048, 2048) + weight(2048,) | weighted_rms_norm | VALIDATED |
@@ -59,8 +59,25 @@ Note: seq_len=128 had issues with Flash Attention (required LK=256 workaround). 
   - [x] 1D. Eltwise Add at n=4194304
   - [x] 1E. Flash Attention GQA (LQ=2048, LK=2048, LKP=64, LQP=256, 32Q/8KV)
   - [x] 1F. SwiGLU Activation at n=16777216
-- [x] Phase 2: Single Transformer Block -- VERIFIED (all 15 steps corr>0.948, top-1 matches CPU)
-- [ ] Phase 3: Full 16-Layer Model (run with real weights)
+- [x] Phase 2: Single Transformer Block -- VERIFIED (all 15 steps corr>0.999, top-1 matches CPU)
+- [x] Phase 3: Full 16-Layer Model -- RUNS END-TO-END (240 kernel invocations, no crashes)
+  - BF16 output run: top-1 incorrect ("def") due to BF16 accumulator truncation
+  - Fixed: F32 GEMM output eliminates truncation. Down GEMM: 0.948 -> 0.9998 per layer
+  - Single-layer re-verified: all 15 steps corr>0.999. Top-1 matches CPU.
+  - Kernel caching implemented: `KernelCache` compiles 10 unique kernels once, saves to `kernel_cache/`, reuses via `XRTCompileArtifact`. CLI: `--compile-only`, `--run-only`, `--profile`.
+  - **16-layer profiled**: 18.7s NPU kernel time + CPU attention (334s one-time compile). Per-layer avg 1.62s.
+  - Flash attention NPU kernel has correctness bug (corr=0.31 vs standard attention). GitHub issue submitted upstream.
+  - See `LLAMA_flash_attention.md` for full investigation.
+- [x] Phase 3A: CPU Attention Fallback -- **VERIFIED CORRECT**
+  - `--cpu-attn` flag (default: on) replaces NPU flash attention with `attention_reference()` from CPU
+  - **1-layer**: All 14 NPU kernels corr>0.999 (`[OK]`). Top-1 matches CPU.
+  - **16-layer**: Top-1 = " Paris" (correct answer, prob=0.48). Logits corr=0.972 vs CPU F32.
+  - All per-kernel, per-layer, and full-model verification tests pass.
+  - Use `--npu-attn` to switch back to NPU flash attention kernel (when fixed).
+- [ ] Phase 3B: Fix Flash Attention NPU kernel (upstream bug)
+  - Two CPU references verified identical (corr=0.9999) — issue is the kernel, not invocation
+  - Standalone `PASS!` is a false positive (loose tolerances + narrow data range)
+  - GitHub issue submitted to Xilinx/mlir-air — waiting for developer fix
 - [ ] Phase 4: Performance Optimization
 - [ ] Phase 5: Decode Phase (future work)
 
@@ -75,6 +92,7 @@ programming_examples/llama3/
   llama3_weights.py          # Weight loading from safetensors + RoPE LUT
   llama3_reference.py        # CPU reference implementation (F32)
   llama3_prefill.py          # NPU integration: sequential kernel invocations
+  diagnose_layer.py          # Per-kernel NPU vs CPU diagnostic (isolation test)
   swiglu_activation.py       # Standalone SwiGLU AIR kernel (Python)
   swiglu_activation.cc       # SwiGLU C++ kernel (for Peano)
   Makefile                   # Build targets
@@ -83,4 +101,6 @@ programming_examples/llama3/
   LLAMA_progress.md          # Progress tracker (session log)
   LLAMA_verification.md      # Commands, test results, bugs
   LLAMA_explanation.md       # Code walkthrough (architecture -> implementation)
+  LLAMA_gemm.md              # GEMM precision analysis & IRON comparison
+  LLAMA_flash_attention.md   # Flash attention causal masking investigation
 ```
