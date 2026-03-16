@@ -141,36 +141,32 @@ All 9 kernel configs tested on NPU2 hardware with random data:
 | | **16-layer profiled** (`--profile --cpu-attn`): 25.9s total prefill (18.7s NPU kernel time, ~7.2s CPU attention + overhead). Per-layer avg: 1.62s wall, 1.17s kernel. |
 | | **Phase 3A: VERIFIED CORRECT.** Full LLAMA-3.2-1B pipeline produces correct output with CPU attention fallback. |
 | 2026-03-16 | **Phase 4 started: Per-kernel performance profiling.** Added C++ profiling harness (`test.cpp` + `make profile`) to `eltwise_add/` following the `matrix_multiplication/bf16` pattern. |
-| | **Eltwise add profiled** (C++ harness, 10 warmup + 20 measured iterations, XRT context reused): |
-| | - Our kernel (F32, scalar, 2 cores): **214,619 µs avg**, 0.23 GB/s bandwidth |
-| | - IRON (BF16, 16-wide vectorized, 8 columns): **432 µs avg**, 57.6 GB/s bandwidth |
-| | - **Gap: 497× latency, 250× bandwidth.** Root cause: scalar load/store loop with no vectorization. |
-| | - The 214ms is actual kernel execution (not XRT overhead) — confirmed by C++ harness which keeps XRT context open across iterations. |
+| | **Eltwise add profiled** — baseline F32 scalar: 214,619 µs, 0.23 GB/s. IRON: 432 µs, 57.6 GB/s. Gap: 497×. |
+| | **Eltwise add optimized** — BF16 vec16 [8,1] herd: **415 µs, 60.6 GB/s**. Matches IRON (0.96×). 517× speedup over baseline. |
+| | Full herd config sweep (12 configs): only [8,1] achieves 8-column parallelism; multi-row herds fail with ShimDMA channel exhaustion. |
+| | Makefile updated with `AIE_TARGET` detection: `aie2p` (NPU2) defaults to BF16/vec16/[8,1]; `aie2` (NPU1) defaults to F32/scalar/[1,2]. |
 
 ---
 
 ## Phase 4: Per-Kernel Performance Profiling
 
-### Eltwise Add — Bottleneck Analysis (2026-03-16)
+### Eltwise Add — Optimized (2026-03-16)
 
-**Problem size**: 4,194,304 elements (LLAMA residual add: 2048 × 2048)
+**Problem size**: 4,194,304 BF16 elements (LLAMA residual add: 2048 × 2048)
 
-| Metric | Our kernel (F32) | IRON (BF16) | Gap |
-|--------|-----------------|-------------|-----|
-| **Avg latency** | 214,619 µs | 432 µs | **497×** |
-| **Avg bandwidth** | 0.23 GB/s | 57.6 GB/s | **250×** |
-| **Data volume** | 48 MB (3×16MB F32) | 24 MB (3×8MB BF16) | 2× |
-| **Vectorization** | Scalar load/store | 16-wide BF16 vectors | — |
-| **Cores** | 2 (herd [1,2]) | 8 columns | 4× |
-| **Tile size** | 1024 | 2048 | 2× |
+| Version | Herd | Latency | Bandwidth | Speedup | vs IRON |
+|---------|------|---------|-----------|---------|---------|
+| Baseline (F32 scalar) | [1,2] | 214,619 µs | 0.23 GB/s | 1× | 497× |
+| **Optimized (BF16 vec16)** | **[8,1]** | **415 µs** | **60.6 GB/s** | **517×** | **0.96×** |
+| IRON reference | 8 cols | 432 µs | 57.6 GB/s | — | 1.0× |
 
-**Root cause**: The `eltwise_add.py` kernel uses a scalar `for i in range_(tile_n): load, load, add, store` loop. On AIE2P, this processes one element per cycle instead of 16 (BF16) or 8 (F32) elements per vector instruction. Combined with only 2 cores vs IRON's 8 columns, the theoretical gap is ~64×. The additional ~4× gap is likely from DMA scheduling inefficiency (no double-buffering or pipelining).
+See `docs/kernels/eltwise_add.md` for full herd sweep results and correctness verification.
 
 **Profiling commands**:
 ```bash
-# Our kernel
+# Our kernel (NPU2 defaults: BF16 vec16 [8,1], N=4M)
 cd programming_examples/eltwise_add
-make profile N=4194304 TILE_N=1024
+make profile
 
 # IRON reference
 cd /home/jiajli/apps/IRON
