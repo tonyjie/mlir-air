@@ -542,6 +542,8 @@ IRON reference (`/home/jiajli/apps/IRON/iron/operators/gemm/design.py`):
 
 ## Document References
 
+All docs are in `programming_examples/llama3/docs/`:
+
 - `LLAMA_PLAN.md` -- High-level plan (phases, architecture decisions, kernel table)
 - `LLAMA_progress.md` -- Session-by-session progress log
 - `LLAMA_verification.md` -- This file (architecture, commands, test results, bugs)
