@@ -118,5 +118,25 @@ run-prefill-verify: compile-external-kernels
 	PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) cd $(BUILD_DIR) && ${powershell} python3 ${srcdir}/llama3_prefill.py \
 		--model $(LLAMA_MODEL) --seq-len $(SEQ_LEN) --n-layers $(N_LAYERS) --verify
 
+# Compile-only: pre-compile all 10 kernels to cache
+compile-prefill-kernels: compile-external-kernels
+	PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) cd $(BUILD_DIR) && ${powershell} python3 ${srcdir}/llama3_prefill.py \
+		--model $(LLAMA_MODEL) --seq-len $(SEQ_LEN) --compile-only --profile
+
+# Run-only: use cached kernels (skip compilation)
+run-prefill-cached: compile-external-kernels
+	PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) cd $(BUILD_DIR) && ${powershell} python3 ${srcdir}/llama3_prefill.py \
+		--model $(LLAMA_MODEL) --seq-len $(SEQ_LEN) --n-layers $(N_LAYERS) --run-only --profile
+
+# Full model with profiling (compile + run)
+run-prefill-profile: compile-external-kernels
+	PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) cd $(BUILD_DIR) && ${powershell} python3 ${srcdir}/llama3_prefill.py \
+		--model $(LLAMA_MODEL) --seq-len $(SEQ_LEN) --n-layers $(N_LAYERS) --profile
+
+# Single-layer cached run with verification
+run-prefill-1layer-cached: compile-external-kernels
+	PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) cd $(BUILD_DIR) && ${powershell} python3 ${srcdir}/llama3_prefill.py \
+		--model $(LLAMA_MODEL) --seq-len $(SEQ_LEN) --n-layers 1 --run-only --verify --profile
+
 clean:
-	rm -rf $(BUILD_DIR) __pycache__ .kernel_cache
+	rm -rf $(BUILD_DIR) __pycache__ kernel_cache
