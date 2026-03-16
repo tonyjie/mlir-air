@@ -140,6 +140,42 @@ All 9 kernel configs tested on NPU2 hardware with random data:
 | | **16-layer verified** (`--verify --cpu-attn`): All 16 layers pass. **Top-1 = " Paris"** (prob=0.48, correct factual answer). Logits corr=0.972 vs CPU F32. CPU top-1 = " the" (prob=0.065) — both valid, difference is benign BF16 numerical noise. |
 | | **16-layer profiled** (`--profile --cpu-attn`): 25.9s total prefill (18.7s NPU kernel time, ~7.2s CPU attention + overhead). Per-layer avg: 1.62s wall, 1.17s kernel. |
 | | **Phase 3A: VERIFIED CORRECT.** Full LLAMA-3.2-1B pipeline produces correct output with CPU attention fallback. |
+| 2026-03-16 | **Phase 4 started: Per-kernel performance profiling.** Added C++ profiling harness (`test.cpp` + `make profile`) to `eltwise_add/` following the `matrix_multiplication/bf16` pattern. |
+| | **Eltwise add profiled** (C++ harness, 10 warmup + 20 measured iterations, XRT context reused): |
+| | - Our kernel (F32, scalar, 2 cores): **214,619 µs avg**, 0.23 GB/s bandwidth |
+| | - IRON (BF16, 16-wide vectorized, 8 columns): **432 µs avg**, 57.6 GB/s bandwidth |
+| | - **Gap: 497× latency, 250× bandwidth.** Root cause: scalar load/store loop with no vectorization. |
+| | - The 214ms is actual kernel execution (not XRT overhead) — confirmed by C++ harness which keeps XRT context open across iterations. |
+
+---
+
+## Phase 4: Per-Kernel Performance Profiling
+
+### Eltwise Add — Bottleneck Analysis (2026-03-16)
+
+**Problem size**: 4,194,304 elements (LLAMA residual add: 2048 × 2048)
+
+| Metric | Our kernel (F32) | IRON (BF16) | Gap |
+|--------|-----------------|-------------|-----|
+| **Avg latency** | 214,619 µs | 432 µs | **497×** |
+| **Avg bandwidth** | 0.23 GB/s | 57.6 GB/s | **250×** |
+| **Data volume** | 48 MB (3×16MB F32) | 24 MB (3×8MB BF16) | 2× |
+| **Vectorization** | Scalar load/store | 16-wide BF16 vectors | — |
+| **Cores** | 2 (herd [1,2]) | 8 columns | 4× |
+| **Tile size** | 1024 | 2048 | 2× |
+
+**Root cause**: The `eltwise_add.py` kernel uses a scalar `for i in range_(tile_n): load, load, add, store` loop. On AIE2P, this processes one element per cycle instead of 16 (BF16) or 8 (F32) elements per vector instruction. Combined with only 2 cores vs IRON's 8 columns, the theoretical gap is ~64×. The additional ~4× gap is likely from DMA scheduling inefficiency (no double-buffering or pipelining).
+
+**Profiling commands**:
+```bash
+# Our kernel
+cd programming_examples/eltwise_add
+make profile N=4194304 TILE_N=1024
+
+# IRON reference
+cd /home/jiajli/apps/IRON
+python3 -m pytest iron/operators/elementwise_add/test.py -k "llama_prefill_add_2048tok" -v -s
+```
 
 ---
 
@@ -194,15 +230,13 @@ programming_examples/llama3/
   debug_gemm.py              # GEMM isolation debug
   debug_gemm_real.py         # GEMM debug with real weights
   kernel_cache/              # Cached kernel binaries + manifest.json
-  LLAMA_PLAN.md              # High-level plan
-  LLAMA_progress.md          # This file (progress tracker)
-  LLAMA_verification.md      # Commands, test results, bugs
-  LLAMA_explanation.md       # Code walkthrough (architecture -> implementation)
-  LLAMA_gemm.md              # GEMM precision analysis & IRON comparison
-  LLAMA_flash_attention.md   # Flash attention investigation (causal masking, output mismatch, config sweep)
-  test_flash_attn_configs.py # Flash attention configuration sweep script
-  flash_attn_study_results.json  # Sweep results data
-  flash_attn_github_issue.md # GitHub issue template for upstream
+  docs/
+    LLAMA_PLAN.md              # High-level plan
+    LLAMA_progress.md          # This file (progress tracker)
+    LLAMA_verification.md      # Commands, test results, bugs
+    LLAMA_explanation.md       # Code walkthrough (architecture -> implementation)
+    LLAMA_gemm.md              # GEMM precision analysis & IRON comparison
+    LLAMA_flash_attention.md   # Flash attention investigation (causal masking, output mismatch, config sweep)
 ```
 
 ---

@@ -288,10 +288,13 @@ All configurations fit within the 64KB L1 budget.
 
 ## Document References
 
+All docs are in `programming_examples/llama3/docs/`:
+
 - `LLAMA_PLAN.md` -- High-level plan
 - `LLAMA_progress.md` -- Session log
 - `LLAMA_verification.md` -- Test results, commands, bugs
 - `LLAMA_explanation.md` -- Code walkthrough
 - `LLAMA_gemm.md` -- This file (GEMM precision & config reference)
+- `LLAMA_flash_attention.md` -- Flash attention investigation
 - IRON source: `/home/jiajli/apps/IRON/iron/operators/gemm/design.py`
 - IRON LLAMA config: `/home/jiajli/apps/IRON/iron/applications/llama_3.2_1b/configs/llama32_1b.json`

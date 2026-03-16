@@ -78,7 +78,9 @@ Note: seq_len=128 had issues with Flash Attention (required LK=256 workaround). 
   - Two CPU references verified identical (corr=0.9999) — issue is the kernel, not invocation
   - Standalone `PASS!` is a false positive (loose tolerances + narrow data range)
   - GitHub issue submitted to Xilinx/mlir-air — waiting for developer fix
-- [ ] Phase 4: Performance Optimization
+- [ ] Phase 4: Performance Optimization — IN PROGRESS
+  - Eltwise add profiled: 214ms (ours) vs 0.43ms (IRON) — 497× gap. Scalar kernel, needs vectorization.
+  - C++ profiling harness added to `eltwise_add/` (`test.cpp` + `make profile`)
 - [ ] Phase 5: Decode Phase (future work)
 
 ### Previous validation (seq_len=128) -- kept for reference
@@ -92,15 +94,15 @@ programming_examples/llama3/
   llama3_weights.py          # Weight loading from safetensors + RoPE LUT
   llama3_reference.py        # CPU reference implementation (F32)
   llama3_prefill.py          # NPU integration: sequential kernel invocations
-  diagnose_layer.py          # Per-kernel NPU vs CPU diagnostic (isolation test)
   swiglu_activation.py       # Standalone SwiGLU AIR kernel (Python)
   swiglu_activation.cc       # SwiGLU C++ kernel (for Peano)
   Makefile                   # Build targets
   run_npu2_swiglu_peano.lit  # LIT test for SwiGLU
-  LLAMA_PLAN.md              # This plan
-  LLAMA_progress.md          # Progress tracker (session log)
-  LLAMA_verification.md      # Commands, test results, bugs
-  LLAMA_explanation.md       # Code walkthrough (architecture -> implementation)
-  LLAMA_gemm.md              # GEMM precision analysis & IRON comparison
-  LLAMA_flash_attention.md   # Flash attention causal masking investigation
+  docs/
+    LLAMA_PLAN.md              # This plan
+    LLAMA_progress.md          # Progress tracker (session log)
+    LLAMA_verification.md      # Commands, test results, bugs
+    LLAMA_explanation.md       # Code walkthrough (architecture -> implementation)
+    LLAMA_gemm.md              # GEMM precision analysis & IRON comparison
+    LLAMA_flash_attention.md   # Flash attention causal masking investigation
 ```

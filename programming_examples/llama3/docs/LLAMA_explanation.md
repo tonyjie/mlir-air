@@ -524,7 +524,11 @@ aircc uses a hardcoded `air_project/` working directory. When compiling multiple
 
 ## Document References
 
+All docs are in `programming_examples/llama3/docs/`:
+
 - `LLAMA_PLAN.md` -- High-level plan (phases, architecture decisions)
 - `LLAMA_progress.md` -- Session log and current status
 - `LLAMA_verification.md` -- Test results, commands, bugs
 - `LLAMA_explanation.md` -- This file (code walkthrough)
+- `LLAMA_gemm.md` -- GEMM precision analysis & IRON comparison
+- `LLAMA_flash_attention.md` -- Flash attention investigation
