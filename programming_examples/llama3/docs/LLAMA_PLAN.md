@@ -79,8 +79,9 @@ Note: seq_len=128 had issues with Flash Attention (required LK=256 workaround). 
   - Standalone `PASS!` is a false positive (loose tolerances + narrow data range)
   - GitHub issue submitted to Xilinx/mlir-air — waiting for developer fix
 - [ ] Phase 4: Performance Optimization — IN PROGRESS
-  - Eltwise add profiled: 214ms (ours) vs 0.43ms (IRON) — 497× gap. Scalar kernel, needs vectorization.
+  - [x] Eltwise add optimized: BF16 vec16 [8,1] → **415 µs** (was 214ms). Matches IRON (432 µs). PR #1431.
   - C++ profiling harness added to `eltwise_add/` (`test.cpp` + `make profile`)
+  - [ ] Next: Profile remaining kernels (GEMM, SwiGLU, RMSNorm, RoPE)
 - [ ] Phase 5: Decode Phase (future work)
 
 ### Previous validation (seq_len=128) -- kept for reference

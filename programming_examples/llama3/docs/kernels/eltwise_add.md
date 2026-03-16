@@ -96,13 +96,25 @@ Residual additions in steps 9 and 15 of each transformer block:
 ### Commands
 
 ```bash
-# Correctness (compile-and-run with Python verification)
-cd programming_examples/eltwise_add/build_peano
-python3 ../eltwise_add.py --n 4194304 --tile-n 2048 --vector-size 16 --dtype bf16 --herd-x 8 --herd-y 1
-
-# C++ profiling with correctness check
 cd programming_examples/eltwise_add
-make profile N=4194304 TILE_N=2048
+
+# Correctness (compile-and-run with Python verification, NPU2 defaults)
+make run
+
+# C++ profiling with correctness check (NPU2 defaults: BF16 vec16 [8,1], N=4M)
+make profile
+
+# NPU1 config (F32 scalar [1,2])
+make run AIE_TARGET=aie2
+
+# Override any parameter
+make profile N=65536                    # smaller problem
+make profile HERD_X=4 HERD_Y=1         # different herd
+make run DTYPE=f32 VECTOR_SIZE=0        # F32 scalar mode
+
+# LIT tests (from build/ directory)
+lit -v programming_examples/eltwise_add/run_makefile_peano_npu2.lit   # NPU2: run + profile
+lit -v programming_examples/eltwise_add/run_makefile_peano.lit        # NPU1: F32 scalar
 ```
 
 ---
