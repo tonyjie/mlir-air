@@ -79,31 +79,32 @@ Note: seq_len=128 had issues with Flash Attention (required LK=256 workaround). 
   - Standalone `PASS!` is a false positive (loose tolerances + narrow data range)
   - GitHub issue submitted to Xilinx/mlir-air — waiting for developer fix
 - [ ] Phase 4: Performance Optimization — IN PROGRESS
-  - [x] Eltwise add optimized: BF16 vec16 [8,1] → **415 µs** (was 214ms). Matches IRON (432 µs). PR #1431.
-  - C++ profiling harness added to `eltwise_add/` (`test.cpp` + `make profile`)
-  - [ ] Next: Profile remaining kernels (GEMM, SwiGLU, RMSNorm, RoPE)
+  - [x] Eltwise add: BF16 vec16 [8,1] → 415 µs (was 214ms). Matches IRON. PR #1431.
+  - [x] XRT context reuse: NPU kernel 13.40s → 8.77s (34% reduction).
+  - Current: **8.77s NPU kernel** (IRON: 2.32s, gap: 3.8×). Wall: ~47s (CPU attention dominates).
+  - FFN block is 71% of NPU time (390ms/layer vs IRON 57.7ms). Next optimization target.
+  - See `docs/performance_optimization.md` for full breakdown and roadmap.
 - [ ] Phase 5: Decode Phase (future work)
 
-### Previous validation (seq_len=128) -- kept for reference
-
-All kernels passed at seq_len=128 dimensions (2026-03-12). These are smaller shapes that served as initial smoke tests but are not the target operating point.
-
-## Files Created
+## Files
 
 ```
 programming_examples/llama3/
+  llama3_prefill.py          # NPU integration (KernelCache + transformer block pipeline)
   llama3_weights.py          # Weight loading from safetensors + RoPE LUT
   llama3_reference.py        # CPU reference implementation (F32)
-  llama3_prefill.py          # NPU integration: sequential kernel invocations
   swiglu_activation.py       # Standalone SwiGLU AIR kernel (Python)
   swiglu_activation.cc       # SwiGLU C++ kernel (for Peano)
   Makefile                   # Build targets
-  run_npu2_swiglu_peano.lit  # LIT test for SwiGLU
   docs/
-    LLAMA_PLAN.md              # This plan
-    LLAMA_progress.md          # Progress tracker (session log)
-    LLAMA_verification.md      # Commands, test results, bugs
-    LLAMA_explanation.md       # Code walkthrough (architecture -> implementation)
-    LLAMA_gemm.md              # GEMM precision analysis & IRON comparison
-    LLAMA_flash_attention.md   # Flash attention causal masking investigation
+    LLAMA_PLAN.md                   # This plan
+    LLAMA_progress.md               # Session log
+    LLAMA_verification.md           # Architecture, commands, test results, bugs
+    LLAMA_explanation.md            # Code walkthrough
+    performance_optimization.md     # Performance profiling & optimization roadmap
+    LLAMA_flash_attention.md        # Flash attention bug investigation
+    LLAMA_gemm.md                   # GEMM precision investigation (historical)
+    kernels/
+      eltwise_add.md                # Eltwise add optimization (herd sweep, IRON comparison)
+      gemm.md                       # GEMM precision & performance analysis
 ```

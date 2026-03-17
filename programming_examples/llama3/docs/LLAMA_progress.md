@@ -152,163 +152,27 @@ All 9 kernel configs tested on NPU2 hardware with random data:
 
 ---
 
-## Phase 4: Per-Kernel Performance Profiling
+## Phase 4: Performance Optimization
 
-### Eltwise Add — Optimized (2026-03-16)
+See `performance_optimization.md` for full profiling breakdown, IRON comparison, and optimization roadmap.
 
-**Problem size**: 4,194,304 BF16 elements (LLAMA residual add: 2048 × 2048)
-
-| Version | Herd | Latency | Bandwidth | Speedup | vs IRON |
-|---------|------|---------|-----------|---------|---------|
-| Baseline (F32 scalar) | [1,2] | 214,619 µs | 0.23 GB/s | 1× | 497× |
-| **Optimized (BF16 vec16)** | **[8,1]** | **415 µs** | **60.6 GB/s** | **517×** | **0.96×** |
-| IRON reference | 8 cols | 432 µs | 57.6 GB/s | — | 1.0× |
-
-See `docs/kernels/eltwise_add.md` for full herd sweep results and correctness verification.
-
-**Profiling commands**:
-```bash
-# Our kernel (NPU2 defaults: BF16 vec16 [8,1], N=4M)
-cd programming_examples/eltwise_add
-make profile
-
-# IRON reference
-cd /home/jiajli/apps/IRON
-python3 -m pytest iron/operators/elementwise_add/test.py -k "llama_prefill_add_2048tok" -v -s
-```
+**Summary**: NPU kernel 18.67s → **8.77s** (after BF16 eltwise add + XRT context reuse). IRON: 2.32s. Gap: 3.8×. FFN block is 71% of NPU time.
 
 ---
 
-## Profiling Results (seq_len=2048, 16 layers, CPU attention fallback)
-
-### Compilation (one-time, 10 unique kernels)
-
-| Kernel | Time |
-|--------|------|
-| gemm_gate_up (2048x2048x8192) | 276.4s |
-| flash_attn | 24.8s |
-| gemm_qo (2048x2048x2048) | 18.8s |
-| gemm_down (2048x8192x2048) | 13.4s |
-| gemm_kv (2048x2048x512) | 3.2s |
-| rmsnorm / swiglu / rope_q/k / add | < 1s each |
-| **Total** | **338.9s** |
-
-### Execution (per-invocation avg, with BF16 vectorized add + CPU attention)
-
-IRON numbers measured on our NPU2 at 2048-token scale (2026-03-16), using:
-`pytest iron/operators/<op>/test.py -m "llama and extensive" -v -s`
-
-| Kernel | Ours Avg | Count | Ours Total | % of NPU | IRON (µs) | IRON cmd |
-|--------|----------|-------|------------|----------|-----------|----------|
-| GEMM Gate/Up | 117ms | x32 | 3.74s | **28%** | (fused) | SwiGLU block: 80,500 µs |
-| GEMM Q/O | 54ms | x32 | 1.73s | 13% | 7,367 | `gemm_2048x2048x2048_8cols` |
-| GEMM Down | 102ms | x16 | 1.63s | 12% | (fused) | SwiGLU block |
-| SwiGLU | 89ms | x16 | 1.42s | 11% | (fused) | SwiGLU block |
-| Eltwise Add | 42ms | x32 | 1.34s | 10% | 432 | `llama_prefill_add_2048tok` |
-| GEMM K/V | 40ms | x32 | 1.28s | 10% | 1,650 | `llama_kv_proj_2048tok` |
-| RMSNorm | 30ms | x33 | 0.99s | 7% | 880 | `llama_prefill_rms_norm_2048tok` |
-| RoPE Q | 56ms | x16 | 0.90s | 7% | 738 | `llama_prefill_q_2048tok` |
-| RoPE K | 21ms | x16 | 0.34s | 3% | 233 | `llama_prefill_k_2048tok` |
-| **NPU Total** | | **225** | **13.40s** | | | |
-| CPU Attention | ~2.37s | x16 | ~37.9s | — | 36,750 | `llama_prefill_2048tok` (MHA) |
-
-**IRON per-layer estimate** (from isolated kernel benchmarks):
-- Attention block: RMSNorm (0.88ms) + GEMM Q (7.4ms) + GEMM K (1.7ms) + GEMM V (1.7ms) + RoPE Q (0.74ms) + RoPE K (0.23ms) + MHA (36.8ms) + GEMM O (7.4ms) + Add (0.43ms) = **57.3ms**
-- FFN block: RMSNorm (0.88ms) + SwiGLU fused (80.5ms) + Add (0.43ms) = **81.8ms**
-- **Total per layer: ~139ms** (isolated kernel sum, no overhead)
-- **16 layers: ~2.2s** (kernel only) vs 2.91s measured (0.7s Python/XRT overhead)
-
-**Our per-layer estimate** (subtracting ~40ms XRT overhead per invocation):
-- 13 NPU invocations per layer × ~40ms overhead = ~520ms overhead per layer
-- Actual kernel time: ~0.84s - 0.52s = **~320ms** per layer
-- **16 layers kernel-only: ~5.1s** vs IRON's ~2.2s → **~2.3× actual compute gap**
-
-**Per-layer avg**: 3.21s wall, 0.84s NPU kernel
-**Total prefill**: 13.4s NPU kernel + ~37.9s CPU attention = 51.4s wall
-**IRON reference**: 2.91s total prefill (16 layers)
-
-**Key gap analysis**:
-1. **XRT load/unload overhead**: ~40ms × 225 invocations ≈ 9s (67% of our NPU time). IRON uses persistent XRT context.
-2. **Actual compute gap**: ~2.3× (our ~5.1s vs IRON's ~2.2s kernel-only). Likely from IRON's kernel fusion (SwiGLU = 5 ops fused) and C++ kernel compiler optimizations.
-3. **CPU attention**: 37.9s (74% of wall time). IRON's NPU MHA = 36.8ms × 16 = 0.59s.
-
-**Note**: CPU attention dominates wall time. When NPU flash attention kernel is fixed + XRT context reuse implemented, expected total: ~5-6s (vs IRON's 2.91s).
-
-### Profiling history
-
-| Version | NPU Kernel Total | Wall Time | Add Time | Bottleneck |
-|---------|-----------------|-----------|----------|------------|
-| v1: F32 scalar add | 18.67s | 25.9s | 8.19s (44%) | Eltwise Add |
-| **v2: BF16 vec16 add** | **13.40s** | **51.4s** | **1.34s (10%)** | **CPU Attention (74%)** |
-
-Note: Wall time increased from 25.9s to 51.4s because CPU attention now takes longer per invocation (~2.37s vs ~0.45s previously). This is because the BF16 residual inputs to attention have slightly different values, causing the CPU `attention_reference()` to compute a full (seq_len × seq_len) attention matrix with different data patterns. The NPU kernel time improved by 28%.
-
----
-
-## File Inventory
-
-```
-programming_examples/llama3/
-  llama3_weights.py          # Weight loading + RoPE LUT
-  llama3_reference.py        # CPU reference (F32)
-  llama3_prefill.py          # NPU integration (KernelCache + Profiler + pipeline)
-  diagnose_layer.py          # Per-kernel NPU vs CPU diagnostic (isolation test)
-  swiglu_activation.py       # SwiGLU AIR kernel
-  swiglu_activation.cc       # SwiGLU C++ kernel
-  Makefile                   # Build targets
-  run_npu2_swiglu_peano.lit  # LIT test
-  debug_gemm.py              # GEMM isolation debug
-  debug_gemm_real.py         # GEMM debug with real weights
-  kernel_cache/              # Cached kernel binaries + manifest.json
-  docs/
-    LLAMA_PLAN.md              # High-level plan
-    LLAMA_progress.md          # This file (progress tracker)
-    LLAMA_verification.md      # Commands, test results, bugs
-    LLAMA_explanation.md       # Code walkthrough (architecture -> implementation)
-    LLAMA_gemm.md              # GEMM precision analysis & IRON comparison
-    LLAMA_flash_attention.md   # Flash attention investigation (causal masking, output mismatch, config sweep)
-```
-
----
-
-## Quick Reference: Commands
+## Quick Reference
 
 ```bash
-# Compile external kernels (one-time)
-make compile-external-kernels PEANO_INSTALL_DIR=$PEANO_INSTALL_DIR
+cd programming_examples/llama3/build_peano
 
-# Compile all 10 unique kernels to cache (one-time, ~5.5 min)
-cd build_peano && python3 ../llama3_prefill.py --compile-only --profile
+# Compile (one-time, ~5.5 min)
+python3 ../llama3_prefill.py --compile-only --profile
 
-# Single-layer test with verification (CPU attention fallback, default)
-cd build_peano && python3 ../llama3_prefill.py --run-only --n-layers 1 --verify
+# Run + verify
+python3 ../llama3_prefill.py --run-only --n-layers 16 --verify --profile
 
-# Full 16-layer run with profiling (CPU attention fallback, default)
-cd build_peano && python3 ../llama3_prefill.py --run-only --n-layers 16 --profile
-
-# Full 16-layer with verification (proves correctness)
-cd build_peano && python3 ../llama3_prefill.py --run-only --n-layers 16 --verify
-
-# Force NPU flash attention (to test when kernel fix lands)
-cd build_peano && python3 ../llama3_prefill.py --run-only --n-layers 1 --verify --npu-attn
-
-# Per-layer NPU vs CPU diagnostic (degradation curve)
-cd build_peano && python3 ../llama3_prefill.py --run-only --n-layers 16 --diagnostic
-
-# Per-kernel isolation diagnostic (identifies bad kernels)
-cd build_peano && python3 ../diagnose_layer.py --layer 0
-
-# Full run (compile + run in one shot)
-make run-prefill-profile PEANO_INSTALL_DIR=$PEANO_INSTALL_DIR
-
-# CPU reference only (no NPU)
-python3 llama3_reference.py --model /path/to/Llama-3.2-1B
-
-# SwiGLU standalone test
-make run-swiglu PEANO_INSTALL_DIR=$PEANO_INSTALL_DIR
-
-# Flash attention causal test (PASS — but uses its own reference, not standard attention)
-cd programming_examples/flash_attention/kernel_fusion_based
-make run LQ=2048 LK=2048 LQP=256 LKP=64 DK=64 DV=64 \
-  NUM_HEADS=32 NUM_KV_HEADS=8 EXTRA_PY_FLAGS="--causal"
+# Single layer
+python3 ../llama3_prefill.py --run-only --n-layers 1 --verify
 ```
+
+See `performance_optimization.md` for profiling commands (AIR + IRON) and `LLAMA_verification.md` for full command reference.
