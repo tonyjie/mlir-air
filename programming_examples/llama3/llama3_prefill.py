@@ -285,6 +285,7 @@ class KernelCache:
         self.profiler = profiler or Profiler()
         self.artifacts = {}  # name -> XRTCompileArtifact
         self._loaded = {}  # name -> (backend, invoker) for XRT context reuse
+        self._cached_bos = {}  # name -> list of xrt.bo for BO reuse
 
     def _log(self, msg):
         if self.verbose:
@@ -374,11 +375,12 @@ class KernelCache:
         print(f"  Compiled {name}: {compile_time:.1f}s -> {cached_binary.name}")
 
     def load_and_run(self, name, backend_kwargs, *inputs):
-        """Load cached kernel and execute.
+        """Load cached kernel and execute with BO reuse.
 
-        Keeps the XRT backend loaded between invocations of the same kernel
-        to avoid ~40ms per-invocation load/unload overhead. The backend and
-        invoker are cached in self._loaded and cleaned up by unload_all().
+        Three levels of caching to minimize per-invocation overhead:
+        1. XRT context (device, xclbin, kernel) — cached per kernel name
+        2. Buffer Objects — cached per kernel name, reused across calls
+        3. Instruction BO sync — done once on first call
 
         Args:
             name: Kernel name (must have been compiled first)
@@ -388,6 +390,7 @@ class KernelCache:
         Returns:
             Tuple of numpy arrays (all kernel outputs)
         """
+        import pyxrt as xrt
         from air.backend.xrt import XRTBackend
 
         if name not in self.artifacts:
@@ -396,7 +399,7 @@ class KernelCache:
                 f"Available: {list(self.artifacts.keys())}"
             )
 
-        # Load backend + invoker on first call, reuse on subsequent calls
+        # Level 1: Load backend on first call (XRT context reuse)
         if name not in self._loaded:
             artifact = self.artifacts[name]
             backend = XRTBackend(**backend_kwargs)
@@ -405,18 +408,68 @@ class KernelCache:
             self._loaded[name] = (backend, invoker)
             self._log(f"Loaded {name} (XRT context cached)")
 
-        _, invoker = self._loaded[name]
+        backend, _ = self._loaded[name]
 
+        # Level 2: Allocate BOs on first call, reuse on subsequent calls
+        sizes_in_bytes = [a.size * a.itemsize for a in inputs]
+        is_elf = self.artifacts[name].output_binary.endswith(".elf")
+
+        if name not in self._cached_bos:
+            if is_elf:
+                bos = [xrt.ext.bo(backend.device, s) for s in sizes_in_bytes]
+            else:
+                bos = [
+                    xrt.bo(
+                        backend.device,
+                        s,
+                        xrt.bo.host_only,
+                        backend.kernel.group_id(i + 3),
+                    )
+                    for i, s in enumerate(sizes_in_bytes)
+                ]
+            self._cached_bos[name] = bos
+            # Sync instruction BO once (only needed for xclbin mode)
+            if not is_elf and backend.bo_instr is not None:
+                backend.bo_instr.sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
+            self._log(f"Allocated {len(bos)} BOs for {name}")
+
+        bos = self._cached_bos[name]
+
+        # Write input data to cached BOs
         t0 = time.time()
         with filelock.FileLock("/tmp/npu.lock"):
-            results = invoker(*inputs)
-        duration = time.time() - t0
+            for i, a in enumerate(inputs):
+                if a.dtype == bfloat16:
+                    a = a.view(np.int16)
+                bos[i].write(a, 0)
+                bos[i].sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
 
+            # Launch kernel
+            if is_elf:
+                run = xrt.run(backend.kernel)
+                for i, bo in enumerate(bos):
+                    run.set_arg(i, bo)
+                run.start()
+                run.wait2()
+            else:
+                h = backend.kernel(3, backend.bo_instr, len(backend.instr_v), *bos)
+                h.wait()
+
+            # Read results back
+            for i in range(len(inputs)):
+                bos[i].sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE)
+            results = tuple(
+                bos[i].read(s, 0).view(inputs[i].dtype)
+                for i, s in enumerate(sizes_in_bytes)
+            )
+
+        duration = time.time() - t0
         self.profiler.record_kernel(name, duration)
         return results
 
     def unload_all(self):
-        """Unload all cached XRT backends. Call at program end."""
+        """Unload all cached XRT backends and BOs. Call at program end."""
+        self._cached_bos.clear()
         for name, (backend, _) in self._loaded.items():
             backend.unload()
             self._log(f"Unloaded {name}")
