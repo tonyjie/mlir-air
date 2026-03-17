@@ -759,6 +759,7 @@ if __name__ == "__main__":
                 mlir_module,
                 inputs=[input_a, input_b],
                 stochastic_expected_outputs=[sampled_data],
+                rtol=0,  # Integer matmul should be exact
             )
         )
 

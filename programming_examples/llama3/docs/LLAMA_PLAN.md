@@ -80,9 +80,12 @@ Note: seq_len=128 had issues with Flash Attention (required LK=256 workaround). 
   - GitHub issue submitted to Xilinx/mlir-air — waiting for developer fix
 - [ ] Phase 4: Performance Optimization — IN PROGRESS
   - [x] Eltwise add: BF16 vec16 [8,1] → 415 µs (was 214ms). Matches IRON. PR #1431.
-  - [x] XRT context reuse: NPU kernel 13.40s → 8.77s (34% reduction).
-  - Current: **8.77s NPU kernel** (IRON: 2.32s, gap: 3.8×). Wall: ~47s (CPU attention dominates).
-  - FFN block is 71% of NPU time (390ms/layer vs IRON 57.7ms). Next optimization target.
+  - [x] XRT context + BO reuse: NPU kernel 18.67s → **6.49s** (65% reduction).
+  - [x] GEMM investigation: Found optimal tiles (3.5-5.5× speedup) + rounding mode bug fix.
+  - Current: **6.49s NPU kernel** (IRON: 2.32s, gap: 2.8×). Wall: ~47s (CPU attention dominates).
+  - Blocked: GEMM direct codegen precision (needs upstream MLIR-AIE rounding mode support).
+  - Blocked: NPU flash attention (needs upstream kernel fix).
+  - Actionable: RoPE/RMSNorm vectorization.
   - See `docs/performance_optimization.md` for full breakdown and roadmap.
 - [ ] Phase 5: Decode Phase (future work)
 
