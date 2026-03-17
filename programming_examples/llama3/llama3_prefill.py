@@ -284,6 +284,7 @@ class KernelCache:
         self.verbose = verbose
         self.profiler = profiler or Profiler()
         self.artifacts = {}  # name -> XRTCompileArtifact
+        self._loaded = {}  # name -> (backend, invoker) for XRT context reuse
 
     def _log(self, msg):
         if self.verbose:
@@ -375,6 +376,10 @@ class KernelCache:
     def load_and_run(self, name, backend_kwargs, *inputs):
         """Load cached kernel and execute.
 
+        Keeps the XRT backend loaded between invocations of the same kernel
+        to avoid ~40ms per-invocation load/unload overhead. The backend and
+        invoker are cached in self._loaded and cleaned up by unload_all().
+
         Args:
             name: Kernel name (must have been compiled first)
             backend_kwargs: Dict of kwargs for XRTBackend constructor
@@ -391,18 +396,31 @@ class KernelCache:
                 f"Available: {list(self.artifacts.keys())}"
             )
 
-        artifact = self.artifacts[name]
-        backend = XRTBackend(**backend_kwargs)
+        # Load backend + invoker on first call, reuse on subsequent calls
+        if name not in self._loaded:
+            artifact = self.artifacts[name]
+            backend = XRTBackend(**backend_kwargs)
+            with filelock.FileLock("/tmp/npu.lock"):
+                invoker = backend.load(artifact)
+            self._loaded[name] = (backend, invoker)
+            self._log(f"Loaded {name} (XRT context cached)")
+
+        _, invoker = self._loaded[name]
 
         t0 = time.time()
         with filelock.FileLock("/tmp/npu.lock"):
-            invoker = backend.load(artifact)
             results = invoker(*inputs)
-        backend.unload()
         duration = time.time() - t0
 
         self.profiler.record_kernel(name, duration)
         return results
+
+    def unload_all(self):
+        """Unload all cached XRT backends. Call at program end."""
+        for name, (backend, _) in self._loaded.items():
+            backend.unload()
+            self._log(f"Unloaded {name}")
+        self._loaded.clear()
 
     @property
     def kernel_names(self):
