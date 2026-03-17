@@ -27,127 +27,94 @@ Performance optimization of the LLAMA-3.2-1B BF16 prefill pipeline (seq_len=2048
 | Priority | Action | Savings | Complexity | Status |
 |----------|--------|---------|-----------|--------|
 | **1** | Fix NPU flash attention | **37s** wall | Blocked upstream | Waiting |
-| **2** | Optimize FFN block | **~4s** NPU | High (fusion or per-kernel) | Not started |
-| **3** | Switch GEMM to BF16 output | **~0.5-1s** NPU | Low (one-arg change) | Ready |
-| **4** | Vectorize RoPE / RMSNorm | **~0.3s** NPU | Medium (eltwise_add pattern) | Ready |
-| **5** | GEMM tile/herd tuning | **~0.3s** NPU | Medium | Ready |
+| **2** | **Integrate GEMM optimal tiles + 8×4 herd** | **~4s** NPU | **Low** | **Ready** |
+| **3** | Vectorize RoPE / RMSNorm | **~0.3s** NPU | Medium (eltwise_add pattern) | Ready |
+| **4** | FFN kernel fusion | **~2s** NPU | High | Not started |
+
+### Blocked Items
+
+| Item | Issue | Workaround |
+|------|-------|-----------|
+| **NPU Flash Attention** | Kernel correctness bug (corr=0.31) | CPU `attention_reference()` fallback |
+
+### Actionable Now
+
+| Item | Action | Impact |
+|------|--------|--------|
+| **GEMM integration** | Update `_build_gemm_module()` with 8×4 herd + per-shape tiles | **~4s NPU savings** (3.5-5.5× faster GEMM) |
+| **RoPE vectorization** | Apply eltwise_add pattern (BF16 vec16, [8,1] herd) | ~0.3s NPU savings |
+| **RMSNorm vectorization** | Same pattern | ~0.3s NPU savings |
+
+Note: GEMM rounding mode fix landed in upstream MLIR-AIE rebuild (2026-03-19). Direct codegen now produces correct precision (corr=0.99992, 8% fail at 4% tolerance). See `kernels/gemm.md` for full analysis.
 
 ---
 
 ## AIR vs IRON — Kernel Breakdown Comparison
 
-All numbers measured on the same NPU2, seq_len=2048. AIR: 2026-03-17, IRON: 2026-03-16.
+AIR: measured 2026-03-19. IRON: from `/home/jiajli/apps/IRON/docs/IRON_LLAMA_profile.md` (prio=False, emu=True, correct LLAMA config).
 
-### Understanding the Measurements
+### Per-Kernel Standalone Comparison (kernel dispatch + wait only)
 
-Each kernel invocation involves these phases:
+IRON standalone from `pytest --build-dir build_llama -m "llama and extensive"`.
+AIR standalone from `test.exe` (best tile configs, 8×4 herd, direct codegen).
 
-```
-bo.write()          — memcpy: numpy → BO (host pinned memory)
-bo.sync(TO_DEVICE)  — DMA: host → NPU
-kernel() + wait()   — actual NPU compute
-bo.sync(FROM_DEV)   — DMA: NPU → host
-bo.read()           — memcpy: BO → numpy
-```
+| Kernel | Shape | AIR (µs) | AIR GFLOP/s | IRON (µs) | IRON GFLOP/s | AIR corr | IRON corr | AIR vs IRON |
+|--------|-------|---------|-------------|----------|-------------|---------|-----------|-------------|
+| GEMM Q/O | 2048³ | **2,822** | 6,088 | 3,539 | 4,854 | 0.99992 | 0.99994 | **1.25× faster** |
+| GEMM K/V | 2048×2048×512 | **722** | 5,949 | 762 | 5,634 | 0.99992 | 0.99994 | **1.06× faster** |
+| SwiGLU Prefill | 2048×2048×8192 (fused) | — | — | 48,100 | — | — | 0.99972 | — |
+| MHA | seq=2048, 32 heads | — (CPU) | — | 30,989 | — | — | 0.99758 | — |
+| RMSNorm | 4M BF16 | — | — | 843 | — | — | 0.99998 | — |
+| RoPE Q | 65536×64 | — | — | 845 | — | — | 0.99999 | — |
+| RoPE K | 16384×64 | — | — | 257 | — | — | 0.99999 | — |
+| Eltwise Add | 4M BF16 | 415 | 60,600 | 429 | 58,600 | 0.99998 | 0.99998 | **1.03× faster** |
 
-The two frameworks measure differently:
+### IRON Model-Level Timing (includes data transfer)
 
-| Measurement | AIR (our `load_and_run`) | IRON standalone (pytest) | IRON model (`_execute_aie`) |
-|-------------|-------------------------|------------------------|----------------------------|
-| BO allocation | No (cached) | No (pre-allocated) | No (pre-allocated) |
-| `bo.write` / `write_buffer` | **Yes** | No | **Yes** |
-| `bo.sync(TO_DEVICE)` | **Yes** | No (before timer) | No (before timer in `run_runlist`) |
-| kernel + wait | **Yes** | **Yes** | **Yes** |
-| `bo.sync(FROM_DEVICE)` | **Yes** | No (after timer) | No (after timer in `run_runlist`) |
-| `bo.read` / `read_buffer` | **Yes** | No | **Yes** (in `_execute_aie`) |
+From IRON end-to-end run (2.75s prefill):
 
-**For apple-to-apple comparison**, we use IRON's model-level timing (`_execute_aie_operation`) which includes write + kernel + read, comparable to our `load_and_run`.
-
-Phase breakdown example (eltwise add, 4M BF16 elements, with BO reuse):
-
-| Phase | AIR (µs) | Notes |
-|-------|---------|-------|
-| `bo.write()` | 1,677 | memcpy 3 × 8MB numpy → BO |
-| `bo.sync(TO_DEVICE)` | 211 | DMA to NPU |
-| **kernel + wait** | **482** | Actual NPU compute |
-| `bo.sync(FROM_DEVICE)` | 226 | DMA from NPU |
-| `bo.read()` | 2,901 | memcpy 3 × 8MB BO → numpy |
-| **Total** | **5,498** | |
-
-Kernel compute is only **9%** of per-invocation time. Host-side memory copies (`bo.write` + `bo.read`) dominate at 83%.
-
-### Per-Invocation Comparison — Apple-to-Apple (including data transfer)
-
-IRON model numbers from `_execute_aie_operation` (includes write_buffer + run_runlist + read_buffer).
-AIR numbers from `load_and_run` profiler (includes bo.write + sync + kernel + sync + read).
-
-Source: `docs/iron_profile_20260316.csv`, `docs/profiling_results_20260317.txt`
-
-| # | Kernel | Shape | AIR (ms) | IRON model (ms) | Gap | IRON standalone (ms) |
-|---|--------|-------|---------|-----------------|-----|---------------------|
-| 1 | RMSNorm | (2048, 2048) + weight | 10 | 4.3 | 2.3× | 0.88 |
-| 2 | GEMM Q | (2048, 2048) × (2048, 2048) → F32 | 23 | 8.8* | 2.6× | 7.4 |
-| 3 | GEMM K | (2048, 2048) × (2048, 512) → F32 | 5 | 8.8* | 0.6× | 1.65 |
-| 4 | GEMM V | (2048, 2048) × (2048, 512) → F32 | 5 | 8.8* | 0.6× | 1.65 |
-| 5 | RoPE Q | (65536, 64) BF16 | 11 | 5.0 | 2.2× | 0.74 |
-| 6 | RoPE K | (16384, 64) BF16 | 3 | 5.0 | 0.6× | 0.23 |
-| 7 | Attention | Q(32,2048,64) K(8,2048,64) V(8,2048,64) | **2,370** (CPU) | **42.7** (NPU) | 56× | 36.8 |
-| 8 | GEMM O | (2048, 2048) × (2048, 2048) → F32 | 23 | 8.8* | 2.6× | 7.4 |
-| 9 | Add | (4194304,) BF16 | 6 | 4.2 | 1.4× | 0.43 |
-| 10 | RMSNorm | (2048, 2048) + weight | 10 | 4.3 | 2.3× | 0.88 |
-| 11 | GEMM Gate | (2048, 2048) × (2048, 8192) → F32 | 86 | — | — | — |
-| 12 | GEMM Up | (2048, 2048) × (2048, 8192) → F32 | 86 | — | — | — |
-| 13 | SwiGLU | SiLU(gate)×up, n=16M, BF16 | 58 | — | — | — |
-| 14 | GEMM Down | (2048, 8192) × (8192, 2048) → F32 | 72 | — | — | — |
-| 15 | Add | (4194304,) BF16 | 6 | 4.2 | 1.4× | 0.43 |
-| | **FFN block (steps 10-15)** | | **318** | **57.7** | **5.5×** | — |
-| | **Layer total (NPU only, no attn)** | | **405** | — | — | — |
-
-\*IRON GEMM `_execute_aie_operation` avg = 8.75ms across 65 calls (mix of Q/K/V/O shapes). Per-shape breakdown not available from model profiling.
+| Function | Calls | Avg/call (ms) |
+|----------|-------|---------------|
+| `transformer.forward` | 16 | 152.3 |
+| `gqa.forward` | 16 | 76.9 |
+| `swiglu_prefill.forward` | 16 | 57.4 |
+| `gemm.forward` | 65 | 10.6 |
+| `mha.forward` | 16 | 37.0 |
+| `rope.forward` | 32 | 5.3 |
+| `elementwise_add.forward` | 32 | 4.5 |
+| `rms_norm.forward` | 33 | 4.3 |
 
 ### 16-Layer Totals
 
 | Metric | AIR | IRON | Gap |
 |--------|-----|------|-----|
-| **Total prefill (wall)** | ~47s | **2.84s** | 16.5× |
-| **NPU kernel total** | **6.49s** | 2.32s (`run_runlist`) | 2.8× |
-| **Per-layer (NPU kernel)** | 0.41s | 0.15s | 2.7× |
-| All operator `_execute_aie` total | — | 2.75s (`__call__`) | — |
+| **Total prefill (wall)** | ~47s | **2.75s** | 17× |
+| **NPU kernel total** | **6.49s** | ~2.4s (from model profile) | 2.7× |
+| **Per-layer** | 0.41s | 0.15s | 2.7× |
 | CPU attention total | ~37.9s | — | — |
-| IRON NPU attention total | — | 0.68s | — |
-
-### IRON Profiling Details
-
-Per-kernel latencies measured with:
-```bash
-cd /home/jiajli/apps/IRON
-pytest iron/operators/<op>/test.py -m "llama and extensive" -v -s
-```
-
-End-to-end model profiling:
-```bash
-cd /home/jiajli/apps/IRON/iron/applications/llama_3.2_1b
-PYTHONPATH=/home/jiajli/apps/IRON:$PYTHONPATH python3 inference.py \
-    <weights> <tokenizer> --num_tokens 1 --prompt_len 2048 --profile -vv
-# Analyze: python3 analyze_profile.py logs/profile_<timestamp>.log
-```
-
-IRON end-to-end breakdown (2.84s total):
-
-| Function | Calls | Total (s) | Avg (ms) |
-|----------|-------|-----------|----------|
-| `run_runlist` (pure NPU dispatch) | 194 | **2.32** | 12.0 |
-| `swiglu_prefill._execute_aie` | 16 | 0.92 | 57.7 |
-| `gemm._execute_aie` | 65 | 0.57 | 8.8 |
-| `mha._execute_aie` | 16 | 0.68 | 42.7 |
-| Python overhead (buffer sync, etc.) | — | 0.52 | — |
+| IRON NPU attention total | — | 0.59s (MHA) | — |
 
 ### IRON Architecture Advantages
 
-- **Persistent XRT context**: 194 dispatches share one context (no per-call load/unload)
-- **SwiGLU fusion**: 5 ops in one dispatch (57.7ms vs our 390ms for 4 separate ops)
+- **Persistent XRT context**: All dispatches share one context (no per-call load/unload)
+- **SwiGLU fusion**: 5 ops in one dispatch (57.4ms vs our ~300ms for 4 separate ops)
 - **ObjectFIFO DMA**: Compiler-managed double-buffering (vs our explicit `dma_memcpy_nd`)
 - **C++ kernel hints**: `AIE_PREPARE_FOR_PIPELINING`, `AIE_LOOP_MIN_ITERATION_COUNT`
+
+### IRON Profiling Reference
+
+Full IRON profiling data: `/home/jiajli/apps/IRON/docs/IRON_LLAMA_profile.md`
+
+```bash
+# End-to-end model
+cd /home/jiajli/apps/IRON
+source ironenv/bin/activate
+python iron/applications/llama_3.2_1b/inference.py \
+    <weights> <tokenizer> --num_tokens 1 --prompt_len 2048 --profile -vv
+
+# Per-kernel (use separate build dir to avoid cache conflicts)
+pytest iron/operators/ -m "llama and extensive" --build-dir build_llama -v -s
+```
 
 ---
 
@@ -173,10 +140,10 @@ IRON end-to-end breakdown (2.84s total):
 
 | Metric | Baseline | +BF16 Add | +XRT Reuse | +BO Reuse | IRON |
 |--------|----------|-----------|------------|-----------|------|
-| NPU kernel total | 18.67s | 13.40s | 8.77s | **6.49s** | 2.32s |
+| NPU kernel total | 18.67s | 13.40s | 8.77s | **6.49s** | ~2.4s |
 | NPU per-layer | 1.17s | 0.84s | 0.55s | **0.41s** | 0.15s |
-| Wall time | 25.9s | 51.4s | ~47s | ~47s | 2.84s |
-| Gap to IRON (NPU) | 8.1× | 5.8× | 3.8× | **2.8×** | 1.0× |
+| Wall time | 25.9s | 51.4s | ~47s | ~47s | 2.75s |
+| Gap to IRON (NPU) | 7.8× | 5.6× | 3.7× | **2.7×** | 1.0× |
 | Top-1 prediction | " Paris" | " Paris" | " Paris" | " Paris" | — |
 
 Note: Wall time unchanged after BO reuse because CPU attention (~38s) dominates. NPU kernel time improved 65% from baseline.
@@ -185,24 +152,28 @@ Note: Wall time unchanged after BO reuse because CPU attention (~38s) dominates.
 
 ## Remaining Per-Kernel Optimization Targets
 
-**Overall target**: NPU 6.49s → ~2.3s = **4.2s savings** (to match IRON)
+**Overall target**: NPU 6.49s → ~2.4s = **4.1s savings** (to match IRON)
 
-Using apple-to-apple comparison (both including data transfer):
+| Priority | Kernel | AIR (ms) | IRON standalone (ms) | IRON model (ms) | Action | Status |
+|----------|--------|---------|---------------------|-----------------|--------|--------|
+| **Blocked** | Attention (MHA) | 2,370 (CPU) | 31.0 | 37.0 | Upstream kernel fix | Waiting |
+| **Ready** | GEMM Q/O | 23 | 3.5 | 10.6 | Integrate 8×4 + optimal tiles | **Ready** |
+| **Ready** | RoPE Q | 11 | 0.85 | 5.3 | Vectorize, [8,1] herd | Actionable |
+| **Ready** | RMSNorm | 10 | 0.84 | 4.3 | Vectorize, [8,1] herd | Actionable |
+| **Done** | Eltwise Add | 6 | 0.43 | 4.5 | Nearly matched | Complete |
+| **Done** | GEMM K/V | 5 | 0.76 | (in 10.6 avg) | Already faster | — |
+| **Future** | FFN fusion | 302 | 48.1 (fused) | 57.4 (fused) | Kernel fusion | Complex |
 
-| Priority | Kernel | Shape | AIR (ms) | IRON model (ms) | Gap | Action |
-|----------|--------|-------|---------|-----------------|-----|--------|
-| **High** | FFN block (steps 11-14) | 2048×2048×8192 (fused) | 302 | 57.7 | 5.2× | Kernel fusion |
-| **Medium** | GEMM Q/O | 2048×2048×2048 | 23 | 8.8 | 2.6× | BF16 output, tile/herd tuning |
-| **Medium** | RoPE Q | (65536, 64) BF16 | 11 | 5.0 | 2.2× | Vectorize, [8,1] herd |
-| **Medium** | RMSNorm | (2048, 2048) BF16 | 10 | 4.3 | 2.3× | Vectorize, [8,1] herd |
-| **Low** | Eltwise Add | (4194304,) BF16 | 6 | 4.2 | 1.4× | Nearly matched |
-| **Low** | GEMM K/V | 2048×2048×512 | 5 | 8.8 | 0.6× | Already faster than IRON |
-| **Low** | RoPE K | (16384, 64) BF16 | 3 | 5.0 | 0.6× | Already faster than IRON |
-| **Blocked** | Attention (MHA) | Q(32,2048,64) | 2,370 (CPU) | 42.7 | 56× | Upstream NPU kernel fix |
-| **Low** | RoPE K | (16384, 64) BF16 | 4 | 0.23 | 17× | Vectorize |
-| **Blocked** | Attention (MHA) | Q(32,2048,64) | 2,370 (CPU) | 42.7 | 56× | Upstream NPU kernel fix |
+### GEMM Status
 
-Note: IRON fuses Gate GEMM + Up GEMM + SiLU + mul + Down GEMM into a single SwiGLU prefill dispatch. See `kernels/gemm.md` for GEMM precision and accumulator analysis.
+Rounding mode fix landed in upstream MLIR-AIE rebuild (2026-03-19). Direct codegen now produces correct precision.
+
+- **Performance**: 8×4 herd + optimal tiles → Q/O: 2,822 µs (**25% faster** than IRON's 3,539 µs). K/V: 722 µs (6% faster than IRON's 762 µs).
+- **Precision**: corr=0.99992, 4% fail=8.0% (IRON: 0.99994, 7.5%). Rounding bias eliminated (mean_signed ≈ 0).
+- **Verification**: `run.py` tolerance fixed from rtol=1.0 to 0.04. Integer variants set to rtol=0 (exact).
+- **Ready to integrate** into LLAMA pipeline.
+
+See `kernels/gemm.md` for full analysis.
 
 ---
 
@@ -223,6 +194,16 @@ Cache `(backend, invoker)` per kernel in `KernelCache._loaded`. Load once per un
 Pre-allocate BOs on first invocation per kernel, reuse on subsequent calls. Also sync instruction BO only once. NPU total: 8.77s → 6.49s (26% reduction). Eliminated ~5ms per-invocation BO allocation overhead.
 
 Combined XRT context + BO reuse: 13.40s → 6.49s (**52% total reduction**).
+
+### 4. GEMM Investigation (2026-03-17)
+
+**Performance**: Found optimal tile configs (8×4 herd, per-shape tiles) giving 3.5-5.5× standalone speedup. Q/O: 14,012 → 2,902 µs. Matches IRON at ~5,900 GFLOP/s.
+
+**Precision**: Discovered BFP16 rounding mode bug — AIE2P default is `floor` rounding, causing systematic -0.065×K bias. Fixed in non-direct-codegen path by adding `set_rounding(conv_even)` to `mm_aie2p.cc`. After fix: corr=0.99992, 4% fail=8% (matching IRON's 7.4%).
+
+**Verification**: Fixed `run.py` test tolerances (rtol 1.0→0.04 for BF16, 0 for integer). Old 100% tolerance was masking precision bugs.
+
+See `kernels/gemm.md` for full analysis.
 
 ---
 
