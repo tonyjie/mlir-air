@@ -693,6 +693,8 @@ if __name__ == "__main__":
         print(mlir_module)
         exit(0)
 
+    # Use random inputs with realistic range (matching IRON's test range)
+    np.random.seed(42)
     input_a = (np.random.randn(args.m, args.k) * 4).astype(INPUT_DATATYPE)
     input_b = (np.random.rand(args.k, args.n) * 4).astype(INPUT_DATATYPE)
 
@@ -743,9 +745,7 @@ if __name__ == "__main__":
                 mlir_module,
                 inputs=[input_a, input_b],
                 stochastic_expected_outputs=[sampled_data],
-                rtol=0.05,
-                atol=4,
-                max_mismatch_percentage=5,
+                rtol=4e-2,  # 4% relative tolerance (matching IRON)
             )
         )
 

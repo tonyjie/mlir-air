@@ -51,6 +51,11 @@ static inline void matmul_vectorized_2x2_mmul(const T_in *__restrict pA,
 
   using MMUL = aie::mmul<r, s, t, T_in, T_in, accauto>;
 
+  // Set rounding mode to round-to-nearest-even to avoid systematic negative
+  // bias from BFP16 emulation. Without this, floor rounding causes cumulative
+  // bias of approximately -0.065 * K per output element.
+  ::aie::set_rounding(aie::rounding_mode::conv_even);
+
   event0();
 
   for (unsigned z = 0; z < rowA; z += 2)
