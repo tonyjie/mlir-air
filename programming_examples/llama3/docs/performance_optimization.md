@@ -4,7 +4,33 @@
 
 Performance optimization of the LLAMA-3.2-1B BF16 prefill pipeline (seq_len=2048, 16 layers) on NPU2 (AIE2P). Reference implementation: IRON (`/home/jiajli/apps/IRON`).
 
-**Current status**: NPU kernel time = **8.77s**, wall time = ~47s. IRON reference = **2.84s**.
+### Current Status
+
+| Metric | Baseline | Current | IRON | Gap to IRON |
+|--------|----------|---------|------|-------------|
+| NPU kernel total | 18.67s | **8.77s** | 2.32s | 3.8× |
+| Wall time | 25.9s | ~47s | 2.84s | 16.5× |
+| Per-layer (NPU) | 1.17s | 0.55s | 0.15s | 3.7× |
+
+### Where the Time Goes (8.77s NPU breakdown)
+
+| Category | Per-layer | ×16 layers | % of NPU | IRON | Gap |
+|----------|----------|------------|----------|------|-----|
+| **FFN block** (Gate+Up+SwiGLU+Down) | 390ms | 6.24s | **71%** | 57.7ms | 6.8× |
+| **GEMM Q/O** (×2) | 66ms | 1.06s | 12% | 14.8ms | 4.5× |
+| **Small kernels** (RMSNorm, RoPE, Add) | 60ms | 0.96s | 11% | 3.1ms | 19× |
+| **GEMM K/V** (×2) | 16ms | 0.26s | 3% | 3.3ms | 4.8× |
+| **CPU Attention** | 2,370ms | 37.9s | (wall only) | 42.7ms | 56× |
+
+### Next Steps (ordered by impact)
+
+| Priority | Action | Savings | Complexity | Status |
+|----------|--------|---------|-----------|--------|
+| **1** | Fix NPU flash attention | **37s** wall | Blocked upstream | Waiting |
+| **2** | Optimize FFN block | **~5.3s** NPU | High (fusion or per-kernel) | Not started |
+| **3** | Switch GEMM to BF16 output | **~1-2s** NPU | Low (one-arg change) | Ready |
+| **4** | Vectorize RoPE / RMSNorm | **~0.8s** NPU | Medium (eltwise_add pattern) | Ready |
+| **5** | GEMM tile/herd tuning | **~0.5s** NPU | Medium | Ready |
 
 ---
 
@@ -109,29 +135,22 @@ Note: Wall time increased after BF16 add because the BF16 residual state changes
 
 ---
 
-## Remaining Optimization Priorities
+## Remaining Per-Kernel Optimization Targets
 
-### Priority 1: Fix NPU Flash Attention (upstream bug)
+**Overall target**: NPU 8.77s → ~2.3s = **6.5s savings** (to match IRON)
 
-**Impact**: ~37.9s → ~0.7s = **37s savings** (dominates wall time)
+| Priority | Kernel | Shape | AIR (ms) | IRON (ms) | Gap | Action |
+|----------|--------|-------|---------|-----------|-----|--------|
+| **High** | FFN block (steps 11-14) | 2048×2048×8192 (fused) | 390 | 57.7 | 6.8× | Kernel fusion |
+| **High** | RoPE Q | (65536, 64) BF16 | 16 | 0.74 | 22× | Vectorize, [8,1] herd |
+| **Medium** | RMSNorm | (2048, 2048) BF16 | 15 | 0.88 | 17× | Vectorize, [8,1] herd |
+| **Medium** | GEMM Q/O | 2048×2048×2048 | 33 | 7.4 | 4.5× | BF16 output, tile/herd tuning |
+| **Medium** | GEMM K/V | 2048×2048×512 | 8 | 1.65 | 4.8× | BF16 output, tile/herd tuning |
+| **Low** | Eltwise Add | (4194304,) BF16 | 13 | 0.43 | 30× | Kernel matched; BO alloc overhead |
+| **Low** | RoPE K | (16384, 64) BF16 | 4 | 0.23 | 17× | Vectorize |
+| **Blocked** | Attention (MHA) | Q(32,2048,64) | 2,370 (CPU) | 42.7 | 56× | Upstream NPU kernel fix |
 
-CPU `attention_reference()` runs at 2,370ms/invocation. IRON's NPU MHA runs at 42.7ms. **56× gap**.
-
-**Status**: Blocked on upstream kernel fix. See `LLAMA_flash_attention.md`.
-
-### Priority 2: Per-Kernel Compute Optimization
-
-**Impact**: NPU 8.77s → ~2.3s = **6.5s savings** (to match IRON)
-
-| Priority | Kernel | AIR (ms) | IRON (ms) | Gap | Action |
-|----------|--------|---------|-----------|-----|--------|
-| **High** | FFN block (steps 11-14) | 390 | 57.7 (fused) | 6.8× | Kernel fusion |
-| **High** | RoPE Q | 16 | 0.74 | 22× | Vectorize, 8-column herd |
-| **Medium** | RMSNorm | 15 | 0.88 | 17× | Vectorize, 8-column herd |
-| **Medium** | GEMM Q/O | 33 | 7.4 | 4.5× | Tile/herd tuning |
-| **Medium** | GEMM K/V | 8 | 1.65 | 4.8× | Tile/herd tuning |
-| **Low** | Eltwise Add | 13 | 0.43 | 30× | BO alloc overhead; kernel already matched |
-| **Low** | RoPE K | 4 | 0.23 | 17× | Vectorize |
+Note: IRON fuses Gate GEMM + Up GEMM + SiLU + mul + Down GEMM into a single SwiGLU prefill dispatch. See `kernels/gemm.md` for GEMM precision and accumulator analysis.
 
 ---
 
