@@ -195,27 +195,44 @@ python3 -m pytest iron/operators/elementwise_add/test.py -k "llama_prefill_add_2
 
 ### Execution (per-invocation avg, with BF16 vectorized add + CPU attention)
 
-| Kernel | Ours Avg | Count | Ours Total | % of NPU | IRON ref (per-inv) | Notes |
-|--------|----------|-------|------------|----------|-------------------|-------|
-| GEMM Gate/Up | 0.117s | x32 | 3.74s | **28%** | ~10.6ms | IRON uses fused SwiGLU block |
-| GEMM Q/O | 0.054s | x32 | 1.73s | 13% | ~10.6ms | IRON GEMM 2048² = 7.5ms (8-col) |
-| GEMM Down | 0.102s | x16 | 1.63s | 12% | ~10.6ms | |
-| SwiGLU | 0.089s | x16 | 1.42s | 11% | (fused) | IRON fuses gate+up+act+down |
-| Eltwise Add | 0.042s | x32 | 1.34s | 10% | ~0.43ms | **Matched IRON** (standalone) |
-| GEMM K/V | 0.040s | x32 | 1.28s | 10% | ~0.31ms | |
-| RMSNorm | 0.030s | x33 | 0.99s | 7% | ~0.09ms | |
-| RoPE Q | 0.056s | x16 | 0.90s | 7% | ~0.07ms | |
-| RoPE K | 0.021s | x16 | 0.34s | 3% | ~0.07ms | |
+IRON numbers measured on our NPU2 at 2048-token scale (2026-03-16), using:
+`pytest iron/operators/<op>/test.py -m "llama and extensive" -v -s`
+
+| Kernel | Ours Avg | Count | Ours Total | % of NPU | IRON (µs) | IRON cmd |
+|--------|----------|-------|------------|----------|-----------|----------|
+| GEMM Gate/Up | 117ms | x32 | 3.74s | **28%** | (fused) | SwiGLU block: 80,500 µs |
+| GEMM Q/O | 54ms | x32 | 1.73s | 13% | 7,367 | `gemm_2048x2048x2048_8cols` |
+| GEMM Down | 102ms | x16 | 1.63s | 12% | (fused) | SwiGLU block |
+| SwiGLU | 89ms | x16 | 1.42s | 11% | (fused) | SwiGLU block |
+| Eltwise Add | 42ms | x32 | 1.34s | 10% | 432 | `llama_prefill_add_2048tok` |
+| GEMM K/V | 40ms | x32 | 1.28s | 10% | 1,650 | `llama_kv_proj_2048tok` |
+| RMSNorm | 30ms | x33 | 0.99s | 7% | 880 | `llama_prefill_rms_norm_2048tok` |
+| RoPE Q | 56ms | x16 | 0.90s | 7% | 738 | `llama_prefill_q_2048tok` |
+| RoPE K | 21ms | x16 | 0.34s | 3% | 233 | `llama_prefill_k_2048tok` |
 | **NPU Total** | | **225** | **13.40s** | | | |
-| CPU Attention | ~2.37s | x16 | ~37.9s | — | ~43ms (NPU) | IRON uses NPU MHA |
+| CPU Attention | ~2.37s | x16 | ~37.9s | — | 36,750 | `llama_prefill_2048tok` (MHA) |
+
+**IRON per-layer estimate** (from isolated kernel benchmarks):
+- Attention block: RMSNorm (0.88ms) + GEMM Q (7.4ms) + GEMM K (1.7ms) + GEMM V (1.7ms) + RoPE Q (0.74ms) + RoPE K (0.23ms) + MHA (36.8ms) + GEMM O (7.4ms) + Add (0.43ms) = **57.3ms**
+- FFN block: RMSNorm (0.88ms) + SwiGLU fused (80.5ms) + Add (0.43ms) = **81.8ms**
+- **Total per layer: ~139ms** (isolated kernel sum, no overhead)
+- **16 layers: ~2.2s** (kernel only) vs 2.91s measured (0.7s Python/XRT overhead)
+
+**Our per-layer estimate** (subtracting ~40ms XRT overhead per invocation):
+- 13 NPU invocations per layer × ~40ms overhead = ~520ms overhead per layer
+- Actual kernel time: ~0.84s - 0.52s = **~320ms** per layer
+- **16 layers kernel-only: ~5.1s** vs IRON's ~2.2s → **~2.3× actual compute gap**
 
 **Per-layer avg**: 3.21s wall, 0.84s NPU kernel
 **Total prefill**: 13.4s NPU kernel + ~37.9s CPU attention = 51.4s wall
-**IRON reference**: 2.91s total prefill (16 layers), ~182ms/layer
+**IRON reference**: 2.91s total prefill (16 layers)
 
-**Key gap analysis**: Our NPU kernel time (13.4s) is ~4.6× IRON's total prefill (2.91s). The gap is dominated by **per-invocation XRT load/unload overhead** (~40ms × 225 invocations ≈ 9s). Actual kernel compute is estimated at ~4s, closer to IRON. IRON avoids this overhead by maintaining a persistent XRT context across all kernel dispatches.
+**Key gap analysis**:
+1. **XRT load/unload overhead**: ~40ms × 225 invocations ≈ 9s (67% of our NPU time). IRON uses persistent XRT context.
+2. **Actual compute gap**: ~2.3× (our ~5.1s vs IRON's ~2.2s kernel-only). Likely from IRON's kernel fusion (SwiGLU = 5 ops fused) and C++ kernel compiler optimizations.
+3. **CPU attention**: 37.9s (74% of wall time). IRON's NPU MHA = 36.8ms × 16 = 0.59s.
 
-**Note**: CPU attention dominates wall time (74%). Flash Attention runs on CPU (`--cpu-attn` default) due to NPU kernel bug. When NPU kernel is fixed (~0.155s/invocation), total would drop to ~16s. With XRT context reuse, total would drop further to ~4-5s.
+**Note**: CPU attention dominates wall time. When NPU flash attention kernel is fixed + XRT context reuse implemented, expected total: ~5-6s (vs IRON's 2.91s).
 
 ### Profiling history
 
