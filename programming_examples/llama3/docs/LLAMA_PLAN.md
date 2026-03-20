@@ -75,16 +75,18 @@ Note: seq_len=128 had issues with Flash Attention (required LK=256 workaround). 
   - All per-kernel, per-layer, and full-model verification tests pass.
   - Use `--npu-attn` to switch back to NPU flash attention kernel (when fixed).
 - [ ] Phase 3B: Fix Flash Attention NPU kernel (upstream bug)
-  - Two CPU references verified identical (corr=0.9999) — issue is the kernel, not invocation
-  - Standalone `PASS!` is a false positive (loose tolerances + narrow data range)
-  - GitHub issue submitted to Xilinx/mlir-air — waiting for developer fix
+  - Kernel produces uncorrelated output (corr=0.13-0.34) for ALL configs at LQ=2048.
+  - `make run PASS` is a false positive — element-wise tolerance can't detect wrong attention patterns.
+  - PR #1438 fixed BD exhaustion but NOT the correctness bug.
+  - `test_precision.py` created for correlation-based validation.
+  - GitHub issue with reproducer filed. See `docs/kernels/flash_attention.md`.
 - [ ] Phase 4: Performance Optimization — IN PROGRESS
   - [x] Eltwise add: BF16 vec16 [8,1] → 415 µs (was 214ms). Matches IRON. PR #1431.
   - [x] XRT context + BO reuse: NPU kernel 18.67s → **6.49s** (65% reduction).
-  - [x] GEMM investigation: Found optimal tiles (3.5-5.5× speedup) + rounding mode bug fix.
-  - Current: **6.49s NPU kernel** (IRON: 2.32s, gap: 2.8×). Wall: ~47s (CPU attention dominates).
-  - Blocked: GEMM direct codegen precision (needs upstream MLIR-AIE rounding mode support).
-  - Blocked: NPU flash attention (needs upstream kernel fix).
+  - [x] GEMM: Optimal tiles (3.5-5.5× speedup) + rounding mode fix landed upstream. **Ready to integrate.**
+  - [x] FlashAttention: Investigated — still broken (corr=0.13-0.34). CPU fallback required.
+  - Current: **6.49s NPU kernel** (IRON: ~2.4s, gap: 2.7×). Wall: ~47s (CPU attention dominates).
+  - **Next**: Integrate GEMM optimal tiles into LLAMA pipeline, verify 16-layer correctness.
   - Actionable: RoPE/RMSNorm vectorization.
   - See `docs/performance_optimization.md` for full breakdown and roadmap.
 - [ ] Phase 5: Decode Phase (future work)

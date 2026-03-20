@@ -150,13 +150,20 @@ All 9 kernel configs tested on NPU2 hardware with random data:
 | | **Profiling**: NPU kernel total dropped from 18.67s → **13.40s** (28% reduction). Eltwise add: 8.19s → 1.34s (6.1× in pipeline). |
 | | Eltwise add is no longer the bottleneck. GEMM Gate/Up (0.117s × 32 = 3.74s, 28%) is now the largest contributor. |
 
+| 2026-03-17 | **XRT context + BO reuse**: NPU kernel 13.40s → 8.77s → **6.49s**. |
+| 2026-03-17 | **GEMM investigation**: Found optimal tiles (3.5-5.5× speedup). Discovered BFP16 rounding mode bug. Fixed in non-direct-codegen path. |
+| 2026-03-19 | **GEMM rounding fix landed upstream** in MLIR-AIE rebuild. Direct codegen now produces correct precision (corr=0.99992). |
+| 2026-03-19 | **GEMM verified**: All 4 LLAMA shapes pass precision check. AIR 25% faster than IRON on Q/O. Ready to integrate. |
+| 2026-03-20 | **FlashAttention re-tested** after PR #1438. **Still broken**: corr=0.13-0.34 for ALL configs at LQ=2048. `make run PASS` is false positive. Created `test_precision.py` and filed GitHub issue. CPU fallback remains necessary. |
+| 2026-03-20 | **GEMM `run.py` test fixed**: rtol 1.0→0.04, inputs changed from `arange` to `randn*4`. Integer tests set to exact (rtol=0). |
+
 ---
 
 ## Phase 4: Performance Optimization
 
 See `performance_optimization.md` for full profiling breakdown, IRON comparison, and optimization roadmap.
 
-**Summary**: NPU kernel 18.67s → **8.77s** (after BF16 eltwise add + XRT context reuse). IRON: 2.32s. Gap: 3.8×. FFN block is 71% of NPU time.
+**Summary**: NPU kernel 18.67s → **6.49s** (BF16 add + XRT/BO reuse). IRON: ~2.4s. Gap: 2.7×. GEMM optimization ready to integrate (3.5-5.5× kernel speedup). FlashAttention still broken (CPU fallback).
 
 ---
 
