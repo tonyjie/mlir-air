@@ -35,7 +35,7 @@ Performance optimization of the LLAMA-3.2-1B BF16 prefill pipeline (seq_len=2048
 
 | Item | Issue | Workaround |
 |------|-------|-----------|
-| **NPU Flash Attention** | Kernel correctness bug (corr=0.31) | CPU `attention_reference()` fallback |
+| **NPU Flash Attention** | Kernel still produces uncorrelated output (corr=0.13-0.34 vs standard attention for ALL configs at LQ=2048). `make run PASS` is a false positive — element-wise tolerance can't detect wrong attention patterns. GitHub issue filed. | CPU `attention_reference()` fallback (`--cpu-attn`) |
 
 ### Actionable Now
 

@@ -27,34 +27,49 @@ PR #1438 fixed the **causal masking BD exhaustion** bug and the **kernel correct
 
 Tested with `atol=0.15, rtol=0.04` (the kernel's built-in tolerance).
 
-Tolerance: `atol=0.15, rtol=0.04`. All at LQ=LK=2048, LQP=256, LKP=64, DK=DV=64, val_range=3.
+### Precision Metrics (measured with `test_precision.py`)
 
-| Config | NH | NKV | Causal | max_diff | avg_diff | Mismatches | Total | Fail% | Status |
-|--------|----|-----|--------|---------|---------|-----------|-------|-------|--------|
-| LIT causal | 2 | 2 | Yes | — | — | 0 | 32K | 0% | **PASS** (LQ=16384) |
-| LIT GQA | 12 | 6 | No | — | — | 0 | 393K | 0% | **PASS** (LQ=512) |
-| **2 heads** | **2** | **2** | **No** | **0.469** | **0.306** | **5,817** | **262K** | **2.2%** | **FAIL** |
-| 4 heads | 4 | 4 | No | — | — | 0 | 524K | 0% | **PASS** |
-| 6 heads | 6 | 6 | No | — | — | 0 | 786K | 0% | **PASS** |
-| 8 heads MHA | 8 | 8 | No | — | — | 0 | 1.0M | 0% | **PASS** |
-| 8 heads GQA | 8 | 4 | No | — | — | 0 | 1.0M | 0% | **PASS** |
-| **10 heads** | **10** | **10** | **No** | — | — | **39,704** | **1.3M** | **3.0%** | **FAIL** |
-| **12 heads** | **12** | **12** | **No** | **0.305** | **0.239** | **43,924** | **1.6M** | **2.8%** | **FAIL** |
-| **LLAMA** | **32** | **8** | **No** | **0.289** | **0.241** | **85,792** | **4.2M** | **2.0%** | **FAIL** |
-| **LLAMA causal** | **32** | **8** | **Yes** | **0.477** | **0.286** | **357,646** | **4.2M** | **8.5%** | **FAIL** |
-| **IRON MHA** | **32** | **8** | **Yes** | **0.25** | **0.021** | **~110** | **~21K** | **0.1%** | **PASS** |
+All at LQ=LK=2048, LQP=256, LKP=64, DK=DV=64, val_range=3.
 
-### Failure Pattern
+| Config | NH | NKV | Causal | corr | max_err | mean_err | 4%-fail | `make run` |
+|--------|----|-----|--------|------|---------|----------|---------|-----------|
+| 4h MHA | 4 | 4 | No | **0.132** | 0.719 | 0.073 | 10.1% | PASS* |
+| 8h MHA | 8 | 8 | No | **0.175** | 1.217 | 0.076 | 11.3% | PASS* |
+| **LLAMA** | **32** | **8** | **No** | **0.287** | **0.711** | **0.064** | **6.5%** | **FAIL** |
+| **LLAMA causal** | **32** | **8** | **Yes** | **0.343** | **2.160** | **0.096** | **17.9%** | **FAIL** |
+| **IRON MHA** | **32** | **8** | **Yes** | **0.998** | **0.25** | **0.021** | **0.1%** | **PASS** |
 
-The pattern is **non-monotonic**: NH=2 fails, NH=4/6/8 pass, NH≥10 fails. This suggests the issue is related to how the kernel partitions heads into the AIE herd/segment, not simply "more heads = worse."
+\*`make run` reports PASS because `max_mismatch_percentage=2` allows up to 2% element failures, and mean_err (~0.07) is below `atol=0.15`. However the **correlation is 0.13-0.18** — the output is numerically plausible but mathematically wrong.
 
-- **NH=4,6,8**: These divide evenly into the kernel's internal segment unroll factor (2) and herd configuration, producing correct results.
-- **NH=2**: Likely a boundary case in the segment partitioning.
-- **NH≥10**: Exceeds some internal buffer or DMA scheduling limit.
+### Critical Finding
 
-The LIT tests pass because they use different LQ/LK values (16384 or 512) where the total buffer sizes are within limits despite having many heads.
+**The flash attention kernel correctness bug is NOT fixed.** Correlation = 0.13-0.34 for ALL configs at LQ=2048, including those that `make run` reports as PASS. This is the same magnitude as the original corr=0.31 bug.
 
-The failures are **precision mismatches** (max_diff=0.24-0.48), not compilation errors. Causal masking adds more errors (8.5% vs 2.0%) due to additional masking computation. IRON MHA achieves much better precision (0.1% fail, max_err=0.25) at the same LLAMA scale.
+The `make run PASS` is misleading because:
+- Output values are in the correct **range** (~1.0-2.0, softmax-averaged V values)
+- **Mean absolute error** is small (~0.07) relative to `atol=0.15`
+- But the output has **no correlation** with the correct attention — it's computing the wrong thing
+- The test's element-wise tolerance (`atol=0.15, rtol=0.04, max_mismatch_percentage=2`) cannot detect this class of bug where the output is in-range but mathematically incorrect
+
+**IRON MHA achieves corr=0.998 at the same scale**, confirming the computation is achievable.
+
+### Why `make run` Passes for Some Configs
+
+With `max_mismatch_percentage=2` and `atol=0.15`:
+- Output mean ≈ 1.5 (correct range for averaged V in [0,3])
+- mean_err ≈ 0.07 < atol=0.15 → most elements pass
+- Only ~6-11% elements exceed tolerance → 4h/8h have <2% mismatches at the default `atol/rtol`
+- But correlation is 0.13-0.18 → output is essentially random within the correct range
+
+### Reproducible Precision Measurement
+
+```bash
+cd programming_examples/flash_attention/kernel_fusion_based
+
+# Precision test (measures corr, max_err, mean_err, 4%-fail)
+python3 test_precision.py --num-heads 8 --num-kv-heads 8
+python3 test_precision.py --num-heads 32 --num-kv-heads 8 --causal
+```
 
 ### Likely Root Cause
 
