@@ -17,7 +17,7 @@ Performance optimization of the LLAMA-3.2-1B BF16 prefill pipeline (seq_len=2048
 
 | Kernel | Avg (ms) | Count | Total (s) | % of NPU | IRON model (ms) |
 |--------|----------|-------|-----------|----------|-----------------|
-| SwiGLU | 59 | x16 | 0.94 | **26%** | (fused 57.4) |
+| SwiGLU | 37 | x16 | 0.59 | **17%** | (fused 57.4) |
 | GEMM Gate/Up | 24 | x32 | 0.77 | 21% | (fused) |
 | GEMM Down | 27 | x16 | 0.43 | 12% | (fused) |
 | GEMM Q/O | 10 | x32 | 0.32 | 9% | 10.6 |
@@ -129,7 +129,7 @@ pytest iron/operators/ -m "llama and extensive" --build-dir build_llama -v -s
 |--------|-------|----------|-----------|------------|-----------|------------|-----------------|
 | GEMM Gate/Up | 2048×2048×8192 | 110 | 117 | 111 | 86 | **24** | (fused) |
 | GEMM Down | 2048×8192×2048 | 103 | 102 | 91 | 72 | **27** | (fused) |
-| SwiGLU | n=16M, BF16 | 86 | 89 | 77 | 58 | **59** | (fused) |
+| SwiGLU | n=16M, BF16 | 86 | 89 | 77 | 58 | **37** | (fused) |
 | GEMM Q/O | 2048×2048×2048 | 51 | 54 | 33 | 23 | **10** | 10.6 |
 | RoPE Q | 65536×64 | 27 | 56 | 16 | 11 | **17** | 5.3 |
 | RMSNorm | (2048, 2048) | 28 | 30 | 15 | 10 | **10** | 4.3 |
@@ -141,14 +141,16 @@ pytest iron/operators/ -m "llama and extensive" --build-dir build_llama -v -s
 
 | Metric | Baseline | +BF16 Add | +XRT Reuse | +BO Reuse | +GEMM Opt | IRON |
 |--------|----------|-----------|------------|-----------|-----------|------|
-| NPU kernel total | 18.67s | 13.40s | 8.77s | 6.49s | **3.60s** | ~2.4s |
+| NPU kernel total | 18.67s | 13.40s | 8.77s | 6.49s | **3.57s** | ~2.4s |
 | NPU per-layer | 1.17s | 0.84s | 0.55s | 0.41s | **0.22s** | 0.15s |
-| Wall time | 25.9s | 51.4s | ~47s | ~47s | **~43s** | 2.75s |
+| Wall time | 25.9s | 51.4s | ~47s | ~47s | **~44s** | 2.75s |
 | Gap to IRON (NPU) | 7.8× | 5.6× | 3.7× | 2.7× | **1.5×** | 1.0× |
-| Compilation | 334s | 334s | 334s | 334s | **34s** | — |
+| Compilation | 334s | 334s | 334s | 334s | **37s** | — |
 | Top-1 prediction | " Paris" | " Paris" | " Paris" | " Paris" | " Paris" | — |
 
-NPU kernel time reduced **81%** from baseline (18.67s → 3.60s). Gap to IRON narrowed from 7.8× to **1.5×**. Wall time dominated by CPU attention (~38s).
+NPU kernel time reduced **81%** from baseline (18.67s → 3.57s). Gap to IRON narrowed from 7.8× to **1.5×**. Wall time dominated by CPU attention (~38s).
+
+Note: "+GEMM Opt" column includes both GEMM tile optimization and SwiGLU [8,1] herd optimization (59ms→37ms via tile_n=4096 to fit BD limit).
 
 ---
 
@@ -203,6 +205,20 @@ Combined XRT context + BO reuse: 13.40s → 6.49s (**52% total reduction**).
 | Logits corr (16 layers) | 0.969 | **0.994** | Improved |
 
 See `kernels/gemm.md` for full analysis.
+
+### 5. SwiGLU Optimization (2026-03-20)
+
+Updated C++ kernel to 16-wide BF16 vectors with pipelining hints. Scaled herd from [1,2] to [8,1] by increasing tile_n from 1024 to 4096 (keeping iterations under BD limit).
+
+| Metric | Before | After | Improvement |
+|--------|--------|-------|-------------|
+| SwiGLU avg | 59ms | **37ms** | **1.6×** |
+| Herd | [1,2] (2 cores) | [8,1] (8 cores) | 4× more DMA bandwidth |
+| Vector width | 8 | 16 | 2× (but DMA-bound) |
+
+**BD exhaustion workaround**: At 16.7M elements with tile_n=1024, [8,1] needs 1024 iterations × 3 BDs = 3072 BDs — exceeds hardware limit (~3072 max). Increasing tile_n to 4096 reduces iterations to 512 → fits. This is a limitation of AIR's per-iteration BD generation (IRON avoids this via ObjectFIFO repeating patterns).
+
+See `kernels/swiglu.md` for full analysis including BD limit investigation.
 
 ---
 

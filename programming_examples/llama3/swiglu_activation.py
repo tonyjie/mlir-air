@@ -28,12 +28,14 @@ range_ = for_
 
 
 @module_builder
-def build_module(n, tile_n, np_dtype_in):
+def build_module(n, tile_n, np_dtype_in, herd_x=1, herd_y=None):
     xrt_dtype = type_mapper(np_dtype_in)
-    num_tiles = 2
+    if herd_y is None:
+        herd_y = 2  # default backward-compatible
+    total_tiles = herd_x * herd_y
     assert (
-        n % (tile_n * num_tiles) == 0
-    ), f"n ({n}) must be divisible by tile_n * num_tiles ({tile_n * num_tiles})"
+        n % (tile_n * total_tiles) == 0
+    ), f"n ({n}) must be divisible by tile_n * total_tiles ({tile_n * total_tiles})"
 
     # L3 types
     l3MemrefTy = MemRefType.get([n], xrt_dtype)
@@ -57,7 +59,7 @@ def build_module(n, tile_n, np_dtype_in):
     def swiglu_activation(arg0, arg1, arg2):
         # arg0 = gate [n], arg1 = up [n], arg2 = output [n]
 
-        @herd(name="herd_0", sizes=[1, num_tiles], operands=[arg0, arg1, arg2])
+        @herd(name="herd_0", sizes=[herd_x, herd_y], operands=[arg0, arg1, arg2])
         def herd_body(_tx, _ty, _sx, _sy, l3_gate, l3_up, l3_out):
             l1_gate = AllocOp(l1MemrefTy, [], [])
             l1_up = AllocOp(l1MemrefTy, [], [])
@@ -65,21 +67,28 @@ def build_module(n, tile_n, np_dtype_in):
 
             tile_n_i32 = ConstantOp(T.i32(), tile_n)
 
-            for loop_iv in range_(0, n, tile_n * num_tiles):
+            for loop_iv in range_(0, n, tile_n * total_tiles):
+                # Compute linear tile index: tx * herd_y + ty
                 offset_map = AffineMap.get(
                     0,
-                    2,
+                    3,
                     [
                         AffineExpr.get_add(
                             AffineSymbolExpr.get(0),
                             AffineExpr.get_mul(
-                                AffineSymbolExpr.get(1),
+                                AffineExpr.get_add(
+                                    AffineExpr.get_mul(
+                                        AffineSymbolExpr.get(1),
+                                        AffineConstantExpr.get(herd_y),
+                                    ),
+                                    AffineSymbolExpr.get(2),
+                                ),
                                 AffineConstantExpr.get(tile_n),
                             ),
                         )
                     ],
                 )
-                offset = affine_apply(offset_map, [loop_iv, _ty])
+                offset = affine_apply(offset_map, [loop_iv, _tx, _ty])
 
                 dma_memcpy_nd(
                     l1_gate,
