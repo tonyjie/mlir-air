@@ -156,6 +156,9 @@ All 9 kernel configs tested on NPU2 hardware with random data:
 | 2026-03-19 | **GEMM verified**: All 4 LLAMA shapes pass precision check. AIR 25% faster than IRON on Q/O. Ready to integrate. |
 | 2026-03-20 | **FlashAttention re-tested** after PR #1438. **Still broken**: corr=0.13-0.34 for ALL configs at LQ=2048. `make run PASS` is false positive. Created `test_precision.py` and filed GitHub issue. CPU fallback remains necessary. |
 | 2026-03-20 | **GEMM `run.py` test fixed**: rtol 1.0→0.04, inputs changed from `arange` to `randn*4`. Integer tests set to exact (rtol=0). |
+| 2026-03-20 | **GEMM integrated into LLAMA pipeline**: 8×4 herd, per-shape optimal tiles, BF16 output. NPU 6.49s → **3.60s** (44% reduction). Compilation 334s → 34s. |
+| | **16-layer verified**: Top-1 = " Paris" (prob=0.19). Logits corr=0.994. All 240 steps `[OK]`. |
+| | Gap to IRON: **1.5×** (was 2.7×). SwiGLU (26%) and GEMM Gate/Up (21%) are largest NPU contributors. |
 
 ---
 
@@ -163,7 +166,7 @@ All 9 kernel configs tested on NPU2 hardware with random data:
 
 See `performance_optimization.md` for full profiling breakdown, IRON comparison, and optimization roadmap.
 
-**Summary**: NPU kernel 18.67s → **6.49s** (BF16 add + XRT/BO reuse). IRON: ~2.4s. Gap: 2.7×. GEMM optimization ready to integrate (3.5-5.5× kernel speedup). FlashAttention still broken (CPU fallback).
+**Summary**: NPU kernel 18.67s → **3.60s** (81% reduction: BF16 add + XRT/BO reuse + GEMM optimization). IRON: ~2.4s. Gap: **1.5×**. FlashAttention still broken (CPU fallback, ~38s wall).
 
 ---
 
