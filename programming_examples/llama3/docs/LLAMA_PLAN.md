@@ -83,10 +83,9 @@ Note: seq_len=128 had issues with Flash Attention (required LK=256 workaround). 
 - [ ] Phase 4: Performance Optimization — IN PROGRESS
   - [x] Eltwise add: BF16 vec16 [8,1] → 415 µs (was 214ms). Matches IRON. PR #1431.
   - [x] XRT context + BO reuse: NPU kernel 18.67s → **6.49s** (65% reduction).
-  - [x] GEMM: Optimal tiles (3.5-5.5× speedup) + rounding mode fix landed upstream. **Ready to integrate.**
+  - [x] GEMM: Optimized tiles + 8×4 herd + BF16 output **integrated**. NPU 6.49s → **3.60s**.
   - [x] FlashAttention: Investigated — still broken (corr=0.13-0.34). CPU fallback required.
-  - Current: **6.49s NPU kernel** (IRON: ~2.4s, gap: 2.7×). Wall: ~47s (CPU attention dominates).
-  - **Next**: Integrate GEMM optimal tiles into LLAMA pipeline, verify 16-layer correctness.
+  - Current: **3.60s NPU kernel** (IRON: ~2.4s, gap: **1.5×**). Wall: ~43s (CPU attention dominates).
   - Actionable: RoPE/RMSNorm vectorization.
   - See `docs/performance_optimization.md` for full breakdown and roadmap.
 - [ ] Phase 5: Decode Phase (future work)
