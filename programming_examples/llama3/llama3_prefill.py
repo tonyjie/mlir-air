@@ -490,8 +490,14 @@ class KernelCache:
 #   output_binary_name: base name for output (optional)
 
 
-def _build_gemm_module(m, k, n, herd_m=4, herd_n=4):
-    """Build and transform a GEMM MLIR module."""
+def _build_gemm_module(
+    m, k, n, tile_m=64, tile_k_l2=64, tile_k_l1=32, tile_n=64, herd_m=8, herd_n=4
+):
+    """Build and transform a GEMM MLIR module.
+
+    Uses BF16 output (rounding mode fix landed upstream 2026-03-19).
+    Default tile config optimized for NPU2 8×4 herd.
+    """
     from matrix_multiplication.bf16.run import build_module as build_gemm
     from air.ir import Module
     from air.dialects.air import run_transform
@@ -500,14 +506,14 @@ def _build_gemm_module(m, k, n, herd_m=4, herd_n=4):
         m,
         k,
         n,
-        32,
-        64,
-        32,
-        32,  # tile_m, tile_k_l2, tile_k_l1, tile_n
+        tile_m,
+        tile_k_l2,
+        tile_k_l1,
+        tile_n,
         herd_m,
         herd_n,
         bfloat16,
-        np.float32,  # F32 output for precision
+        bfloat16,  # BF16 output (rounding fix applied)
         arch="aie2p",
         direct_codegen=True,
     )
@@ -517,13 +523,14 @@ def _build_gemm_module(m, k, n, herd_m=4, herd_n=4):
     return mlir_module
 
 
-def compile_all_kernels(cache, config, seq_len):
+def compile_all_kernels(cache, config, seq_len, cpu_attn=True):
     """Pre-compile all unique kernel configs to cache.
 
     Args:
         cache: KernelCache instance
         config: LlamaConfig
         seq_len: Sequence length (e.g. 2048)
+        cpu_attn: If True, skip flash attention compilation (use CPU fallback)
     """
     emb_dim = config.emb_dim
     n_heads = config.n_heads
@@ -533,7 +540,6 @@ def compile_all_kernels(cache, config, seq_len):
     kv_dim = n_kv_heads * head_dim
     n_total = seq_len * emb_dim
     n_hidden_total = seq_len * hidden_dim
-    herd_m = 4 if seq_len >= 128 else 2
 
     print(f"\n{'='*60}")
     print(f"Compiling {10} unique kernels (seq_len={seq_len})...")
@@ -548,10 +554,12 @@ def compile_all_kernels(cache, config, seq_len):
         {"verbose": cache.verbose, "omit_while_true_loop": False},
     )
 
-    # 2. GEMM Q/O: (seq_len, emb_dim, emb_dim)
+    # 2. GEMM Q/O: (seq_len, emb_dim, emb_dim) — large K, tile_k_l2=256
     cache.compile_and_cache(
         "gemm_qo",
-        _build_gemm_module(seq_len, emb_dim, emb_dim, herd_m, 4),
+        _build_gemm_module(
+            seq_len, emb_dim, emb_dim, tile_m=64, tile_k_l2=256, tile_k_l1=32, tile_n=64
+        ),
         {
             "verbose": cache.verbose,
             "omit_while_true_loop": False,
@@ -559,10 +567,12 @@ def compile_all_kernels(cache, config, seq_len):
         },
     )
 
-    # 3. GEMM K/V: (seq_len, emb_dim, kv_dim)
+    # 3. GEMM K/V: (seq_len, emb_dim, kv_dim) — small N, tile_n=128
     cache.compile_and_cache(
         "gemm_kv",
-        _build_gemm_module(seq_len, emb_dim, kv_dim, herd_m, 4),
+        _build_gemm_module(
+            seq_len, emb_dim, kv_dim, tile_m=64, tile_k_l2=64, tile_k_l1=32, tile_n=128
+        ),
         {
             "verbose": cache.verbose,
             "omit_while_true_loop": False,
@@ -570,10 +580,18 @@ def compile_all_kernels(cache, config, seq_len):
         },
     )
 
-    # 4. GEMM Gate/Up: (seq_len, emb_dim, hidden_dim)
+    # 4. GEMM Gate/Up: (seq_len, emb_dim, hidden_dim) — large N, tile_n=128
     cache.compile_and_cache(
         "gemm_gate_up",
-        _build_gemm_module(seq_len, emb_dim, hidden_dim, herd_m, 4),
+        _build_gemm_module(
+            seq_len,
+            emb_dim,
+            hidden_dim,
+            tile_m=64,
+            tile_k_l2=64,
+            tile_k_l1=32,
+            tile_n=128,
+        ),
         {
             "verbose": cache.verbose,
             "omit_while_true_loop": False,
@@ -581,10 +599,18 @@ def compile_all_kernels(cache, config, seq_len):
         },
     )
 
-    # 5. GEMM Down: (seq_len, hidden_dim, emb_dim)
+    # 5. GEMM Down: (seq_len, hidden_dim, emb_dim) — large K, tile_k_l2=256
     cache.compile_and_cache(
         "gemm_down",
-        _build_gemm_module(seq_len, hidden_dim, emb_dim, herd_m, 4),
+        _build_gemm_module(
+            seq_len,
+            hidden_dim,
+            emb_dim,
+            tile_m=64,
+            tile_k_l2=256,
+            tile_k_l1=32,
+            tile_n=64,
+        ),
         {
             "verbose": cache.verbose,
             "omit_while_true_loop": False,
@@ -608,36 +634,41 @@ def compile_all_kernels(cache, config, seq_len):
         {"verbose": cache.verbose, "omit_while_true_loop": False},
     )
 
-    # 8. Flash Attention GQA
-    from flash_attention.kernel_fusion_based.attn import build_module as build_attn
+    # 8. Flash Attention GQA (skip if using CPU attention fallback)
+    if not cpu_attn:
+        from flash_attention.kernel_fusion_based.attn import (
+            build_module as build_attn,
+        )
 
-    lkp = head_dim  # 64
-    lqp = 256
-    enable_shared_buffers = lkp == head_dim
-    cache.compile_and_cache(
-        "flash_attn",
-        build_attn(
-            lk=seq_len,
-            lkp=lkp,
-            lq=seq_len,
-            lqp=lqp,
-            dk=head_dim,
-            dv=head_dim,
-            num_q_tiles=4,
-            num_cascade_stages=4,
-            num_heads=n_heads,
-            num_kv_heads=n_kv_heads,
-            causal=True,
-        ),
-        {
-            "verbose": cache.verbose,
-            "omit_while_true_loop": not enable_shared_buffers,
-            "omit_pingpong": "all",
-            "runtime_loop_tiling_sizes": [1, 1],
-            "output_format": "elf",
-            "instance_name": "attention_bf16",
-        },
-    )
+        lkp = head_dim  # 64
+        lqp = 256
+        enable_shared_buffers = lkp == head_dim
+        cache.compile_and_cache(
+            "flash_attn",
+            build_attn(
+                lk=seq_len,
+                lkp=lkp,
+                lq=seq_len,
+                lqp=lqp,
+                dk=head_dim,
+                dv=head_dim,
+                num_q_tiles=4,
+                num_cascade_stages=4,
+                num_heads=n_heads,
+                num_kv_heads=n_kv_heads,
+                causal=True,
+            ),
+            {
+                "verbose": cache.verbose,
+                "omit_while_true_loop": not enable_shared_buffers,
+                "omit_pingpong": "all",
+                "runtime_loop_tiling_sizes": [1, 1],
+                "output_format": "elf",
+                "instance_name": "attention_bf16",
+            },
+        )
+    else:
+        print("  Skipping flash_attn compilation (using CPU attention fallback)")
 
     # 9. SwiGLU: n = seq_len * hidden_dim
     from llama3.swiglu_activation import build_module as build_swiglu
@@ -776,7 +807,7 @@ def run_transformer_block(
     print(f"    Step 2: Q projection ({seq_len}x{emb_dim}x{emb_dim})")
     a = np.asarray(normed, dtype=bfloat16).reshape(seq_len, emb_dim)
     b = np.asarray(layer_weights.wq, dtype=bfloat16).reshape(emb_dim, emb_dim)
-    c = np.zeros((seq_len, emb_dim), dtype=np.float32)
+    c = np.zeros((seq_len, emb_dim), dtype=bfloat16)
     results = _run_cached(cache, "gemm_qo", _GEMM_BACKEND, a, b, c)
     q = results[-1].reshape(seq_len, emb_dim).astype(bfloat16)
     if verify:
@@ -789,7 +820,7 @@ def run_transformer_block(
     kv_dim = n_kv_heads * head_dim  # 512
     print(f"    Step 3: K projection ({seq_len}x{emb_dim}x{kv_dim})")
     b_kv = np.asarray(layer_weights.wk, dtype=bfloat16).reshape(emb_dim, kv_dim)
-    c_kv = np.zeros((seq_len, kv_dim), dtype=np.float32)
+    c_kv = np.zeros((seq_len, kv_dim), dtype=bfloat16)
     results = _run_cached(cache, "gemm_kv", _GEMM_BACKEND, a, b_kv, c_kv)
     k = results[-1].reshape(seq_len, kv_dim).astype(bfloat16)
     if verify:
@@ -801,7 +832,7 @@ def run_transformer_block(
     # 4. V Projection (same shape as K)
     print(f"    Step 4: V projection ({seq_len}x{emb_dim}x{kv_dim})")
     b_v = np.asarray(layer_weights.wv, dtype=bfloat16).reshape(emb_dim, kv_dim)
-    c_v = np.zeros((seq_len, kv_dim), dtype=np.float32)
+    c_v = np.zeros((seq_len, kv_dim), dtype=bfloat16)
     results = _run_cached(cache, "gemm_kv", _GEMM_BACKEND, a, b_v, c_v)
     v = results[-1].reshape(seq_len, kv_dim).astype(bfloat16)
     if verify:
@@ -912,7 +943,7 @@ def run_transformer_block(
     print(f"    Step 8: O projection")
     a_o = np.asarray(attn_out, dtype=bfloat16).reshape(seq_len, emb_dim)
     b_o = np.asarray(layer_weights.wo, dtype=bfloat16).reshape(emb_dim, emb_dim)
-    c_o = np.zeros((seq_len, emb_dim), dtype=np.float32)
+    c_o = np.zeros((seq_len, emb_dim), dtype=bfloat16)
     results = _run_cached(cache, "gemm_qo", _GEMM_BACKEND, a_o, b_o, c_o)
     proj = results[-1].reshape(seq_len, emb_dim).astype(bfloat16)
     if verify:
@@ -956,7 +987,7 @@ def run_transformer_block(
     b_gate = np.asarray(layer_weights.w_gate, dtype=bfloat16).reshape(
         emb_dim, hidden_dim
     )
-    c_gate = np.zeros((seq_len, hidden_dim), dtype=np.float32)
+    c_gate = np.zeros((seq_len, hidden_dim), dtype=bfloat16)
     results = _run_cached(cache, "gemm_gate_up", _GEMM_BACKEND, a_g, b_gate, c_gate)
     gate = results[-1].reshape(seq_len, hidden_dim).astype(bfloat16)
     if verify:
@@ -970,7 +1001,7 @@ def run_transformer_block(
     # 12. Up GEMM (same shape as gate)
     print(f"    Step 12: Up GEMM ({seq_len}x{emb_dim}x{hidden_dim})")
     b_up = np.asarray(layer_weights.w_up, dtype=bfloat16).reshape(emb_dim, hidden_dim)
-    c_up = np.zeros((seq_len, hidden_dim), dtype=np.float32)
+    c_up = np.zeros((seq_len, hidden_dim), dtype=bfloat16)
     results = _run_cached(cache, "gemm_gate_up", _GEMM_BACKEND, a_g, b_up, c_up)
     up = results[-1].reshape(seq_len, hidden_dim).astype(bfloat16)
     if verify:
@@ -1001,7 +1032,7 @@ def run_transformer_block(
     print(f"    Step 14: Down GEMM ({seq_len}x{hidden_dim}x{emb_dim})")
     a_d = np.asarray(swiglu_out, dtype=bfloat16).reshape(seq_len, hidden_dim)
     b_d = np.asarray(layer_weights.w_down, dtype=bfloat16).reshape(hidden_dim, emb_dim)
-    c_d = np.zeros((seq_len, emb_dim), dtype=np.float32)
+    c_d = np.zeros((seq_len, emb_dim), dtype=bfloat16)
     results = _run_cached(cache, "gemm_down", _GEMM_BACKEND, a_d, b_d, c_d)
     down = results[-1].reshape(seq_len, emb_dim).astype(bfloat16)
     if verify:
@@ -1299,7 +1330,7 @@ if __name__ == "__main__":
 
     # --- Compilation phase ---
     if not args.run_only:
-        compile_all_kernels(cache, config, args.seq_len)
+        compile_all_kernels(cache, config, args.seq_len, cpu_attn=args.cpu_attn)
         if args.compile_only:
             profiler.report()
             print(f"\nKernels cached to {cache.cache_dir}/")
