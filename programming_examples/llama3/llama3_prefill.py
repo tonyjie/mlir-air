@@ -675,7 +675,7 @@ def compile_all_kernels(cache, config, seq_len, cpu_attn=True):
 
     cache.compile_and_cache(
         "swiglu",
-        build_swiglu(n_hidden_total, 1024, bfloat16),
+        build_swiglu(n_hidden_total, 4096, bfloat16, herd_x=8, herd_y=1),
         {"verbose": cache.verbose, "omit_while_true_loop": False},
     )
 
