@@ -159,6 +159,7 @@ All 9 kernel configs tested on NPU2 hardware with random data:
 | 2026-03-20 | **GEMM integrated into LLAMA pipeline**: 8×4 herd, per-shape optimal tiles, BF16 output. NPU 6.49s → **3.60s** (44% reduction). Compilation 334s → 34s. |
 | | **16-layer verified**: Top-1 = " Paris" (prob=0.19). Logits corr=0.994. All 240 steps `[OK]`. |
 | | Gap to IRON: **1.5×** (was 2.7×). SwiGLU (26%) and GEMM Gate/Up (21%) are largest NPU contributors. |
+| 2026-03-20 | **SwiGLU optimized**: [8,1] herd + tile_n=4096 + 16-wide vectors. 59ms → **37ms** (1.6×). BD exhaustion workaround: larger tiles reduce iteration count under BD limit. |
 
 ---
 
@@ -166,7 +167,7 @@ All 9 kernel configs tested on NPU2 hardware with random data:
 
 See `performance_optimization.md` for full profiling breakdown, IRON comparison, and optimization roadmap.
 
-**Summary**: NPU kernel 18.67s → **3.60s** (81% reduction: BF16 add + XRT/BO reuse + GEMM optimization). IRON: ~2.4s. Gap: **1.5×**. FlashAttention still broken (CPU fallback, ~38s wall).
+**Summary**: NPU kernel 18.67s → **3.57s** (81% reduction: BF16 add + XRT/BO reuse + GEMM optimization + SwiGLU [8,1]). IRON: ~2.4s. Gap: **1.5×**. FlashAttention still broken (CPU fallback, ~38s wall).
 
 ---
 

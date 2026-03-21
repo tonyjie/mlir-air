@@ -27,15 +27,24 @@
 extern "C" {
 
 void swiglu_bf16(bfloat16 *gate, bfloat16 *up, bfloat16 *out, int32_t n) {
-  constexpr int VecLen = 8;
+  constexpr int VecLen = 16;
   aie::vector<bfloat16, VecLen> half_vec =
       aie::broadcast<bfloat16, VecLen>((bfloat16)0.5f);
   aie::vector<bfloat16, VecLen> one_vec =
       aie::broadcast<bfloat16, VecLen>((bfloat16)1.0f);
 
-  for (int i = 0; i < n; i += VecLen) {
-    aie::vector<bfloat16, VecLen> g = aie::load_v<VecLen>(gate + i);
-    aie::vector<bfloat16, VecLen> u = aie::load_v<VecLen>(up + i);
+  bfloat16 *__restrict pG = gate;
+  bfloat16 *__restrict pU = up;
+  bfloat16 *__restrict pO = out;
+  const int F = n / VecLen;
+
+  AIE_PREPARE_FOR_PIPELINING
+  AIE_LOOP_MIN_ITERATION_COUNT(16)
+  for (int i = 0; i < F; i++) {
+    aie::vector<bfloat16, VecLen> g = aie::load_v<VecLen>(pG);
+    pG += VecLen;
+    aie::vector<bfloat16, VecLen> u = aie::load_v<VecLen>(pU);
+    pU += VecLen;
 
     aie::vector<bfloat16, VecLen> g_half = aie::mul(g, half_vec);
     aie::accum<accfloat, VecLen> tanh_in;
@@ -47,7 +56,8 @@ void swiglu_bf16(bfloat16 *gate, bfloat16 *up, bfloat16 *out, int32_t n) {
     aie::vector<bfloat16, VecLen> silu = aie::mul(g, sigmoid);
     aie::vector<bfloat16, VecLen> result = aie::mul(silu, u);
 
-    aie::store_v(out + i, result);
+    aie::store_v(pO, result);
+    pO += VecLen;
   }
 }
 
