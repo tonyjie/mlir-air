@@ -2,172 +2,120 @@
 
 ## Overview
 
-Performance optimization of the LLAMA-3.2-1B BF16 prefill pipeline (seq_len=2048, 16 layers) on NPU2 (AIE2P). Reference implementation: IRON (`/home/jiajli/apps/IRON`).
+Performance optimization of the LLAMA-3.2-1B BF16 prefill pipeline (seq_len=2048, 16 layers) on NPU2 (AIE2P).
 
-### Current Status
-
-| Metric | Baseline | Current | IRON | Gap to IRON |
-|--------|----------|---------|------|-------------|
-| NPU kernel total | 18.67s | **3.60s** | ~2.4s | **1.5×** |
-| Wall time | 25.9s | ~43s | 2.75s | 15.6× |
-| Per-layer (NPU) | 1.17s | **0.22s** | 0.15s | **1.5×** |
-| Compilation | 334s | **34s** | — | — |
-
-### Where the Time Goes (3.60s NPU breakdown)
-
-| Kernel | Avg (ms) | Count | Total (s) | % of NPU | IRON model (ms) |
-|--------|----------|-------|-----------|----------|-----------------|
-| SwiGLU | 37 | x16 | 0.59 | **17%** | (fused 57.4) |
-| GEMM Gate/Up | 24 | x32 | 0.77 | 21% | (fused) |
-| GEMM Down | 27 | x16 | 0.43 | 12% | (fused) |
-| GEMM Q/O | 10 | x32 | 0.32 | 9% | 10.6 |
-| RoPE Q | 17 | x16 | 0.27 | 8% | 5.3 |
-| RMSNorm | 10 | x33 | 0.33 | 9% | 4.3 |
-| Eltwise Add | 10 | x32 | 0.32 | 9% | 4.5 |
-| GEMM K/V | 6 | x32 | 0.19 | 5% | (in 10.6) |
-| RoPE K | 4 | x16 | 0.06 | 2% | 5.3 |
-| **NPU Total** | | **225** | **3.60** | | |
-| CPU Attention | ~2,400 | x16 | ~38s | (wall) | 37.0 |
-
-### Next Steps (ordered by impact)
-
-| Priority | Action | Savings | Complexity | Status |
-|----------|--------|---------|-----------|--------|
-| **1** | Fix NPU flash attention | **38s** wall | Blocked upstream | Waiting |
-| **2** | Vectorize RoPE / RMSNorm | **~0.3s** NPU | Medium (eltwise_add pattern) | Ready |
-| **3** | FFN kernel fusion | **~1s** NPU | High | Not started |
-
-### Blocked Items
-
-| Item | Issue | Workaround |
-|------|-------|-----------|
-| **NPU Flash Attention** | Kernel still produces uncorrelated output (corr=0.13-0.34 vs standard attention for ALL configs at LQ=2048). `make run PASS` is a false positive — element-wise tolerance can't detect wrong attention patterns. GitHub issue filed. | CPU `attention_reference()` fallback (`--cpu-attn`) |
-
-### Actionable Now
-
-| Item | Action | Impact |
-|------|--------|--------|
-| **RoPE vectorization** | Apply eltwise_add pattern (BF16 vec16, [8,1] herd) | ~0.3s NPU savings |
-| **RMSNorm vectorization** | Same pattern | ~0.3s NPU savings |
+Reference: IRON (`/home/jiajli/apps/IRON`). IRON profiling data: `/home/jiajli/apps/IRON/docs/IRON_LLAMA_profile.md`.
 
 ---
 
-## AIR vs IRON — Kernel Breakdown Comparison
+## End-to-End Prefill Comparison
 
-AIR: measured 2026-03-19. IRON: from `/home/jiajli/apps/IRON/docs/IRON_LLAMA_profile.md` (prio=False, emu=True, correct LLAMA config).
+| Metric | AIR (current) | IRON | Notes |
+|--------|--------------|------|-------|
+| **NPU kernel total** | **3.57s** | **~2.4s** | **Gap: 1.5×** |
+| **Wall time** | **~44s** | **2.75s** | AIR uses CPU attention (~38s overhead) |
+| Per-layer (NPU kernel) | 0.22s | 0.15s | 1.5× |
+| Compilation | 37s | cached | One-time cost |
+| Top-1 prediction | " Paris" ✓ | — | Correct factual answer |
+| Logits corr vs CPU F32 | 0.994 | — | |
+
+**Note on wall time**: AIR's 44s wall time is dominated by CPU attention fallback (~38s). IRON runs attention on NPU (MHA, 37ms/layer). Excluding attention:
+
+| Metric | AIR (excl. attention) | IRON (excl. attention) | Gap |
+|--------|----------------------|----------------------|-----|
+| NPU kernels (non-attn) | **3.57s** | ~1.8s (total minus MHA) | **2.0×** |
+| Per-layer (non-attn) | 0.22s | ~0.11s | 2.0× |
+
+---
+
+## Per-Kernel Comparison (per-invocation, in LLAMA pipeline)
+
+AIR numbers include BO data transfer (write + sync + kernel + sync + read).
+IRON model numbers from `operator.forward()` (includes write_buffer + run_runlist + read_buffer).
+
+| Step | Kernel | Shape | AIR (ms) | IRON model (ms) | Gap |
+|------|--------|-------|---------|-----------------|-----|
+| 1,10 | RMSNorm | (2048, 2048) | 10 | 4.3 | 2.3× |
+| 2 | GEMM Q | 2048×2048×2048 | 10 | 10.6* | 1.0× |
+| 3 | GEMM K | 2048×2048×512 | 6 | 10.6* | — |
+| 4 | GEMM V | 2048×2048×512 | 6 | 10.6* | — |
+| 5 | RoPE Q | (65536, 64) | 17 | 5.3 | 3.2× |
+| 6 | RoPE K | (16384, 64) | 4 | 5.3 | — |
+| 7 | **Attention** | 32 heads, 2048 seq | **2,400 (CPU)** | **37.0 (NPU)** | **65×** |
+| 8 | GEMM O | 2048×2048×2048 | 10 | 10.6* | 1.0× |
+| 9,15 | Eltwise Add | (4,194,304) BF16 | 10 | 4.5 | 2.2× |
+| 11 | GEMM Gate | 2048×2048×8192 | 24 | (fused) | — |
+| 12 | GEMM Up | 2048×2048×8192 | 24 | (fused) | — |
+| 13 | SwiGLU | SiLU(gate)×up, 16.7M | 37 | (fused) | — |
+| 14 | GEMM Down | 2048×8192×2048 | 27 | (fused) | — |
+| 11-14 | **FFN block** | | **112** | **57.4** (fused) | **2.0×** |
+
+\*IRON GEMM model avg = 10.6ms across 65 calls (mix of Q/K/V/O shapes).
 
 ### Per-Kernel Standalone Comparison (kernel dispatch + wait only)
 
-IRON standalone from `pytest --build-dir build_llama -m "llama and extensive"`.
-AIR standalone from `test.exe` (best tile configs, 8×4 herd, direct codegen).
+Standalone measurements isolate kernel execution from data transfer overhead.
 
-| Kernel | Shape | AIR (µs) | AIR GFLOP/s | IRON (µs) | IRON GFLOP/s | AIR corr | IRON corr | AIR vs IRON |
-|--------|-------|---------|-------------|----------|-------------|---------|-----------|-------------|
-| GEMM Q/O | 2048³ | **2,822** | 6,088 | 3,539 | 4,854 | 0.99992 | 0.99994 | **1.25× faster** |
-| GEMM K/V | 2048×2048×512 | **722** | 5,949 | 762 | 5,634 | 0.99992 | 0.99994 | **1.06× faster** |
-| SwiGLU Prefill | 2048×2048×8192 (fused) | — | — | 48,100 | — | — | 0.99972 | — |
-| MHA | seq=2048, 32 heads | — (CPU) | — | 30,989 | — | — | 0.99758 | — |
-| RMSNorm | 4M BF16 | — | — | 843 | — | — | 0.99998 | — |
-| RoPE Q | 65536×64 | — | — | 845 | — | — | 0.99999 | — |
-| RoPE K | 16384×64 | — | — | 257 | — | — | 0.99999 | — |
-| Eltwise Add | 4M BF16 | 415 | 60,600 | 429 | 58,600 | 0.99998 | 0.99998 | **1.03× faster** |
+| Kernel | AIR (µs) | IRON (µs) | AIR vs IRON |
+|--------|---------|----------|-------------|
+| GEMM Q/O (2048³) | **2,822** | 3,539 | **1.25× faster** |
+| GEMM K/V (2048×2048×512) | **722** | 762 | **1.06× faster** |
+| GEMM Gate/Up (2048×2048×8192) | **10,865** | 14,322 | **1.32× faster** |
+| GEMM Down (2048×8192×2048) | **10,230** | 12,536 | **1.23× faster** |
+| Eltwise Add (4M BF16) | **415** | 429 | **1.03× faster** |
+| SwiGLU fused (5 ops) | — | 48,100 | — |
+| MHA (2048 seq, 32 heads) | — (CPU) | 30,989 | — |
+| RMSNorm (4M BF16) | — | 843 | — |
+| RoPE Q (65536×64) | — | 845 | — |
+| RoPE K (16384×64) | — | 257 | — |
 
-### IRON Model-Level Timing (includes data transfer)
+AIR GEMM kernels are **23-32% faster** than IRON standalone. Eltwise add is matched.
 
-From IRON end-to-end run (2.75s prefill):
+---
 
-| Function | Calls | Avg/call (ms) |
-|----------|-------|---------------|
-| `transformer.forward` | 16 | 152.3 |
-| `gqa.forward` | 16 | 76.9 |
-| `swiglu_prefill.forward` | 16 | 57.4 |
-| `gemm.forward` | 65 | 10.6 |
-| `mha.forward` | 16 | 37.0 |
-| `rope.forward` | 32 | 5.3 |
-| `elementwise_add.forward` | 32 | 4.5 |
-| `rms_norm.forward` | 33 | 4.3 |
+## Blocked Items
 
-### 16-Layer Totals
+| Item | Issue | Workaround |
+|------|-------|-----------|
+| **NPU Flash Attention** | Kernel produces uncorrelated output (corr=0.13-0.34) for ALL configs. `make run PASS` is false positive. GitHub issue filed. | CPU `attention_reference()` fallback (`--cpu-attn`) |
 
-| Metric | AIR | IRON | Gap |
-|--------|-----|------|-----|
-| **Total prefill (wall)** | ~47s | **2.75s** | 17× |
-| **NPU kernel total** | **6.49s** | ~2.4s (from model profile) | 2.7× |
-| **Per-layer** | 0.41s | 0.15s | 2.7× |
-| CPU attention total | ~37.9s | — | — |
-| IRON NPU attention total | — | 0.59s (MHA) | — |
+## Next Steps
 
-### IRON Architecture Advantages
-
-- **Persistent XRT context**: All dispatches share one context (no per-call load/unload)
-- **SwiGLU fusion**: 5 ops in one dispatch (57.4ms vs our ~300ms for 4 separate ops)
-- **ObjectFIFO DMA**: Compiler-managed double-buffering (vs our explicit `dma_memcpy_nd`)
-- **C++ kernel hints**: `AIE_PREPARE_FOR_PIPELINING`, `AIE_LOOP_MIN_ITERATION_COUNT`
-
-### IRON Profiling Reference
-
-Full IRON profiling data: `/home/jiajli/apps/IRON/docs/IRON_LLAMA_profile.md`
-
-```bash
-# End-to-end model
-cd /home/jiajli/apps/IRON
-source ironenv/bin/activate
-python iron/applications/llama_3.2_1b/inference.py \
-    <weights> <tokenizer> --num_tokens 1 --prompt_len 2048 --profile -vv
-
-# Per-kernel (use separate build dir to avoid cache conflicts)
-pytest iron/operators/ -m "llama and extensive" --build-dir build_llama -v -s
-```
+| Priority | Action | Savings | Status |
+|----------|--------|---------|--------|
+| **1** | Fix NPU flash attention | **38s** wall | Blocked upstream |
+| **2** | Vectorize RoPE / RMSNorm | ~0.3s NPU | Ready |
+| **3** | FFN kernel fusion | ~1s NPU | Complex |
 
 ---
 
 ## Optimization History
 
-### Per-Kernel Progression (per-invocation avg, ms)
-
-| Kernel | Shape | Baseline | +BF16 Add | +XRT Reuse | +BO Reuse | IRON model | IRON standalone |
-|--------|-------|----------|-----------|------------|-----------|------------|-----------------|
-| GEMM Gate/Up | 2048×2048×8192 | 110 | 117 | 111 | 86 | **24** | (fused) |
-| GEMM Down | 2048×8192×2048 | 103 | 102 | 91 | 72 | **27** | (fused) |
-| SwiGLU | n=16M, BF16 | 86 | 89 | 77 | 58 | **37** | (fused) |
-| GEMM Q/O | 2048×2048×2048 | 51 | 54 | 33 | 23 | **10** | 10.6 |
-| RoPE Q | 65536×64 | 27 | 56 | 16 | 11 | **17** | 5.3 |
-| RMSNorm | (2048, 2048) | 28 | 30 | 15 | 10 | **10** | 4.3 |
-| Eltwise Add | n=4M | **256** (F32) | **42** (BF16) | 13 | 6 | **10** | 4.5 |
-| GEMM K/V | 2048×2048×512 | 21 | 40 | 8 | 5 | **6** | (in 10.6) |
-| RoPE K | 16384×64 | 16 | 21 | 4 | 3 | **4** | 5.3 |
-
 ### Totals Progression
 
-| Metric | Baseline | +BF16 Add | +XRT Reuse | +BO Reuse | +GEMM Opt | IRON |
-|--------|----------|-----------|------------|-----------|-----------|------|
+| Metric | Baseline | +BF16 Add | +XRT Reuse | +BO Reuse | +GEMM/SwiGLU Opt | IRON |
+|--------|----------|-----------|------------|-----------|-----------------|------|
 | NPU kernel total | 18.67s | 13.40s | 8.77s | 6.49s | **3.57s** | ~2.4s |
 | NPU per-layer | 1.17s | 0.84s | 0.55s | 0.41s | **0.22s** | 0.15s |
 | Wall time | 25.9s | 51.4s | ~47s | ~47s | **~44s** | 2.75s |
 | Gap to IRON (NPU) | 7.8× | 5.6× | 3.7× | 2.7× | **1.5×** | 1.0× |
 | Compilation | 334s | 334s | 334s | 334s | **37s** | — |
-| Top-1 prediction | " Paris" | " Paris" | " Paris" | " Paris" | " Paris" | — |
 
-NPU kernel time reduced **81%** from baseline (18.67s → 3.57s). Gap to IRON narrowed from 7.8× to **1.5×**. Wall time dominated by CPU attention (~38s).
+NPU kernel time reduced **81%** from baseline (18.67s → 3.57s). Gap to IRON narrowed from 7.8× to **1.5×**.
 
-Note: "+GEMM Opt" column includes both GEMM tile optimization and SwiGLU [8,1] herd optimization (59ms→37ms via tile_n=4096 to fit BD limit).
+### Per-Kernel Progression (per-invocation avg, ms)
 
----
-
-## Remaining Per-Kernel Optimization Targets
-
-**Overall target**: NPU 3.60s → ~2.4s = **1.2s savings** (to match IRON)
-
-| Priority | Kernel | AIR (ms) | IRON standalone (ms) | IRON model (ms) | Action | Status |
-|----------|--------|---------|---------------------|-----------------|--------|--------|
-| **Blocked** | Attention (MHA) | 2,400 (CPU) | 31.0 | 37.0 | Upstream kernel fix | Waiting |
-| **Ready** | RoPE Q | 17 | 0.85 | 5.3 | Vectorize, [8,1] herd | Actionable |
-| **Ready** | RMSNorm | 10 | 0.84 | 4.3 | Vectorize, [8,1] herd | Actionable |
-| **Done** | GEMM (all) | 10-27 | 0.8-14.3 | 10.6 | **Integrated** | Complete |
-| **Done** | Eltwise Add | 10 | 0.43 | 4.5 | Nearly matched | Complete |
-| **Future** | FFN fusion | 134 (4 ops) | 48.1 (fused) | 57.4 (fused) | Kernel fusion | Complex |
-
-See `kernels/gemm.md` for GEMM analysis, `kernels/flash_attention.md` for attention status.
+| Kernel | Baseline | +BF16 Add | +XRT Reuse | +BO Reuse | Current | IRON model |
+|--------|----------|-----------|------------|-----------|---------|------------|
+| GEMM Gate/Up | 110 | 117 | 111 | 86 | **24** | (fused) |
+| SwiGLU | 86 | 89 | 77 | 58 | **37** | (fused) |
+| GEMM Down | 103 | 102 | 91 | 72 | **27** | (fused) |
+| GEMM Q/O | 51 | 54 | 33 | 23 | **10** | 10.6 |
+| RoPE Q | 27 | 56 | 16 | 11 | **17** | 5.3 |
+| RMSNorm | 28 | 30 | 15 | 10 | **10** | 4.3 |
+| Eltwise Add | **256** (F32) | **42** (BF16) | 13 | 6 | **10** | 4.5 |
+| GEMM K/V | 21 | 40 | 8 | 5 | **6** | (in 10.6) |
+| RoPE K | 16 | 21 | 4 | 3 | **4** | 5.3 |
 
 ---
 
@@ -176,49 +124,41 @@ See `kernels/gemm.md` for GEMM analysis, `kernels/flash_attention.md` for attent
 ### 1. Eltwise Add: F32 Scalar → BF16 Vectorized (2026-03-16)
 
 517× standalone speedup, matches IRON. BF16 16-wide vectorized, [8,1] herd.
-
-**PR**: https://github.com/Xilinx/mlir-air/pull/1431. See `docs/kernels/eltwise_add.md` for full analysis.
+**PR**: https://github.com/Xilinx/mlir-air/pull/1431. See `kernels/eltwise_add.md`.
 
 ### 2. XRT Context Reuse (2026-03-16)
 
-Cache `(backend, invoker)` per kernel in `KernelCache._loaded`. Load once per unique kernel, reuse invoker. NPU total: 13.40s → 8.77s (34% reduction). Eliminated ~40ms per-invocation device/xclbin/context setup overhead.
+Cache `(backend, invoker)` per kernel. NPU total: 13.40s → 8.77s (34% reduction).
 
 ### 3. Buffer Object (BO) Reuse (2026-03-17)
 
-Pre-allocate BOs on first invocation per kernel, reuse on subsequent calls. Also sync instruction BO only once. NPU total: 8.77s → 6.49s (26% reduction). Eliminated ~5ms per-invocation BO allocation overhead.
-
-Combined XRT context + BO reuse: 13.40s → 6.49s (**52% total reduction**).
+Pre-allocate BOs per kernel. NPU total: 8.77s → 6.49s (26% reduction).
 
 ### 4. GEMM Optimization + Integration (2026-03-17 — 2026-03-20)
 
-**Investigation (2026-03-17—19)**: Found optimal tile configs (8×4 herd, per-shape tiles). Discovered BFP16 rounding mode bug (`floor` → -0.065×K bias). Fixed upstream in MLIR-AIE rebuild.
-
-**Integration (2026-03-20)**: Updated `_build_gemm_module()` with per-shape optimal tiles, BF16 output, 8×4 herd.
-
-| Metric | Before | After | Improvement |
-|--------|--------|-------|-------------|
-| NPU kernel total | 6.49s | **3.60s** | **44% reduction** |
-| GEMM Gate/Up avg | 86ms | **24ms** | 3.6× |
-| GEMM Q/O avg | 23ms | **10ms** | 2.3× |
-| GEMM Down avg | 72ms | **27ms** | 2.7× |
-| Compilation | 334s | **34s** | 10× |
-| Logits corr (16 layers) | 0.969 | **0.994** | Improved |
-
-See `kernels/gemm.md` for full analysis.
+Per-shape optimal tiles (8×4 herd, BF16 output). BFP16 rounding mode fix landed upstream. NPU total: 6.49s → 3.60s (44% reduction). See `kernels/gemm.md`.
 
 ### 5. SwiGLU Optimization (2026-03-20)
 
-Updated C++ kernel to 16-wide BF16 vectors with pipelining hints. Scaled herd from [1,2] to [8,1] by increasing tile_n from 1024 to 4096 (keeping iterations under BD limit).
+[8,1] herd + tile_n=4096 + 16-wide vectors. 59ms → 37ms (1.6×). BD exhaustion workaround: larger tiles to reduce iteration count under BD limit. See `kernels/swiglu.md`.
 
-| Metric | Before | After | Improvement |
-|--------|--------|-------|-------------|
-| SwiGLU avg | 59ms | **37ms** | **1.6×** |
-| Herd | [1,2] (2 cores) | [8,1] (8 cores) | 4× more DMA bandwidth |
-| Vector width | 8 | 16 | 2× (but DMA-bound) |
+---
 
-**BD exhaustion workaround**: At 16.7M elements with tile_n=1024, [8,1] needs 1024 iterations × 3 BDs = 3072 BDs — exceeds hardware limit (~3072 max). Increasing tile_n to 4096 reduces iterations to 512 → fits. This is a limitation of AIR's per-iteration BD generation (IRON avoids this via ObjectFIFO repeating patterns).
+## Known Limitations
 
-See `kernels/swiglu.md` for full analysis including BD limit investigation.
+### AIR DMA Buffer Descriptor (BD) Exhaustion
+
+AIR's `dma_memcpy_nd` generates per-iteration BD chains that scale linearly with `n / tile_n`. The hardware has a fixed BD limit (~48 per MemTile). This prevents scaling to more AIE columns for large buffers:
+
+| Buffer size | tile_n=2048, [8,1] iters | Compiles? |
+|------------|-------------------------|-----------|
+| 4.2M (eltwise_add) | 256 | **OK** |
+| 15.7M | 960 | **OK** (max safe) |
+| 16.8M (SwiGLU) | 1024 | **FAIL** |
+
+**Workaround**: Increase tile_n to reduce iteration count. tile_n=4096 at 16.8M → 512 iterations → fits.
+
+**IRON avoids this** via ObjectFIFO, which generates repeating BD patterns (fixed ~2 BDs per buffer regardless of iteration count).
 
 ---
 
@@ -229,33 +169,24 @@ See `kernels/swiglu.md` for full analysis including BD limit investigation.
 cd programming_examples/llama3/build_peano
 python3 ../llama3_prefill.py --run-only --n-layers 16 --profile --cpu-attn
 
-# AIR: Single layer with verification
-python3 ../llama3_prefill.py --run-only --n-layers 1 --verify --profile
-
-# IRON: Per-kernel benchmarks at 2048 tokens
-cd /home/jiajli/apps/IRON
-pytest iron/operators/gemm/test.py -k "gemm_2048x2048x2048" -v -s
-pytest iron/operators/gemm/test.py -k "llama_kv_proj_2048tok" -v -s
-pytest iron/operators/rms_norm/test.py -m "llama and extensive" -v -s
-pytest iron/operators/rope/test.py -m "llama and extensive" -v -s
-pytest iron/operators/elementwise_add/test.py -m "llama and extensive" -v -s
-pytest iron/operators/mha/test.py -m "llama and extensive" -v -s
-pytest iron/operators/swiglu_prefill/test.py -m "llama and extensive" -v -s
+# AIR: Compile + run
+python3 ../llama3_prefill.py --compile-only --cpu-attn
+python3 ../llama3_prefill.py --run-only --n-layers 16 --verify --cpu-attn
 
 # IRON: End-to-end model
-cd /home/jiajli/apps/IRON/iron/applications/llama_3.2_1b
-PYTHONPATH=/home/jiajli/apps/IRON:$PYTHONPATH python3 inference.py \
+cd /home/jiajli/apps/IRON && source ironenv/bin/activate
+python iron/applications/llama_3.2_1b/inference.py \
     <weights> <tokenizer> --num_tokens 1 --prompt_len 2048 --profile -vv
 
-# Standalone kernel profiling (C++ harness)
-cd programming_examples/eltwise_add
-make profile
+# IRON: Per-kernel benchmarks
+pytest iron/operators/ -m "llama and extensive" --build-dir build_llama -v -s
 ```
 
 ---
 
 ## Per-Kernel Analysis Docs
 
-Detailed per-kernel optimization analysis in `docs/kernels/`:
 - `kernels/eltwise_add.md` — Herd sweep, IRON comparison, correctness verification
-- (Future: `kernels/gemm.md`, `kernels/rope.md`, etc.)
+- `kernels/gemm.md` — Tile optimization, precision analysis, rounding mode investigation
+- `kernels/swiglu.md` — [8,1] optimization, BD exhaustion analysis
+- `kernels/flash_attention.md` — Correctness investigation, precision metrics, status
