@@ -888,7 +888,7 @@ def run_transformer_block(
 
     # 7. Flash Attention GQA
     if cpu_attn:
-        # CPU fallback — NPU flash attention kernel has correctness bug
+        # CPU fallback for debugging/comparison
         print(
             f"    Step 7: Attention GQA [CPU fallback] ({n_heads}Q/{n_kv_heads}KV heads)"
         )
@@ -903,13 +903,13 @@ def run_transformer_block(
         print(
             f"    Step 7: Flash Attention GQA [NPU] ({n_heads}Q/{n_kv_heads}KV heads)"
         )
+        # Reshape to (heads, seq, dim) — kernel expects unscaled Q
+        # (scaling by 1/sqrt(dk) is handled internally by the kernel)
         q_attn = np.ascontiguousarray(
             q_roped.reshape(seq_len, n_heads, head_dim)
             .transpose(1, 0, 2)
             .astype(bfloat16)
         )
-        scale = 1.0 / np.sqrt(head_dim)
-        q_attn_scaled = (q_attn.astype(np.float32) * scale).astype(bfloat16)
         k_attn = np.ascontiguousarray(
             k_roped.reshape(seq_len, n_kv_heads, head_dim)
             .transpose(1, 0, 2)
@@ -919,18 +919,16 @@ def run_transformer_block(
             v.reshape(seq_len, n_kv_heads, head_dim).transpose(1, 0, 2).astype(bfloat16)
         )
         # Causal masking is applied internally by the kernel (causal=True).
-        # The external mask input is zeros (no additional masking needed).
-        mask = np.zeros((n_heads, seq_len, seq_len), dtype=bfloat16)
+        # No external mask argument — kernel handles causal masking.
         attn_output = np.zeros((n_heads, seq_len, head_dim), dtype=bfloat16)
         attn_bk = _attn_backend_kwargs(head_dim)
         results = _run_cached(
             cache,
             "flash_attn",
             attn_bk,
-            q_attn_scaled,
+            q_attn,
             k_attn,
             v_attn,
-            mask,
             attn_output,
         )
         attn_out_heads = results[-1].reshape(n_heads, seq_len, head_dim)
@@ -1299,18 +1297,18 @@ if __name__ == "__main__":
     parser.add_argument(
         "--cpu-attn",
         action="store_true",
-        default=True,
+        default=False,
         help="Use CPU attention fallback instead of NPU flash attention "
-        "(default: True, NPU kernel has correctness bug)",
+        "(for debugging/comparison)",
     )
     parser.add_argument(
         "--npu-attn",
         action="store_true",
-        help="Use NPU flash attention kernel (overrides --cpu-attn)",
+        help="Use NPU flash attention kernel (default; kept for backward compat)",
     )
     args = parser.parse_args()
 
-    # --npu-attn overrides --cpu-attn
+    # --cpu-attn explicitly requests CPU fallback; --npu-attn overrides it back
     if args.npu_attn:
         args.cpu_attn = False
 
