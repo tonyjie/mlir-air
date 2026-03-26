@@ -74,19 +74,17 @@ Note: seq_len=128 had issues with Flash Attention (required LK=256 workaround). 
   - **16-layer**: Top-1 = " Paris" (correct answer, prob=0.48). Logits corr=0.972 vs CPU F32.
   - All per-kernel, per-layer, and full-model verification tests pass.
   - Use `--npu-attn` to switch back to NPU flash attention kernel (when fixed).
-- [ ] Phase 3B: Fix Flash Attention NPU kernel (upstream bug)
-  - Kernel produces uncorrelated output (corr=0.13-0.34) for ALL configs at LQ=2048.
-  - `make run PASS` is a false positive — element-wise tolerance can't detect wrong attention patterns.
-  - PR #1438 fixed BD exhaustion but NOT the correctness bug.
-  - `test_precision.py` created for correlation-based validation.
-  - GitHub issue with reproducer filed. See `docs/kernels/flash_attention.md`.
+- [x] Phase 3B: Fix Flash Attention NPU kernel — **FIXED** (2026-03-26)
+  - All configs pass with corr > 0.996. LLAMA causal: corr=0.9976, 15ms, 2× faster than IRON.
+  - See `docs/kernels/flash_attention.md`.
 - [ ] Phase 4: Performance Optimization — IN PROGRESS
-  - [x] Eltwise add: BF16 vec16 [8,1] → 415 µs (was 214ms). Matches IRON. PR #1431.
+  - [x] Eltwise add: BF16 vec16 [8,1] → 415 µs. Matches IRON. PR #1431.
   - [x] XRT context + BO reuse: NPU kernel 18.67s → **6.49s** (65% reduction).
   - [x] GEMM: Optimized tiles + 8×4 herd + BF16 output **integrated**. NPU 6.49s → **3.60s**.
-  - [x] FlashAttention: Investigated — still broken (corr=0.13-0.34). CPU fallback required.
-  - Current: **3.60s NPU kernel** (IRON: ~2.4s, gap: **1.5×**). Wall: ~43s (CPU attention dominates).
-  - Actionable: RoPE/RMSNorm vectorization.
+  - [x] SwiGLU: [8,1] herd + 16-wide vectors. 59ms → 37ms.
+  - [x] FlashAttention: **Fixed and 2× faster than IRON** (15ms vs 31ms).
+  - [x] FlashAttention integration: **DONE** (2026-03-26). NPU attention is now default. Top-1 " Paris", logits corr=0.993. Wall time ~44s → ~4-5s. NPU kernel total 3.60s.
+  - **Next**: RoPE/RMSNorm vectorization, FFN fusion.
   - See `docs/performance_optimization.md` for full breakdown and roadmap.
 - [ ] Phase 5: Decode Phase (future work)
 
