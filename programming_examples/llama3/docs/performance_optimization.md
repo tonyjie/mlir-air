@@ -55,12 +55,45 @@ AIR wall time 5.39s = weight loading (~1.5s) + embedding + 16 layers (3.88s) + f
 
 Note: AIR per-block numbers come from "kernel time" profiling (inside `load_and_run`) and sum to ~200ms. The remaining ~43ms/layer is host-side data prep (numpy reshaping, dtype conversion, weight slicing) between kernel calls that IRON avoids via fused operators and PyTorch tensor views.
 
-**Largest remaining gaps**:
-1. **FFN** (109ms vs 57.4ms): IRON fuses Gate+Up+SiLU×mul+Down into one kernel, eliminating 3 DDR round-trips. AIR runs 4 separate kernels.
-2. **Host overhead** (~43ms/layer): AIR does explicit BO write/sync/read + numpy reshaping between every kernel. IRON uses memory-mapped BOs and PyTorch tensor views.
-3. **RMSNorm** (8ms vs 4.3ms): IRON is 1.9× faster.
+**Largest remaining gap: Host-side overhead in FFN path**
 
-**FlashAttention integrated** (2026-03-26): CPU attention fallback eliminated. Wall time dropped from ~44s to **5.39s** (8.2× improvement). NPU kernel total 3.11s (flash_attn 22ms avg/layer, 0.35s total for 16 layers).
+The per-layer gap (243ms AIR vs 152ms IRON) breaks down as:
+- **FFN block** (109ms vs 57.4ms) — 52ms gap, largest single contributor
+- **Host overhead** (~43ms/layer) — inter-kernel data prep in Python/numpy
+- **RMSNorm** (8ms vs 4.3ms) — 7ms gap
+
+#### Understanding the host overhead on shared-memory Ryzen AI
+
+CPU and NPU share the same DDR — there is no discrete device memory. XRT buffer objects (BOs) are DDR allocations accessible by both. The `bo.sync()` calls are **CPU cache coherency operations** (flush/invalidate), not DMA transfers.
+
+The actual overhead in AIR comes from **unnecessary DDR→DDR memcpy** between kernel calls:
+
+```
+Gate GEMM output: NPU writes to BO_gate_out (DDR address A)
+                  bo.read() → memcpy DDR(A) → numpy array (DDR address B)    # ~1-2ms for 33MB
+                  ... numpy reshaping ...
+SiLU×mul input:   bo.write() → memcpy numpy (DDR address B) → BO_swiglu_in (DDR address C)  # ~1-2ms
+                  bo.sync(TO_DEVICE) → flush CPU cache                       # ~0.1ms
+```
+
+The data never leaves DDR, but gets copied between different DDR regions (BO memory ↔ numpy array memory) via CPU memcpy.
+
+**IRON avoids this** by passing the same BO to consecutive kernels in `run_runlist()`:
+- Gate GEMM writes to `BO["left"]`, SiLU reads from `BO["left"]` — same DDR address, zero copies
+- `write_buffer()` uses `bo.map()` + `np.copyto()` — one copy into mapped BO memory (vs AIR's `bo.write()` which copies into an internal buffer)
+- `read_buffer()` uses `bo.map()` + `np.frombuffer()` — zero-copy view of BO memory (vs AIR's `bo.read()` which allocates + copies)
+
+Per-layer host overhead breakdown (AIR, estimated):
+
+| Source | Cost | Occurrences/layer | Total |
+|--------|------|-------------------|-------|
+| `bo.write()` memcpy (inputs) | ~1-2ms per 33MB buffer | ~15 buffers | ~15-20ms |
+| `bo.read()` memcpy (outputs) | ~1-2ms per 33MB buffer | ~15 buffers | ~15-20ms |
+| numpy reshape/cast between kernels | ~0.5ms each | ~15 | ~5-8ms |
+| `bo.sync()` cache ops | ~0.1ms each | ~30 | ~3ms |
+| **Total host overhead** | | | **~40ms/layer** |
+
+**FlashAttention integrated** (2026-03-26): CPU attention fallback eliminated. Wall time dropped from ~44s to **5.39s** (8.2× improvement).
 
 ---
 
@@ -109,19 +142,16 @@ AIR GEMM kernels are **23-32% faster** than IRON standalone. Eltwise add is matc
 
 ---
 
-## Blocked Items
-
-| Item | Issue | Workaround |
-|------|-------|-----------|
-| **NPU Flash Attention** | Kernel produces uncorrelated output (corr=0.13-0.34) for ALL configs. `make run PASS` is false positive. GitHub issue filed. | CPU `attention_reference()` fallback (`--cpu-attn`) |
-
 ## Next Steps
 
-| Priority | Action | Savings | Status |
-|----------|--------|---------|--------|
-| **1** | **Integrate NPU FlashAttention** | **~38s wall** (replace CPU fallback) | **Ready (fixed 2026-03-26)** |
-| **2** | Vectorize RoPE / RMSNorm | ~0.3s NPU | Ready |
-| **3** | FFN kernel fusion | ~1s NPU | Complex |
+| Priority | Action | Estimated savings | Notes |
+|----------|--------|-------------------|-------|
+| **1** | **Host-side optimization: eliminate unnecessary memcpy in FFN path** | **~25-30ms/layer (~0.4-0.5s total)** | Reuse BOs across kernels; use `bo.map()` zero-copy reads; avoid weight re-writes |
+| **2** | **FFN operator composition** (IRON-style `run_runlist`)  | **~10-15ms/layer (~0.2s total)** | Sequence Gate→SiLU×mul→Down in single dispatch, intermediate BOs stay on NPU |
+| **3** | Vectorize RoPE / RMSNorm | ~0.15s total | RoPE: 13ms vs IRON 10.6ms; RMSNorm: 8ms vs IRON 4.3ms |
+| **4** | True FFN kernel fusion at MLIR level | ~0.5-1s total | Fuse Gate+Up+SiLU×mul+Down into single AIR launch; enables L2-level data reuse |
+
+Priority 1 requires only Python changes to `KernelCache.load_and_run()` — pass output BOs of one kernel as input BOs to the next without host memcpy. Priority 2 extends this to multi-kernel runlists. No MLIR or kernel changes needed for either.
 
 ---
 
@@ -129,15 +159,14 @@ AIR GEMM kernels are **23-32% faster** than IRON standalone. Eltwise add is matc
 
 ### Totals Progression
 
-| Metric | Baseline | +BF16 Add | +XRT Reuse | +BO Reuse | +GEMM/SwiGLU Opt | IRON |
-|--------|----------|-----------|------------|-----------|-----------------|------|
-| NPU kernel total | 18.67s | 13.40s | 8.77s | 6.49s | **3.57s** | ~2.4s |
-| NPU per-layer | 1.17s | 0.84s | 0.55s | 0.41s | **0.22s** | 0.15s |
-| Wall time | 25.9s | 51.4s | ~47s | ~47s | **~44s** | 2.75s |
-| Gap to IRON (NPU) | 7.8× | 5.6× | 3.7× | 2.7× | **1.5×** | 1.0× |
-| Compilation | 334s | 334s | 334s | 334s | **37s** | — |
+| Metric | Baseline | +BF16 Add | +XRT Reuse | +BO Reuse | +GEMM/SwiGLU Opt | +FlashAttn | IRON |
+|--------|----------|-----------|------------|-----------|-----------------|------------|------|
+| Per-layer (with host) | 1.17s | 0.84s | 0.55s | 0.41s | 0.22s | **0.243s** | 0.152s |
+| 16 layers (with host) | 18.67s | 13.40s | 8.77s | 6.49s | 3.57s | **3.88s** | 2.44s |
+| Wall time | 25.9s | 51.4s | ~47s | ~47s | ~44s | **5.39s** | 2.75s |
+| Gap to IRON (per-layer) | 7.8× | 5.6× | 3.7× | 2.7× | 1.5× | **1.59×** | 1.0× |
 
-NPU kernel time reduced **81%** from baseline (18.67s → 3.57s). Gap to IRON narrowed from 7.8× to **1.5×**.
+Per-layer time increased slightly from 0.22s to 0.243s because FlashAttention (22ms) replaced CPU attention (not in NPU timing), but wall time dropped **8.2×** (44s → 5.39s) by eliminating CPU fallback. Gap to IRON is **1.59×** measured at comparable scope (with host overhead).
 
 ### Per-Kernel Progression (per-invocation avg, ms)
 
@@ -178,6 +207,10 @@ Per-shape optimal tiles (8×4 herd, BF16 output). BFP16 rounding mode fix landed
 
 [8,1] herd + tile_n=4096 + 16-wide vectors. 59ms → 37ms (1.6×). BD exhaustion workaround: larger tiles to reduce iteration count under BD limit. See `kernels/swiglu.md`.
 
+### 6. FlashAttention Integration (2026-03-26)
+
+Replaced CPU attention fallback with NPU FlashAttention kernel. Kernel takes unscaled Q (scaling handled internally), 4 args (Q, K, V, Output), causal masking built-in. Wall time: ~44s → 5.39s. FlashAttention: 22ms avg/layer, corr=0.9976 standalone. See `kernels/flash_attention.md`.
+
 ---
 
 ## Known Limitations
@@ -203,13 +236,15 @@ The ShimDMA hardware has **16 BD slots per channel**. Each BD can repeat up to 3
 ## Profiling Commands
 
 ```bash
-# AIR: Full 16-layer profiling
+# AIR: Full 16-layer profiling (NPU attention, default)
 cd programming_examples/llama3/build_peano
-python3 ../llama3_prefill.py --run-only --n-layers 16 --profile --cpu-attn
+python3 ../llama3_prefill.py --run-only --n-layers 16 --profile
 
-# AIR: Compile + run
-python3 ../llama3_prefill.py --compile-only --cpu-attn
-python3 ../llama3_prefill.py --run-only --n-layers 16 --verify --cpu-attn
+# AIR: With verification
+python3 ../llama3_prefill.py --run-only --n-layers 16 --verify --profile
+
+# AIR: With CPU attention fallback (for comparison)
+python3 ../llama3_prefill.py --run-only --n-layers 16 --profile --cpu-attn
 
 # IRON: End-to-end model
 cd /home/jiajli/apps/IRON && source ironenv/bin/activate
