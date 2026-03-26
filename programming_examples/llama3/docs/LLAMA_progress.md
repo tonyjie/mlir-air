@@ -6,17 +6,26 @@
 
 ---
 
-## Current Status: Full 16-Layer Model VERIFIED with CPU Attention Fallback
+## Current Status: Full 16-Layer Model VERIFIED with NPU FlashAttention
 
-**Pipeline is functionally correct.** All 16 layers x 15 steps run end-to-end. With CPU attention fallback (`--cpu-attn`, default), the model produces correct output:
-- **Top-1**: " Paris" (prob=0.48) for prompt "The capital of France is"
-- **Logits correlation**: 0.972 vs CPU F32 reference
-- **Per-kernel**: All 14 NPU kernels corr>0.999. CPU attention is correct by definition.
-- **Per-layer**: All 16 layer outputs corr=0.999998-0.999999
+**All 16 layers x 15 steps run end-to-end on NPU**, including FlashAttention with GQA and causal masking:
+- **Top-1**: " Paris" (prob=0.18) for prompt "The capital of France is"
+- **Logits correlation**: 0.993 vs CPU F32 reference
+- **Per-kernel**: All 240 NPU kernel invocations corr>0.999
+- **Per-layer**: All 16 layer outputs corr=0.999996-0.999998
+- **NPU kernel time**: 3.11s (flash_attn avg 22ms/layer, 16 invocations = 0.35s)
+- **Wall time**: 5.39s (down from ~44s with CPU attention — 8.2× improvement)
+- **Standalone kernel test**: `make run` passes with corr=0.9976 (LLAMA causal, 32Q/8KV)
 
-**Remaining issue**: NPU flash attention kernel has a correctness bug (corr=0.31 vs standard attention). GitHub issue submitted upstream. CPU fallback (`attention_reference()`) is used until the kernel is fixed. Use `--npu-attn` to test the NPU kernel when a fix lands.
+**NPU attention is now the default.** Use `--cpu-attn` for debugging/comparison. The CPU fallback path is still available and produces corr=0.972.
 
-**Next step**: Phase 4 (performance optimization) or Phase 3B (NPU flash attention fix from upstream).
+**Key integration notes:**
+- Kernel expects **unscaled Q** — scaling by 1/sqrt(dk) is handled internally
+- Kernel takes **4 args** (Q, K, V, Output) — no mask buffer (causal masking is internal)
+- Kernel uses **ELF format** — compiled via `make run` in `flash_attention/kernel_fusion_based/`
+- IRON MHA comparison: AIR FlashAttention is 2× faster (15ms vs 31ms standalone)
+
+**Next step**: Performance optimization — vectorize RoPE/RMSNorm, FFN kernel fusion.
 
 ---
 
@@ -160,6 +169,7 @@ All 9 kernel configs tested on NPU2 hardware with random data:
 | | **16-layer verified**: Top-1 = " Paris" (prob=0.19). Logits corr=0.994. All 240 steps `[OK]`. |
 | | Gap to IRON: **1.5×** (was 2.7×). SwiGLU (26%) and GEMM Gate/Up (21%) are largest NPU contributors. |
 | 2026-03-20 | **SwiGLU optimized**: [8,1] herd + tile_n=4096 + 16-wide vectors. 59ms → **37ms** (1.6×). BD exhaustion workaround: larger tiles reduce iteration count under BD limit. |
+| 2026-03-26 | **FlashAttention FIXED**: All configs pass with corr > 0.996. LLAMA causal (32h/8kv, 2048 seq): **15ms, 2,281 GFLOP/s** — **2× faster than IRON** (31ms). Only valid tile config: LQP=256, LKP=64 (causal constraints). Ready to integrate into LLAMA pipeline. |
 
 ---
 
@@ -167,7 +177,7 @@ All 9 kernel configs tested on NPU2 hardware with random data:
 
 See `performance_optimization.md` for full profiling breakdown, IRON comparison, and optimization roadmap.
 
-**Summary**: NPU kernel 18.67s → **3.57s** (81% reduction: BF16 add + XRT/BO reuse + GEMM optimization + SwiGLU [8,1]). IRON: ~2.4s. Gap: **1.5×**. FlashAttention still broken (CPU fallback, ~38s wall).
+**Summary**: NPU kernel 18.67s → **3.57s** (81% reduction). FlashAttention now fixed (15ms, 2× faster than IRON). **Next**: Integrate NPU FlashAttention to replace CPU fallback (~38s savings).
 
 ---
 

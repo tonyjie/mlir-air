@@ -12,19 +12,55 @@ Reference: IRON (`/home/jiajli/apps/IRON`). IRON profiling data: `/home/jiajli/a
 
 | Metric | AIR (current) | IRON | Notes |
 |--------|--------------|------|-------|
-| **NPU kernel total** | **3.57s** | **~2.4s** | **Gap: 1.5×** |
-| **Wall time** | **~44s** | **2.75s** | AIR uses CPU attention (~38s overhead) |
-| Per-layer (NPU kernel) | 0.22s | 0.15s | 1.5× |
-| Compilation | 37s | cached | One-time cost |
+| **16 transformer layers** | **3.88s** | **2.44s** | **Gap: 1.59×** (same profiling scope — see below) |
+| **Wall time** | **5.39s** | **2.75s** | AIR includes weight loading (~1.5s) + CPU LM Head |
+| Per-layer avg | 243ms | 152ms | 1.59× |
 | Top-1 prediction | " Paris" ✓ | — | Correct factual answer |
-| Logits corr vs CPU F32 | 0.994 | — | |
+| Logits corr vs CPU F32 | 0.993 | — | |
 
-**Note on wall time**: AIR's 44s wall time is dominated by CPU attention fallback (~38s). IRON runs attention on NPU (MHA, 37ms/layer). Excluding attention:
+### Profiling Scope
 
-| Metric | AIR (excl. attention) | IRON (excl. attention) | Gap |
-|--------|----------------------|----------------------|-----|
-| NPU kernels (non-attn) | **3.57s** | ~1.8s (total minus MHA) | **2.0×** |
-| Per-layer (non-attn) | 0.22s | ~0.11s | 2.0× |
+Both AIR and IRON are profiled with host overhead included:
+
+**IRON**: `transformer.forward` (2.437s total / 16 layers) is timed by `sys.setprofile()`. Each operator's `forward()` includes torch→numpy conversion, `write_buffer()` (memory-mapped BO, zero-copy), `run_runlist()` (BO sync + kernel launch + wait), `read_buffer()` (memory-mapped, zero-copy), and numpy→torch conversion.
+
+**AIR**: "Total prefill" (3.88s) is timed by `profiler.start_layer()` / `end_layer()` around `run_transformer_block()`. Each kernel's `load_and_run()` includes `bo.write()` + `bo.sync(TO_DEVICE)`, kernel launch + wait, `bo.sync(FROM_DEVICE)` + `bo.read()`, plus numpy reshaping and dtype conversion between kernel calls.
+
+Both scopes include host overhead. IRON has lower host overhead due to memory-mapped BOs (zero-copy) vs AIR's explicit BO write/sync/read (3 copies per buffer).
+
+**AIR also reports "kernel time" (3.11s)** which only covers the `load_and_run()` calls, excluding inter-kernel data prep. This has no IRON equivalent and understates the gap.
+
+### Scope Outside 16 Transformer Layers
+
+| Component | AIR | IRON | Notes |
+|-----------|-----|------|-------|
+| Token embedding | CPU lookup | CPU lookup | Both negligible |
+| Final RMSNorm | NPU (in wall time) | NPU (in `model.forward`) | |
+| **LM Head** | **CPU** (`np @ lm_head.T`) | **NPU** (`AIEGEMM 2048×2048×128256`) | AIR has no NPU LM Head yet |
+| Weight loading | ~1.5s (in wall time) | Separate (before `model.forward`) | |
+
+IRON `model.forward` = embedding + 16 layers + final norm + **NPU LM Head** = 2.744s.
+AIR wall time 5.39s = weight loading (~1.5s) + embedding + 16 layers (3.88s) + final norm + CPU LM Head.
+
+### Per-Block Breakdown (per layer)
+
+| Block | AIR | IRON | Gap | Notes |
+|-------|-----|------|-----|-------|
+| Attention (QKV GEMMs + RoPE + Attn + O GEMM) | **65ms** | **76.9ms** | **0.85× (AIR faster)** | AIR FlashAttn 22ms vs IRON MHA 37ms |
+| FFN (Gate + Up + SiLU×mul + Down) | **109ms** | **57.4ms** | **1.9× (IRON faster)** | IRON fuses all 4 ops into one kernel |
+| RMSNorm ×2 | 16ms | 8.6ms | 1.9× | |
+| Eltwise Add ×2 | 10ms | 9.0ms | 1.1× | |
+| Host overhead (data prep between kernels) | ~43ms | ~0ms | — | AIR: numpy reshape/cast between each kernel |
+| **Total per layer** | **243ms** | **152ms** | **1.59×** | |
+
+Note: AIR per-block numbers come from "kernel time" profiling (inside `load_and_run`) and sum to ~200ms. The remaining ~43ms/layer is host-side data prep (numpy reshaping, dtype conversion, weight slicing) between kernel calls that IRON avoids via fused operators and PyTorch tensor views.
+
+**Largest remaining gaps**:
+1. **FFN** (109ms vs 57.4ms): IRON fuses Gate+Up+SiLU×mul+Down into one kernel, eliminating 3 DDR round-trips. AIR runs 4 separate kernels.
+2. **Host overhead** (~43ms/layer): AIR does explicit BO write/sync/read + numpy reshaping between every kernel. IRON uses memory-mapped BOs and PyTorch tensor views.
+3. **RMSNorm** (8ms vs 4.3ms): IRON is 1.9× faster.
+
+**FlashAttention integrated** (2026-03-26): CPU attention fallback eliminated. Wall time dropped from ~44s to **5.39s** (8.2× improvement). NPU kernel total 3.11s (flash_attn 22ms avg/layer, 0.35s total for 16 layers).
 
 ---
 
@@ -41,7 +77,7 @@ IRON model numbers from `operator.forward()` (includes write_buffer + run_runlis
 | 4 | GEMM V | 2048×2048×512 | 6 | 10.6* | — |
 | 5 | RoPE Q | (65536, 64) | 17 | 5.3 | 3.2× |
 | 6 | RoPE K | (16384, 64) | 4 | 5.3 | — |
-| 7 | **Attention** | 32 heads, 2048 seq | **2,400 (CPU)** | **37.0 (NPU)** | **65×** |
+| 7 | **Attention** | 32 heads, 2048 seq, causal | **15 (NPU)** | **37.0 (NPU)** | **2.5× faster** |
 | 8 | GEMM O | 2048×2048×2048 | 10 | 10.6* | 1.0× |
 | 9,15 | Eltwise Add | (4,194,304) BF16 | 10 | 4.5 | 2.2× |
 | 11 | GEMM Gate | 2048×2048×8192 | 24 | (fused) | — |
@@ -64,7 +100,7 @@ Standalone measurements isolate kernel execution from data transfer overhead.
 | GEMM Down (2048×8192×2048) | **10,230** | 12,536 | **1.23× faster** |
 | Eltwise Add (4M BF16) | **415** | 429 | **1.03× faster** |
 | SwiGLU fused (5 ops) | — | 48,100 | — |
-| MHA (2048 seq, 32 heads) | — (CPU) | 30,989 | — |
+| **FlashAttention (causal)** | **15,022** | **30,989** | **2.06× faster** |
 | RMSNorm (4M BF16) | — | 843 | — |
 | RoPE Q (65536×64) | — | 845 | — |
 | RoPE K (16384×64) | — | 257 | — |
@@ -83,7 +119,7 @@ AIR GEMM kernels are **23-32% faster** than IRON standalone. Eltwise add is matc
 
 | Priority | Action | Savings | Status |
 |----------|--------|---------|--------|
-| **1** | Fix NPU flash attention | **38s** wall | Blocked upstream |
+| **1** | **Integrate NPU FlashAttention** | **~38s wall** (replace CPU fallback) | **Ready (fixed 2026-03-26)** |
 | **2** | Vectorize RoPE / RMSNorm | ~0.3s NPU | Ready |
 | **3** | FFN kernel fusion | ~1s NPU | Complex |
 
@@ -146,19 +182,21 @@ Per-shape optimal tiles (8×4 herd, BF16 output). BFP16 rounding mode fix landed
 
 ## Known Limitations
 
-### AIR DMA Buffer Descriptor (BD) Exhaustion
+### AIR DMA Buffer Descriptor (BD) Exhaustion (upstream issue)
 
-AIR's `dma_memcpy_nd` generates per-iteration BD chains that scale linearly with `n / tile_n`. The hardware has a fixed BD limit (~48 per MemTile). This prevents scaling to more AIE columns for large buffers:
+The ShimDMA hardware has **16 BD slots per channel**. Each BD can repeat up to 32 times, so one channel handles at most `16 BDs × 32 repeats × tile_n` elements. When the per-column data exceeds this, compilation fails.
 
-| Buffer size | tile_n=2048, [8,1] iters | Compiles? |
-|------------|-------------------------|-----------|
-| 4.2M (eltwise_add) | 256 | **OK** |
-| 15.7M | 960 | **OK** (max safe) |
-| 16.8M (SwiGLU) | 1024 | **FAIL** |
+| Buffer size | Per-column data | 16 BDs × 32 × tile_n=2048 | Fits? |
+|------------|----------------|--------------------------|-------|
+| 4.2M / 8 cols | 524K | 1,048K | **YES** |
+| 16.8M / 8 cols | 2,097K | 1,048K | **NO** |
+| 16.8M / 8 cols (tile_n=4096) | 2,097K | 2,097K | **YES** |
 
-**Workaround**: Increase tile_n to reduce iteration count. tile_n=4096 at 16.8M → 512 iterations → fits.
+**Workaround**: Increase tile_n so that `16 × 32 × tile_n ≥ n / num_columns`.
 
-**IRON avoids this** via ObjectFIFO, which generates repeating BD patterns (fixed ~2 BDs per buffer regardless of iteration count).
+**IRON avoids this** via ObjectFIFO, which uses repeating BD patterns with address auto-increment (2 BDs per buffer regardless of data size).
+
+**Upstream fix needed**: AIR's `dma_memcpy_nd` lowering should generate repeating BD patterns instead of per-iteration BD chains. See `kernels/swiglu.md` for detailed analysis.
 
 ---
 
