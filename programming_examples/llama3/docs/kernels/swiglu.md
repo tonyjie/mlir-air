@@ -94,58 +94,81 @@ The BD exhaustion is from too many iterations. Increasing tile_n reduces iterati
 
 ### What is a Buffer Descriptor (BD)?
 
-A BD is a hardware configuration record that tells the DMA engine where to read/write data. Each BD specifies an address, size, and transfer pattern. The NPU2 has a **fixed number of BD slots** per DMA engine (~48 per MemTile).
+A BD is a hardware configuration record that tells the DMA engine where to read/write data. Each BD specifies an address, size, and stride pattern. The NPU2 ShimDMA has **16 BD slots per channel**, each supporting up to **32 repeats** (`repeat_count`).
 
-### How AIR generates DMA instructions
+### The Hardware Constraint
 
-AIR's `dma_memcpy_nd` generates **one BD per DMA transfer**. Each loop iteration creates separate BDs:
-
-```python
-for i in range(0, 16777216, tile_n * num_tiles):    # Many iterations
-    dma_memcpy_nd(l1_gate, l3_gate, offset=i, size=tile_n)   # 1 BD
-    dma_memcpy_nd(l1_up,   l3_up,   offset=i, size=tile_n)   # 1 BD
-    # kernel call...
-    dma_memcpy_nd(l3_out,  l1_out,  offset=i, size=tile_n)   # 1 BD
-```
-
-Total BDs = iterations × 3 buffers. For 16.7M elements:
-- tile_n=1024, [8,1]: 2048 iterations × 3 = **6,144 BDs → FAIL**
-- tile_n=4096, [8,1]: 512 iterations × 3 = **1,536 BDs → OK**
-
-### How IRON avoids this
-
-IRON uses **ObjectFIFO** which generates **repeating DMA patterns**:
+Each ShimDMA channel can address at most:
 
 ```
-ObjectFIFO approach (IRON):
-  BD 0: transfer to buffer A  ─┐
-  BD 1: transfer to buffer B  ─┤ Hardware loops these 2 BDs
-                                │ with auto-incrementing address
-  Total: 2 BDs per buffer      │ Works for ANY iteration count
+16 BD slots × 32 repeats × tile_n elements = max elements per channel
 ```
 
+With tile_n=2048: `16 × 32 × 2048 = 1,048,576` elements per channel.
+With [8,1] herd: each column has one ShimDMA channel per buffer direction.
+Per-column data = `total_n / 8 columns`.
+
+| Total n | Per-column | 16×32×2048 capacity | Fits? |
+|---------|-----------|---------------------|-------|
+| 4.2M | 524K | 1,048K | **YES** |
+| 8.4M | 1,048K | 1,048K | **YES** (exact) |
+| 16.8M | 2,097K | 1,048K | **NO** (needs 32 BDs) |
+| 16.8M (tile_n=4096) | 2,097K | 2,097K | **YES** (exact) |
+
+### What the Generated IR Looks Like
+
+From `npu.air.mlir` (the failing 16.8M case):
+
+```mlir
+aie.runtime_sequence @eltwise_add(%arg0, %arg1, %arg2) {
+  // Channel 0_0: Input A, Column 0
+  // 16 BDs, each with repeat_count=31 (32 repeats), offset increments by 1M
+  %0 = aiex.dma_configure_task_for @air_channel_0_0 {
+    aie.dma_bd(%arg0, offset=0, size=4096, strides=[32×32768, 2×16384, 4×512, 512×1])
+  } {repeat_count = 31}     // BD 0: covers elements [0, 1M)
+  %1 = aiex.dma_configure_task_for @air_channel_0_0 {
+    aie.dma_bd(%arg0, offset=1048576, size=4096, ...)
+  } {repeat_count = 31}     // BD 1: covers elements [1M, 2M)
+  ...
+  %15 = aiex.dma_configure_task_for @air_channel_0_0 {
+    aie.dma_bd(%arg0, offset=15728640, size=4096, ...)
+  } {repeat_count = 31}     // BD 15: covers elements [15M, 16M)
+  // ^^^ 16 BDs cover 16 × 32 × 2048 = 1,048,576 elements
+  // But column 0 needs 2,097,152 elements → needs 32 BDs → FAIL
+}
 ```
-dma_memcpy_nd approach (AIR):
-  BD 0: transfer chunk 0
-  BD 1: transfer chunk 1       One BD per iteration
-  BD 2: transfer chunk 2       Total: N BDs per buffer
-  ...                          Exceeds limit for large N
-  BD N: transfer chunk N
+
+Total: 384 BDs across 24 channels (3 buffers × 8 columns). Each channel uses exactly 16 BDs (the hardware limit), but needs 32 for 16.8M elements.
+
+### How IRON Avoids This (upstream fix direction)
+
+IRON's ObjectFIFO generates **2 BDs per buffer** with hardware address auto-increment:
+
+```
+BD 0: transfer to L1 buffer A → hardware increments address
+BD 1: transfer to L1 buffer B → hardware increments address
+(loop back to BD 0 with new address — works for ANY data size)
 ```
 
-### BD Limit Threshold
+The upstream fix for AIR would be to generate similar repeating BD patterns in the `dma_memcpy_nd` lowering, instead of unrolling every iteration into a separate BD.
 
-Empirically tested with eltwise_add (3 buffers, [8,1] herd, tile_n=2048):
+### Reproducible Commands
 
-| Buffer size | Iterations | Status |
-|------------|-----------|--------|
-| 4.2M | 256 | OK |
-| 8.4M | 512 | OK |
-| 12.6M | 768 | OK |
-| 15.7M | 960 | OK (max safe) |
-| **16.8M** | **1024** | **FAIL** |
+```bash
+cd programming_examples/eltwise_add
 
-Limit: ~1,024 iterations with 3 buffers at [8,1] herd. This applies to **any kernel** with large buffers, not just SwiGLU.
+# WORKS: 4.2M elements (LLAMA eltwise_add size)
+make profile N=4194304
+
+# WORKS: 8.4M elements (at the limit)
+make profile N=8388608
+
+# FAILS: 16.8M elements (BD exhaustion — needs 32 BDs, only 16 available)
+make profile N=16777216
+
+# WORKS: 16.8M with larger tile (halves BD count)
+make profile N=16777216 TILE_N=4096
+```
 
 ---
 
