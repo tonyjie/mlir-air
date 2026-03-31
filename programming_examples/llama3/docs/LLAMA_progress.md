@@ -13,8 +13,9 @@
 - **Logits correlation**: 0.993 vs CPU F32 reference
 - **Per-kernel**: All NPU kernel invocations corr>0.999
 - **Per-layer**: All 16 layer outputs corr=0.999996-0.999997
-- **NPU kernel time**: 2.10s (ffn_multi avg 52ms/layer, flash_attn avg 22ms/layer)
-- **Wall time**: 4.51s
+- **NPU kernel time**: 1.93s (attn_gemms avg 8ms/layer, ffn_multi avg 50ms/layer, flash_attn avg 22ms/layer)
+- **Wall time**: 4.00s
+- **vs IRON**: AIR per-layer 140ms vs IRON 152ms — **AIR is now faster**
 - **8 unique kernels**: rmsnorm, gemm_qo, gemm_kv, ffn_multi (4 launches), rope_q, rope_k, flash_attn, add
 - **Standalone kernel test**: `make run` passes with corr=0.9976 (LLAMA causal, 32Q/8KV)
 
