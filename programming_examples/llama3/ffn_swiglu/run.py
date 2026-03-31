@@ -127,7 +127,15 @@ def build_ffn_module(
         print_kernels: If True, print each sub-kernel's MLIR before stitching.
     """
     from llama3.llama3_prefill import _build_gemm_module
-    from silu_and_mul import build_module_2d as build_swiglu
+
+    # Import silu_and_mul from same directory as this file
+    import importlib.util
+
+    _silu_path = os.path.join(os.path.dirname(__file__), "silu_and_mul.py")
+    _spec = importlib.util.spec_from_file_location("silu_and_mul", _silu_path)
+    _silu_mod = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_silu_mod)
+    build_swiglu = _silu_mod.build_module_2d
 
     # Build each kernel independently
     print("  [1/4] Gate GEMM...")
