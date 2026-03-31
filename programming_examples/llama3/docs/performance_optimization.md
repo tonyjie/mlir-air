@@ -48,7 +48,7 @@ AIR wall time 4.51s = weight loading (~1.5s) + embedding + 16 layers (2.65s) + f
 |-------|-----|------|-----|-------|
 | Attention (QKV GEMMs + RoPE + Attn + O GEMM) | **65ms** | **76.9ms** | **0.85× (AIR faster)** | AIR FlashAttn 22ms vs IRON MHA 37ms |
 | FFN (Gate + Up + SiLU×mul + Down) | **52ms** (multi-launch) | **57.4ms** | **0.9× (AIR faster)** | AIR multi-launch + read-only-output; was 109ms with separate kernels |
-| RMSNorm ×2 | 16ms | 8.6ms | 1.9× | |
+| RMSNorm ×2 | 12ms (6ms each) | 8.6ms (4.3ms each) | 1.4× | Single tile; multi-tile blocked by aiecc bug (see `kernels/rmsnorm.md`) |
 | Eltwise Add ×2 | 10ms | 9.0ms | 1.1× | |
 | Host overhead (data prep between kernels) | ~17ms | ~0ms | — | Reduced by multi-launch + read-only-output |
 | **Total per layer** | **160ms** | **152ms** | **1.05×** | |
@@ -57,7 +57,7 @@ Note: FFN multi-launch + read-only-output eliminated most host overhead in the F
 
 **Largest remaining gaps:**
 - **Host overhead** (~17ms/layer) — inter-kernel data prep for attention path
-- **RMSNorm** (9ms vs 4.3ms) — 5ms gap
+- **RMSNorm** (6ms vs 4.3ms) — 1.7ms gap per invocation (see `kernels/rmsnorm.md`)
 - **FFN block** now **faster** than IRON (52ms vs 57.4ms)
 
 #### Understanding the host overhead on shared-memory Ryzen AI
@@ -104,7 +104,7 @@ IRON model numbers from `operator.forward()` (includes write_buffer + run_runlis
 
 | Step | Kernel | Shape | AIR (ms) | IRON model (ms) | Gap |
 |------|--------|-------|---------|-----------------|-----|
-| 1,10 | RMSNorm | (2048, 2048) | 10 | 4.3 | 2.3× |
+| 1,10 | RMSNorm | (2048, 2048) | 6.3 (C++ profiled) | 4.3 | 1.5× |
 | 2 | GEMM Q | 2048×2048×2048 | 10 | 10.6* | 1.0× |
 | 3 | GEMM K | 2048×2048×512 | 6 | 10.6* | — |
 | 4 | GEMM V | 2048×2048×512 | 6 | 10.6* | — |
@@ -130,7 +130,7 @@ Standalone measurements isolate kernel execution from data transfer overhead.
 | Eltwise Add (4M BF16) | **415** | 429 | **1.03× faster** |
 | SwiGLU fused (5 ops) | — | 48,100 | — |
 | **FlashAttention (causal)** | **15,022** | **30,989** | **2.06× faster** |
-| RMSNorm (4M BF16) | — | 843 | — |
+| RMSNorm (4M BF16) | **6,287** | 843* | **Single tile; multi-tile blocked** |
 | RoPE Q (65536×64) | — | 845 | — |
 | RoPE K (16384×64) | — | 257 | — |
 
@@ -143,9 +143,10 @@ AIR GEMM kernels are **23-32% faster** than IRON standalone. Eltwise add is matc
 | Priority | Action | Estimated savings | Notes |
 |----------|--------|-------------------|-------|
 | **1** | **Attention-path multi-launch** | **~15-20ms/layer** | Apply same multi-launch pattern to QKV GEMMs + RoPE + Attn + O GEMM |
-| **2** | Vectorize RoPE / RMSNorm | ~0.10s total | RoPE: 10ms vs IRON 5.3ms; RMSNorm: 9ms vs IRON 4.3ms |
-| **3** | Host-side `bo.map()` zero-copy reads | ~5-10ms/layer | Eliminate remaining DDR memcpy in attention path |
-| **4** | True FFN kernel fusion (single launch) | ~0.3s total | Fuse Gate+Up+SiLU×mul+Down into 1 AIR launch; enables L2-level data reuse |
+| **2** | Multi-tile RMSNorm | ~0.06s total | 6.3ms vs IRON 4.3ms × 33 invocations. Blocked by aiecc weight broadcast bug. See `kernels/rmsnorm.md` |
+| **3** | Vectorize RoPE | ~0.05s total | RoPE: 10ms vs IRON 5.3ms |
+| **4** | Host-side `bo.map()` zero-copy reads | ~5-10ms/layer | Eliminate remaining DDR memcpy in attention path |
+| **5** | True FFN kernel fusion (single launch) | ~0.3s total | Fuse Gate+Up+SiLU×mul+Down into 1 AIR launch; enables L2-level data reuse |
 
 Priorities 1-2 completed: FFN multi-launch (done), FlashAttention integration (done).
 
@@ -267,3 +268,5 @@ pytest iron/operators/ -m "llama and extensive" --build-dir build_llama -v -s
 - `kernels/gemm.md` — Tile optimization, precision analysis, rounding mode investigation
 - `kernels/silu_and_mul.md` — [8,1] optimization, BD exhaustion analysis
 - `kernels/flash_attention.md` — Correctness investigation, precision metrics, status
+- `kernels/ffn_swiglu.md` — Multi-launch FFN block optimization, MLIR stitching
+- `kernels/rmsnorm.md` — Multi-tile investigation, aiecc weight broadcast bug

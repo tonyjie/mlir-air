@@ -26,7 +26,7 @@
 - Kernel uses **ELF format** — compiled via `make run` in `flash_attention/kernel_fusion_based/`
 - IRON MHA comparison: AIR FlashAttention is 2× faster (15ms vs 31ms standalone)
 
-**Next step**: Performance optimization — vectorize RoPE/RMSNorm, FFN kernel fusion.
+**Next step**: Performance optimization — multi-tile RMSNorm (blocked by aiecc weight broadcast bug, see `kernels/rmsnorm.md`), vectorize RoPE.
 
 ---
 
