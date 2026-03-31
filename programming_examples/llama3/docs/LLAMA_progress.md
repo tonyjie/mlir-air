@@ -8,13 +8,14 @@
 
 ## Current Status: Full 16-Layer Model VERIFIED with NPU FlashAttention
 
-**All 16 layers x 15 steps run end-to-end on NPU**, including FlashAttention with GQA and causal masking:
+**All 16 layers run end-to-end on NPU**, including FlashAttention (GQA, causal) and multi-launch FFN:
 - **Top-1**: " Paris" (prob=0.18) for prompt "The capital of France is"
 - **Logits correlation**: 0.993 vs CPU F32 reference
-- **Per-kernel**: All 240 NPU kernel invocations corr>0.999
-- **Per-layer**: All 16 layer outputs corr=0.999996-0.999998
-- **NPU kernel time**: 3.11s (flash_attn avg 22ms/layer, 16 invocations = 0.35s)
-- **Wall time**: 5.39s (down from ~44s with CPU attention — 8.2× improvement)
+- **Per-kernel**: All NPU kernel invocations corr>0.999
+- **Per-layer**: All 16 layer outputs corr=0.999996-0.999997
+- **NPU kernel time**: 2.71s (ffn_multi avg 83ms/layer, flash_attn avg 22ms/layer)
+- **Wall time**: 4.88s
+- **8 unique kernels**: rmsnorm, gemm_qo, gemm_kv, ffn_multi (4 launches), rope_q, rope_k, flash_attn, add
 - **Standalone kernel test**: `make run` passes with corr=0.9976 (LLAMA causal, 32Q/8KV)
 
 **NPU attention is now the default.** Use `--cpu-attn` for debugging/comparison. The CPU fallback path is still available and produces corr=0.972.
