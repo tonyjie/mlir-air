@@ -542,7 +542,7 @@ def compile_all_kernels(cache, config, seq_len, cpu_attn=True):
     n_hidden_total = seq_len * hidden_dim
 
     print(f"\n{'='*60}")
-    print(f"Compiling {10} unique kernels (seq_len={seq_len})...")
+    print(f"Compiling {8} unique kernels (seq_len={seq_len})...")
     print(f"{'='*60}\n")
 
     # 1. RMSNorm: (seq_len, emb_dim)
@@ -580,41 +580,17 @@ def compile_all_kernels(cache, config, seq_len, cpu_attn=True):
         },
     )
 
-    # 4. GEMM Gate/Up: (seq_len, emb_dim, hidden_dim) — large N, tile_n=128
-    cache.compile_and_cache(
-        "gemm_gate_up",
-        _build_gemm_module(
-            seq_len,
-            emb_dim,
-            hidden_dim,
-            tile_m=64,
-            tile_k_l2=64,
-            tile_k_l1=32,
-            tile_n=128,
-        ),
-        {
-            "verbose": cache.verbose,
-            "omit_while_true_loop": False,
-            "runtime_loop_tiling_sizes": [2, 2],
-        },
-    )
+    # 4. FFN multi-launch: Gate GEMM + Up GEMM + SiLU×mul + Down GEMM (4 launches in 1 ELF)
+    from llama3.ffn_swiglu.run import build_ffn_module
 
-    # 5. GEMM Down: (seq_len, hidden_dim, emb_dim) — large K, tile_k_l2=256
     cache.compile_and_cache(
-        "gemm_down",
-        _build_gemm_module(
-            seq_len,
-            hidden_dim,
-            emb_dim,
-            tile_m=64,
-            tile_k_l2=256,
-            tile_k_l1=32,
-            tile_n=64,
-        ),
+        "ffn_multi",
+        build_ffn_module(seq_len, emb_dim, hidden_dim),
         {
             "verbose": cache.verbose,
             "omit_while_true_loop": False,
-            "runtime_loop_tiling_sizes": [2, 2],
+            "output_format": "elf",
+            "instance_name": "ffn_block",
         },
     )
 
@@ -670,14 +646,7 @@ def compile_all_kernels(cache, config, seq_len, cpu_attn=True):
     else:
         print("  Skipping flash_attn compilation (using CPU attention fallback)")
 
-    # 9. SwiGLU: n = seq_len * hidden_dim
-    from llama3.ffn_swiglu.silu_and_mul import build_module as build_swiglu
-
-    cache.compile_and_cache(
-        "swiglu",
-        build_swiglu(n_hidden_total, 4096, bfloat16, herd_x=8, herd_y=1),
-        {"verbose": cache.verbose, "omit_while_true_loop": False},
-    )
+    # 9. (SwiGLU is now part of ffn_multi above)
 
     # 10. Eltwise Add: n = seq_len * emb_dim
     from eltwise_add.eltwise_add import build_module as build_add
@@ -715,6 +684,11 @@ _GEMM_BACKEND = {
     "runtime_loop_tiling_sizes": [2, 2],
 }
 _SIMPLE_BACKEND = {"omit_while_true_loop": False}
+_FFN_BACKEND = {
+    "omit_while_true_loop": False,
+    "output_format": "elf",
+    "instance_name": "ffn_block",
+}
 
 
 def _attn_backend_kwargs(head_dim):
@@ -979,65 +953,48 @@ def run_transformer_block(
     else:
         _compare("ffn_norm", normed2)
 
-    # 11. Gate GEMM
-    print(f"    Step 11: Gate GEMM ({seq_len}x{emb_dim}x{hidden_dim})")
-    a_g = np.asarray(normed2, dtype=bfloat16).reshape(seq_len, emb_dim)
-    b_gate = np.asarray(layer_weights.w_gate, dtype=bfloat16).reshape(
+    # 11-14. FFN block (multi-launch: Gate GEMM + Up GEMM + SiLU×mul + Down GEMM)
+    print(
+        f"    Steps 11-14: FFN block [multi-launch] "
+        f"({seq_len}x{emb_dim}x{hidden_dim})"
+    )
+    ffn_input = np.asarray(normed2, dtype=bfloat16).reshape(seq_len, emb_dim)
+    w_gate = np.asarray(layer_weights.w_gate, dtype=bfloat16).reshape(
         emb_dim, hidden_dim
     )
-    c_gate = np.zeros((seq_len, hidden_dim), dtype=bfloat16)
-    results = _run_cached(cache, "gemm_gate_up", _GEMM_BACKEND, a_g, b_gate, c_gate)
-    gate = results[-1].reshape(seq_len, hidden_dim).astype(bfloat16)
-    if verify:
-        ref = normed2.astype(np.float32) @ np.asarray(
-            layer_weights.w_gate, dtype=np.float32
-        )
-        _compare("gate", gate, ref)
-    else:
-        _compare("gate", gate)
-
-    # 12. Up GEMM (same shape as gate)
-    print(f"    Step 12: Up GEMM ({seq_len}x{emb_dim}x{hidden_dim})")
-    b_up = np.asarray(layer_weights.w_up, dtype=bfloat16).reshape(emb_dim, hidden_dim)
-    c_up = np.zeros((seq_len, hidden_dim), dtype=bfloat16)
-    results = _run_cached(cache, "gemm_gate_up", _GEMM_BACKEND, a_g, b_up, c_up)
-    up = results[-1].reshape(seq_len, hidden_dim).astype(bfloat16)
-    if verify:
-        ref = normed2.astype(np.float32) @ np.asarray(
-            layer_weights.w_up, dtype=np.float32
-        )
-        _compare("up", up, ref)
-    else:
-        _compare("up", up)
-
-    # 13. SwiGLU activation
-    n_hidden_total = seq_len * hidden_dim
-    print(f"    Step 13: SwiGLU activation (n={n_hidden_total})")
-    gate_flat = np.asarray(gate, dtype=bfloat16).flatten()
-    up_flat = np.asarray(up, dtype=bfloat16).flatten()
-    swiglu_out_buf = np.zeros(n_hidden_total, dtype=bfloat16)
-    results = _run_cached(
-        cache, "swiglu", _SIMPLE_BACKEND, gate_flat, up_flat, swiglu_out_buf
+    gate_buf = np.zeros((seq_len, hidden_dim), dtype=bfloat16)
+    w_up = np.asarray(layer_weights.w_up, dtype=bfloat16).reshape(emb_dim, hidden_dim)
+    up_buf = np.zeros((seq_len, hidden_dim), dtype=bfloat16)
+    swiglu_buf = np.zeros((seq_len, hidden_dim), dtype=bfloat16)
+    w_down = np.asarray(layer_weights.w_down, dtype=bfloat16).reshape(
+        hidden_dim, emb_dim
     )
-    swiglu_out = results[-1].reshape(seq_len, hidden_dim)
-    if verify:
-        ref = swiglu_ref(gate.astype(np.float32), up.astype(np.float32))
-        _compare("swiglu", swiglu_out, ref)
-    else:
-        _compare("swiglu", swiglu_out)
-
-    # 14. Down GEMM
-    print(f"    Step 14: Down GEMM ({seq_len}x{hidden_dim}x{emb_dim})")
-    a_d = np.asarray(swiglu_out, dtype=bfloat16).reshape(seq_len, hidden_dim)
-    b_d = np.asarray(layer_weights.w_down, dtype=bfloat16).reshape(hidden_dim, emb_dim)
-    c_d = np.zeros((seq_len, emb_dim), dtype=bfloat16)
-    results = _run_cached(cache, "gemm_down", _GEMM_BACKEND, a_d, b_d, c_d)
+    ffn_output = np.zeros((seq_len, emb_dim), dtype=bfloat16)
+    results = _run_cached(
+        cache,
+        "ffn_multi",
+        _FFN_BACKEND,
+        ffn_input,
+        w_gate,
+        gate_buf,
+        w_up,
+        up_buf,
+        swiglu_buf,
+        w_down,
+        ffn_output,
+    )
     down = results[-1].reshape(seq_len, emb_dim).astype(bfloat16)
     if verify:
-        ref = swiglu_out.astype(np.float32) @ np.asarray(
-            layer_weights.w_down, dtype=np.float32
+        # Full FFN reference: gate→up→swiglu→down
+        ref_gate = normed2.astype(np.float32) @ np.asarray(
+            layer_weights.w_gate, dtype=np.float32
         )
-        _compare("down", down, ref)
+        ref_up = normed2.astype(np.float32) @ np.asarray(
+            layer_weights.w_up, dtype=np.float32
+        )
+        ref_swiglu = swiglu_ref(ref_gate, ref_up)
+        ref_down = ref_swiglu @ np.asarray(layer_weights.w_down, dtype=np.float32)
+        _compare("down", down, ref_down)
     else:
         _compare("down", down)
 
