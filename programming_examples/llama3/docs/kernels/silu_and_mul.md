@@ -1,8 +1,11 @@
-# SwiGLU Activation Kernel — Performance Analysis
+# SiLU + Elementwise Multiply Kernel — Performance Analysis
 
 ## Role in LLAMA Pipeline
 
 Step 13 of each transformer block: `output = SiLU(gate) × up`
+
+This is the **element-wise activation** kernel only (not the full FFN block).
+For the fused FFN block (Gate GEMM + Up GEMM + SiLU×mul + Down GEMM), see `ffn_swiglu.md`.
 
 Where `SiLU(x) = x × sigmoid(x) = x × 0.5 × (tanh(x/2) + 1)`
 
@@ -39,17 +42,9 @@ Where `SiLU(x) = x × sigmoid(x) = x × 0.5 × (tanh(x/2) + 1)`
 | Loop hints | `AIE_PREPARE_FOR_PIPELINING` | `AIE_PREPARE_FOR_PIPELINING` |
 | Algorithm | tanh approximation | tanh approximation (same) |
 
-### FFN Block Comparison (steps 11-14)
+### FFN Block Context
 
-| Step | Kernel | AIR (ms) | IRON (ms) |
-|------|--------|---------|----------|
-| 11 | GEMM Gate (2048×2048×8192) | 24 | (fused) |
-| 12 | GEMM Up (2048×2048×8192) | 24 | (fused) |
-| 13 | SwiGLU (SiLU+mul, 16.7M) | 37 | (fused) |
-| 14 | GEMM Down (2048×8192×2048) | 27 | (fused) |
-| | **Total** | **112** | **57.4** (fused, standalone: 48.1) |
-
-AIR FFN = 112ms vs IRON fused = 57.4ms (**2.0× gap**). IRON fuses all 5 ops (Gate+Up+SiLU+mul+Down) into a single dispatch with shared L1/L2 buffers.
+The SiLU×mul kernel is step 13 of the FFN block (steps 11-14). For the full FFN block optimization using multi-launch fusion (Gate GEMM + Up GEMM + SiLU×mul + Down GEMM → single ELF), see `ffn_swiglu.md`.
 
 ---
 
@@ -57,7 +52,7 @@ AIR FFN = 112ms vs IRON fused = 57.4ms (**2.0× gap**). IRON fuses all 5 ops (Ga
 
 ### Attempt 1: 16-wide Vectors + Pipelining (keep [1,2] herd)
 
-Updated `swiglu_activation.cc`: VecLen 8→16, added `AIE_PREPARE_FOR_PIPELINING`, pointer-increment loop.
+Updated `silu_and_mul.cc`: VecLen 8→16, added `AIE_PREPARE_FOR_PIPELINING`, pointer-increment loop.
 
 **Result**: 59ms → 61ms — **no improvement**. Kernel is **DMA-bound**, not compute-bound. The actual compute (~10ms) is fast; the 100MB data transfer dominates.
 
@@ -202,6 +197,7 @@ make run-swiglu PEANO_INSTALL_DIR=$PEANO_INSTALL_DIR
 
 ## Related Documents
 
-- `performance_optimization.md` — Overall LLAMA optimization roadmap
-- `kernels/eltwise_add.md` — Similar optimization pattern (same BD limit applies)
-- `kernels/gemm.md` — GEMM optimization (completed)
+- `ffn_swiglu.md` — Full FFN block multi-launch optimization (Gate+Up+SiLU×mul+Down)
+- `../performance_optimization.md` — Overall LLAMA optimization roadmap
+- `eltwise_add.md` — Similar optimization pattern (same BD limit applies)
+- `gemm.md` — GEMM optimization (completed)

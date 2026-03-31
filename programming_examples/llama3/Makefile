@@ -41,8 +41,8 @@ compile-external-kernels:
 	@if [ -z "$(PEANO_INSTALL_DIR)" ]; then \
 		echo "Error: PEANO_INSTALL_DIR is required."; exit 1; \
 	fi
-	@echo "  [1/3] swiglu_activation.o"
-	$(PEANO_INSTALL_DIR)/bin/clang++ ${PEANOWRAP2P_FLAGS} -c ${srcdir}/swiglu_activation.cc -o $(BUILD_DIR)/swiglu_activation.o
+	@echo "  [1/3] silu_and_mul.o"
+	$(PEANO_INSTALL_DIR)/bin/clang++ ${PEANOWRAP2P_FLAGS} -c ${srcdir}/ffn_swiglu/silu_and_mul.cc -o $(BUILD_DIR)/silu_and_mul.o
 	@echo "  [2/3] rope.o"
 	$(PEANO_INSTALL_DIR)/bin/clang++ ${PEANOWRAP2P_FLAGS} -c ${progdir}/rope_lut/rope.cc -o $(BUILD_DIR)/rope.o
 	@echo "  [3/3] attn.o"
@@ -51,7 +51,7 @@ compile-external-kernels:
 	@echo "=== External kernels compiled ==="
 	@echo "  Copying to air_project/ for aircc..."
 	mkdir -p $(BUILD_DIR)/air_project
-	cp $(BUILD_DIR)/swiglu_activation.o $(BUILD_DIR)/air_project/
+	cp $(BUILD_DIR)/silu_and_mul.o $(BUILD_DIR)/air_project/
 	cp $(BUILD_DIR)/rope.o $(BUILD_DIR)/air_project/
 	cp $(BUILD_DIR)/attn.o $(BUILD_DIR)/air_project/
 
@@ -63,7 +63,7 @@ compile-swiglu-kernel:
 	mkdir -p $(BUILD_DIR)
 	@if [ -n "$(PEANO_INSTALL_DIR)" ]; then \
 		echo "Using clang++ from PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR)"; \
-		$(PEANO_INSTALL_DIR)/bin/clang++ ${PEANOWRAP2P_FLAGS} -c ${srcdir}/swiglu_activation.cc -o $(BUILD_DIR)/swiglu_activation.o; \
+		$(PEANO_INSTALL_DIR)/bin/clang++ ${PEANOWRAP2P_FLAGS} -c ${srcdir}/ffn_swiglu/silu_and_mul.cc -o $(BUILD_DIR)/silu_and_mul.o; \
 	else \
 		echo "Error: PEANO_INSTALL_DIR is required for SwiGLU kernel compilation."; \
 		exit 1; \
@@ -71,11 +71,11 @@ compile-swiglu-kernel:
 
 run-swiglu: compile-swiglu-kernel
 	mkdir -p $(BUILD_DIR)
-	PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) cd $(BUILD_DIR) && ${powershell} python3 ${srcdir}/swiglu_activation.py \
+	PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) cd $(BUILD_DIR) && ${powershell} python3 ${srcdir}/ffn_swiglu/silu_and_mul.py \
 		--n $(SWIGLU_N) --tile-n $(SWIGLU_TILE_N) $(OUTPUT_FORMAT_FLAG)
 
 print-swiglu:
-	${powershell} python3 ${srcdir}/swiglu_activation.py $(OUTPUT_FORMAT_FLAG) -p
+	${powershell} python3 ${srcdir}/ffn_swiglu/silu_and_mul.py $(OUTPUT_FORMAT_FLAG) -p
 
 # ============================================================
 # CPU reference (no NPU needed)

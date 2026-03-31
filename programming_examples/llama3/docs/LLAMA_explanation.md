@@ -156,7 +156,7 @@ Other `compile_*` methods follow the same pattern but are simpler (no transform 
 - `compile_rms_norm(m, n)` -- calls `weighted_rms_norm.build_module()`
 - `compile_rope(seq_len, embed_dim)` -- calls `rope_lut.build_module()`
 - `compile_eltwise_add(n)` -- calls `eltwise_add.build_module()`
-- `compile_swiglu(n)` -- calls `swiglu_activation.build_module()`
+- `compile_swiglu(n)` -- calls `silu_and_mul.build_module()`
 - `compile_flash_attention(lq, lk, ...)` -- calls `attn.build_module()`
 
 #### Layer 2: `run_transformer_block()`
@@ -216,7 +216,7 @@ def run_full_model(token_ids, weights, config, compiler, rope_lut_bf16, verify=F
 
 ---
 
-### `swiglu_activation.py` -- SwiGLU AIR Kernel
+### `ffn_swiglu/silu_and_mul.py` -- SwiGLU AIR Kernel
 
 **What it does**: Generates AIR MLIR for element-wise SwiGLU: `output[i] = SiLU(gate[i]) * up[i]`.
 
@@ -225,12 +225,12 @@ The Python code constructs the MLIR IR using the `@module_builder` decorator pat
 ```python
 @module_builder
 def build_module(n, tile_n, np_dtype_in):
-    # Declare external C++ function (compiled separately as swiglu_activation.o)
-    swiglu_func = FuncOp("swiglu_bf16", ([l1MemrefTy, l1MemrefTy, l1MemrefTy, T.i32()], []))
-    swiglu_func.attributes["link_with"] = StringAttr.get("swiglu_activation.o")
+    # Declare external C++ function (compiled separately as silu_and_mul.o)
+    swiglu_func = FuncOp("silu_and_mul_bf16", ([l1MemrefTy, l1MemrefTy, l1MemrefTy, T.i32()], []))
+    swiglu_func.attributes["link_with"] = StringAttr.get("silu_and_mul.o")
 
     @FuncOp.from_py_func(l3MemrefTy, l3MemrefTy, l3MemrefTy)
-    def swiglu_activation(gate, up, output):
+    def silu_and_mul(gate, up, output):
         # 1x2 herd: 2 AIE tiles process data in parallel
         @herd(name="herd_0", sizes=[1, 2], operands=[gate, up, output])
         def herd_body(_tx, _ty, ...):
@@ -254,9 +254,9 @@ def build_module(n, tile_n, np_dtype_in):
                 dma_memcpy_nd(output, l1_out, dst_offsets=[offset], dst_sizes=[tile_n])
 ```
 
-The corresponding C++ kernel (`swiglu_activation.cc`) uses AIE vector intrinsics:
+The corresponding C++ kernel (`ffn_swiglu/silu_and_mul.cc`) uses AIE vector intrinsics:
 ```cpp
-void swiglu_bf16(bfloat16 *gate, bfloat16 *up, bfloat16 *out, int32_t n) {
+void silu_and_mul_bf16(bfloat16 *gate, bfloat16 *up, bfloat16 *out, int32_t n) {
     for (int i = 0; i < n; i += 8) {
         auto g = aie::load_v<8>(gate + i);  // Load 8 BF16 values
         auto u = aie::load_v<8>(up + i);
@@ -271,7 +271,7 @@ void swiglu_bf16(bfloat16 *gate, bfloat16 *up, bfloat16 *out, int32_t n) {
 
 ---
 
-### `swiglu_activation.cc` -- C++ AIE Kernel
+### `ffn_swiglu/silu_and_mul.cc` -- C++ AIE Kernel
 
 Extracted from `ffn_swiglu/prefill/ffn_kernels.cc`. Implements SiLU(x) * y using AIE vector intrinsics (`aie::tanh`, `aie::mul`, `aie::load_v`, `aie::store_v`). Compiled with Peano compiler targeting `aie2p-none-unknown-elf`.
 
@@ -289,7 +289,7 @@ Compiles three C++ kernels with Peano for AIE2P target:
 # 1. SwiGLU kernel
 $PEANO_INSTALL_DIR/bin/clang++ -O2 -std=c++20 --target=aie2p-none-unknown-elf \
   -I $AIEOPT_DIR/include \
-  -c swiglu_activation.cc -o build_peano/swiglu_activation.o
+  -c ffn_swiglu/silu_and_mul.cc -o build_peano/silu_and_mul.o
 
 # 2. RoPE kernel (from rope_lut example)
 $PEANO_INSTALL_DIR/bin/clang++ -O2 -std=c++20 --target=aie2p-none-unknown-elf \
@@ -310,11 +310,11 @@ cp build_peano/*.o build_peano/air_project/
 ### `make run-swiglu`
 
 ```bash
-# Step 1: Compile swiglu_activation.cc -> swiglu_activation.o
+# Step 1: Compile ffn_swiglu/silu_and_mul.cc -> silu_and_mul.o
 (same as above, just the swiglu part)
 
 # Step 2: Run the Python test
-cd build_peano && python3 ../swiglu_activation.py --n 65536 --tile-n 1024 --output-format xclbin
+cd build_peano && python3 ../ffn_swiglu/silu_and_mul.py --n 65536 --tile-n 1024 --output-format xclbin
 ```
 
 The Python script:
@@ -417,7 +417,7 @@ STEPS 11-12: Gate/Up GEMMs
   Same for w_up
 
 STEP 13: SwiGLU
-  kernel: swiglu_activation (1x2 herd)
+  kernel: silu_and_mul (8x1 herd)
   input:  gate_flat (16777216,) + up_flat (16777216,)
   output: swiglu_flat (16777216,) -> reshape to (2048, 8192)
 
