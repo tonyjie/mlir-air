@@ -12,12 +12,13 @@ Architecture:
   2. Run phase: Construct XRTCompileArtifact from cached binary paths,
      load via XRTBackend.load(), execute on NPU.
 
-There are only 10 unique kernel configs across 16 layers (240 invocations):
+There are only 8 unique kernel configs across 16 layers (176 invocations):
   - 1 RMSNorm config
-  - 4 GEMM configs (Q/O, K/V, Gate/Up, Down)
+  - 1 GEMM config (O projection)
+  - 1 Attention GEMMs multi-launch (Q+K+V in one ELF, 3 air.launch ops)
+  - 1 FFN multi-launch (Gate+Up+SiLU*mul+Down in one ELF, 4 air.launch ops)
   - 2 RoPE configs (Q heads, K heads)
   - 1 Flash Attention config
-  - 1 SwiGLU config
   - 1 Eltwise Add config
 
 Usage:
@@ -374,7 +375,7 @@ class KernelCache:
 
         print(f"  Compiled {name}: {compile_time:.1f}s -> {cached_binary.name}")
 
-    def load_and_run(self, name, backend_kwargs, *inputs):
+    def load_and_run(self, name, backend_kwargs, *inputs, output_indices=None):
         """Load cached kernel and execute with BO reuse.
 
         Three levels of caching to minimize per-invocation overhead:
@@ -386,6 +387,9 @@ class KernelCache:
             name: Kernel name (must have been compiled first)
             backend_kwargs: Dict of kwargs for XRTBackend constructor
             *inputs: numpy arrays to pass to the kernel
+            output_indices: Optional list of buffer indices to read back from
+                device. If None, only the last buffer is read back (default).
+                Use for multi-output kernels (e.g. attn_gemms: [2, 4, 6]).
 
         Returns:
             Tuple of numpy arrays (all kernel outputs)
@@ -455,14 +459,19 @@ class KernelCache:
                 h = backend.kernel(3, backend.bo_instr, len(backend.instr_v), *bos)
                 h.wait()
 
-            # Read back only the last buffer (output) — inputs and intermediates
-            # don't need to be read back to host
-            last = len(inputs) - 1
-            bos[last].sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE)
+            # Read back output buffers from device.
+            # Default: only the last buffer. Multi-output kernels can specify
+            # output_indices (e.g. [2, 4, 6] for attn_gemms).
+            if output_indices is None:
+                readback_set = {len(inputs) - 1}
+            else:
+                readback_set = set(output_indices)
+            for idx in readback_set:
+                bos[idx].sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE)
             results = tuple(
                 (
                     bos[i].read(s, 0).view(inputs[i].dtype)
-                    if i == last
+                    if i in readback_set
                     else np.empty(0, dtype=inputs[i].dtype)
                 )
                 for i, s in enumerate(sizes_in_bytes)
@@ -572,16 +581,17 @@ def compile_all_kernels(cache, config, seq_len, cpu_attn=True):
         },
     )
 
-    # 3. GEMM K/V: (seq_len, emb_dim, kv_dim) — small N, tile_n=128
+    # 3. Attention GEMMs multi-launch: Q + K + V in one ELF (3 air.launch ops)
+    from llama3.attn_gemms_multi import build_attn_gemms_module
+
     cache.compile_and_cache(
-        "gemm_kv",
-        _build_gemm_module(
-            seq_len, emb_dim, kv_dim, tile_m=64, tile_k_l2=64, tile_k_l1=32, tile_n=128
-        ),
+        "attn_gemms",
+        build_attn_gemms_module(seq_len, emb_dim, kv_dim),
         {
             "verbose": cache.verbose,
             "omit_while_true_loop": False,
-            "runtime_loop_tiling_sizes": [2, 2],
+            "output_format": "elf",
+            "instance_name": "attn_gemms",
         },
     )
 
@@ -678,9 +688,11 @@ def compile_all_kernels(cache, config, seq_len, cpu_attn=True):
 # ---------------------------------------------------------------------------
 
 
-def _run_cached(cache, name, backend_kwargs, *inputs):
+def _run_cached(cache, name, backend_kwargs, *inputs, output_indices=None):
     """Run a cached kernel. Thin wrapper around cache.load_and_run."""
-    return cache.load_and_run(name, backend_kwargs, *inputs)
+    return cache.load_and_run(
+        name, backend_kwargs, *inputs, output_indices=output_indices
+    )
 
 
 # Backend kwarg presets for each kernel type
@@ -693,6 +705,11 @@ _FFN_BACKEND = {
     "omit_while_true_loop": False,
     "output_format": "elf",
     "instance_name": "ffn_block",
+}
+_ATTN_GEMM_BACKEND = {
+    "omit_while_true_loop": False,
+    "output_format": "elf",
+    "instance_name": "attn_gemms",
 }
 
 
@@ -782,42 +799,52 @@ def run_transformer_block(
     else:
         _compare("attn_norm", normed)
 
-    # 2. Q Projection
-    print(f"    Step 2: Q projection ({seq_len}x{emb_dim}x{emb_dim})")
-    a = np.asarray(normed, dtype=bfloat16).reshape(seq_len, emb_dim)
-    b = np.asarray(layer_weights.wq, dtype=bfloat16).reshape(emb_dim, emb_dim)
-    c = np.zeros((seq_len, emb_dim), dtype=bfloat16)
-    results = _run_cached(cache, "gemm_qo", _GEMM_BACKEND, a, b, c)
-    q = results[-1].reshape(seq_len, emb_dim).astype(bfloat16)
+    # 2-4. Q/K/V Projection (multi-launch: 3 GEMMs in one ELF)
+    kv_dim = n_kv_heads * head_dim  # 512
+    print(
+        f"    Steps 2-4: Q/K/V projection [multi-launch] "
+        f"(Q: {seq_len}x{emb_dim}x{emb_dim}, K/V: {seq_len}x{emb_dim}x{kv_dim})"
+    )
+    attn_input = np.asarray(normed, dtype=bfloat16).reshape(seq_len, emb_dim)
+    wq = np.asarray(layer_weights.wq, dtype=bfloat16).reshape(emb_dim, emb_dim)
+    q_buf = np.zeros((seq_len, emb_dim), dtype=bfloat16)
+    wk = np.asarray(layer_weights.wk, dtype=bfloat16).reshape(emb_dim, kv_dim)
+    k_buf = np.zeros((seq_len, kv_dim), dtype=bfloat16)
+    wv = np.asarray(layer_weights.wv, dtype=bfloat16).reshape(emb_dim, kv_dim)
+    v_buf = np.zeros((seq_len, kv_dim), dtype=bfloat16)
+
+    results = _run_cached(
+        cache,
+        "attn_gemms",
+        _ATTN_GEMM_BACKEND,
+        attn_input,
+        wq,
+        q_buf,
+        wk,
+        k_buf,
+        wv,
+        v_buf,
+        output_indices=[2, 4, 6],
+    )
+    q = results[2].reshape(seq_len, emb_dim).astype(bfloat16)
+    k = results[4].reshape(seq_len, kv_dim).astype(bfloat16)
+    v = results[6].reshape(seq_len, kv_dim).astype(bfloat16)
     if verify:
-        ref = normed.astype(np.float32) @ np.asarray(layer_weights.wq, dtype=np.float32)
-        _compare("q", q, ref)
+        ref_q = normed.astype(np.float32) @ np.asarray(
+            layer_weights.wq, dtype=np.float32
+        )
+        ref_k = normed.astype(np.float32) @ np.asarray(
+            layer_weights.wk, dtype=np.float32
+        )
+        ref_v = normed.astype(np.float32) @ np.asarray(
+            layer_weights.wv, dtype=np.float32
+        )
+        _compare("q", q, ref_q)
+        _compare("k", k, ref_k)
+        _compare("v", v, ref_v)
     else:
         _compare("q", q)
-
-    # 3. K Projection
-    kv_dim = n_kv_heads * head_dim  # 512
-    print(f"    Step 3: K projection ({seq_len}x{emb_dim}x{kv_dim})")
-    b_kv = np.asarray(layer_weights.wk, dtype=bfloat16).reshape(emb_dim, kv_dim)
-    c_kv = np.zeros((seq_len, kv_dim), dtype=bfloat16)
-    results = _run_cached(cache, "gemm_kv", _GEMM_BACKEND, a, b_kv, c_kv)
-    k = results[-1].reshape(seq_len, kv_dim).astype(bfloat16)
-    if verify:
-        ref = normed.astype(np.float32) @ np.asarray(layer_weights.wk, dtype=np.float32)
-        _compare("k", k, ref)
-    else:
         _compare("k", k)
-
-    # 4. V Projection (same shape as K)
-    print(f"    Step 4: V projection ({seq_len}x{emb_dim}x{kv_dim})")
-    b_v = np.asarray(layer_weights.wv, dtype=bfloat16).reshape(emb_dim, kv_dim)
-    c_v = np.zeros((seq_len, kv_dim), dtype=bfloat16)
-    results = _run_cached(cache, "gemm_kv", _GEMM_BACKEND, a, b_v, c_v)
-    v = results[-1].reshape(seq_len, kv_dim).astype(bfloat16)
-    if verify:
-        ref = normed.astype(np.float32) @ np.asarray(layer_weights.wv, dtype=np.float32)
-        _compare("v", v, ref)
-    else:
         _compare("v", v)
 
     # 5. RoPE on Q
