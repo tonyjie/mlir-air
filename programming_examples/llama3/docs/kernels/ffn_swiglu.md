@@ -52,18 +52,20 @@ Intermediates (%arg2, %arg4, %arg5) are DDR buffers shared between launches. The
 
 ## Performance
 
-| Metric | 4 Separate Kernels | Multi-Launch | IRON Fused |
-|--------|-------------------|-------------|------------|
-| Kernel time | 109ms | **35.7ms** | ~48ms |
-| Total (with host) | ~149ms | **46.0ms** | 57.4ms |
-| Speedup vs separate | — | **3.0× / 3.2×** | — |
-| vs IRON | 0.39× | **1.24×** | 1.0× |
-| Correlation vs CPU F32 | 0.999+ | 0.9996 | 0.999+ |
+| Metric | 4 Separate Kernels | Multi-Launch | Multi-Launch + ReadOpt | IRON Fused |
+|--------|-------------------|-------------|----------------------|------------|
+| Kernel time | 109ms | 35.7ms | **35.7ms** | ~48ms |
+| Total (with host) | ~149ms | 83ms | **52ms** | 57.4ms |
+| Speedup vs separate | — | 1.8× | **2.9×** | — |
+| vs IRON | 0.39× | 0.69× | **1.10×** | 1.0× |
+| Correlation vs CPU F32 | 0.999+ | 0.9996 | 0.9996 | 0.999+ |
 
-The multi-launch FFN eliminates:
+The multi-launch FFN + read-only-output eliminates:
 - 3 inter-kernel host round-trips (~25ms saved: no DDR→DDR memcpy for intermediates)
 - 3 kernel dispatch overheads (~5ms saved)
-- 3 weight re-transfers (~10ms saved)
+- Unnecessary BO read-back of 210MB (~30ms saved: only read 8MB output)
+
+See `../host_optimization.md` for detailed BO write/read analysis.
 
 ---
 
