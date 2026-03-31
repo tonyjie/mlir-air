@@ -38,8 +38,8 @@ Created `programming_examples/llama3/` with:
 | `llama3_weights.py` | 456 | Load weights from safetensors, RoPE LUT generation |
 | `llama3_reference.py` | 461 | CPU reference forward pass (F32) with per-step intermediates |
 | `llama3_prefill.py` | ~1160 | NPU integration: KernelCache + compile_all_kernels + Profiler + transformer block + full model |
-| `swiglu_activation.py` | 189 | Standalone SwiGLU AIR kernel |
-| `swiglu_activation.cc` | 54 | SwiGLU C++ kernel for Peano |
+| `ffn_swiglu/silu_and_mul.py` | 189 | Standalone SwiGLU AIR kernel |
+| `ffn_swiglu/silu_and_mul.cc` | 54 | SwiGLU C++ kernel for Peano |
 | `Makefile` | ~100 | Build targets for all operations |
 | `run_npu2_swiglu_peano.lit` | 10 | LIT test for CI |
 | `debug_gemm.py` | ~200 | GEMM isolation debug script |

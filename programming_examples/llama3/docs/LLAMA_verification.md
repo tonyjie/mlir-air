@@ -17,8 +17,8 @@ programming_examples/llama3/
   llama3_prefill.py          # Main orchestrator - KernelCompiler + transformer block
   llama3_weights.py          # Weight loading from HuggingFace safetensors
   llama3_reference.py        # CPU reference (F32) for verification
-  swiglu_activation.py       # SwiGLU AIR kernel (Python IR generator)
-  swiglu_activation.cc       # SwiGLU C++ kernel (compiled with Peano)
+  ffn_swiglu/silu_and_mul.py       # SwiGLU AIR kernel (Python IR generator)
+  ffn_swiglu/silu_and_mul.cc       # SwiGLU C++ kernel (compiled with Peano)
   Makefile                   # Build targets
 ```
 
@@ -31,7 +31,7 @@ The kernels themselves live in separate directories (reused from existing exampl
 | RoPE LUT | `rope_lut/rope_lut.py` | External kernel (`rope.o` from `rope.cc`) |
 | Eltwise Add | `eltwise_add/eltwise_add.py` | Scalar load/store |
 | Flash Attention GQA | `flash_attention/kernel_fusion_based/attn.py` | External kernel (`attn.o` from `attn.cc`) |
-| SwiGLU Activation | `llama3/swiglu_activation.py` | External kernel (`swiglu_activation.o`) |
+| SwiGLU Activation | `llama3/ffn_swiglu/silu_and_mul.py` | External kernel (`silu_and_mul.o`) |
 
 ### How a Kernel Runs on NPU2
 
@@ -155,7 +155,7 @@ make compile-external-kernels PEANO_INSTALL_DIR=$PEANO_INSTALL_DIR
 ```
 
 This compiles three C++ kernels with Peano for AIE2P:
-- `swiglu_activation.o` -- from `swiglu_activation.cc`
+- `silu_and_mul.o` -- from `ffn_swiglu/silu_and_mul.cc`
 - `rope.o` -- from `rope_lut/rope.cc`
 - `attn.o` -- from `flash_attention/kernel_fusion_based/attn.cc`
 
