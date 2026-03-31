@@ -455,11 +455,16 @@ class KernelCache:
                 h = backend.kernel(3, backend.bo_instr, len(backend.instr_v), *bos)
                 h.wait()
 
-            # Read results back
-            for i in range(len(inputs)):
-                bos[i].sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE)
+            # Read back only the last buffer (output) — inputs and intermediates
+            # don't need to be read back to host
+            last = len(inputs) - 1
+            bos[last].sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE)
             results = tuple(
-                bos[i].read(s, 0).view(inputs[i].dtype)
+                (
+                    bos[i].read(s, 0).view(inputs[i].dtype)
+                    if i == last
+                    else np.empty(0, dtype=inputs[i].dtype)
+                )
                 for i, s in enumerate(sizes_in_bytes)
             )
 
