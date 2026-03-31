@@ -83,8 +83,9 @@ Note: seq_len=128 had issues with Flash Attention (required LK=256 workaround). 
   - [x] GEMM: Optimized tiles + 8×4 herd + BF16 output **integrated**. NPU 6.49s → **3.60s**.
   - [x] SwiGLU: [8,1] herd + 16-wide vectors. 59ms → 37ms.
   - [x] FlashAttention: **Fixed and 2× faster than IRON** (15ms vs 31ms).
-  - [x] FlashAttention integration: **DONE** (2026-03-26). NPU attention is now default. Top-1 " Paris", logits corr=0.993. Wall time ~44s → ~4-5s. NPU kernel total 3.60s.
-  - **Next**: RoPE/RMSNorm vectorization, FFN fusion.
+  - [x] FlashAttention integration: **DONE** (2026-03-26). NPU attention is now default. Top-1 " Paris", logits corr=0.993.
+  - [x] FFN multi-launch: **DONE** (2026-03-30). 4 launches in 1 ELF. FFN 109ms → 83ms. Per-layer 243ms → 190ms. Wall time 5.39s → 4.88s. Gap to IRON: 1.59× → **1.25×**.
+  - **Next**: RoPE/RMSNorm vectorization, attention-path multi-launch.
   - See `docs/performance_optimization.md` for full breakdown and roadmap.
 - [ ] Phase 5: Decode Phase (future work)
 
