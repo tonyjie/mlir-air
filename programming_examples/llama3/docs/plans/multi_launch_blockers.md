@@ -45,7 +45,9 @@ air.launch args(%arg = %cs : memref<4194304xbf16>) {
 
 **Fix**: Move `collapse_shape` inside the eltwise_add's `air.launch` body (same pattern as SwiGLU). The launch should receive the 2D func arg, then collapse inside.
 
-**Status**: Fix identified but not yet implemented. The `_wrap_ir_in_launch` utility in `ffn_full_multi.py` needs to handle this case — pass 2D args through launch, collapse inside.
+**Status**: Fix implemented (collapse_shape moved inside launch, matching SwiGLU pattern). However, the 6-launch module STILL fails — the standalone 2D eltwise_add with collapse_shape compiles fine, but combined with 5 other launches, it exceeds resource limits (likely DMA channel/BD exhaustion across 6 launches in one ELF).
+
+**Root cause updated**: Not the collapse_shape pattern itself (which works in isolation), but **resource exhaustion** when combining too many launches with diverse herd sizes and DMA patterns in one ELF. The 4-launch FFN (Gate+Up+SwiGLU+Down) is the current practical limit for multi-launch.
 
 ---
 
