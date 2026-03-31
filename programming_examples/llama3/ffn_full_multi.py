@@ -34,9 +34,17 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from air.ir import *
+from air.dialects.affine import apply as affine_apply
 from air.dialects.air import *
+from air.dialects import arith
+from air.dialects.memref import AllocOp, DeallocOp, subview
+from air.dialects.vector import transfer_read, transfer_write
+from air.dialects.func import FuncOp
+from air.dialects.scf import for_, yield_
 from air.backend.xrt_runner import XRTRunner, type_mapper
 from air.backend.xrt import XRTBackend
+
+range_ = for_
 
 # ---------------------------------------------------------------------------
 # MLIR text stitching utilities (shared with ffn_swiglu/run.py)
@@ -372,31 +380,146 @@ def build_ffn_full_module(
         bodies.append(body)
         maps_all.extend(maps)
 
-    # Eltwise Add: needs special handling because its inputs are collapse_shape
-    # views of 2D buffers (arg0=res1 and arg9=down_out), not separate func args.
+    # Eltwise Add: build a 2D version that accepts 2D memrefs and does
+    # collapse_shape INSIDE the launch (not between launches).
+    # This avoids the airrt-to-npu legalization failure.
+    from llama3.ffn_swiglu.silu_and_mul import (
+        build_module_2d as _build_silu_2d_ref,
+    )  # just for pattern ref
+    from eltwise_add.eltwise_add import build_module as build_add_1d
+
+    # Build a custom 2D eltwise_add module with collapse_shape inside launch
+    @module_builder
+    def _build_add_2d(rows, cols, np_dtype, vector_size, herd_x, herd_y):
+        """Eltwise add accepting 2D memrefs, collapsing to 1D inside launch."""
+        from air.dialects.memref import collapse_shape as memref_collapse_shape
+
+        xrt_dtype = type_mapper(np_dtype)
+        n = rows * cols
+        l3_2d_ty = MemRefType.get([rows, cols], xrt_dtype)
+        l3_1d_ty = MemRefType.get([n], xrt_dtype)
+
+        # Build the 1D add module to extract its herd body
+        add_1d_mod = build_add_1d(n, cols, np_dtype, vector_size, herd_x, herd_y)
+        add_1d_ir = str(add_1d_mod)
+
+        # Parse the 1D module, wrap it: accept 2D args, collapse inside launch
+        @FuncOp.from_py_func(l3_2d_ty, l3_2d_ty, l3_1d_ty)
+        def eltwise_add_2d(arg0_2d, arg1_2d, arg2_1d):
+            @launch(operands=[arg0_2d, arg1_2d, arg2_1d])
+            def add_launch(l_a, l_b, l_out):
+                a_flat = memref_collapse_shape(l3_1d_ty, l_a, [[0, 1]])
+                b_flat = memref_collapse_shape(l3_1d_ty, l_b, [[0, 1]])
+
+                @segment(name="add_seg", operands=[a_flat, b_flat, l_out])
+                def add_seg(s_a, s_b, s_out):
+                    # Re-create the eltwise_add herd body inline
+                    total_tiles = herd_x * herd_y
+                    tile_n = cols  # tile size = columns
+                    l1_space = IntegerAttr.get(T.i32(), MemorySpace.L1)
+                    l1TileTy = MemRefType.get(
+                        [tile_n], xrt_dtype, memory_space=l1_space
+                    )
+                    vecTy = VectorType.get([vector_size], xrt_dtype)
+                    identity_map = AffineMapAttr.get(AffineMap.get_identity(1))
+
+                    @herd(
+                        name="add_herd",
+                        sizes=[herd_x, herd_y],
+                        operands=[s_a, s_b, s_out],
+                    )
+                    def add_body(_tx, _ty, _sx, _sy, h_a, h_b, h_out):
+                        l1_a = AllocOp(l1TileTy, [], [])
+                        l1_b = AllocOp(l1TileTy, [], [])
+                        l1_out = AllocOp(l1TileTy, [], [])
+                        c0 = arith.ConstantOp.create_index(0)
+                        cst0 = arith.ConstantOp(xrt_dtype, 0.0)
+
+                        chunk_size = n // total_tiles
+                        offset_map = AffineMap.get(
+                            0,
+                            3,
+                            [
+                                AffineExpr.get_add(
+                                    AffineSymbolExpr.get(0),
+                                    AffineExpr.get_mul(
+                                        AffineExpr.get_add(
+                                            AffineExpr.get_mul(
+                                                AffineSymbolExpr.get(1),
+                                                AffineConstantExpr.get(herd_y),
+                                            ),
+                                            AffineSymbolExpr.get(2),
+                                        ),
+                                        AffineConstantExpr.get(tile_n),
+                                    ),
+                                )
+                            ],
+                        )
+
+                        for loop_iv in range_(0, chunk_size, tile_n):
+                            offset = affine_apply(offset_map, [loop_iv, _tx, _ty])
+                            dma_memcpy_nd(
+                                l1_a,
+                                h_a,
+                                src_offsets=[offset],
+                                src_sizes=[tile_n],
+                                src_strides=[1],
+                            )
+                            dma_memcpy_nd(
+                                l1_b,
+                                h_b,
+                                src_offsets=[offset],
+                                src_sizes=[tile_n],
+                                src_strides=[1],
+                            )
+
+                            for j in range_(0, tile_n, vector_size):
+                                sub_a = subview(l1_a.result, [j], [vector_size], [1])
+                                sub_b = subview(l1_b.result, [j], [vector_size], [1])
+                                sub_out = subview(
+                                    l1_out.result, [j], [vector_size], [1]
+                                )
+                                v_a = transfer_read(
+                                    vecTy, sub_a, [c0], identity_map, cst0, [True]
+                                )
+                                v_b = transfer_read(
+                                    vecTy, sub_b, [c0], identity_map, cst0, [True]
+                                )
+                                v_sum = arith.addf(v_a, v_b)
+                                transfer_write(
+                                    None, v_sum, sub_out, [c0], identity_map, [True]
+                                )
+                                yield_([])
+
+                            dma_memcpy_nd(
+                                h_out,
+                                l1_out,
+                                dst_offsets=[offset],
+                                dst_sizes=[tile_n],
+                                dst_strides=[1],
+                            )
+                            yield_([])
+
+                        DeallocOp(l1_a)
+                        DeallocOp(l1_b)
+                        DeallocOp(l1_out)
+
+    add_2d_mod = _build_add_2d(seq_len, emb_dim, bfloat16, 16, 8, 1)
+    add_ir = str(add_2d_mod)
+
     add_body = _extract_between_func_and_return(add_ir)
     add_maps = _extract_affine_maps(add_ir)
     add_body = _rename_all(add_body, "a")
     add_maps = [_rename_all(m, "a") for m in add_maps]
-    # Map: add arg0 -> %res1_flat, add arg1 -> %down_flat, add arg2 -> %arg10
-    add_body = add_body.replace("=%a_arg0,", "=%res1_flat,")
-    add_body = add_body.replace("=%a_arg0)", "=%res1_flat)")
-    add_body = add_body.replace("=%a_arg1,", "=%down_flat,")
-    add_body = add_body.replace("=%a_arg1)", "=%down_flat)")
-    add_body = add_body.replace("=%a_arg2,", "=%arg10,")
-    add_body = add_body.replace("=%a_arg2)", "=%arg10)")
+    # Add takes 2D, 2D, 1D: map to arg0 (res1), arg9 (down_out), arg10 (output)
+    add_body = _fix_launch_func_args(add_body, "a", {0: 0, 1: 9, 2: 10})
     bodies.append(add_body)
     maps_all.extend(add_maps)
 
     # Collect private func declarations (SwiGLU has the external kernel)
     privates = _extract_private_funcs(swiglu_ir)
 
-    # collapse_shape ops to create 1D aliases for the eltwise add
-    collapse_ops = f"""\
-    %res1_flat = memref.collapse_shape %arg0 [[0, 1]] : memref<{seq_len}x{emb_dim}xbf16> into memref<{n_total}xbf16>
-    %down_flat = memref.collapse_shape %arg9 [[0, 1]] : memref<{seq_len}x{emb_dim}xbf16> into memref<{n_total}xbf16>"""
-
-    # Assemble the combined module (11 func args instead of 13)
+    # Assemble the combined module (11 func args, NO collapse_shape between launches)
     combined = "\n".join(maps_all) + f"""
 module {{
   {"  ".join(p.strip() + chr(10) for p in privates)}  func.func @ffn_full(
@@ -417,7 +540,6 @@ module {{
 {bodies[2]}
 {bodies[3]}
 {bodies[4]}
-{collapse_ops}
 {bodies[5]}
     return
   }}
