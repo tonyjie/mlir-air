@@ -124,23 +124,26 @@ After the 56-pass aircc pipeline, this is **fully resolved**: zero `collapse_sha
 | FFN + RMSNorm + Add | 6 | SwiGLU: yes, Add: yes | ❌ | collapse_shape NOT resolved for Add |
 | Need to test: FFN + Add (no RMSNorm) | 5 | Both | ? | Would help determine threshold |
 
-### Hypothesis: Resource-dependent pass behavior
+### Updated Finding: Structural Bug, NOT Resource Exhaustion
 
-The aircc pass pipeline includes optimization passes that trace memref origins and resolve `collapse_shape` operations. These passes appear to work correctly when resources (DMA channels, BD slots, ShimDMA tiles) are within budget, but may **skip or fail silently** when the total resource demand from 6 launches exceeds available capacity.
+**Disproved**: The resource exhaustion hypothesis was tested by compiling the same 6-launch module at tiny scale (M=128, emb=128, hidden=512). It fails with the **identical error**, proving the issue is structural, not resource-dependent.
 
-Estimated DMA channel usage per launch:
+**Systematic isolation** (all tests at full LLAMA scale unless noted):
 
-| Launch | Herd Size | Est. ShimDMA Channels |
-|--------|-----------|----------------------|
-| RMSNorm | [1,1] | ~4 |
-| Gate GEMM | [8,4] | ~48 |
-| Up GEMM | [8,4] | ~48 |
-| SwiGLU | [8,1] | ~24 |
-| Down GEMM | [8,4] | ~48 |
-| Eltwise Add | [8,1] | ~24 |
-| **Total** | | **~196** |
+| Test | Launches | collapse_shape in | Result |
+|------|----------|-------------------|--------|
+| FFN (Gate+Up+SwiGLU+Down) | 4 | SwiGLU only | ✅ OK |
+| FFN + RMSNorm | 5 | SwiGLU only | ✅ OK |
+| FFN + 1D Add (no cs) | 5 | SwiGLU only | ✅ OK |
+| RMS + FFN + 1D Add (no cs) | 6 | SwiGLU only | ✅ OK |
+| Standalone Add_2D | 1 | Add only | ✅ OK |
+| 2-launch (simple + Add_2D) | 2 | Add only | ✅ OK |
+| **RMS + FFN + Add_2D** | **6** | **SwiGLU + Add** | **❌ FAIL** |
+| **RMS + FFN + Add_2D (tiny)** | **6** | **SwiGLU + Add** | **❌ FAIL** |
 
-NPU2 has 8 ShimDMA tiles. If a per-tile or global channel limit is exceeded, the lowering may leave some DMAs unresolved.
+**Root cause**: The `airrt-to-npu` pass fails when a module has **two or more launches containing `memref.collapse_shape`** combined with GEMM launches that have complex multi-herd structure. A single collapse_shape launch (SwiGLU in 4-launch FFN) is correctly resolved. Adding a second collapse_shape launch (Add) triggers the bug regardless of data size.
+
+The pass appears to correctly trace the first collapse_shape through the lowered DMA chain but fails on the second, leaving `airrt.dma_memcpy_nd` ops referencing unresolved `%collapse_shape` SSA values.
 
 ---
 
