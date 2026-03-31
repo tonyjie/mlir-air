@@ -33,7 +33,7 @@ Each transformer block runs 15 kernel invocations:
 | 10 | RMSNorm (pre-FFN) | (2048, 2048) + weight(2048,) | weighted_rms_norm | VALIDATED |
 | 11 | Gate GEMM | (2048, 2048) @ W(2048, 8192) | matrix_multiplication/bf16 | VALIDATED |
 | 12 | Up GEMM | (2048, 2048) @ W(2048, 8192) | matrix_multiplication/bf16 | VALIDATED |
-| 13 | SwiGLU activation | SiLU(gate) * up, n=2048*8192 | swiglu_activation | VALIDATED (n=16777216) |
+| 13 | SwiGLU activation | SiLU(gate) * up, n=2048*8192 | silu_and_mul | VALIDATED (n=16777216) |
 | 14 | Down GEMM | (2048, 8192) @ W(8192, 2048) | matrix_multiplication/bf16 | VALIDATED |
 | 15 | Residual Add | (2048*2048) + (2048*2048) | eltwise_add | VALIDATED |
 
@@ -95,8 +95,8 @@ programming_examples/llama3/
   llama3_prefill.py          # NPU integration (KernelCache + transformer block pipeline)
   llama3_weights.py          # Weight loading from safetensors + RoPE LUT
   llama3_reference.py        # CPU reference implementation (F32)
-  swiglu_activation.py       # Standalone SwiGLU AIR kernel (Python)
-  swiglu_activation.cc       # SwiGLU C++ kernel (for Peano)
+  ffn_swiglu/silu_and_mul.py       # Standalone SwiGLU AIR kernel (Python)
+  ffn_swiglu/silu_and_mul.cc       # SwiGLU C++ kernel (for Peano)
   Makefile                   # Build targets
   docs/
     LLAMA_PLAN.md                   # This plan

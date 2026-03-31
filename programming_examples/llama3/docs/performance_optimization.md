@@ -205,7 +205,7 @@ Per-shape optimal tiles (8×4 herd, BF16 output). BFP16 rounding mode fix landed
 
 ### 5. SwiGLU Optimization (2026-03-20)
 
-[8,1] herd + tile_n=4096 + 16-wide vectors. 59ms → 37ms (1.6×). BD exhaustion workaround: larger tiles to reduce iteration count under BD limit. See `kernels/swiglu.md`.
+[8,1] herd + tile_n=4096 + 16-wide vectors. 59ms → 37ms (1.6×). BD exhaustion workaround: larger tiles to reduce iteration count under BD limit. See `kernels/silu_and_mul.md`.
 
 ### 6. FlashAttention Integration (2026-03-26)
 
@@ -229,7 +229,7 @@ The ShimDMA hardware has **16 BD slots per channel**. Each BD can repeat up to 3
 
 **IRON avoids this** via ObjectFIFO, which uses repeating BD patterns with address auto-increment (2 BDs per buffer regardless of data size).
 
-**Upstream fix needed**: AIR's `dma_memcpy_nd` lowering should generate repeating BD patterns instead of per-iteration BD chains. See `kernels/swiglu.md` for detailed analysis.
+**Upstream fix needed**: AIR's `dma_memcpy_nd` lowering should generate repeating BD patterns instead of per-iteration BD chains. See `kernels/silu_and_mul.md` for detailed analysis.
 
 ---
 
@@ -261,5 +261,5 @@ pytest iron/operators/ -m "llama and extensive" --build-dir build_llama -v -s
 
 - `kernels/eltwise_add.md` — Herd sweep, IRON comparison, correctness verification
 - `kernels/gemm.md` — Tile optimization, precision analysis, rounding mode investigation
-- `kernels/swiglu.md` — [8,1] optimization, BD exhaustion analysis
+- `kernels/silu_and_mul.md` — [8,1] optimization, BD exhaustion analysis
 - `kernels/flash_attention.md` — Correctness investigation, precision metrics, status

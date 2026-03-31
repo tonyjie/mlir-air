@@ -72,7 +72,7 @@ def prepare_air_project():
     air_proj.mkdir(parents=True, exist_ok=True)
 
     # Copy external kernel .o files if they exist in the current build dir
-    for obj_name in ["swiglu_activation.o", "rope.o", "attn.o"]:
+    for obj_name in ["silu_and_mul.o", "rope.o", "attn.o"]:
         src = Path(obj_name)
         if src.exists():
             shutil.copy2(src, air_proj / obj_name)
@@ -671,7 +671,7 @@ def compile_all_kernels(cache, config, seq_len, cpu_attn=True):
         print("  Skipping flash_attn compilation (using CPU attention fallback)")
 
     # 9. SwiGLU: n = seq_len * hidden_dim
-    from llama3.swiglu_activation import build_module as build_swiglu
+    from llama3.ffn_swiglu.silu_and_mul import build_module as build_swiglu
 
     cache.compile_and_cache(
         "swiglu",
