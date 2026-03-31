@@ -1,14 +1,11 @@
-//===- swiglu_activation.cc - Standalone SwiGLU activation kernel -*- C++
-//-*-===//
+//===- silu_and_mul.cc - SiLU + elementwise multiply kernel -*- C++ -*-===//
 //
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc.
 //
-// Standalone SwiGLU element-wise activation kernel:
+// Element-wise SiLU activation followed by multiply:
 //   output[i] = SiLU(gate[i]) * up[i]
 //   SiLU(x) = x * sigmoid(x) = x * 0.5 * (tanh(x/2) + 1)
-//
-// Extracted from programming_examples/ffn_swiglu/prefill/ffn_kernels.cc
 //
 //===----------------------------------------------------------------------===//
 
@@ -26,7 +23,7 @@
 
 extern "C" {
 
-void swiglu_bf16(bfloat16 *gate, bfloat16 *up, bfloat16 *out, int32_t n) {
+void silu_and_mul_bf16(bfloat16 *gate, bfloat16 *up, bfloat16 *out, int32_t n) {
   constexpr int VecLen = 16;
   aie::vector<bfloat16, VecLen> half_vec =
       aie::broadcast<bfloat16, VecLen>((bfloat16)0.5f);
