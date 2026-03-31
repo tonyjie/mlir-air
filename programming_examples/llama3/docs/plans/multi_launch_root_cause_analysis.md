@@ -143,7 +143,33 @@ After the 56-pass aircc pipeline, this is **fully resolved**: zero `collapse_sha
 
 **Root cause**: The `airrt-to-npu` pass fails when a module has **two or more launches containing `memref.collapse_shape`** combined with GEMM launches that have complex multi-herd structure. A single collapse_shape launch (SwiGLU in 4-launch FFN) is correctly resolved. Adding a second collapse_shape launch (Add) triggers the bug regardless of data size.
 
-The pass appears to correctly trace the first collapse_shape through the lowered DMA chain but fails on the second, leaving `airrt.dma_memcpy_nd` ops referencing unresolved `%collapse_shape` SSA values.
+### Definitive Root Cause (identified via pass-by-pass IR analysis)
+
+The `air-dma-to-channel` pass (or a preceding pass) **hoists `memref.collapse_shape` out of `air.launch` bodies** into the func body level. After hoisting, the collapse_shape result is used as a launch operand:
+
+```mlir
+// After air-dma-to-channel + canonicalize (pass 9):
+%cs = memref.collapse_shape %arg0 [[0, 1]]    ← HOISTED OUT of launch
+air.launch args(%arg11=%cs, ...) {             ← launch references %cs
+    air.channel.put @channel_54(%arg11[...])   ← DMA via channel
+}
+```
+
+The SwiGLU's collapse_shape is ALSO hoisted but gets **folded away** by canonicalize (the DMA-to-channel conversion for SwiGLU produces a pattern that canonicalize can simplify). The eltwise_add's collapse_shape is hoisted but NOT folded — it persists through the remaining passes into the `airrt` dialect, where `airrt-to-npu` can't trace it back to a function argument.
+
+**Evidence**: Pass-by-pass collapse_shape counts in the 6-launch module:
+
+| Pass | SwiGLU 16M collapse_shape | Add 4M collapse_shape |
+|------|--------------------------|----------------------|
+| 05 (air-hoist-dma-in-accum-pattern) | 4 | 3 |
+| 08 (air-dma-to-channel) | 7 | 3 |
+| 09 (canonicalize) | **0** (resolved) | **3** (NOT resolved) |
+| 53 (final before airrt-to-npu) | 0 | 3 → 16 airrt DMAs fail |
+
+**Fix direction**: Either:
+1. Prevent the hoisting pass from moving collapse_shape out of launch bodies, OR
+2. Teach `airrt-to-npu` to trace through `memref.collapse_shape` (simple: the base pointer is the same, just the view changes), OR
+3. Add a canonicalization pattern that folds `collapse_shape` + `air.launch args(...)` into `air.launch args(...original 2D...)` with collapse inside
 
 ---
 
