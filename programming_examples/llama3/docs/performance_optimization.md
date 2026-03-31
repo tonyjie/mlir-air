@@ -12,9 +12,9 @@ Reference: IRON (`/home/jiajli/apps/IRON`). IRON profiling data: `/home/jiajli/a
 
 | Metric | AIR (current) | IRON | Notes |
 |--------|--------------|------|-------|
-| **16 transformer layers** | **3.25s** | **2.44s** | **Gap: 1.33×** (same profiling scope — see below) |
-| **Wall time** | **4.88s** | **2.75s** | AIR includes weight loading (~1.5s) + CPU LM Head |
-| Per-layer avg | 190ms | 152ms | 1.25× |
+| **16 transformer layers** | **2.65s** | **2.44s** | **Gap: 1.08×** (same profiling scope — see below) |
+| **Wall time** | **4.51s** | **2.75s** | AIR includes weight loading (~1.5s) + CPU LM Head |
+| Per-layer avg | 160ms | 152ms | 1.05× |
 | Top-1 prediction | " Paris" ✓ | — | Correct factual answer |
 | Logits corr vs CPU F32 | 0.993 | — | |
 
@@ -24,11 +24,11 @@ Both AIR and IRON are profiled with host overhead included:
 
 **IRON**: `transformer.forward` (2.437s total / 16 layers) is timed by `sys.setprofile()`. Each operator's `forward()` includes torch→numpy conversion, `write_buffer()` (memory-mapped BO, zero-copy), `run_runlist()` (BO sync + kernel launch + wait), `read_buffer()` (memory-mapped, zero-copy), and numpy→torch conversion.
 
-**AIR**: "Total prefill" (3.25s) is timed by `profiler.start_layer()` / `end_layer()` around `run_transformer_block()`. Each kernel's `load_and_run()` includes `bo.write()` + `bo.sync(TO_DEVICE)`, kernel launch + wait, `bo.sync(FROM_DEVICE)` + `bo.read()`, plus numpy reshaping and dtype conversion between kernel calls. The FFN block uses multi-launch (4 launches in 1 ELF, single XRT invocation), reducing host overhead.
+**AIR**: "Total prefill" (2.65s) is timed by `profiler.start_layer()` / `end_layer()` around `run_transformer_block()`. Each kernel's `load_and_run()` includes `bo.write()` + `bo.sync(TO_DEVICE)`, kernel launch + wait, `bo.sync(FROM_DEVICE)` + `bo.read()` (output only), plus numpy reshaping and dtype conversion between kernel calls. The FFN block uses multi-launch (4 launches in 1 ELF, single XRT invocation) with read-only-output optimization.
 
-Both scopes include host overhead. IRON has lower host overhead due to memory-mapped BOs (zero-copy) vs AIR's explicit BO write/sync/read (3 copies per buffer).
+Both scopes include host overhead. See `host_optimization.md` for detailed BO write/read analysis.
 
-**AIR also reports "kernel time" (2.71s)** which only covers the `load_and_run()` calls, excluding inter-kernel data prep. This has no IRON equivalent and understates the gap.
+**AIR also reports "kernel time" (2.10s)** which only covers the `load_and_run()` calls, excluding inter-kernel data prep.
 
 ### Scope Outside 16 Transformer Layers
 
@@ -40,25 +40,25 @@ Both scopes include host overhead. IRON has lower host overhead due to memory-ma
 | Weight loading | ~1.5s (in wall time) | Separate (before `model.forward`) | |
 
 IRON `model.forward` = embedding + 16 layers + final norm + **NPU LM Head** = 2.744s.
-AIR wall time 4.88s = weight loading (~1.5s) + embedding + 16 layers (3.25s) + final norm + CPU LM Head.
+AIR wall time 4.51s = weight loading (~1.5s) + embedding + 16 layers (2.65s) + final norm + CPU LM Head.
 
 ### Per-Block Breakdown (per layer)
 
 | Block | AIR | IRON | Gap | Notes |
 |-------|-----|------|-----|-------|
 | Attention (QKV GEMMs + RoPE + Attn + O GEMM) | **65ms** | **76.9ms** | **0.85× (AIR faster)** | AIR FlashAttn 22ms vs IRON MHA 37ms |
-| FFN (Gate + Up + SiLU×mul + Down) | **83ms** (multi-launch) | **57.4ms** | **1.4× (IRON faster)** | AIR multi-launch (4 launches in 1 ELF); was 109ms with separate kernels |
+| FFN (Gate + Up + SiLU×mul + Down) | **52ms** (multi-launch) | **57.4ms** | **0.9× (AIR faster)** | AIR multi-launch + read-only-output; was 109ms with separate kernels |
 | RMSNorm ×2 | 16ms | 8.6ms | 1.9× | |
 | Eltwise Add ×2 | 10ms | 9.0ms | 1.1× | |
-| Host overhead (data prep between kernels) | ~21ms | ~0ms | — | Reduced from ~43ms by FFN multi-launch |
-| **Total per layer** | **190ms** | **152ms** | **1.25×** | |
+| Host overhead (data prep between kernels) | ~17ms | ~0ms | — | Reduced by multi-launch + read-only-output |
+| **Total per layer** | **160ms** | **152ms** | **1.05×** | |
 
-Note: FFN multi-launch eliminated ~26ms/layer of host overhead by combining 4 separate kernel calls into 1. Remaining host overhead (~21ms) is from attention-path kernels (QKV GEMMs, RoPE, FlashAttn, O GEMM, residual adds).
+Note: FFN multi-launch + read-only-output eliminated most host overhead in the FFN path. Remaining ~17ms is from attention-path kernels (QKV GEMMs, RoPE, FlashAttn, O GEMM, residual adds). See `host_optimization.md` for detailed analysis.
 
 **Largest remaining gaps:**
-- **FFN block** (83ms vs 57.4ms) — 26ms gap (reduced from 52ms by multi-launch)
-- **Host overhead** (~21ms/layer) — remaining inter-kernel data prep for attention path
+- **Host overhead** (~17ms/layer) — inter-kernel data prep for attention path
 - **RMSNorm** (9ms vs 4.3ms) — 5ms gap
+- **FFN block** now **faster** than IRON (52ms vs 57.4ms)
 
 #### Understanding the host overhead on shared-memory Ryzen AI
 
@@ -92,7 +92,8 @@ Per-layer host overhead breakdown (AIR, estimated):
 | **Total host overhead** | | | **~40ms/layer** |
 
 **FlashAttention integrated** (2026-03-26): CPU attention fallback eliminated.
-**FFN multi-launch integrated** (2026-03-30): 4 FFN kernels fused into 1 ELF. Wall time 5.39s → 4.88s, kernel time 3.11s → 2.71s.
+**FFN multi-launch** (2026-03-30): 4 FFN kernels fused into 1 ELF.
+**Read-only-output** (2026-03-31): Skip reading back intermediates/weights. FFN 83ms → 52ms. Total kernel 2.71s → 2.10s. Wall time 4.88s → 4.51s.
 
 ---
 
@@ -154,14 +155,14 @@ Priorities 1-2 completed: FFN multi-launch (done), FlashAttention integration (d
 
 ### Totals Progression
 
-| Metric | Baseline | +BF16 Add | +XRT Reuse | +BO Reuse | +GEMM/SwiGLU Opt | +FlashAttn | +FFN Multi | IRON |
-|--------|----------|-----------|------------|-----------|-----------------|------------|------------|------|
-| Per-layer (with host) | 1.17s | 0.84s | 0.55s | 0.41s | 0.22s | 0.243s | **0.190s** | 0.152s |
-| 16 layers (with host) | 18.67s | 13.40s | 8.77s | 6.49s | 3.57s | 3.88s | **3.25s** | 2.44s |
-| Wall time | 25.9s | 51.4s | ~47s | ~47s | ~44s | 5.39s | **4.88s** | 2.75s |
-| Gap to IRON (per-layer) | 7.8× | 5.6× | 3.7× | 2.7× | 1.5× | 1.59× | **1.25×** | 1.0× |
+| Metric | Baseline | +BF16 Add | +XRT Reuse | +BO Reuse | +GEMM/SwiGLU Opt | +FlashAttn | +FFN Multi | +ReadOpt | IRON |
+|--------|----------|-----------|------------|-----------|-----------------|------------|------------|---------|------|
+| Per-layer (with host) | 1.17s | 0.84s | 0.55s | 0.41s | 0.22s | 0.243s | 0.190s | **0.160s** | 0.152s |
+| 16 layers (with host) | 18.67s | 13.40s | 8.77s | 6.49s | 3.57s | 3.88s | 3.25s | **2.65s** | 2.44s |
+| Wall time | 25.9s | 51.4s | ~47s | ~47s | ~44s | 5.39s | 4.88s | **4.51s** | 2.75s |
+| Gap to IRON (per-layer) | 7.8× | 5.6× | 3.7× | 2.7× | 1.5× | 1.59× | 1.25× | **1.05×** | 1.0× |
 
-FFN multi-launch (2026-03-30): Fused Gate+Up+SiLU×mul+Down into 4 `air.launch` ops in 1 ELF. Per-layer 243ms → 190ms (22% improvement). Gap to IRON narrowed from 1.59× to **1.25×**.
+Read-only-output (2026-03-31): Only read back the output buffer, skip syncing/reading inputs, weights, and intermediates. FFN multi-launch 83ms → 52ms. Per-layer 190ms → 160ms. Gap to IRON: 1.25× → **1.05×**.
 
 ### Per-Kernel Progression (per-invocation avg, ms)
 
@@ -208,7 +209,11 @@ Replaced CPU attention fallback with NPU FlashAttention kernel. Kernel takes uns
 
 ### 7. FFN Multi-Launch (2026-03-30)
 
-Fused Gate GEMM + Up GEMM + SiLU×mul + Down GEMM into 4 `air.launch` ops in a single ELF. One `xrt.run()` executes all 4 launches — intermediates flow through shared DDR buffers without host memcpy. FFN: 109ms → 83ms (24% faster). Per-layer: 243ms → 190ms (22% faster). Gap to IRON: 1.59× → 1.25×. See `kernels/ffn_swiglu.md`.
+Fused Gate GEMM + Up GEMM + SiLU×mul + Down GEMM into 4 `air.launch` ops in a single ELF. One `xrt.run()` executes all 4 launches — intermediates flow through shared DDR buffers without host memcpy. FFN: 109ms → 83ms (24% faster). See `kernels/ffn_swiglu.md`.
+
+### 8. Read-Only-Output (2026-03-31)
+
+Only sync + read the last buffer (output) after kernel execution. Previously all buffers (including inputs, weights, intermediates) were read back — 218MB of unnecessary memcpy for the FFN block. FFN: 83ms → 52ms (37% faster). Total kernel: 2.71s → 2.10s. Gap to IRON: 1.25× → 1.05×. See `host_optimization.md`.
 
 ---
 
