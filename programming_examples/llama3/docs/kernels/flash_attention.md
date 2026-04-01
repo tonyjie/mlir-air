@@ -102,6 +102,6 @@ Original flash attention kernel with missing causal masking and BD exhaustion. F
 
 ## Related Documents
 
-- `performance_optimization.md` — Overall LLAMA optimization roadmap
+- `perf_opt_prefill.md` — Overall LLAMA optimization roadmap
 - `/home/jiajli/apps/IRON/docs/IRON_LLAMA_profile.md` — IRON MHA profiling
 - `kernels/gemm.md` — GEMM optimization (similar precision analysis approach)

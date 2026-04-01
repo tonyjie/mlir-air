@@ -168,9 +168,9 @@ But: the 2D/1D aliasing for residual add inputs is the same pattern we solved in
 
 | Priority | Merge | Invocations saved | Status | File |
 |----------|-------|-------------------|--------|------|
-| **1** | **C: RMSNorm + FFN + Add** | 2 | **DONE** — integrated into LLAMA pipeline | `ffn_full_multi.py` |
-| **2** | **A: RoPE Q + RoPE K** | 1 | **DONE** — integrated into LLAMA pipeline | `rope_qk_multi.py` |
-| **3** | **B: O GEMM + Add** | 1 | **DONE** — integrated into LLAMA pipeline | `o_proj_add_multi.py` |
+| **1** | **C: RMSNorm + FFN + Add** | 2 | **DONE** | `multi_launch_builder/ffn_full_multi.py` |
+| **2** | **A: RoPE Q + RoPE K** | 1 | **DONE** | `multi_launch_builder/rope_qk_multi.py` |
+| **3** | **B: O GEMM + Add** | 1 | **DONE** | `multi_launch_builder/o_proj_add_multi.py` |
 
 ### Current State (Merge A + B integrated)
 
@@ -208,5 +208,5 @@ But: the 2D/1D aliasing for residual add inputs is the same pattern we solved in
 ### Remaining Merge: C (RMSNorm + FFN + Add)
 
 Would reduce to 6 invocations. Currently blocked — the 6-launch module compiles and runs (corr=0.999) but needs full integration work. The `air.segment` wrapper fix resolved the compiler bug. Key files:
-- `ffn_full_multi.py` — 6-launch builder (RMS + Gate + Up + SwiGLU + Down + Add)
+- `multi_launch_builder/ffn_full_multi.py` — 6-launch builder (RMS + Gate + Up + SwiGLU + Down + Add)
 - `repro_herd_load_bug.py` — Reproducer for the compiler bug (bare herd without segment)
