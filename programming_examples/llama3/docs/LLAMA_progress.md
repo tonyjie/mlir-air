@@ -6,28 +6,47 @@
 
 ---
 
-## Current Status: Full 16-Layer Model VERIFIED with NPU FlashAttention
+## Current Status: Full NPU Pipeline with LM Head (25% faster than IRON)
 
-**All 16 layers run end-to-end on NPU**, including FlashAttention (GQA, causal) and multi-launch FFN:
-- **Top-1**: " Paris" (prob=0.18) for prompt "The capital of France is"
-- **Logits correlation**: 0.993 vs CPU F32 reference
-- **Per-kernel**: All NPU kernel invocations corr>0.999
-- **Per-layer**: All 16 layer outputs corr=0.999996-0.999997
-- **NPU kernel time**: 1.93s (attn_gemms avg 8ms/layer, ffn_multi avg 50ms/layer, flash_attn avg 22ms/layer)
-- **Wall time**: 4.00s
-- **vs IRON**: AIR per-layer 140ms vs IRON 152ms — **AIR is now faster**
-- **8 unique kernels**: rmsnorm, gemm_qo, gemm_kv, ffn_multi (4 launches), rope_q, rope_k, flash_attn, add
-- **Standalone kernel test**: `make run` passes with corr=0.9976 (LLAMA causal, 32Q/8KV)
+**All 16 layers + LM Head run end-to-end on NPU**:
+- **Top-1**: " Paris" for prompt "The capital of France is"
+- **Logits correlation**: 0.989 vs CPU F32 reference
+- **Total prefill**: **2.05s** (vs IRON 2.744s — **AIR 25% faster**)
+- **Wall time**: **2.51s** (vs IRON 2.75s — **AIR faster even with weight loading**)
+- **Per-layer avg**: **107ms** (vs IRON 152ms — **30% faster**)
+- **LM Head**: **173ms** (vs IRON 217ms — **20% faster**, 8-launch ELF)
+- **XRT invocations**: **5 per layer** + 1 for LM Head
+- **7 unique kernels** (6 ELF + 1 xclbin)
 
-**NPU attention is now the default.** Use `--cpu-attn` for debugging/comparison. The CPU fallback path is still available and produces corr=0.972.
+**All multi-launch merges integrated:**
+- **Merge A**: RoPE Q + RoPE K → `rope_qk` (1 ELF, 2 herds, 12ms)
+- **Merge B**: O GEMM + Residual Add → `o_proj_add` (1 ELF, 2 launches, 7ms)
+- **Merge C**: RMSNorm + FFN + Add → `ffn_full` (1 ELF, 6 launches, 58ms)
+- **Plan A**: RMSNorm + Attn GEMMs → `rms_attn_gemms` (1 ELF, 4 launches, 14ms)
 
-**Key integration notes:**
-- Kernel expects **unscaled Q** — scaling by 1/sqrt(dk) is handled internally
-- Kernel takes **4 args** (Q, K, V, Output) — no mask buffer (causal masking is internal)
-- Kernel uses **ELF format** — compiled via `make run` in `flash_attention/kernel_fusion_based/`
-- IRON MHA comparison: AIR FlashAttention is 2× faster (15ms vs 31ms standalone)
+**Per-layer kernel breakdown (5 invocations):**
 
-**Next step**: Performance optimization — multi-tile RMSNorm (blocked by aiecc weight broadcast bug, see `kernels/rmsnorm.md`), vectorize RoPE.
+| Kernel | Avg (ms) | Type |
+|--------|----------|------|
+| rms_attn_gemms | 14 | ELF (4 launches: RMS+Q+K+V) |
+| rope_qk | 12 | ELF (2 herds: Q+K) |
+| flash_attn | 21 | ELF |
+| o_proj_add | 7 | ELF (2 launches: O GEMM+Add) |
+| ffn_full | 58 | ELF (6 launches: RMS+Gate+Up+SiLU+Down+Add) |
+
+**Investigated but deferred (Plan B — DMA transpose):**
+- Would merge 5 → 3 invocations by adding NPU transpose launches between QKV GEMMs ↔ RoPE and FlashAttn ↔ O GEMM
+- **Blocked by hardware**: AIE DMA requires innermost stride=1 for sub-32b types (BF16). Strided DMA transpose only works for 32b+ data (see `data_transfer_transpose/dma/` vs `dma_bf16/`)
+- Alternative: tiled C++ transpose kernel — viable but adds complexity for ~3-5ms/layer savings
+- See `plans/easy_merges_multi_launch.md` for full analysis
+
+**NPU LM Head**: 8-launch multi-launch ELF (8 partitions of N=16384). Single XRT invocation. Static weight BOs pre-loaded at init. `bo.map()` zero-copy reads. **173ms** (vs IRON 217ms, vs CPU 1526ms).
+
+**`bo.map()` zero-copy**: All kernels use `bo.map()` for BO reads/writes (matching IRON's approach), eliminating memcpy overhead.
+
+**Remaining optimization opportunities:**
+- Multi-tile RMSNorm (8ms → ~4ms) — blocked by aiecc weight broadcast bug
+- Plan B C++ transpose kernel — would enable 3 invocations/layer
 
 ---
 

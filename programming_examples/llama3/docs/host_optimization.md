@@ -145,12 +145,15 @@ Intermediates persist across `run_runlist()` calls within the same forward pass 
 
 ## Performance Progression
 
-| Stage | FFN (ms) | Per-layer (ms) | 16-layer (s) | Gap to IRON |
-|-------|---------|---------------|-------------|-------------|
-| 4 separate kernels | 149 | 243 | 3.88 | 1.59× |
-| + Multi-launch | 83 | 190 | 3.25 | 1.25× |
-| + Read-only-output | **52** | **~160** | **2.65** | **~1.08×** |
-| IRON reference | 57.4 | 152 | 2.44 | 1.0× |
+| Stage | Per-layer (ms) | 16-layer (s) | Total prefill | Gap to IRON |
+|-------|---------------|-------------|---------------|-------------|
+| 4 separate kernels | 243 | 3.88 | — | 1.59× |
+| + FFN Multi-launch | 190 | 3.25 | — | 1.25× |
+| + Read-only-output | ~160 | 2.65 | — | ~1.08× |
+| + Attn GEMMs multi-launch | 140 | 2.45 | — | 0.92× |
+| + Merge A+B+C+PlanA | 113 | 1.81 | 2.30s | 0.74× |
+| + NPU LM Head + bo.map() | **107** | **1.71** | **2.05s** | **0.70×** |
+| IRON reference | 152 | 2.44 | 2.744s | 1.0× |
 
 ---
 
@@ -158,7 +161,5 @@ Intermediates persist across `run_runlist()` calls within the same forward pass 
 
 | Priority | Action | Savings | Complexity |
 |----------|--------|---------|-----------|
-| 1 | Skip writing intermediate/output buffer zeros | ~4ms/layer | Low — check buffer index |
-| 2 | Use `bo.map()` for zero-copy reads | ~1ms/layer | Low — replace `bo.read` with `np.frombuffer(bo.map())` |
-| 3 | Pre-load static weights via `bo.map()` | ~2ms/layer | Medium — cache weight BOs across layers |
-| 4 | Attention-path multi-launch | ~15ms/layer | High — same stitching approach as FFN |
+| 1 | Multi-tile RMSNorm | ~4ms/layer | Blocked — aiecc weight broadcast bug |
+| 2 | Plan B: C++ transpose kernel | ~3-5ms/layer (5→3 invocations) | Medium — BF16 DMA stride limitation |

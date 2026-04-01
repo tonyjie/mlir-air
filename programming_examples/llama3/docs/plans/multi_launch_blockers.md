@@ -14,52 +14,72 @@
 
 ---
 
-## Blocker 2: `memref.collapse_shape` at airrt level (Merge C)
+## Blocker 2: Missing `air.segment` wrapper on bare herd launches (Merge C) — FIXED
 
-**Affects**: Combining kernels with different memref shapes (2D GEMM + 1D eltwise_add) in one multi-launch ELF
+**Affects**: Multi-launch ELF containing a mix of segment-wrapped and bare-herd launches
 
 **Error**: `failed to legalize operation 'airrt.dma_memcpy_nd'` in `airrt-to-npu` pass
 
-**Root cause**: When `memref.collapse_shape` is placed **between launches** (at the func body level, outside any `air.launch`), it survives lowering to the airrt dialect. The `airrt-to-npu` pass then encounters DMA operations referencing `%collapse_shape` results instead of direct func args. It cannot trace these back to XRT buffer objects.
+**Root cause**: The `airrt-to-npu` pass's `identifyLaunchRegions()` only looks for `airrt::SegmentLoadOp` to associate launch regions with `aie.device` ops. If a launch contains only a bare `air.herd` (no `air.segment` wrapper), it lowers to `airrt.herd_load` instead of `airrt.segment_load`. When other launches in the same function DO have segment_load, `regions.empty()` is false, so the fallback path (which handles both op types) is never reached. The bare-herd launch's DMA ops are silently dropped during per-device function splitting, and `DmaToNpuPattern` fails because the DMAs aren't inside any `aie.device`.
 
-**Working pattern** (FFN SwiGLU):
+**Failing pattern**:
 ```mlir
-// collapse_shape INSIDE air.launch → works
-air.launch args(%arg8 = %func_arg : memref<2048x8192xbf16>) {
-    %cs = memref.collapse_shape %arg8 [[0, 1]] : ... into memref<16777216xbf16>
-    air.segment args(%seg_arg = %cs : memref<16777216xbf16>) {
-        // DMA references %seg_arg (a segment arg, not collapse_shape result)
+// Bare air.herd inside air.launch (no air.segment) → FAILS in multi-launch
+air.launch args(%arg3=%arg0, ...) {
+    air.herd @herd_0 tile (...) args(...) { ... }
+}
+```
+
+**Working pattern** (after fix):
+```mlir
+// air.herd wrapped in air.segment inside air.launch → WORKS
+air.launch args(%arg3=%arg0, ...) {
+    air.segment @seg_name args(%arg6=%arg3, ...) {
+        air.herd @herd_0 tile (...) args(...) { ... }
     }
 }
 ```
 
-**Failing pattern** (FFN Full):
-```mlir
-// collapse_shape BETWEEN launches → fails
-%cs = memref.collapse_shape %func_arg [[0, 1]] : ... into memref<4194304xbf16>
-air.launch args(%arg = %cs : memref<4194304xbf16>) {
-    // After lowering, airrt.dma_memcpy_nd references %cs directly
-    // airrt-to-npu can't trace %cs back to a func arg → FAILS
-}
-```
+**Fix applied**: Modified `_wrap_ir_in_launch()` in `ffn_full_multi.py` to add both `air.launch` AND `air.segment` wrappers around bare herds. This ensures `airrt.segment_load` is generated.
 
-**Fix**: Move `collapse_shape` inside the eltwise_add's `air.launch` body (same pattern as SwiGLU). The launch should receive the 2D func arg, then collapse inside.
+**Upstream fix recommended**: `identifyLaunchRegions()` in `AIRRtToNpuPass.cpp` should also handle `airrt::HerdLoadOp`, not just `airrt::SegmentLoadOp`.
 
-**Status**: Fix implemented (collapse_shape moved inside launch, matching SwiGLU pattern). However, the 6-launch module STILL fails — the standalone 2D eltwise_add with collapse_shape compiles fine, but combined with 5 other launches, it exceeds resource limits (likely DMA channel/BD exhaustion across 6 launches in one ELF).
-
-**Root cause updated**: Not the collapse_shape pattern itself (which works in isolation), but **resource exhaustion** when combining too many launches with diverse herd sizes and DMA patterns in one ELF. The 4-launch FFN (Gate+Up+SwiGLU+Down) is the current practical limit for multi-launch.
+**Status**: User-side workaround applied. 6-launch module (RMS+FFN+Add) now compiles and runs successfully.
 
 ---
 
 ## Impact on Multi-Launch Roadmap
 
-| Merge | Blocker | Fix |
-|-------|---------|-----|
-| FFN multi-launch (DONE) | None | — |
-| Attn GEMMs multi-launch (DONE) | None | — |
-| RoPE Q+K (built, not integrated) | None (likely works) | — |
-| **RMSNorm + FFN + Add** | **Blocker 2** (collapse_shape) | Move collapse inside launch |
-| **O GEMM + Add** | **Blocker 2** (same pattern) | Same fix |
-| **Multi-tile RMSNorm** | **Blocker 1** (weight broadcast) | Upstream fix needed |
+| Merge | Status | Notes |
+|-------|--------|-------|
+| FFN multi-launch | **DONE** | Now part of ffn_full (Merge C) |
+| Attn GEMMs multi-launch | **DONE** | Now part of rms_attn_gemms (Plan A) |
+| RoPE Q+K (Merge A) | **DONE** | 2 herds, integrated |
+| O GEMM + Add (Merge B) | **DONE** | 2 launches, integrated |
+| RMSNorm + FFN + Add (Merge C) | **DONE** | 6 launches, integrated |
+| RMSNorm + Attn GEMMs (Plan A) | **DONE** | 4 launches, integrated |
+| DMA Transpose (Plan B) | **DEFERRED** | BF16 DMA stride hardware limitation — see below |
+| Multi-tile RMSNorm | **BLOCKED** | Blocker 1 — upstream fix needed |
 
-The collapse_shape fix (Blocker 2) is implementable — it requires modifying how the eltwise_add kernel is stitched to receive 2D args and collapse internally (same pattern that already works for SwiGLU in the FFN).
+All merges that were blocked by Blocker 2 (missing air.segment) are resolved.
+
+---
+
+## Blocker 3: BF16 DMA Stride Limitation (Plan B)
+
+**Affects**: NPU-side data transpose for BF16 between kernels with different data layouts
+
+**Error**: `'aie.dma_bd' op For <32b width datatypes, inner-most dim stride must be 1`
+
+**Root cause**: AIE DMA hardware requires the innermost dimension stride to be 1 for sub-32b datatypes (BF16 is 16-bit). Strided DMA writes (needed for transpose) only work for 32b+ types (uint32, float32).
+
+**Evidence**:
+- `data_transfer_transpose/dma/transpose.py` — works with uint32 (strided DMA write)
+- `data_transfer_transpose/dma_bf16/transpose_bf16.py` — requires C++ kernel (cannot use strided DMA)
+- Our `dma_transpose.py` attempt — fails at `air-to-aie` pass with stride error
+
+**Impact**: Cannot merge QKV GEMMs + transpose + RoPE or FlashAttn + transpose + O GEMM into single ELFs using pure DMA. A tiled C++ transpose kernel would be needed.
+
+**Workaround**: CPU-side transpose between kernel invocations (current approach, ~2-3ms overhead).
+
+**Status**: Documented as future opportunity. Current 5-invocation pipeline at 113ms/layer is 26% faster than IRON.
