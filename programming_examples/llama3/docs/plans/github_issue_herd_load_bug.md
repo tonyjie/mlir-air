@@ -1,18 +1,16 @@
-# GitHub Issue Draft: `airrt-to-npu` fails for multi-launch ELF with bare `air.herd` (no `air.segment`)
-
----
+# GitHub Issue: `airrt-to-npu` fails for multi-launch ELF with bare `air.herd` (no `air.segment`)
 
 ## Title
 
-`airrt-to-npu`: bare `air.herd` launches silently dropped in multi-launch ELF, causing "failed to legalize airrt.dma_memcpy_nd"
+`airrt-to-npu`: `identifyLaunchRegions` only handles `SegmentLoadOp`, silently drops bare `HerdLoadOp` launches in multi-launch ELF
 
 ## Labels
 
 bug, airrt-to-npu, multi-launch, elf
 
-## Description
+---
 
-### Summary
+## Summary
 
 When a multi-launch ELF module contains a launch with a bare `air.herd` (no `air.segment` wrapper) alongside launches that DO have `air.segment`, the `airrt-to-npu` pass fails with:
 
@@ -20,53 +18,119 @@ When a multi-launch ELF module contains a launch with a bare `air.herd` (no `air
 error: failed to legalize operation 'airrt.dma_memcpy_nd' that was explicitly marked illegal
 ```
 
-The root cause is that `identifyLaunchRegions()` in `AIRRtToNpuPass.cpp` only looks for `airrt::SegmentLoadOp` to associate launch regions with `aie.device` ops. Launches that lower to `airrt::HerdLoadOp` (from bare `air.herd`) are silently skipped. Their DMA ops are left orphaned outside any `aie.device`, and `DmaToNpuPattern::matchAndRewrite` fails because `op->getParentOfType<AIE::DeviceOp>()` returns null.
+## Reproducer
 
-### Reproducer
+Self-contained Python script — two identical eltwise-add launches. The only difference is whether each has an `air.segment` wrapper:
 
-Two identical eltwise-add launches in a single function. The only difference is whether each launch wraps its herd in an `air.segment`:
+```python
+#!/usr/bin/env python3
+"""Reproducer: airrt-to-npu fails when mixing segment/bare-herd launches.
 
-```mlir
-// WORKS: Both launches have air.segment
-func.func @test(%arg0: ..., %arg5: ...) {
-    air.launch args(...) {
-        air.segment @add1_seg args(...) {      // <-- segment present
-            air.herd @add1_herd tile(...) { ... }
-        }
-    }
-    air.launch args(...) {
-        air.segment @add2_seg args(...) {      // <-- segment present
-            air.herd @add2_herd tile(...) { ... }
-        }
-    }
-    return
-}
+Test 1: Both have air.segment → PASS
+Test 2: One has segment, one has bare herd → FAIL
+"""
+from ml_dtypes import bfloat16
+from air.ir import *
+from air.dialects.affine import apply as affine_apply
+from air.dialects.air import *
+from air.dialects import arith
+from air.dialects.memref import AllocOp, DeallocOp, subview
+from air.dialects.vector import transfer_read, transfer_write
+from air.dialects.func import FuncOp
+from air.dialects.scf import for_, yield_
+from air.backend.xrt import XRTBackend
+from air.backend.xrt_runner import type_mapper
 
-// FAILS: Second launch has bare herd (no segment)
-func.func @test(%arg0: ..., %arg5: ...) {
-    air.launch args(...) {
-        air.segment @add1_seg args(...) {      // <-- segment present
-            air.herd @add1_herd tile(...) { ... }
-        }
-    }
-    air.launch args(...) {
-        air.herd @add2_herd tile(...) { ... }  // <-- NO segment wrapper
-    }
-    return
-}
+range_ = for_
+
+def _build_add_launch(xrt_dtype, n, tile_n, herd_x, vector_size, use_segment, name="add"):
+    l1_space = IntegerAttr.get(T.i32(), MemorySpace.L1)
+    l1_ty = MemRefType.get([tile_n], xrt_dtype, memory_space=l1_space)
+    vec_ty = VectorType.get([vector_size], xrt_dtype)
+    imap = AffineMapAttr.get(AffineMap.get_identity(1))
+    chunk = n // herd_x
+    omap = AffineMap.get(0, 2, [AffineExpr.get_add(
+        AffineSymbolExpr.get(0),
+        AffineExpr.get_mul(AffineSymbolExpr.get(1), AffineConstantExpr.get(tile_n)))])
+
+    def _herd_body(ha, hb, ho, tx, ty):
+        l1a = AllocOp(l1_ty, [], [])
+        l1b = AllocOp(l1_ty, [], [])
+        l1o = AllocOp(l1_ty, [], [])
+        c0 = arith.ConstantOp.create_index(0)
+        cst = arith.ConstantOp(xrt_dtype, 0.0)
+        for iv in range_(0, chunk, tile_n):
+            off = affine_apply(omap, [iv, tx])
+            dma_memcpy_nd(l1a, ha, src_offsets=[off], src_sizes=[tile_n], src_strides=[1])
+            dma_memcpy_nd(l1b, hb, src_offsets=[off], src_sizes=[tile_n], src_strides=[1])
+            for j in range_(0, tile_n, vector_size):
+                sa = subview(l1a.result, [j], [vector_size], [1])
+                sb = subview(l1b.result, [j], [vector_size], [1])
+                so = subview(l1o.result, [j], [vector_size], [1])
+                va = transfer_read(vec_ty, sa, [c0], imap, cst, [True])
+                vb = transfer_read(vec_ty, sb, [c0], imap, cst, [True])
+                transfer_write(None, arith.addf(va, vb), so, [c0], imap, [True])
+                yield_([])
+            dma_memcpy_nd(ho, l1o, dst_offsets=[off], dst_sizes=[tile_n], dst_strides=[1])
+            yield_([])
+        DeallocOp(l1a); DeallocOp(l1b); DeallocOp(l1o)
+
+    def builder(a, b, out):
+        @launch(operands=[a, b, out])
+        def the_launch(la, lb, lo):
+            if use_segment:
+                @segment(name=f"{name}_seg", operands=[la, lb, lo])
+                def seg(sa, sb, so):
+                    @herd(name=f"{name}_herd", sizes=[herd_x, 1], operands=[sa, sb, so])
+                    def h(tx, ty, sx, sy, ha, hb, ho): _herd_body(ha, hb, ho, tx, ty)
+            else:
+                @herd(name=f"{name}_herd", sizes=[herd_x, 1], operands=[la, lb, lo])
+                def h(tx, ty, sx, sy, ha, hb, ho): _herd_body(ha, hb, ho, tx, ty)
+    return builder
+
+def build_two_launches(n, use_segment_1, use_segment_2):
+    @module_builder
+    def mod():
+        xrt = type_mapper(bfloat16)
+        l3_ty = MemRefType.get([n], xrt)
+        b1 = _build_add_launch(xrt, n, 128, 8, 16, use_segment_1, name="add1")
+        b2 = _build_add_launch(xrt, n, 128, 8, 16, use_segment_2, name="add2")
+        @FuncOp.from_py_func(l3_ty, l3_ty, l3_ty, l3_ty, l3_ty, l3_ty)
+        def test(a1, b1_arg, out1, a2, b2_arg, out2):
+            b1(a1, b1_arg, out1); b2(a2, b2_arg, out2)
+    return mod()
+
+def compile_test(name, module):
+    backend = XRTBackend(verbose=False, omit_while_true_loop=False,
+                         output_format="elf", instance_name=name)
+    try:
+        backend.compile(module); backend.unload(); return True, "OK"
+    except Exception as e:
+        backend.unload()
+        lines = [l for l in str(e).split("\n") if "error:" in l.lower()]
+        return False, lines[0][:150] if lines else str(e)[:150]
+
+N = 1024
+print("Test 1: Both with air.segment (should PASS)")
+ok, msg = compile_test("both_seg", build_two_launches(N, True, True))
+print(f"  {'PASS' if ok else 'FAIL'}: {msg}")
+
+print("Test 2: Mixed — launch 1 has segment, launch 2 has bare herd (should FAIL)")
+ok2, msg2 = compile_test("mixed", build_two_launches(N, True, False))
+print(f"  {'PASS' if ok2 else 'FAIL'}: {msg2}")
 ```
 
-Self-contained Python reproducer (requires `air` Python bindings): [`repro_herd_load_bug.py`](https://github.com/.../repro_herd_load_bug.py)
-
-```bash
-python3 repro_herd_load_bug.py
-# Test 1: Both launches have air.segment (should PASS) → PASS: OK
-# Test 2: Launch 1 has segment, Launch 2 has bare herd (should FAIL) → FAIL: failed to legalize
+**Expected output:**
+```
+Test 1: Both with air.segment (should PASS)
+  PASS: OK
+Test 2: Mixed — launch 1 has segment, launch 2 has bare herd (should FAIL)
+  FAIL: failed to legalize operation 'airrt.dma_memcpy_nd' that was explicitly marked illegal
 ```
 
-### Root Cause Analysis
+## Root Cause
 
-In `AIRRtToNpuPass.cpp`, `identifyLaunchRegions()` at ~line 1005:
+In `AIRRtToNpuPass.cpp`, `identifyLaunchRegions()` (~line 1005) only walks for `airrt::SegmentLoadOp`:
 
 ```cpp
 forOp.walk([&](airrt::SegmentLoadOp segLoadOp) {
@@ -78,35 +142,23 @@ forOp.walk([&](airrt::SegmentLoadOp segLoadOp) {
 });
 ```
 
-This only walks for `SegmentLoadOp`. Launches with bare herds lower to `airrt.herd_load` (not `airrt.segment_load`), so they are never added to `regions`.
-
-There IS a fallback path (~line 1551) that handles both `SegmentLoadOp` and `HerdLoadOp`:
+Launches with bare `air.herd` (no `air.segment`) lower to `airrt::HerdLoadOp`, which is **not matched**. There IS a fallback path (~line 1553) that handles both:
 
 ```cpp
 if (regions.empty()) {
-    // Fallback: no launch boundaries found, use old behavior
     funcOp.walk([&](Operation *o) {
-        if (isa<airrt::SegmentLoadOp, airrt::HerdLoadOp>(o)) {
-            ...
-        }
+        if (isa<airrt::SegmentLoadOp, airrt::HerdLoadOp>(o)) { ... }
     });
 }
 ```
 
-But this fallback only runs when `regions.empty()`. In the mixed case (some segment, some herd), `regions` is non-empty, so the fallback is skipped.
+But this only runs when `regions.empty()`. In the mixed case, segment-based launches populate `regions`, so the fallback is skipped. The bare-herd launch's DMA ops are orphaned outside any `aie.device`, and `DmaToNpuPattern` fails because `op->getParentOfType<AIE::DeviceOp>()` returns null.
 
-Later, `moveFuncOpToEndOfDeviceOp` splits the function into per-device functions (one per identified region). The unidentified bare-herd region's DMA ops are lost — they were in the original func which is erased (line 1643: `funcOp.erase()`).
+## Suggested Fix
 
-### Expected Behavior
-
-All launch regions should be correctly identified and associated with their `aie.device`, regardless of whether they use `air.segment` or bare `air.herd`.
-
-### Suggested Fix
-
-In `identifyLaunchRegions()`, also walk for `airrt::HerdLoadOp`:
+In `identifyLaunchRegions()`, also handle `HerdLoadOp`:
 
 ```cpp
-// Handle both segment-based and herd-based launches
 forOp.walk([&](Operation *op) {
     StringRef deviceName;
     if (auto segLoad = dyn_cast<airrt::SegmentLoadOp>(op))
@@ -115,25 +167,18 @@ forOp.walk([&](Operation *op) {
         deviceName = herdLoad.getSymName();
     else
         return;
-
     AIE::DeviceOp device = getDeviceByName(module, deviceName);
-    if (device) {
+    if (device)
         regions.push_back({forOp, deviceName, device});
-    }
 });
 ```
 
-### Workaround
+## Workaround
 
-Wrap all bare `air.herd` ops in `air.segment` before combining into a multi-launch module. This ensures `airrt.segment_load` is generated for every launch.
+Wrap all bare `air.herd` ops in `air.segment` before combining into multi-launch modules.
 
-### Impact
+## Environment
 
-This blocks multi-launch ELF compilation for any module that mixes segment-wrapped launches (e.g., GEMM with tiled data movement) with simpler bare-herd launches (e.g., element-wise operations, normalization kernels). Our use case: combining RMSNorm (bare herd) + FFN GEMM (with segment) + eltwise add in a single 6-launch ELF for LLAMA inference.
-
-### Environment
-
-- mlir-air: built from source (current HEAD)
-- mlir-aie: installed from `my_install/mlir-aie/`
+- mlir-air: built from source
 - Target: NPU2 (AIE2P, Strix)
 - Output format: ELF (`--output-format elf`)
