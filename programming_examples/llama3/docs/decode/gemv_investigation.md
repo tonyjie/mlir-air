@@ -83,9 +83,38 @@ Build `llama3/decode_kernels/gemv_multi_col.py`:
 6. Test at all 5 LLAMA shapes
 7. Profile vs IRON (target: match 8-column performance)
 
+## Blocker: Broadcast DMA compiler bug
+
+The multi-column GEMV with `herd(sizes=[1, num_cols])` **hits the same broadcast DMA bug** as RMSNorm multi-tile (see `issues/github_issue_weight_broadcast_dma.md`). The B vector DMA (same data to all columns, no tile-dependent offset) causes:
+
+```
+error: operand #2 does not dominate this use
+```
+
+Attempted workarounds:
+- Dummy tile-dependent offset (`0 * _ty`): compiler optimizes it away, same error
+- This is the same root cause as the RMSNorm weight broadcast bug
+
+## Alternative: Multi-launch GEMV (workaround)
+
+Use multiple single-core `air.launch` ops in one ELF, each handling M/N rows — same approach as prefill merges:
+
+```
+func @gemv_4col(A, B, C) {
+    air.launch 1: C[0:M/4] = A[0:M/4, :] @ B       (single core)
+    air.launch 2: C[M/4:M/2] = A[M/4:M/2, :] @ B   (single core)
+    air.launch 3: C[M/2:3M/4] = A[M/2:3M/4, :] @ B (single core)
+    air.launch 4: C[3M/4:M] = A[3M/4:M, :] @ B     (single core)
+    return
+}
+```
+
+Each launch is independent (no broadcast needed). The existing `matvec.py` single-core GEMV works at all LLAMA shapes. Stitching via text-based MLIR works (proven in prefill).
+
+**Estimated performance**: 4 single-core launches ≈ 4x speedup vs 1 core. Not as good as true 4-column herd (less overlap), but avoids the compiler bug.
+
 ## Next steps
 
-1. Build `gemv_multi_col.py` following above architecture
-2. Test at all 5 LLAMA GEMV shapes with num_cols=4
-3. Profile and compare with single-core results
-4. If 4 cols hits row limit, try adjusting `row-offset` in air-to-aie pass
+1. Build multi-launch GEMV using text stitching (like prefill multi-launch builders)
+2. Test at LLAMA shapes
+3. Profile vs single-core and IRON
