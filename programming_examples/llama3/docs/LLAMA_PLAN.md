@@ -1,114 +1,83 @@
-# LLAMA-3.2-1B BF16 on MLIR-AIR (NPU2) -- High-Level Plan
+# LLAMA-3.2-1B BF16 on MLIR-AIR (NPU2) -- Plan & Status
 
 ## Context
 
-**Goal**: Implement a functionally correct, then performant, LLAMA-3.2-1B BF16 inference on MLIR-AIR targeting NPU2 (AIE2P). Use IRON's implementation as the reference architecture.
+**Goal**: Functionally correct and performant LLAMA-3.2-1B BF16 inference on MLIR-AIR targeting NPU2 (AIE2P).
 
 **LLAMA-3.2-1B config**: 16 layers, emb_dim=2048, n_heads=32, head_dim=64, n_kv_groups=8, hidden_dim=8192, vocab_size=128256, BF16, rope_base=500000.
 
-**Key architectural decisions**:
-1. **Prefill first** (seq_len=2048). Decode (seq_len=1, GEMV-based) is a later phase.
-2. **ELF output format** -- no xclbin 5-argument limit, supports multi-argument kernels.
-3. **Embedding and LM Head on CPU initially** -- embedding is a lookup table; LM Head GEMM (2048x128256) is very large.
-4. **Each operator as separate kernel invocation** initially -- compile each operator to its own ELF, invoke sequentially from Python. Fuse later for performance.
-5. **Decompose FFN SwiGLU into separate ops** -- the existing fused `ffn_swiglu/prefill` can't scale to LLAMA dims (L1 overflow at DIM=2048). Use the tiled GEMM kernel + standalone SwiGLU activation instead.
+**Current status**: Prefill complete. **25% faster than IRON** (2.05s vs 2.744s). Decode is future work.
 
 ---
 
-## Per-Block Kernel Sequence (Prefill, seq_len=2048)
+## Per-Block Kernel Sequence (Current — 5 invocations/layer)
 
-Each transformer block runs 15 kernel invocations:
+| # | Operation | Kernel | Launches | Time |
+|---|-----------|--------|----------|------|
+| 1 | RMSNorm + Q/K/V GEMMs | `rms_attn_gemms` | 4 | 14ms |
+| 2 | RoPE Q+K | `rope_qk` | 2 herds | 11ms |
+| 3 | Flash Attention GQA | `flash_attn` | 1 | 20ms |
+| 4 | O GEMM + Residual Add | `o_proj_add` | 2 | 6ms |
+| 5 | RMSNorm + FFN + Residual Add | `ffn_full` | 6 | 56ms |
 
-| # | Operation | Shape | MLIR-AIR Kernel | Status |
-|---|-----------|-------|-----------------|--------|
-| 1 | RMSNorm (pre-attn) | (2048, 2048) + weight(2048,) | weighted_rms_norm | VALIDATED |
-| 2 | Q Projection | (2048, 2048) @ W(2048, 2048) | matrix_multiplication/bf16 | VALIDATED |
-| 3 | K Projection | (2048, 2048) @ W(2048, 512) | matrix_multiplication/bf16 | VALIDATED |
-| 4 | V Projection | (2048, 2048) @ W(2048, 512) | matrix_multiplication/bf16 | VALIDATED |
-| 5 | RoPE on Q | (2048*32, 64) with LUT | rope_lut | VALIDATED (seq_len=65536) |
-| 6 | RoPE on K | (2048*8, 64) with LUT | rope_lut | VALIDATED |
-| 7 | Flash Attention GQA | Q(2048,32,64), K(2048,8,64), V(2048,8,64) | flash_attention/kernel_fusion | **BUGGY** — CPU fallback via `attention_reference()` |
-| 8 | O Projection | (2048, 2048) @ W(2048, 2048) | matrix_multiplication/bf16 | VALIDATED |
-| 9 | Residual Add | (2048*2048) + (2048*2048) | eltwise_add | VALIDATED (n=4194304) |
-| 10 | RMSNorm (pre-FFN) | (2048, 2048) + weight(2048,) | weighted_rms_norm | VALIDATED |
-| 11 | Gate GEMM | (2048, 2048) @ W(2048, 8192) | matrix_multiplication/bf16 | VALIDATED |
-| 12 | Up GEMM | (2048, 2048) @ W(2048, 8192) | matrix_multiplication/bf16 | VALIDATED |
-| 13 | SwiGLU activation | SiLU(gate) * up, n=2048*8192 | silu_and_mul | VALIDATED (n=16777216) |
-| 14 | Down GEMM | (2048, 8192) @ W(8192, 2048) | matrix_multiplication/bf16 | VALIDATED |
-| 15 | Residual Add | (2048*2048) + (2048*2048) | eltwise_add | VALIDATED |
+After 16 blocks: Final RMSNorm + LM Head (8-launch ELF, 173ms).
 
-After 16 blocks: Final RMSNorm + LM Head (CPU).
-
-### Flash Attention Known Good Config
-
-```bash
-make profile LQ=2048 LK=2048 LKP=64 LQP=256 DK=64 DV=64 NUM_HEADS=32 NUM_KV_HEADS=8
-```
-
-Note: seq_len=128 had issues with Flash Attention (required LK=256 workaround). seq_len=2048 is the intended operating point.
+All kernels use multi-launch ELF format. `bo.map()` zero-copy for all reads/writes.
 
 ---
 
 ## Implementation Status
 
 - [x] Phase 0: Infrastructure & Weight Loading
-- [x] Phase 1: Validate Individual Kernels at LLAMA Scale (seq_len=2048) -- ALL PASSED
-  - [x] 1A. GEMM (4 shapes at M=2048: Q/O, K/V, Gate/Up, Down)
-  - [x] 1B. Weighted RMSNorm at M=2048, N=2048
-  - [x] 1C. RoPE LUT at seq_len=65536 (2048*32), embed_dim=64
-  - [x] 1D. Eltwise Add at n=4194304
-  - [x] 1E. Flash Attention GQA (LQ=2048, LK=2048, LKP=64, LQP=256, 32Q/8KV)
-  - [x] 1F. SwiGLU Activation at n=16777216
-- [x] Phase 2: Single Transformer Block -- VERIFIED (all 15 steps corr>0.999, top-1 matches CPU)
-- [x] Phase 3: Full 16-Layer Model -- RUNS END-TO-END (240 kernel invocations, no crashes)
-  - BF16 output run: top-1 incorrect ("def") due to BF16 accumulator truncation
-  - Fixed: F32 GEMM output eliminates truncation. Down GEMM: 0.948 -> 0.9998 per layer
-  - Single-layer re-verified: all 15 steps corr>0.999. Top-1 matches CPU.
-  - Kernel caching implemented: `KernelCache` compiles 10 unique kernels once, saves to `kernel_cache/`, reuses via `XRTCompileArtifact`. CLI: `--compile-only`, `--run-only`, `--profile`.
-  - **16-layer profiled**: 18.7s NPU kernel time + CPU attention (334s one-time compile). Per-layer avg 1.62s.
-  - Flash attention NPU kernel has correctness bug (corr=0.31 vs standard attention). GitHub issue submitted upstream.
-  - See `LLAMA_flash_attention.md` for full investigation.
-- [x] Phase 3A: CPU Attention Fallback -- **VERIFIED CORRECT**
-  - `--cpu-attn` flag (default: on) replaces NPU flash attention with `attention_reference()` from CPU
-  - **1-layer**: All 14 NPU kernels corr>0.999 (`[OK]`). Top-1 matches CPU.
-  - **16-layer**: Top-1 = " Paris" (correct answer, prob=0.48). Logits corr=0.972 vs CPU F32.
-  - All per-kernel, per-layer, and full-model verification tests pass.
-  - Use `--npu-attn` to switch back to NPU flash attention kernel (when fixed).
-- [x] Phase 3B: Fix Flash Attention NPU kernel — **FIXED** (2026-03-26)
-  - All configs pass with corr > 0.996. LLAMA causal: corr=0.9976, 15ms, 2× faster than IRON.
-  - See `docs/kernels/flash_attention.md`.
-- [ ] Phase 4: Performance Optimization — IN PROGRESS
-  - [x] Eltwise add: BF16 vec16 [8,1] → 415 µs. Matches IRON. PR #1431.
-  - [x] XRT context + BO reuse: NPU kernel 18.67s → **6.49s** (65% reduction).
-  - [x] GEMM: Optimized tiles + 8×4 herd + BF16 output **integrated**. NPU 6.49s → **3.60s**.
-  - [x] SwiGLU: [8,1] herd + 16-wide vectors. 59ms → 37ms.
-  - [x] FlashAttention: **Fixed and 2× faster than IRON** (15ms vs 31ms).
-  - [x] FlashAttention integration: **DONE** (2026-03-26). NPU attention is now default. Top-1 " Paris", logits corr=0.993.
-  - [x] FFN multi-launch: **DONE** (2026-03-30). 4 launches in 1 ELF. FFN 109ms → 52ms (with read-only-output).
-  - [x] Attention GEMMs multi-launch: **DONE** (2026-03-31). Q+K+V in 1 ELF. QKV 22ms → 8ms. Per-layer 160ms → 140ms. **AIR now faster than IRON per-layer (0.92×)**.
-  - **Next**: Full-block multi-launch (requires transpose kernel between GEMM→RoPE), multi-tile RMSNorm (blocked by aiecc bug).
-  - See `docs/performance_optimization.md` for full breakdown and roadmap.
-- [ ] Phase 5: Decode Phase (future work)
+- [x] Phase 1: Validate Individual Kernels at LLAMA Scale — ALL PASSED
+- [x] Phase 2: Single Transformer Block — VERIFIED
+- [x] Phase 3: Full 16-Layer Model — VERIFIED
+  - Top-1 " Paris" for "The capital of France is"
+  - Logits correlation 0.989 vs CPU F32 reference
+  - NPU FlashAttention integrated (2× faster than IRON)
+- [x] Phase 4: Performance Optimization — COMPLETE
+  - Multi-launch merges: 10 → 5 invocations/layer
+  - NPU LM Head: 8-partition multi-launch (173ms vs CPU 1526ms)
+  - `bo.map()` zero-copy for all kernels
+  - Static weight BO pre-loading for LM Head
+  - **Result: 2.05s total prefill vs IRON 2.744s (25% faster)**
+  - See `perf_opt_prefill.md` for full breakdown
+- [ ] Phase 5: Decode Phase — PLANNED
+  - See `decode/DECODE_PLAN.md`
+
+### Remaining Optimization Opportunities
+- Multi-tile RMSNorm (8ms → ~4ms) — blocked by aiecc weight broadcast DMA bug
+- Plan B: NPU transpose launches (5 → 3 invocations) — blocked by BF16 DMA stride limitation
+- See `issues/` for compiler bug details and reproducers
+
+---
 
 ## Files
 
 ```
 programming_examples/llama3/
-  llama3_prefill.py          # NPU integration (KernelCache + transformer block pipeline)
-  llama3_weights.py          # Weight loading from safetensors + RoPE LUT
-  llama3_reference.py        # CPU reference implementation (F32)
-  ffn_swiglu/silu_and_mul.py       # Standalone SwiGLU AIR kernel (Python)
-  ffn_swiglu/silu_and_mul.cc       # SwiGLU C++ kernel (for Peano)
-  Makefile                   # Build targets
+  llama3_prefill.py                   # Main pipeline (KernelCache + transformer block)
+  llama3_weights.py                   # Weight loading from safetensors + RoPE LUT
+  llama3_reference.py                 # CPU F32 reference implementation
+  multi_launch_builder/               # Multi-launch ELF builders
+    ffn_full_multi.py                   (6 launches: RMS+Gate+Up+SiLU+Down+Add)
+    rms_attn_gemms_multi.py             (4 launches: RMS+Q+K+V)
+    rope_qk_multi.py                    (2 herds: RoPE Q+K)
+    o_proj_add_multi.py                 (2 launches: O GEMM+Add)
+    lm_head_multi.py                    (8 launches: LM Head partitions)
+    attn_gemms_multi.py                 (3 launches: Q+K+V, standalone)
+  ffn_swiglu/                         # SiLU×mul kernel
+    silu_and_mul.py                     (kernel builder)
+    silu_and_mul.cc                     (C++ kernel)
+    run.py                              (standalone FFN test)
   docs/
-    LLAMA_PLAN.md                   # This plan
-    LLAMA_progress.md               # Session log
-    LLAMA_verification.md           # Architecture, commands, test results, bugs
-    LLAMA_explanation.md            # Code walkthrough
-    performance_optimization.md     # Performance profiling & optimization roadmap
-    LLAMA_flash_attention.md        # Flash attention bug investigation
-    LLAMA_gemm.md                   # GEMM precision investigation (historical)
-    kernels/
-      eltwise_add.md                # Eltwise add optimization (herd sweep, IRON comparison)
-      gemm.md                       # GEMM precision & performance analysis
+    LLAMA_PLAN.md                       # This file
+    LLAMA_progress.md                   # Current status & session log
+    LLAMA_explanation.md                # Code architecture walkthrough
+    perf_opt_prefill.md         # Performance results & history
+    host_optimization.md                # BO/host overhead analysis
+    kernels/                            # Per-kernel analysis (6 files)
+    plans/multi-launch/                 # Multi-launch optimization plans
+    issues/                             # Compiler bugs & reproducers
+    decode/                             # Decode phase planning
 ```

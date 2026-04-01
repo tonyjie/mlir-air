@@ -641,7 +641,7 @@ def compile_all_kernels(cache, config, seq_len, cpu_attn=True):
     )
 
     # 2. O GEMM + Residual Add multi-launch: 2 launches in one ELF
-    from llama3.o_proj_add_multi import build_o_proj_add_module
+    from llama3.multi_launch_builder.o_proj_add_multi import build_o_proj_add_module
 
     cache.compile_and_cache(
         "o_proj_add",
@@ -650,7 +650,9 @@ def compile_all_kernels(cache, config, seq_len, cpu_attn=True):
     )
 
     # 3. RMSNorm + Attention GEMMs multi-launch: RMSNorm + Q + K + V in one ELF (4 launches)
-    from llama3.rms_attn_gemms_multi import build_rms_attn_gemms_module
+    from llama3.multi_launch_builder.rms_attn_gemms_multi import (
+        build_rms_attn_gemms_module,
+    )
 
     cache.compile_and_cache(
         "rms_attn_gemms",
@@ -664,7 +666,7 @@ def compile_all_kernels(cache, config, seq_len, cpu_attn=True):
     )
 
     # 4. FFN Full multi-launch: RMSNorm + Gate GEMM + Up GEMM + SiLU×mul + Down GEMM + Add (6 launches in 1 ELF)
-    from llama3.ffn_full_multi import build_ffn_full_module
+    from llama3.multi_launch_builder.ffn_full_multi import build_ffn_full_module
 
     cache.compile_and_cache(
         "ffn_full",
@@ -678,7 +680,7 @@ def compile_all_kernels(cache, config, seq_len, cpu_attn=True):
     )
 
     # 6. RoPE Q+K multi-launch: 2 herds in one ELF
-    from llama3.rope_qk_multi import build_rope_qk_module
+    from llama3.multi_launch_builder.rope_qk_multi import build_rope_qk_module
 
     cache.compile_and_cache(
         "rope_qk",
@@ -723,7 +725,7 @@ def compile_all_kernels(cache, config, seq_len, cpu_attn=True):
         print("  Skipping flash_attn compilation (using CPU attention fallback)")
 
     # 9. LM Head multi-launch: 8 GEMM partitions in one ELF
-    from llama3.lm_head_multi import build_lm_head_module
+    from llama3.multi_launch_builder.lm_head_multi import build_lm_head_module
 
     cache.compile_and_cache(
         "lm_head",
@@ -1096,7 +1098,7 @@ def run_transformer_block(
     output_bf16 = results[10].reshape(seq_len, emb_dim).astype(bfloat16)
     output_f32 = output_bf16.astype(np.float32)
     if verify:
-        from llama3.ffn_full_multi import ffn_full_reference
+        from llama3.multi_launch_builder.ffn_full_multi import ffn_full_reference
 
         ref = ffn_full_reference(
             res1_bf16,
