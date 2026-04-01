@@ -17,7 +17,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from ffn_full_multi import (
+from llama3.multi_launch_builder.ffn_full_multi import (
     _extract_between_func_and_return,
     _extract_affine_maps,
     _rename_all,

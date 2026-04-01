@@ -46,7 +46,7 @@ range_ = for_
 # MLIR text stitching utilities (shared with ffn_full_multi.py)
 # ---------------------------------------------------------------------------
 
-from ffn_full_multi import (
+from llama3.multi_launch_builder.ffn_full_multi import (
     _extract_between_func_and_return,
     _extract_affine_maps,
     _extract_private_funcs,

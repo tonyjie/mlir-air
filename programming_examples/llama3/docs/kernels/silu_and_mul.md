@@ -198,6 +198,6 @@ make run-swiglu PEANO_INSTALL_DIR=$PEANO_INSTALL_DIR
 ## Related Documents
 
 - `ffn_swiglu.md` — Full FFN block multi-launch optimization (Gate+Up+SiLU×mul+Down)
-- `../performance_optimization.md` — Overall LLAMA optimization roadmap
+- `../perf_opt_prefill.md` — Overall LLAMA optimization roadmap
 - `eltwise_add.md` — Similar optimization pattern (same BD limit applies)
 - `gemm.md` — GEMM optimization (completed)

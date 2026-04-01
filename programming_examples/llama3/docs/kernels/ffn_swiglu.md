@@ -158,4 +158,4 @@ make clean            # Clean build artifacts
 
 - `silu_and_mul.md` — SiLU + elementwise multiply standalone kernel optimization
 - `gemm.md` — GEMM kernel optimization and tile configs
-- `../performance_optimization.md` — Overall LLAMA optimization roadmap
+- `../perf_opt_prefill.md` — Overall LLAMA optimization roadmap

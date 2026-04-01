@@ -159,6 +159,6 @@ Update `_build_gemm_module()` in `llama3_prefill.py`:
 
 ## Related Documents
 
-- `LLAMA_gemm.md` — Historical GEMM precision investigation
-- `performance_optimization.md` — Overall LLAMA optimization roadmap
+
+- `perf_opt_prefill.md` — Overall LLAMA optimization roadmap
 - `kernels/eltwise_add.md` — Eltwise add optimization (completed)

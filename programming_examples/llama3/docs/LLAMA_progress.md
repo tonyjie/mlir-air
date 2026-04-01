@@ -19,10 +19,11 @@
 - **7 unique kernels** (6 ELF + 1 xclbin)
 
 **All multi-launch merges integrated:**
-- **Merge A**: RoPE Q + RoPE K → `rope_qk` (1 ELF, 2 herds, 12ms)
-- **Merge B**: O GEMM + Residual Add → `o_proj_add` (1 ELF, 2 launches, 7ms)
-- **Merge C**: RMSNorm + FFN + Add → `ffn_full` (1 ELF, 6 launches, 58ms)
-- **Plan A**: RMSNorm + Attn GEMMs → `rms_attn_gemms` (1 ELF, 4 launches, 14ms)
+- **Merge A**: RoPE Q + RoPE K → `multi_launch_builder/rope_qk_multi.py` (2 herds, 11ms)
+- **Merge B**: O GEMM + Residual Add → `multi_launch_builder/o_proj_add_multi.py` (2 launches, 6ms)
+- **Merge C**: RMSNorm + FFN + Add → `multi_launch_builder/ffn_full_multi.py` (6 launches, 56ms)
+- **Plan A**: RMSNorm + Attn GEMMs → `multi_launch_builder/rms_attn_gemms_multi.py` (4 launches, 14ms)
+- **LM Head**: 8-partition GEMM → `multi_launch_builder/lm_head_multi.py` (8 launches, 173ms)
 
 **Per-layer kernel breakdown (5 invocations):**
 
@@ -115,7 +116,7 @@ All 9 kernel configs tested on NPU2 hardware with random data:
 
 ## Bugs Found and Fixed
 
-1. **Non-contiguous weight arrays** (critical): `.T` creates F-order view; NPU DMA reads wrong layout. Fix: `np.ascontiguousarray(tensor.T)`. See `LLAMA_verification.md` for full debugging story.
+1. **Non-contiguous weight arrays** (critical): `.T` creates F-order view; NPU DMA reads wrong layout. Fix: `np.ascontiguousarray(tensor.T)`. Fixed by using np.ascontiguousarray().
 2. **Wrong output buffer index**: XRT returns all arrays; output is last. Fix: `results[-1]`.
 3. **Flat array returns**: XRT returns 1D; needed `.reshape()` on all returns.
 4. **Stale air_project/**: Sequential compilations share tmpdir. Fix: `prepare_air_project()` wipes before each compile.
@@ -151,7 +152,7 @@ All 9 kernel configs tested on NPU2 hardware with random data:
 | 2026-03-13 | **ROOT CAUSE FOUND**: Per-kernel diagnostic shows **flash attention (step 7) has corr=0.34** — all other 14 kernels have corr>0.999. The flash attention kernel was compiled without causal masking (`causal=False`), performing bidirectional attention. CPU reference correctly applies causal masking. |
 | | **Fix attempt 1**: `causal=True` — fails to compile at seq_len=2048 due to BD exhaustion (hardware limit: 48 BDs per MemTile, causal needs ~144). |
 | | **Fix attempt 2**: Pass causal mask via external mask input — kernel ignores `arg3` (mask not in launch operands in non-causal path). |
-| | **Status**: Blocked on flash attention causal masking compilation. See `LLAMA_flash_attention.md` for full details. |
+| | **Status**: Blocked on flash attention causal masking compilation. See `kernels/flash_attention.md`. |
 | 2026-03-13 | **F32 residual path improvement** (secondary): Modified `run_transformer_block()` to carry both BF16 and F32 copies of residual state. Correct but not the main issue. |
 | 2026-03-13 | **Configuration sweep**: Created `test_flash_attn_configs.py`. Tested 10 configs at LLAMA shapes. Only 3/10 compile and pass. Best: LQP=256/LKP=64 at 2427 GFLOPS. All causal configs failed (BD exhaustion, pre-upstream-fix). |
 | 2026-03-16 | **Causal BD exhaustion fixed upstream**. `causal=True` now compiles: `make run LQ=2048 LK=2048 LQP=256 LKP=64 ... EXTRA_PY_FLAGS="--causal"` → PASS! |
@@ -196,7 +197,7 @@ All 9 kernel configs tested on NPU2 hardware with random data:
 
 ## Phase 4: Performance Optimization
 
-See `performance_optimization.md` for full profiling breakdown, IRON comparison, and optimization roadmap.
+See `perf_opt_prefill.md` for full profiling breakdown, IRON comparison, and optimization roadmap.
 
 **Summary**: NPU kernel 18.67s → **3.57s** (81% reduction). FlashAttention now fixed (15ms, 2× faster than IRON). **Next**: Integrate NPU FlashAttention to replace CPU fallback (~38s savings).
 
@@ -217,4 +218,4 @@ python3 ../llama3_prefill.py --run-only --n-layers 16 --verify --profile
 python3 ../llama3_prefill.py --run-only --n-layers 1 --verify
 ```
 
-See `performance_optimization.md` for profiling commands (AIR + IRON) and `LLAMA_verification.md` for full command reference.
+See `perf_opt_prefill.md` for profiling commands (AIR + IRON) .
