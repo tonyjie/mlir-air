@@ -109,7 +109,7 @@ def _fix_launch_func_args(text, prefix, arg_map):
 
 
 def _wrap_ir_in_launch(mlir_text):
-    """Wrap a module whose func body contains bare herds in air.launch.
+    """Wrap a module whose func body contains bare herds in air.launch+segment.
 
     Transforms:
         func.func @name(%arg0: T0, %arg1: T1, %arg2: T2) {
@@ -118,14 +118,20 @@ def _wrap_ir_in_launch(mlir_text):
         }
     Into:
         func.func @name(%arg0: T0, %arg1: T1, %arg2: T2) {
-            air.launch () in () args(%arg3=%arg0, %arg4=%arg1, %arg5=%arg2) : T0, T1, T2 {
-                <body with herd refs remapped to %arg3, %arg4, %arg5>
+            air.launch () in () args(%argL0=%arg0, ...) : T0, ... {
+                air.segment @name_seg args(%argS0=%argL0, ...) : T0, ... {
+                    <body with herd refs remapped to %argS0, ...>
+                }
             }
             return
         }
 
-    This is needed because multi-launch ELF modules require each kernel to be
-    wrapped in air.launch, but RMSNorm and Eltwise Add generate bare herds.
+    Both launch AND segment wrappers are needed. Without air.segment, the
+    lowered IR uses airrt.herd_load instead of airrt.segment_load. The
+    airrt-to-npu pass's identifyLaunchRegions only looks for segment_load ops
+    to associate launch regions with aie.device ops. A bare herd_load region
+    gets silently dropped when other segment-based launches exist in the same
+    function, causing "failed to legalize airrt.dma_memcpy_nd".
     """
     lines = mlir_text.split("\n")
 
@@ -145,15 +151,16 @@ def _wrap_ir_in_launch(mlir_text):
     if "air.launch" in body_text:
         return mlir_text
 
+    # Extract the func name for generating segment name
+    func_name_match = re.search(r"func\.func @(\w+)", func_line)
+    func_name = func_name_match.group(1) if func_name_match else "wrapped"
+
     # Parse func args: extract (%arg0: type0, %arg1: type1, ...)
-    # The func signature may span multiple lines if complex, but for our
-    # simple kernels it's on one line.
     sig_match = re.search(r"func\.func @\w+\(([^)]*)\)", func_line)
     if not sig_match:
         return mlir_text
 
     args_str = sig_match.group(1)
-    # Parse individual args
     func_args = []
     for arg in args_str.split(","):
         arg = arg.strip()
@@ -178,30 +185,39 @@ def _wrap_ir_in_launch(mlir_text):
     body_text = "\n".join(body_lines)
 
     # Find the max %argN index used in the body to avoid conflicts.
-    # The herd uses %arg3-%arg9 internally, so launch args must start higher.
     existing_args = [int(m) for m in re.findall(r"%arg(\d+)", body_text)]
     max_existing = max(existing_args) if existing_args else n_args - 1
     launch_arg_start = max_existing + 1
+    segment_arg_start = launch_arg_start + n_args
 
-    # Build the air.launch args clause with safe arg indices
+    # Build launch args clause
     launch_args = ", ".join(
         f"%arg{launch_arg_start + i}={func_args[i][0]}" for i in range(n_args)
     )
     launch_types = ", ".join(func_args[i][1] for i in range(n_args))
 
-    # In the body, remap func arg references to launch arg references.
-    # Process in reverse order of arg index to avoid partial replacements.
+    # Build segment args clause (segment args reference launch args)
+    segment_args = ", ".join(
+        f"%arg{segment_arg_start + i}=%arg{launch_arg_start + i}" for i in range(n_args)
+    )
+    segment_types = launch_types
+
+    # In the body, remap func arg references to segment arg references.
     for i in range(n_args - 1, -1, -1):
-        old_name = func_args[i][0]  # e.g. %arg0
-        new_name = f"%arg{launch_arg_start + i}"  # e.g. %arg10
+        old_name = func_args[i][0]
+        new_name = f"%arg{segment_arg_start + i}"
         body_text = re.sub(re.escape(old_name) + r"(?!\w)", new_name, body_text)
 
-    # Reconstruct the module
+    # Reconstruct the module with both launch and segment wrappers
     new_lines = lines[:body_start]
     new_lines.append(f"    air.launch () in () args({launch_args}) : {launch_types} {{")
-    # Indent body by 2 more spaces
+    new_lines.append(
+        f"      air.segment @{func_name}_seg args({segment_args})"
+        f" : {segment_types} {{"
+    )
     for line in body_text.split("\n"):
-        new_lines.append("  " + line)
+        new_lines.append("    " + line)
+    new_lines.append("      }")
     new_lines.append("    }")
     new_lines.extend(lines[body_end:])
 
@@ -450,7 +466,7 @@ def build_ffn_full_module(
                                             ),
                                             AffineSymbolExpr.get(2),
                                         ),
-                                        AffineConstantExpr.get(tile_n),
+                                        AffineConstantExpr.get(chunk_size),
                                     ),
                                 )
                             ],
