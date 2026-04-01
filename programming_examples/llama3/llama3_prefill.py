@@ -375,7 +375,66 @@ class KernelCache:
 
         print(f"  Compiled {name}: {compile_time:.1f}s -> {cached_binary.name}")
 
-    def load_and_run(self, name, backend_kwargs, *inputs, output_indices=None):
+    def preload_static_inputs(self, name, backend_kwargs, static_inputs):
+        """Pre-load static inputs (e.g. weights) into cached BOs.
+
+        Call once at init time. On subsequent load_and_run calls, pass
+        static_input_indices to skip re-writing these BOs.
+
+        Args:
+            name: Kernel name.
+            backend_kwargs: Backend kwargs (for loading kernel if not loaded).
+            static_inputs: Dict mapping input index → numpy array.
+        """
+        import pyxrt as xrt
+        from air.backend.xrt import XRTBackend
+
+        if name not in self.artifacts:
+            raise RuntimeError(f"Kernel '{name}' not found in cache.")
+
+        # Ensure kernel is loaded
+        if name not in self._loaded:
+            artifact = self.artifacts[name]
+            backend = XRTBackend(**backend_kwargs)
+            with filelock.FileLock("/tmp/npu.lock"):
+                invoker = backend.load(artifact)
+            self._loaded[name] = (backend, invoker)
+
+        backend, _ = self._loaded[name]
+        is_elf = self.artifacts[name].output_binary.endswith(".elf")
+
+        # Write static inputs and cache their BOs
+        if not hasattr(self, "_static_bos"):
+            self._static_bos = {}
+        if name not in self._static_bos:
+            self._static_bos[name] = {}
+
+        for idx, arr in static_inputs.items():
+            size = arr.size * arr.itemsize
+            if is_elf:
+                bo = xrt.ext.bo(backend.device, size)
+            else:
+                bo = xrt.bo(
+                    backend.device,
+                    size,
+                    xrt.bo.host_only,
+                    backend.kernel.group_id(idx + 3),
+                )
+            if arr.dtype == bfloat16:
+                arr = arr.view(np.int16)
+            bo.write(arr, 0)
+            bo.sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
+            self._static_bos[name][idx] = bo
+            self._log(f"Pre-loaded static input {idx} for {name} ({size // 1024}KB)")
+
+    def load_and_run(
+        self,
+        name,
+        backend_kwargs,
+        *inputs,
+        output_indices=None,
+        static_input_indices=None,
+    ):
         """Load cached kernel and execute with BO reuse.
 
         Three levels of caching to minimize per-invocation overhead:
@@ -417,20 +476,23 @@ class KernelCache:
         # Level 2: Allocate BOs on first call, reuse on subsequent calls
         sizes_in_bytes = [a.size * a.itemsize for a in inputs]
         is_elf = self.artifacts[name].output_binary.endswith(".elf")
+        static_indices = set(static_input_indices or [])
 
-        if name not in self._cached_bos:
-            if is_elf:
-                bos = [xrt.ext.bo(backend.device, s) for s in sizes_in_bytes]
-            else:
-                bos = [
-                    xrt.bo(
-                        backend.device,
-                        s,
-                        xrt.bo.host_only,
-                        backend.kernel.group_id(i + 3),
+        first_call = name not in self._cached_bos
+        if first_call:
+            bos = []
+            for i, s in enumerate(sizes_in_bytes):
+                if is_elf:
+                    bos.append(xrt.ext.bo(backend.device, s))
+                else:
+                    bos.append(
+                        xrt.bo(
+                            backend.device,
+                            s,
+                            xrt.bo.host_only,
+                            backend.kernel.group_id(i + 3),
+                        )
                     )
-                    for i, s in enumerate(sizes_in_bytes)
-                ]
             self._cached_bos[name] = bos
             # Sync instruction BO once (only needed for xclbin mode)
             if not is_elf and backend.bo_instr is not None:
@@ -439,13 +501,21 @@ class KernelCache:
 
         bos = self._cached_bos[name]
 
-        # Write input data to cached BOs
+        # Write input data to cached BOs.
+        # Static inputs (e.g. weights) are written on first call only,
+        # then skipped on subsequent calls since BO data is unchanged.
         t0 = time.time()
         with filelock.FileLock("/tmp/npu.lock"):
+            # Write inputs using bo.map() (zero-copy into BO memory)
             for i, a in enumerate(inputs):
+                if i in static_indices and not first_call:
+                    continue  # Already written on first call
                 if a.dtype == bfloat16:
                     a = a.view(np.int16)
-                bos[i].write(a, 0)
+                mv = bos[i].map()
+                src = np.frombuffer(a, dtype=np.uint8)
+                dst = np.frombuffer(mv, dtype=np.uint8, count=len(src))
+                np.copyto(dst, src, casting="no")
                 bos[i].sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
 
             # Launch kernel
@@ -459,9 +529,7 @@ class KernelCache:
                 h = backend.kernel(3, backend.bo_instr, len(backend.instr_v), *bos)
                 h.wait()
 
-            # Read back output buffers from device.
-            # Default: only the last buffer. Multi-output kernels can specify
-            # output_indices (e.g. [2, 4, 6] for attn_gemms).
+            # Read back output buffers using bo.map() (zero-copy view).
             if output_indices is None:
                 readback_set = {len(inputs) - 1}
             else:
@@ -470,7 +538,11 @@ class KernelCache:
                 bos[idx].sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE)
             results = tuple(
                 (
-                    bos[i].read(s, 0).view(inputs[i].dtype)
+                    np.frombuffer(
+                        bos[i].map(),
+                        dtype=inputs[i].dtype,
+                        count=inputs[i].size,
+                    )  # Zero-copy view into BO memory (like IRON's read_buffer)
                     if i in readback_set
                     else np.empty(0, dtype=inputs[i].dtype)
                 )
@@ -559,7 +631,7 @@ def compile_all_kernels(cache, config, seq_len, cpu_attn=True):
     print(f"Compiling {8} unique kernels (seq_len={seq_len})...")
     print(f"{'='*60}\n")
 
-    # 1. RMSNorm: (seq_len, emb_dim)
+    # 1. Standalone RMSNorm (used for final norm before LM Head)
     from weighted_rms_norm.weighted_rms_norm import build_module as build_rms
 
     cache.compile_and_cache(
@@ -568,61 +640,50 @@ def compile_all_kernels(cache, config, seq_len, cpu_attn=True):
         {"verbose": cache.verbose, "omit_while_true_loop": False},
     )
 
-    # 2. GEMM Q/O: (seq_len, emb_dim, emb_dim) — large K, tile_k_l2=256
+    # 2. O GEMM + Residual Add multi-launch: 2 launches in one ELF
+    from llama3.o_proj_add_multi import build_o_proj_add_module
+
     cache.compile_and_cache(
-        "gemm_qo",
-        _build_gemm_module(
-            seq_len, emb_dim, emb_dim, tile_m=64, tile_k_l2=256, tile_k_l1=32, tile_n=64
-        ),
-        {
-            "verbose": cache.verbose,
-            "omit_while_true_loop": False,
-            "runtime_loop_tiling_sizes": [2, 2],
-        },
+        "o_proj_add",
+        build_o_proj_add_module(seq_len, emb_dim),
+        {"verbose": cache.verbose, **_O_PROJ_ADD_BACKEND},
     )
 
-    # 3. Attention GEMMs multi-launch: Q + K + V in one ELF (3 air.launch ops)
-    from llama3.attn_gemms_multi import build_attn_gemms_module
+    # 3. RMSNorm + Attention GEMMs multi-launch: RMSNorm + Q + K + V in one ELF (4 launches)
+    from llama3.rms_attn_gemms_multi import build_rms_attn_gemms_module
 
     cache.compile_and_cache(
-        "attn_gemms",
-        build_attn_gemms_module(seq_len, emb_dim, kv_dim),
+        "rms_attn_gemms",
+        build_rms_attn_gemms_module(seq_len, emb_dim, kv_dim),
         {
             "verbose": cache.verbose,
             "omit_while_true_loop": False,
             "output_format": "elf",
-            "instance_name": "attn_gemms",
+            "instance_name": "rms_attn_gemms",
         },
     )
 
-    # 4. FFN multi-launch: Gate GEMM + Up GEMM + SiLU×mul + Down GEMM (4 launches in 1 ELF)
-    from llama3.ffn_swiglu.run import build_ffn_module
+    # 4. FFN Full multi-launch: RMSNorm + Gate GEMM + Up GEMM + SiLU×mul + Down GEMM + Add (6 launches in 1 ELF)
+    from llama3.ffn_full_multi import build_ffn_full_module
 
     cache.compile_and_cache(
-        "ffn_multi",
-        build_ffn_module(seq_len, emb_dim, hidden_dim),
+        "ffn_full",
+        build_ffn_full_module(seq_len, emb_dim, hidden_dim),
         {
             "verbose": cache.verbose,
             "omit_while_true_loop": False,
             "output_format": "elf",
-            "instance_name": "ffn_block",
+            "instance_name": "ffn_full",
         },
     )
 
-    # 6. RoPE Q: (n_heads * seq_len, head_dim)
-    from rope_lut.rope_lut import build_module as build_rope
+    # 6. RoPE Q+K multi-launch: 2 herds in one ELF
+    from llama3.rope_qk_multi import build_rope_qk_module
 
     cache.compile_and_cache(
-        "rope_q",
-        build_rope(n_heads * seq_len, head_dim, bfloat16),
-        {"verbose": cache.verbose, "omit_while_true_loop": False},
-    )
-
-    # 7. RoPE K: (n_kv_heads * seq_len, head_dim)
-    cache.compile_and_cache(
-        "rope_k",
-        build_rope(n_kv_heads * seq_len, head_dim, bfloat16),
-        {"verbose": cache.verbose, "omit_while_true_loop": False},
+        "rope_qk",
+        build_rope_qk_module(n_heads, n_kv_heads, seq_len, head_dim),
+        {"verbose": cache.verbose, **_ROPE_QK_BACKEND},
     )
 
     # 8. Flash Attention GQA (skip if using CPU attention fallback)
@@ -661,15 +722,18 @@ def compile_all_kernels(cache, config, seq_len, cpu_attn=True):
     else:
         print("  Skipping flash_attn compilation (using CPU attention fallback)")
 
-    # 9. (SwiGLU is now part of ffn_multi above)
-
-    # 10. Eltwise Add: n = seq_len * emb_dim
-    from eltwise_add.eltwise_add import build_module as build_add
+    # 9. LM Head multi-launch: 8 GEMM partitions in one ELF
+    from llama3.lm_head_multi import build_lm_head_module
 
     cache.compile_and_cache(
-        "add",
-        build_add(n_total, 2048, bfloat16, vector_size=16, herd_x=8, herd_y=1),
-        {"verbose": cache.verbose, "omit_while_true_loop": False},
+        "lm_head",
+        build_lm_head_module(seq_len, emb_dim),
+        {
+            "verbose": cache.verbose,
+            "omit_while_true_loop": False,
+            "output_format": "elf",
+            "instance_name": "lm_head",
+        },
     )
 
     # Save manifest for --run-only
@@ -688,10 +752,16 @@ def compile_all_kernels(cache, config, seq_len, cpu_attn=True):
 # ---------------------------------------------------------------------------
 
 
-def _run_cached(cache, name, backend_kwargs, *inputs, output_indices=None):
+def _run_cached(
+    cache, name, backend_kwargs, *inputs, output_indices=None, static_input_indices=None
+):
     """Run a cached kernel. Thin wrapper around cache.load_and_run."""
     return cache.load_and_run(
-        name, backend_kwargs, *inputs, output_indices=output_indices
+        name,
+        backend_kwargs,
+        *inputs,
+        output_indices=output_indices,
+        static_input_indices=static_input_indices,
     )
 
 
@@ -710,6 +780,26 @@ _ATTN_GEMM_BACKEND = {
     "omit_while_true_loop": False,
     "output_format": "elf",
     "instance_name": "attn_gemms",
+}
+_ROPE_QK_BACKEND = {
+    "omit_while_true_loop": False,
+    "output_format": "elf",
+    "instance_name": "rope_qk",
+}
+_FFN_FULL_BACKEND = {
+    "omit_while_true_loop": False,
+    "output_format": "elf",
+    "instance_name": "ffn_full",
+}
+_RMS_ATTN_GEMM_BACKEND = {
+    "omit_while_true_loop": False,
+    "output_format": "elf",
+    "instance_name": "rms_attn_gemms",
+}
+_O_PROJ_ADD_BACKEND = {
+    "omit_while_true_loop": False,
+    "output_format": "elf",
+    "instance_name": "o_proj_add",
 }
 
 
@@ -786,26 +876,15 @@ def run_transformer_block(
 
     print(f"  Layer {layer_idx}: Running transformer block...")
 
-    # 1. Pre-attention RMSNorm
-    print(f"    Step 1: RMSNorm (pre-attn)")
-    x_in = np.asarray(x_bf16, dtype=bfloat16).reshape(seq_len, emb_dim)
-    weight_in = np.asarray(layer_weights.attn_norm, dtype=bfloat16).reshape(emb_dim)
-    y_out = np.zeros((seq_len, emb_dim), dtype=bfloat16)
-    results = _run_cached(cache, "rmsnorm", _SIMPLE_BACKEND, x_in, weight_in, y_out)
-    normed = results[-1].reshape(seq_len, emb_dim)
-    if verify:
-        ref = rms_norm_ref(x_bf16.astype(np.float32), layer_weights.attn_norm)
-        _compare("attn_norm", normed, ref)
-    else:
-        _compare("attn_norm", normed)
-
-    # 2-4. Q/K/V Projection (multi-launch: 3 GEMMs in one ELF)
+    # 1-4. RMSNorm + Q/K/V Projection [multi-launch: 4 launches in one ELF]
     kv_dim = n_kv_heads * head_dim  # 512
     print(
-        f"    Steps 2-4: Q/K/V projection [multi-launch] "
+        f"    Steps 1-4: RMSNorm + Q/K/V [multi-launch, 4 launches] "
         f"(Q: {seq_len}x{emb_dim}x{emb_dim}, K/V: {seq_len}x{emb_dim}x{kv_dim})"
     )
-    attn_input = np.asarray(normed, dtype=bfloat16).reshape(seq_len, emb_dim)
+    x_in = np.asarray(x_bf16, dtype=bfloat16).reshape(seq_len, emb_dim)
+    norm_w = np.asarray(layer_weights.attn_norm, dtype=bfloat16).reshape(emb_dim)
+    normed_buf = np.zeros((seq_len, emb_dim), dtype=bfloat16)
     wq = np.asarray(layer_weights.wq, dtype=bfloat16).reshape(emb_dim, emb_dim)
     q_buf = np.zeros((seq_len, emb_dim), dtype=bfloat16)
     wk = np.asarray(layer_weights.wk, dtype=bfloat16).reshape(emb_dim, kv_dim)
@@ -815,30 +894,27 @@ def run_transformer_block(
 
     results = _run_cached(
         cache,
-        "attn_gemms",
-        _ATTN_GEMM_BACKEND,
-        attn_input,
+        "rms_attn_gemms",
+        _RMS_ATTN_GEMM_BACKEND,
+        x_in,
+        norm_w,
+        normed_buf,
         wq,
         q_buf,
         wk,
         k_buf,
         wv,
         v_buf,
-        output_indices=[2, 4, 6],
+        output_indices=[4, 6, 8],
     )
-    q = results[2].reshape(seq_len, emb_dim).astype(bfloat16)
-    k = results[4].reshape(seq_len, kv_dim).astype(bfloat16)
-    v = results[6].reshape(seq_len, kv_dim).astype(bfloat16)
+    q = results[4].reshape(seq_len, emb_dim).astype(bfloat16)
+    k = results[6].reshape(seq_len, kv_dim).astype(bfloat16)
+    v = results[8].reshape(seq_len, kv_dim).astype(bfloat16)
     if verify:
-        ref_q = normed.astype(np.float32) @ np.asarray(
-            layer_weights.wq, dtype=np.float32
-        )
-        ref_k = normed.astype(np.float32) @ np.asarray(
-            layer_weights.wk, dtype=np.float32
-        )
-        ref_v = normed.astype(np.float32) @ np.asarray(
-            layer_weights.wv, dtype=np.float32
-        )
+        normed_ref = rms_norm_ref(x_bf16.astype(np.float32), layer_weights.attn_norm)
+        ref_q = normed_ref @ np.asarray(layer_weights.wq, dtype=np.float32)
+        ref_k = normed_ref @ np.asarray(layer_weights.wk, dtype=np.float32)
+        ref_v = normed_ref @ np.asarray(layer_weights.wv, dtype=np.float32)
         _compare("q", q, ref_q)
         _compare("k", k, ref_k)
         _compare("v", v, ref_v)
@@ -847,49 +923,57 @@ def run_transformer_block(
         _compare("k", k)
         _compare("v", v)
 
-    # 5. RoPE on Q
-    print(f"    Step 5: RoPE on Q")
+    # 5-6. RoPE Q+K [multi-launch: 2 herds in one ELF]
+    print(f"    Steps 5-6: RoPE Q+K [multi-launch]")
     q_heads = q.reshape(seq_len, n_heads, head_dim)
     q_flat = q_heads.transpose(1, 0, 2).reshape(n_heads * seq_len, head_dim)
     rope_lut_q = np.tile(rope_lut_bf16[:seq_len], (n_heads, 1))
     total_q = n_heads * seq_len * head_dim
     q_in = np.asarray(q_flat, dtype=bfloat16).flatten()
-    lut_in = np.asarray(rope_lut_q, dtype=bfloat16).flatten()
-    q_out = np.zeros(total_q, dtype=bfloat16)
-    results = _run_cached(cache, "rope_q", _SIMPLE_BACKEND, q_in, lut_in, q_out)
-    q_roped_flat = results[-1].reshape(n_heads, seq_len, head_dim)
-    q_roped = q_roped_flat.transpose(1, 0, 2).reshape(seq_len, n_heads * head_dim)
-    if verify:
-        q_heads_f32 = q.astype(np.float32).reshape(seq_len, n_heads, head_dim)
-        ref_q_roped = np.empty_like(q_heads_f32)
-        lut_f32 = rope_lut_bf16[:seq_len].astype(np.float32)
-        for h in range(n_heads):
-            ref_q_roped[:, h, :] = apply_rope_ref(q_heads_f32[:, h, :], lut_f32)
-        ref = ref_q_roped.reshape(seq_len, n_heads * head_dim)
-        _compare("q_roped", q_roped, ref)
-    else:
-        _compare("q_roped", q_roped)
+    lut_q_in = np.asarray(rope_lut_q, dtype=bfloat16).flatten()
 
-    # 6. RoPE on K
-    print(f"    Step 6: RoPE on K")
     k_heads = k.reshape(seq_len, n_kv_heads, head_dim)
     k_flat = k_heads.transpose(1, 0, 2).reshape(n_kv_heads * seq_len, head_dim)
     rope_lut_k = np.tile(rope_lut_bf16[:seq_len], (n_kv_heads, 1))
     total_k = n_kv_heads * seq_len * head_dim
     k_in = np.asarray(k_flat, dtype=bfloat16).flatten()
     lut_k_in = np.asarray(rope_lut_k, dtype=bfloat16).flatten()
+
+    q_out = np.zeros(total_q, dtype=bfloat16)
     k_out = np.zeros(total_k, dtype=bfloat16)
-    results = _run_cached(cache, "rope_k", _SIMPLE_BACKEND, k_in, lut_k_in, k_out)
-    k_roped_flat = results[-1].reshape(n_kv_heads, seq_len, head_dim)
+
+    results = _run_cached(
+        cache,
+        "rope_qk",
+        _ROPE_QK_BACKEND,
+        q_in,
+        lut_q_in,
+        k_in,
+        lut_k_in,
+        q_out,
+        k_out,
+        output_indices=[4, 5],
+    )
+    q_roped_flat = results[4].reshape(n_heads, seq_len, head_dim)
+    q_roped = q_roped_flat.transpose(1, 0, 2).reshape(seq_len, n_heads * head_dim)
+    k_roped_flat = results[5].reshape(n_kv_heads, seq_len, head_dim)
     k_roped = k_roped_flat.transpose(1, 0, 2).reshape(seq_len, n_kv_heads * head_dim)
     if verify:
+        lut_f32 = rope_lut_bf16[:seq_len].astype(np.float32)
+        q_heads_f32 = q.astype(np.float32).reshape(seq_len, n_heads, head_dim)
+        ref_q_roped = np.empty_like(q_heads_f32)
+        for h in range(n_heads):
+            ref_q_roped[:, h, :] = apply_rope_ref(q_heads_f32[:, h, :], lut_f32)
+        _compare("q_roped", q_roped, ref_q_roped.reshape(seq_len, n_heads * head_dim))
         k_heads_f32 = k.astype(np.float32).reshape(seq_len, n_kv_heads, head_dim)
         ref_k_roped = np.empty_like(k_heads_f32)
         for h in range(n_kv_heads):
             ref_k_roped[:, h, :] = apply_rope_ref(k_heads_f32[:, h, :], lut_f32)
-        ref = ref_k_roped.reshape(seq_len, n_kv_heads * head_dim)
-        _compare("k_roped", k_roped, ref)
+        _compare(
+            "k_roped", k_roped, ref_k_roped.reshape(seq_len, n_kv_heads * head_dim)
+        )
     else:
+        _compare("q_roped", q_roped)
         _compare("k_roped", k_roped)
 
     # 7. Flash Attention GQA
@@ -943,54 +1027,43 @@ def run_transformer_block(
         )
     _compare("attn_out", attn_out)
 
-    # 8. O Projection
-    print(f"    Step 8: O projection")
+    # 8-9. O Projection + Residual Add [multi-launch: 2 launches in one ELF]
+    print(f"    Steps 8-9: O GEMM + Residual Add [multi-launch]")
     a_o = np.asarray(attn_out, dtype=bfloat16).reshape(seq_len, emb_dim)
     b_o = np.asarray(layer_weights.wo, dtype=bfloat16).reshape(emb_dim, emb_dim)
-    c_o = np.zeros((seq_len, emb_dim), dtype=bfloat16)
-    results = _run_cached(cache, "gemm_qo", _GEMM_BACKEND, a_o, b_o, c_o)
-    proj = results[-1].reshape(seq_len, emb_dim).astype(bfloat16)
-    if verify:
-        ref = attn_out.astype(np.float32) @ np.asarray(
-            layer_weights.wo, dtype=np.float32
-        )
-        _compare("proj", proj, ref)
-    else:
-        _compare("proj", proj)
-
-    # 9. Residual Add (BF16 vectorized on NPU)
-    print(f"    Step 9: Residual add")
-    a_add = x_bf16.flatten().astype(bfloat16)
-    b_add = proj.flatten().astype(bfloat16)
-    c_add = np.zeros(n_total, dtype=bfloat16)
-    results = _run_cached(cache, "add", _SIMPLE_BACKEND, a_add, b_add, c_add)
-    res1_bf16 = results[-1].reshape(seq_len, emb_dim).astype(bfloat16)
+    proj_buf = np.zeros((seq_len, emb_dim), dtype=bfloat16)
+    x_residual_2d = x_bf16.reshape(seq_len, emb_dim).astype(bfloat16)
+    res1_buf = np.zeros(n_total, dtype=bfloat16)
+    results = _run_cached(
+        cache,
+        "o_proj_add",
+        _O_PROJ_ADD_BACKEND,
+        a_o,
+        b_o,
+        proj_buf,
+        x_residual_2d,
+        res1_buf,
+        output_indices=[4],
+    )
+    res1_bf16 = results[4].reshape(seq_len, emb_dim).astype(bfloat16)
     res1_f32 = res1_bf16.astype(np.float32)
     if verify:
-        ref = x_bf16.astype(np.float32) + proj.astype(np.float32)
+        proj_ref = attn_out.astype(np.float32) @ np.asarray(
+            layer_weights.wo, dtype=np.float32
+        )
+        ref = x_bf16.astype(np.float32) + proj_ref
         _compare("res1", res1_bf16, ref)
     else:
         _compare("res1", res1_bf16)
 
-    # 10. Pre-FFN RMSNorm (uses BF16 copy since RMSNorm kernel requires BF16)
-    print(f"    Step 10: RMSNorm (pre-FFN)")
-    x_in2 = np.asarray(res1_bf16, dtype=bfloat16).reshape(seq_len, emb_dim)
-    w_in2 = np.asarray(layer_weights.ffn_norm, dtype=bfloat16).reshape(emb_dim)
-    y_out2 = np.zeros((seq_len, emb_dim), dtype=bfloat16)
-    results = _run_cached(cache, "rmsnorm", _SIMPLE_BACKEND, x_in2, w_in2, y_out2)
-    normed2 = results[-1].reshape(seq_len, emb_dim)
-    if verify:
-        ref = rms_norm_ref(res1_bf16.astype(np.float32), layer_weights.ffn_norm)
-        _compare("ffn_norm", normed2, ref)
-    else:
-        _compare("ffn_norm", normed2)
-
-    # 11-14. FFN block (multi-launch: Gate GEMM + Up GEMM + SiLU×mul + Down GEMM)
+    # 10-15. FFN Full block [multi-launch: RMSNorm + Gate + Up + SiLU×mul + Down + Add]
     print(
-        f"    Steps 11-14: FFN block [multi-launch] "
+        f"    Steps 10-15: FFN Full [multi-launch, 6 launches] "
         f"({seq_len}x{emb_dim}x{hidden_dim})"
     )
-    ffn_input = np.asarray(normed2, dtype=bfloat16).reshape(seq_len, emb_dim)
+    ffn_res1 = np.asarray(res1_bf16, dtype=bfloat16).reshape(seq_len, emb_dim)
+    ffn_norm_w = np.asarray(layer_weights.ffn_norm, dtype=bfloat16).reshape(emb_dim)
+    normed2_buf = np.zeros((seq_len, emb_dim), dtype=bfloat16)
     w_gate = np.asarray(layer_weights.w_gate, dtype=bfloat16).reshape(
         emb_dim, hidden_dim
     )
@@ -1001,45 +1074,37 @@ def run_transformer_block(
     w_down = np.asarray(layer_weights.w_down, dtype=bfloat16).reshape(
         hidden_dim, emb_dim
     )
-    ffn_output = np.zeros((seq_len, emb_dim), dtype=bfloat16)
+    down_buf = np.zeros((seq_len, emb_dim), dtype=bfloat16)
+    output_buf = np.zeros(n_total, dtype=bfloat16)
     results = _run_cached(
         cache,
-        "ffn_multi",
-        _FFN_BACKEND,
-        ffn_input,
-        w_gate,
-        gate_buf,
-        w_up,
-        up_buf,
-        swiglu_buf,
-        w_down,
-        ffn_output,
+        "ffn_full",
+        _FFN_FULL_BACKEND,
+        ffn_res1,  # arg0: res1 (2D)
+        ffn_norm_w,  # arg1: ffn_norm_weight (1D)
+        normed2_buf,  # arg2: normed2 (2D)
+        w_gate,  # arg3: w_gate
+        gate_buf,  # arg4: gate_buf
+        w_up,  # arg5: w_up
+        up_buf,  # arg6: up_buf
+        swiglu_buf,  # arg7: swiglu_buf
+        w_down,  # arg8: w_down
+        down_buf,  # arg9: down_out (2D)
+        output_buf,  # arg10: output (1D)
+        output_indices=[10],
     )
-    down = results[-1].reshape(seq_len, emb_dim).astype(bfloat16)
-    if verify:
-        # Full FFN reference: gate→up→swiglu→down
-        ref_gate = normed2.astype(np.float32) @ np.asarray(
-            layer_weights.w_gate, dtype=np.float32
-        )
-        ref_up = normed2.astype(np.float32) @ np.asarray(
-            layer_weights.w_up, dtype=np.float32
-        )
-        ref_swiglu = swiglu_ref(ref_gate, ref_up)
-        ref_down = ref_swiglu @ np.asarray(layer_weights.w_down, dtype=np.float32)
-        _compare("down", down, ref_down)
-    else:
-        _compare("down", down)
-
-    # 15. Residual Add (BF16 vectorized on NPU)
-    print(f"    Step 15: Residual add")
-    a_add2 = res1_bf16.flatten().astype(bfloat16)
-    b_add2 = down.flatten().astype(bfloat16)
-    c_add2 = np.zeros(n_total, dtype=bfloat16)
-    results = _run_cached(cache, "add", _SIMPLE_BACKEND, a_add2, b_add2, c_add2)
-    output_bf16 = results[-1].reshape(seq_len, emb_dim).astype(bfloat16)
+    output_bf16 = results[10].reshape(seq_len, emb_dim).astype(bfloat16)
     output_f32 = output_bf16.astype(np.float32)
     if verify:
-        ref = res1_bf16.astype(np.float32) + down.astype(np.float32)
+        from llama3.ffn_full_multi import ffn_full_reference
+
+        ref = ffn_full_reference(
+            res1_bf16,
+            layer_weights.ffn_norm,
+            layer_weights.w_gate,
+            layer_weights.w_up,
+            layer_weights.w_down,
+        ).reshape(seq_len, emb_dim)
         _compare("output", output_bf16, ref)
     else:
         _compare("output", output_bf16)
@@ -1050,6 +1115,61 @@ def run_transformer_block(
 # ---------------------------------------------------------------------------
 # Full model forward pass
 # ---------------------------------------------------------------------------
+
+
+def preload_lm_head_weights(weights, config, cache, seq_len):
+    """Pre-load LM Head weight BOs (called once before profiling, like IRON).
+
+    Pre-transposes and writes weight partitions into BOs so that during
+    inference only bo.sync() is needed (no memcpy).
+    """
+    emb_dim = config.emb_dim
+    vocab_size = weights.lm_head.shape[0]
+    n_part = 16384
+    n_partitions = 8
+
+    if hasattr(weights, "_lm_weight_parts"):
+        return  # Already done
+
+    print("Pre-loading LM Head weights into BOs...")
+    weights._lm_weight_parts = []
+    for p in range(n_partitions):
+        n_start = p * n_part
+        n_end = min(n_start + n_part, vocab_size)
+        n_actual = n_end - n_start
+        w = np.zeros((emb_dim, n_part), dtype=bfloat16)
+        w[:, :n_actual] = np.ascontiguousarray(
+            weights.lm_head[n_start:n_end, :].T
+        ).astype(bfloat16)
+        weights._lm_weight_parts.append(w)
+
+    # Pre-allocate BOs and write weights (one-time, outside profiling)
+    _LM_HEAD_BACKEND = {
+        "omit_while_true_loop": False,
+        "output_format": "elf",
+        "instance_name": "lm_head",
+    }
+    # Build dummy inputs to trigger BO allocation and write weights
+    x_dummy = np.zeros((seq_len, emb_dim), dtype=bfloat16)
+    lm_inputs = [x_dummy]
+    for p in range(n_partitions):
+        lm_inputs.append(weights._lm_weight_parts[p])
+        lm_inputs.append(np.zeros((seq_len, n_part), dtype=bfloat16))
+
+    # Allocate BOs and write all data including weights (warmup run).
+    # Temporarily disable profiling so this doesn't count toward inference time.
+    profiler_enabled = cache.profiler.enabled
+    cache.profiler.enabled = False
+    cache.load_and_run(
+        "lm_head",
+        _LM_HEAD_BACKEND,
+        *lm_inputs,
+        output_indices=[2 + 2 * p for p in range(n_partitions)],
+    )
+    cache.profiler.enabled = profiler_enabled
+    print(
+        f"  Pre-loaded {n_partitions} weight partitions ({n_partitions * n_part * emb_dim * 2 // 1024 // 1024}MB)"
+    )
 
 
 def run_full_model(
@@ -1104,10 +1224,63 @@ def run_full_model(
     results = _run_cached(cache, "rmsnorm", _SIMPLE_BACKEND, x_in, w_in, y_out)
     x_normed = results[-1].reshape(seq_len, emb_dim)
 
-    # 4. LM Head (CPU - too large for NPU initially)
-    print("LM Head (CPU)...")
-    lm_head = weights.lm_head.astype(np.float32)
-    logits = x_normed.astype(np.float32) @ lm_head.T  # (seq_len, vocab_size)
+    # 4. LM Head (NPU — 8-partition multi-launch ELF, single XRT invocation)
+    vocab_size = weights.lm_head.shape[0]  # 128256
+    n_part = 16384
+    n_partitions = 8  # 8 * 16384 = 131072 >= 128256
+
+    # Pre-transpose weight partitions once (cached on weights object)
+    if not hasattr(weights, "_lm_weight_parts"):
+        print("LM Head: pre-transposing weight partitions...")
+        weights._lm_weight_parts = []
+        for p in range(n_partitions):
+            n_start = p * n_part
+            n_end = min(n_start + n_part, vocab_size)
+            n_actual = n_end - n_start
+            w = np.zeros((emb_dim, n_part), dtype=bfloat16)
+            w[:, :n_actual] = np.ascontiguousarray(
+                weights.lm_head[n_start:n_end, :].T
+            ).astype(bfloat16)
+            weights._lm_weight_parts.append(w)
+
+    print("LM Head (NPU, 8-launch ELF)...")
+    _LM_HEAD_BACKEND = {
+        "omit_while_true_loop": False,
+        "output_format": "elf",
+        "instance_name": "lm_head",
+    }
+
+    # Build inputs: x + 8 weights + 8 outputs (17 args)
+    x_lm = np.asarray(x_normed, dtype=bfloat16).reshape(seq_len, emb_dim)
+    lm_inputs = [x_lm]
+    output_indices = []
+    for p in range(n_partitions):
+        lm_inputs.append(weights._lm_weight_parts[p])
+        lm_inputs.append(np.zeros((seq_len, n_part), dtype=bfloat16))
+        output_indices.append(2 + 2 * p)
+
+    results = _run_cached(
+        cache,
+        "lm_head",
+        _LM_HEAD_BACKEND,
+        *lm_inputs,
+        output_indices=output_indices,
+        static_input_indices=(
+            {1 + 2 * p for p in range(n_partitions)}  # weights (pre-loaded)
+            | {2 + 2 * p for p in range(n_partitions)}  # outputs (kernel overwrites)
+        ),
+    )
+
+    logits_bf16 = np.zeros((seq_len, vocab_size), dtype=bfloat16)
+    for p in range(n_partitions):
+        out_idx = 2 + 2 * p
+        n_start = p * n_part
+        n_end = min(n_start + n_part, vocab_size)
+        logits_bf16[:, n_start:n_end] = results[out_idx].reshape(seq_len, n_part)[
+            :, : n_end - n_start
+        ]
+
+    logits = logits_bf16.astype(np.float32)
 
     return logits
 
@@ -1380,6 +1553,9 @@ if __name__ == "__main__":
     )
     print(f"Attention mode: {attn_mode}")
     print(f"{'='*60}\n")
+
+    # Pre-load LM Head weights into BOs (outside profiling scope, like IRON)
+    preload_lm_head_weights(weights, config, cache, args.seq_len)
 
     t_prefill_start = time.time()
     logits = run_full_model(

@@ -10,13 +10,16 @@ Reference: IRON (`/home/jiajli/apps/IRON`). IRON profiling data: `/home/jiajli/a
 
 ## End-to-End Prefill Comparison
 
-| Metric | AIR (current) | IRON | Notes |
-|--------|--------------|------|-------|
-| **16 transformer layers** | **2.45s** | **2.44s** | **~Parity** (same profiling scope — see below) |
-| **Wall time** | **4.00s** | **2.75s** | AIR includes weight loading (~1.5s) + CPU LM Head |
-| Per-layer avg | 140ms | 152ms | **0.92× (AIR faster)** |
-| Top-1 prediction | " Paris" ✓ | — | Correct factual answer |
-| Logits corr vs CPU F32 | 0.993 | — | |
+| Metric | AIR (current) | AIR (prev) | IRON | Notes |
+|--------|--------------|------------|------|-------|
+| **16 transformer layers** | **1.71s** | 2.45s | **2.44s** | **30% faster than IRON** |
+| **LM Head** | **173ms** | CPU 1.5s | **217ms** | AIR 20% faster (8-launch ELF, static weight BOs) |
+| **Total prefill** | **2.05s** | — | **2.744s** | **25% faster** (same scope: layers + norm + LM Head) |
+| **Wall time** | **2.51s** | 4.00s | **2.75s** | AIR now faster (includes weight loading) |
+| Per-layer avg | **107ms** | 140ms | 152ms | **0.70× (AIR faster)** |
+| XRT invocations/layer | **5** | 10 | ~12 | All merges integrated + Plan A |
+| Top-1 prediction | " Paris" ✓ | — | — | Correct factual answer |
+| Logits corr vs CPU F32 | 0.989 | 0.993 | — | |
 
 ### Profiling Scope
 
@@ -39,27 +42,35 @@ Both scopes include host overhead. See `host_optimization.md` for detailed BO wr
 | **LM Head** | **CPU** (`np @ lm_head.T`) | **NPU** (`AIEGEMM 2048×2048×128256`) | AIR has no NPU LM Head yet |
 | Weight loading | ~1.5s (in wall time) | Separate (before `model.forward`) | |
 
-IRON `model.forward` = embedding + 16 layers + final norm + **NPU LM Head** = 2.744s.
-AIR wall time 4.00s = weight loading (~1.5s) + embedding + 16 layers (2.45s) + final norm + CPU LM Head.
+IRON `model.forward` = embedding + 16 layers + final norm + NPU LM Head = 2.744s.
+AIR total prefill = embedding + 16 layers + final norm + NPU LM Head = **2.05s**.
 
 ### Per-Block Breakdown (per layer)
 
-| Block | AIR | IRON | Gap | Notes |
-|-------|-----|------|-----|-------|
-| Attention (QKV GEMMs + RoPE + Attn + O GEMM) | **55ms** | **76.9ms** | **0.72× (AIR faster)** | QKV multi-launch 8ms + RoPE 13ms + FlashAttn 22ms + O GEMM 8ms + add 5ms |
-| FFN (Gate + Up + SiLU×mul + Down) | **52ms** (multi-launch) | **57.4ms** | **0.9× (AIR faster)** | AIR multi-launch + read-only-output; was 109ms with separate kernels |
-| RMSNorm ×2 | 12ms (6ms each) | 8.6ms (4.3ms each) | 1.4× | Single tile; multi-tile blocked by aiecc bug (see `kernels/rmsnorm.md`) |
-| Eltwise Add ×2 | 10ms | 9.0ms | 1.1× | |
-| Host overhead (data prep between kernels) | ~17ms | ~0ms | — | Reduced by multi-launch + read-only-output |
-| **Total per layer** | **140ms** | **152ms** | **0.92× (AIR faster)** | |
+| Block | AIR (current) | IRON | Notes |
+|-------|--------------|------|-------|
+| RMSNorm + QKV GEMMs | **14ms** | ~15ms | 4-launch ELF (Plan A) |
+| RoPE Q+K | **11ms** | ~11ms | 2-herd ELF (Merge A) |
+| FlashAttention | **20ms** | ~31ms | ELF, AIR 35% faster |
+| O GEMM + Residual Add | **6ms** | ~15ms | 2-launch ELF (Merge B) |
+| FFN Full (RMS+Gate+Up+SiLU+Down+Add) | **56ms** | **66ms** | 6-launch ELF (Merge C) |
+| **Total per layer** | **~107ms** | **152ms** | **0.70× (AIR faster)** |
 
-Note: FFN multi-launch + read-only-output eliminated most host overhead in the FFN path. Remaining ~17ms is from attention-path kernels (QKV GEMMs, RoPE, FlashAttn, O GEMM, residual adds). See `host_optimization.md` for detailed analysis.
+| Non-layer component | AIR | IRON | Notes |
+|---------------------|-----|------|-------|
+| LM Head | **173ms** | 217ms | 8-launch ELF, static weight BOs, bo.map() zero-copy |
+| Final RMSNorm | 8ms | ~4ms | |
+| Embedding + overhead | ~50ms | ~86ms | |
 
-**Largest remaining gaps:**
-- **Host overhead** (~17ms/layer) — inter-kernel data prep for attention path
-- **RMSNorm** (6ms vs 4.3ms) — 1.7ms gap per invocation (see `kernels/rmsnorm.md`)
-- **FFN block** faster than IRON (50ms vs 57.4ms)
-- **Attention GEMMs** faster than IRON (8ms vs ~32ms for 3 GEMMs)
+**Key optimizations applied:**
+- **Multi-launch ELF**: 5 XRT invocations/layer (down from 10), each ELF contains 2-6 `air.launch` ops
+- **NPU LM Head**: 8-partition multi-launch ELF (single XRT call), pre-loaded weight BOs
+- **`bo.map()` zero-copy**: All kernels use `bo.map()` for reads (like IRON), eliminating output memcpy
+- **Static weight BOs**: LM Head weights written once at init, only `bo.sync()` per inference
+
+**Remaining optimization opportunities:**
+- **Plan B (DMA transpose)**: Would merge 5 → 3 invocations/layer. Blocked by AIE DMA stride=1 for BF16.
+- **RMSNorm multi-tile** (8ms → ~4ms) — blocked by aiecc weight broadcast bug
 
 #### Understanding the host overhead on shared-memory Ryzen AI
 
@@ -157,28 +168,28 @@ Priorities 1-2 completed: FFN multi-launch (done), FlashAttention integration (d
 
 ### Totals Progression
 
-| Metric | Baseline | +BF16 Add | +XRT Reuse | +BO Reuse | +GEMM/SwiGLU | +FlashAttn | +FFN Multi | +ReadOpt | +AttnGEMMs | IRON |
-|--------|----------|-----------|------------|-----------|-------------|------------|------------|---------|-----------|------|
-| Per-layer | 1.17s | 0.84s | 0.55s | 0.41s | 0.22s | 0.243s | 0.190s | 0.160s | **0.140s** | 0.152s |
-| 16 layers | 18.67s | 13.40s | 8.77s | 6.49s | 3.57s | 3.88s | 3.25s | 2.65s | **2.45s** | 2.44s |
-| Wall time | 25.9s | 51.4s | ~47s | ~47s | ~44s | 5.39s | 4.88s | 4.51s | **4.00s** | 2.75s |
-| vs IRON | 7.8× | 5.6× | 3.7× | 2.7× | 1.5× | 1.59× | 1.25× | 1.05× | **0.92×** | 1.0× |
+| Metric | Baseline | +BF16 Add | +XRT Reuse | +BO Reuse | +GEMM/SwiGLU | +FlashAttn | +FFN Multi | +ReadOpt | +AttnGEMMs | +AllMerges | +LMHead+bomap | IRON |
+|--------|----------|-----------|------------|-----------|-------------|------------|------------|---------|-----------|------------|---------------|------|
+| Per-layer | 1.17s | 0.84s | 0.55s | 0.41s | 0.22s | 0.243s | 0.190s | 0.160s | 0.140s | 0.113s | **0.107s** | 0.152s |
+| 16 layers | 18.67s | 13.40s | 8.77s | 6.49s | 3.57s | 3.88s | 3.25s | 2.65s | 2.45s | 1.81s | **1.71s** | 2.44s |
+| Total prefill | — | — | — | — | — | — | — | — | — | — | **2.05s** | 2.744s |
+| Wall time | 25.9s | 51.4s | ~47s | ~47s | ~44s | 5.39s | 4.88s | 4.51s | 4.00s | 3.89s | **2.51s** | 2.75s |
+| XRT inv/layer | 15 | 15 | 15 | 15 | 15 | 15 | 12 | 12 | 10 | 5 | **5** | ~12 |
+| vs IRON | 7.8× | 5.6× | 3.7× | 2.7× | 1.5× | 1.59× | 1.25× | 1.05× | 0.92× | 0.74× | **0.70×** | 1.0× |
 
-Attention GEMMs multi-launch (2026-03-31): Fused Q+K+V GEMM into 3 `air.launch` ops in 1 ELF. QKV 22ms → 8ms. Per-layer 160ms → 140ms. **AIR now faster than IRON per-layer (0.92×)**.
++LMHead+bomap (2026-03-31): NPU LM Head (8-launch ELF, 173ms vs IRON 217ms). `bo.map()` zero-copy for all kernels. Static weight BO pre-loading. **AIR 25% faster than IRON** overall (2.05s vs 2.744s).
 
-### Per-Kernel Progression (per-invocation avg, ms)
+### Per-Kernel Breakdown (current, per-invocation avg, ms)
 
-| Kernel | Baseline | +BF16 Add | +XRT Reuse | +BO Reuse | Current | IRON model |
-|--------|----------|-----------|------------|-----------|---------|------------|
-| GEMM Gate/Up | 110 | 117 | 111 | 86 | **24** | (fused) |
-| SwiGLU | 86 | 89 | 77 | 58 | **37** | (fused) |
-| GEMM Down | 103 | 102 | 91 | 72 | **27** | (fused) |
-| GEMM Q/O | 51 | 54 | 33 | 23 | **10** | 10.6 |
-| RoPE Q | 27 | 56 | 16 | 11 | **17** | 5.3 |
-| RMSNorm | 28 | 30 | 15 | 10 | **10** | 4.3 |
-| Eltwise Add | **256** (F32) | **42** (BF16) | 13 | 6 | **10** | 4.5 |
-| GEMM K/V | 21 | 40 | 8 | 5 | **6** | (in 10.6) |
-| RoPE K | 16 | 21 | 4 | 3 | **4** | 5.3 |
+| Kernel | Invocations/layer | Avg (ms) | Notes |
+|--------|-------------------|----------|-------|
+| rms_attn_gemms | ×1 | 14 | ELF, 4 launches (RMS+Q+K+V) |
+| rope_qk | ×1 | 11 | ELF, 2 herds (Merge A) |
+| flash_attn | ×1 | 20 | ELF, NPU |
+| o_proj_add | ×1 | 6 | ELF, 2 launches (Merge B) |
+| ffn_full | ×1 | 56 | ELF, 6 launches (Merge C: RMS+FFN+Add) |
+| **Per-layer total** | **5** | **~107** | |
+| lm_head | ×1 (total) | 173 | ELF, 8 launches, static weight BOs |
 
 ---
 
