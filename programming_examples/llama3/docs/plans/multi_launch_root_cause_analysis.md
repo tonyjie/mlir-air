@@ -141,55 +141,47 @@ After the 56-pass aircc pipeline, this is **fully resolved**: zero `collapse_sha
 | **RMS + FFN + Add_2D** | **6** | **SwiGLU + Add** | **❌ FAIL** |
 | **RMS + FFN + Add_2D (tiny)** | **6** | **SwiGLU + Add** | **❌ FAIL** |
 
-**Root cause**: The `airrt-to-npu` pass fails when a module has **two or more launches containing `memref.collapse_shape`** combined with GEMM launches that have complex multi-herd structure. A single collapse_shape launch (SwiGLU in 4-launch FFN) is correctly resolved. Adding a second collapse_shape launch (Add) triggers the bug regardless of data size.
+**CORRECTED Root cause**: See below. The original hypothesis about `memref.collapse_shape` hoisting was incorrect.
 
-### Definitive Root Cause (identified via pass-by-pass IR analysis)
+### Definitive Root Cause: Missing `air.segment` Wrapper
 
-The `air-dma-to-channel` pass (or a preceding pass) **hoists `memref.collapse_shape` out of `air.launch` bodies** into the func body level. After hoisting, the collapse_shape result is used as a launch operand:
+**Date identified**: 2026-03-31
 
-```mlir
-// After air-dma-to-channel + canonicalize (pass 9):
-%cs = memref.collapse_shape %arg0 [[0, 1]]    ← HOISTED OUT of launch
-air.launch args(%arg11=%cs, ...) {             ← launch references %cs
-    air.channel.put @channel_54(%arg11[...])   ← DMA via channel
-}
+The actual root cause is that the RMSNorm kernel generates a **bare `air.herd` without an `air.segment` wrapper** inside its `air.launch`. After lowering, this produces `airrt.herd_load` instead of `airrt.segment_load`. The `airrt-to-npu` pass's `identifyLaunchRegions()` function **only looks for `airrt::SegmentLoadOp`** to associate launch regions with `aie.device` ops:
+
+```cpp
+// AIRRtToNpuPass.cpp, identifyLaunchRegions():
+forOp.walk([&](airrt::SegmentLoadOp segLoadOp) {
+    StringRef deviceName = segLoadOp.getSymName();
+    AIE::DeviceOp device = getDeviceByName(module, deviceName);
+    if (device) {
+        regions.push_back({forOp, deviceName, device});
+    }
+});
+// NOTE: Does NOT handle airrt::HerdLoadOp!
 ```
 
-The SwiGLU's collapse_shape is ALSO hoisted but gets **folded away** by canonicalize (the DMA-to-channel conversion for SwiGLU produces a pattern that canonicalize can simplify). The eltwise_add's collapse_shape is hoisted but NOT folded — it persists through the remaining passes into the `airrt` dialect, where `airrt-to-npu` can't trace it back to a function argument.
+When other segment-based launches exist in the same function, `regions.empty()` is false, so the fallback path (which does handle `HerdLoadOp`) is never reached. The unmatched RMSNorm launch region's DMA ops are left in a function that gets split across devices — but the RMSNorm DMAs never get moved into their device. When `DmaToNpuPattern::matchAndRewrite` calls `op->getParentOfType<AIE::DeviceOp>()`, it returns null, and the pattern returns `failure()`.
 
-**Evidence**: Pass-by-pass collapse_shape counts in the 6-launch module:
+**Evidence**:
+- The failing DMA references `%arg1 : memref<128xbf16>` (RMSNorm weight) with `metadata = @air_channel_0`
+- `@air_channel_0`'s `shim_dma_allocation` is inside `aie.device @r_herd_0`
+- The DMA is inside `func.func @ffn_full` at the module level, NOT inside any `aie.device`
+- `identifyLaunchRegions` returns 5 regions (4 FFN + 1 Add, all with `segment_load`) but misses the RMSNorm (which has `herd_load`)
 
-| Pass | SwiGLU 16M collapse_shape | Add 4M collapse_shape |
-|------|--------------------------|----------------------|
-| 05 (air-hoist-dma-in-accum-pattern) | 4 | 3 |
-| 08 (air-dma-to-channel) | 7 | 3 |
-| 09 (canonicalize) | **0** (resolved) | **3** (NOT resolved) |
-| 53 (final before airrt-to-npu) | 0 | 3 → 16 airrt DMAs fail |
+**Fix applied (user-side workaround)**: Wrap bare `air.herd` in both `air.launch` AND `air.segment`. This ensures `airrt.segment_load` is generated, and `identifyLaunchRegions` correctly associates the region with its device. After this fix, the 6-launch module compiles successfully.
 
-**Fix direction**: Either:
-1. Prevent the hoisting pass from moving collapse_shape out of launch bodies, OR
-2. Teach `airrt-to-npu` to trace through `memref.collapse_shape` (simple: the base pointer is the same, just the view changes), OR
-3. Add a canonicalization pattern that folds `collapse_shape` + `air.launch args(...)` into `air.launch args(...original 2D...)` with collapse inside
+**Upstream fix needed**: `identifyLaunchRegions()` in `AIRRtToNpuPass.cpp` should also handle `airrt::HerdLoadOp`, not just `airrt::SegmentLoadOp`. The fallback path (line ~1553) already handles both op types, but it's only reached when `regions.empty()`.
+
+### Previous (incorrect) Hypothesis: collapse_shape Hoisting
+
+The earlier analysis pointed to `memref.collapse_shape` being hoisted out of `air.launch` bodies by `air-dma-to-channel`. While this hoisting does occur, it was a red herring — the `collapse_shape` ops in the SwiGLU and Add launches are fully resolved by canonicalize before reaching `airrt-to-npu`. The actual failure was the RMSNorm's bare herd causing its launch region to be missed during device association.
 
 ---
 
 ## Related Blocker: Weight Broadcast DMA
 
-Separately, weighted RMSNorm with herd > [1,1] fails with a different error (`operand #N does not dominate this use`). This is caused by one-shot DMA of a 1D weight vector to multiple tiles — the `air-to-aie` herd expansion creates SSA dominance violations. This is an orthogonal issue to the multi-launch resource problem.
-
----
-
-## Concrete Questions for Compiler Engineers
-
-1. **Is there a maximum number of launches per ELF?** If so, is it a hard limit or resource-dependent?
-
-2. **Why does `memref.collapse_shape` resolve to func args in the 4-launch case but not in the 6-launch case?** Is there a pass that handles this resolution, and does it have resource-dependent behavior?
-
-3. **Can `airrt-to-npu` be extended to trace through `memref.collapse_shape` operations?** The semantic is simple — `collapse_shape` doesn't change the base pointer, just the view. The BO index should be the same as the source operand.
-
-4. **Is there a way to pre-resolve `collapse_shape` before `airrt-to-npu`?** A canonicalization pass that replaces `collapse_shape` results in DMA operands with the source operand + adjusted offsets/strides.
-
-5. **For the weight broadcast DMA issue**: Can `air-to-aie` handle one-shot DMA (`dma_memcpy_nd` with no tile-dependent offsets) to multiple tiles without SSA dominance violations?
+Separately, weighted RMSNorm with herd > [1,1] fails with a different error (`operand #N does not dominate this use`). This is caused by one-shot DMA of a 1D weight vector to multiple tiles — the `air-to-aie` herd expansion creates SSA dominance violations. This is an orthogonal issue.
 
 ---
 
