@@ -272,7 +272,7 @@ def build_ffn_full_module(
     import importlib.util
 
     _silu_path = os.path.join(
-        os.path.dirname(__file__), "ffn_swiglu", "silu_and_mul.py"
+        os.path.dirname(__file__), "..", "ffn_swiglu", "silu_and_mul.py"
     )
     _spec = importlib.util.spec_from_file_location("silu_and_mul", _silu_path)
     _silu_mod = importlib.util.module_from_spec(_spec)

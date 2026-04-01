@@ -152,15 +152,22 @@ AIR GEMM kernels are **23-32% faster** than IRON standalone. Eltwise add is matc
 
 ## Next Steps
 
-| Priority | Action | Estimated savings | Notes |
-|----------|--------|-------------------|-------|
-| **1** | **Attention-path multi-launch** | **~15-20ms/layer** | Apply same multi-launch pattern to QKV GEMMs + RoPE + Attn + O GEMM |
-| **2** | Multi-tile RMSNorm | ~0.06s total | 6.3ms vs IRON 4.3ms × 33 invocations. Blocked by aiecc weight broadcast bug. See `kernels/rmsnorm.md` |
-| **3** | Vectorize RoPE | ~0.05s total | RoPE: 10ms vs IRON 5.3ms |
-| **4** | Host-side `bo.map()` zero-copy reads | ~5-10ms/layer | Eliminate remaining DDR memcpy in attention path |
-| **5** | True FFN kernel fusion (single launch) | ~0.3s total | Fuse Gate+Up+SiLU×mul+Down into 1 AIR launch; enables L2-level data reuse |
+### Future Prefill Improvements
 
-Priorities 1-2 completed: FFN multi-launch (done), FlashAttention integration (done).
+| Priority | Action | Estimated savings | Status | Details |
+|----------|--------|-------------------|--------|---------|
+| 1 | Multi-tile RMSNorm | ~4ms/layer (~50ms total) | **Blocked** | aiecc weight broadcast DMA bug: `stride=0` rejected. See `issues/github_issue_weight_broadcast_dma.md` |
+| 2 | NPU transpose launches (5→3 invocations) | ~3-5ms/layer | **Blocked** | AIE DMA stride=1 for BF16. Needs C++ transpose kernel. See `issues/dma_transpose.py` |
+| 3 | True FFN kernel fusion (single launch) | ~5-10ms/layer | **Future** | Fuse Gate+Up+SiLU×mul+Down into 1 AIR launch; enables L2-level data reuse |
+| 4 | LM Head partition reduction (8→4) | ~50ms | **Future** | Larger N_part reduces dispatch overhead. Needs padding-aware GEMM or faster compilation for large N |
+
+### Compiler Bugs Blocking Further Optimization
+
+| Bug | Impact | Reproducer | Status |
+|-----|--------|-----------|--------|
+| `identifyLaunchRegions` only handles `SegmentLoadOp` | Bare `air.herd` launches silently dropped in multi-launch ELF | `issues/repro_herd_load_bug.py` | **Workaround applied** (wrap in `air.segment`) |
+| Broadcast DMA generates `stride=0` in `aie.dma_bd` | Multi-tile herd with shared data (e.g. weight broadcast) fails | `issues/github_issue_weight_broadcast_dma.md` | **Upstream fix needed** |
+| BF16 DMA innermost stride must be 1 | Cannot do DMA-only transpose for BF16 data | `issues/dma_transpose.py` | **Hardware limitation** — needs C++ kernel |
 
 ---
 

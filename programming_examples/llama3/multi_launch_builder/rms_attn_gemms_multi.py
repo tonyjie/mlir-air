@@ -32,7 +32,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from air.backend.xrt_runner import XRTRunner
 from air.backend.xrt import XRTBackend
 
-from ffn_full_multi import (
+from llama3.multi_launch_builder.ffn_full_multi import (
     _extract_between_func_and_return,
     _extract_affine_maps,
     _rename_all,
