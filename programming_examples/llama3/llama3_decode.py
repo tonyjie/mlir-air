@@ -244,8 +244,19 @@ def run_decode_block(
     if hasattr(layer_weights, "_layer_idx"):
         layer_idx = layer_weights._layer_idx
 
-    def _run(name, backend, *inputs, **kwargs):
-        return cache.load_and_run(name, backend, *inputs, **kwargs)
+    def _run(name, backend, *inputs, static_indices=None, **kwargs):
+        # Per-layer BO key: same XRT context, separate BOs for weight isolation
+        bk = (
+            f"{name}_L{layer_idx}" if static_indices and layer_idx is not None else None
+        )
+        return cache.load_and_run(
+            name,
+            backend,
+            *inputs,
+            bo_key=bk,
+            static_input_indices=static_indices,
+            **kwargs,
+        )
 
     _QKV_BACKEND = {
         "output_format": "elf",
@@ -289,6 +300,7 @@ def run_decode_block(
         wv,
         v_out,
         output_indices=[2, 4, 6],
+        static_indices={1, 3, 5},  # weights: wq, wk, wv
     )
     q = results[2].astype(bfloat16)
     k = results[4].astype(bfloat16)
@@ -340,6 +352,7 @@ def run_decode_block(
         x_residual,
         res1_buf,
         output_indices=[4],
+        static_indices={0},  # wo weight
     )
     res1 = results[4].astype(bfloat16)
 
@@ -365,6 +378,7 @@ def run_decode_block(
         w_up,
         up_out,
         output_indices=[2, 4],
+        static_indices={0, 3},  # w_gate, w_up weights
     )
     gate = results[2].astype(bfloat16)
     up = results[4].astype(bfloat16)
@@ -383,6 +397,7 @@ def run_decode_block(
         w_down,
         swiglu,
         down_out,
+        static_indices={0},  # w_down weight
     )
     down = results[-1].astype(bfloat16)
 

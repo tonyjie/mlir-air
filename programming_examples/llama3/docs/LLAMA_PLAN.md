@@ -42,8 +42,14 @@ All kernels use multi-launch ELF format. `bo.map()` zero-copy for all reads/writ
   - Static weight BO pre-loading for LM Head
   - **Result: 2.05s total prefill vs IRON 2.744s (25% faster)**
   - See `perf_opt_prefill.md` for full breakdown
-- [ ] Phase 5: Decode Phase — PLANNED
-  - See `decode/DECODE_PLAN.md`
+- [x] Phase 5: Decode Phase — FIRST WORKING PIPELINE
+  - GEMV kernel: 8-column multi-herd, 1.0-1.4x of IRON at all LLAMA shapes
+  - Decode pipeline: 15 NPU invocations/block + CPU attention + CPU SiLU×mul
+  - KV cache: CPU-managed, populated from CPU prefill
+  - Correct text generation: "The capital of France is" → "Paris"
+  - ~500ms/token (vs IRON 370ms) — dominated by Python invoker overhead
+  - NPU kernel time ~62ms/token (vs IRON 132ms standalone — AIR 2x faster)
+  - See `decode/DECODE_PROGRESS.md` for details
 
 ### Remaining Optimization Opportunities
 - Multi-tile RMSNorm (8ms → ~4ms) — blocked by aiecc weight broadcast DMA bug
