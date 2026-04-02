@@ -434,6 +434,7 @@ class KernelCache:
         *inputs,
         output_indices=None,
         static_input_indices=None,
+        bo_key=None,
     ):
         """Load cached kernel and execute with BO reuse.
 
@@ -474,11 +475,13 @@ class KernelCache:
         backend, _ = self._loaded[name]
 
         # Level 2: Allocate BOs on first call, reuse on subsequent calls
+        # bo_key allows separate BO sets for the same kernel (e.g., per-layer weights)
+        _bo_key = bo_key if bo_key is not None else name
         sizes_in_bytes = [a.size * a.itemsize for a in inputs]
         is_elf = self.artifacts[name].output_binary.endswith(".elf")
         static_indices = set(static_input_indices or [])
 
-        first_call = name not in self._cached_bos
+        first_call = _bo_key not in self._cached_bos
         if first_call:
             bos = []
             for i, s in enumerate(sizes_in_bytes):
@@ -493,13 +496,13 @@ class KernelCache:
                             backend.kernel.group_id(i + 3),
                         )
                     )
-            self._cached_bos[name] = bos
+            self._cached_bos[_bo_key] = bos
             # Sync instruction BO once (only needed for xclbin mode)
             if not is_elf and backend.bo_instr is not None:
                 backend.bo_instr.sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
-            self._log(f"Allocated {len(bos)} BOs for {name}")
+            self._log(f"Allocated {len(bos)} BOs for {_bo_key}")
 
-        bos = self._cached_bos[name]
+        bos = self._cached_bos[_bo_key]
 
         # Write input data to cached BOs.
         # Static inputs (e.g. weights) are written on first call only,
