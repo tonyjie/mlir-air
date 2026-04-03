@@ -62,6 +62,7 @@ def build_module(M, N, np_dtype, vector_size=16, herd_x=1):
     if herd_x > 1:
         assert M % herd_x == 0
         rows_per_tile = M // herd_x
+        # Map: global_row = local_row + tx * rows_per_tile
         row_map = AffineMap.get(
             0,
             2,
@@ -75,26 +76,37 @@ def build_module(M, N, np_dtype, vector_size=16, herd_x=1):
             ],
         )
 
-        # 2-herd approach: norm_herd (unweighted, multi-tile) + mul_herd (weight, multi-tile)
-        # Need 4th arg for intermediate buffer
-        @FuncOp.from_py_func(l3MemrefTy, l3WeightTy, l3MemrefTy, l3MemrefTy)
-        def weighted_rms_norm(arg0, arg1, arg2, arg3):
-            # arg0=input, arg1=weight, arg2=intermediate, arg3=output
+        # Single-herd multi-tile: weight is broadcast to all tiles via DMA
+        # (broadcast DMA bug is now fixed — stride=0 BD works)
+        @FuncOp.from_py_func(l3MemrefTy, l3WeightTy, l3MemrefTy)
+        def weighted_rms_norm(arg0, arg1, arg2):
 
-            # Herd 1: Unweighted RMSNorm → intermediate
-            @herd(name="norm_herd", sizes=[herd_x, 1], operands=[arg0, arg2])
-            def norm_body(_tx, _ty, _sx, _sy, l3_in, l3_out):
+            @herd(name="herd_0", sizes=[herd_x, 1], operands=[arg0, arg1, arg2])
+            def herd_body(_tx, _ty, _sx, _sy, l3_in, l3_weight, l3_out):
                 l1_row = AllocOp(l1RowTy, [], [])
                 l1_out = AllocOp(l1RowTy, [], [])
+                l1_weight = AllocOp(l1RowTy, [], [])
                 l1_acc = AllocOp(l1VecTy, [], [])
+
                 c0 = arith.ConstantOp.create_index(0)
                 cst0 = arith.ConstantOp(xrt_dtype, 0.0)
                 n_f = arith.ConstantOp(xrt_dtype, float(N))
                 eps_f = arith.ConstantOp(xrt_dtype, EPS)
+
                 v_zero = BroadcastOp(vecTy, cst0)
+
+                # Weight DMA: same data to all tiles (broadcast)
+                dma_memcpy_nd(
+                    l1_weight,
+                    l3_weight,
+                    src_offsets=[0],
+                    src_sizes=[N],
+                    src_strides=[1],
+                )
 
                 for local_row in range_(rows_per_tile):
                     row = affine_apply(row_map, [local_row, _tx])
+                    # DMA: load one row (tile-dependent offset)
                     dma_memcpy_nd(
                         l1_row,
                         l3_in,
@@ -102,6 +114,8 @@ def build_module(M, N, np_dtype, vector_size=16, herd_x=1):
                         src_sizes=[1, N],
                         src_strides=[N, 1],
                     )
+
+                    # Step 1: Vectorized sum of x^2
                     transfer_write(None, v_zero, l1_acc, [c0], identity_map, [True])
                     for j in range_(0, N, vector_size):
                         sub_row = subview(l1_row.result, [j], [vector_size], [1])
@@ -120,60 +134,23 @@ def build_module(M, N, np_dtype, vector_size=16, herd_x=1):
                         v_sum = arith.addf(v_acc, v_sq_rd)
                         transfer_write(None, v_sum, l1_acc, [c0], identity_map, [True])
                         yield_([])
+
+                    # Horizontal reduce
                     v_final = transfer_read(
                         vecTy, l1_acc, [c0], identity_map, cst0, [True]
                     )
                     total_sum = vector_reduction(xrt_dtype, "add", v_final)
                     rms = arith.divf(total_sum, n_f)
+
+                    # Step 2: rstd = rsqrt(rms + eps) in f32
                     f32 = F32Type.get()
                     rms_eps = arith.addf(rms, eps_f)
                     rms_eps_f32 = arith.extf(f32, rms_eps)
                     rstd_f32 = math_dialect.rsqrt(rms_eps_f32)
                     rstd = arith.truncf(xrt_dtype, rstd_f32)
-                    v_rstd = BroadcastOp(vecTy, rstd)
-                    for j in range_(0, N, vector_size):
-                        sub_row = subview(l1_row.result, [j], [vector_size], [1])
-                        sub_out = subview(l1_out.result, [j], [vector_size], [1])
-                        v_x = transfer_read(
-                            vecTy, sub_row, [c0], identity_map, cst0, [True]
-                        )
-                        v_normed = arith.mulf(v_x, v_rstd)
-                        transfer_write(
-                            None, v_normed, sub_out, [c0], identity_map, [True]
-                        )
-                        yield_([])
-                    dma_memcpy_nd(
-                        l3_out,
-                        l1_out,
-                        dst_offsets=[row, 0],
-                        dst_sizes=[1, N],
-                        dst_strides=[N, 1],
-                    )
-                    yield_([])
-                DeallocOp(l1_row)
-                DeallocOp(l1_out)
-                DeallocOp(l1_acc)
 
-            # Herd 2: Weight multiply — output = intermediate * weight
-            @herd(name="mul_herd", sizes=[herd_x, 1], operands=[arg2, arg1, arg3])
-            def mul_body(_tx, _ty, _sx, _sy, l3_in, l3_w, l3_out):
-                l1_row = AllocOp(l1RowTy, [], [])
-                l1_weight = AllocOp(l1RowTy, [], [])
-                l1_out = AllocOp(l1RowTy, [], [])
-                c0 = arith.ConstantOp.create_index(0)
-                cst0 = arith.ConstantOp(xrt_dtype, 0.0)
-                for local_row in range_(rows_per_tile):
-                    row = affine_apply(row_map, [local_row, _tx])
-                    dma_memcpy_nd(
-                        l1_weight, l3_w, src_offsets=[0], src_sizes=[N], src_strides=[1]
-                    )
-                    dma_memcpy_nd(
-                        l1_row,
-                        l3_in,
-                        src_offsets=[row, 0],
-                        src_sizes=[1, N],
-                        src_strides=[N, 1],
-                    )
+                    # Step 3: y = x * rstd * weight
+                    v_rstd = BroadcastOp(vecTy, rstd)
                     for j in range_(0, N, vector_size):
                         sub_row = subview(l1_row.result, [j], [vector_size], [1])
                         sub_w = subview(l1_weight.result, [j], [vector_size], [1])
@@ -184,11 +161,19 @@ def build_module(M, N, np_dtype, vector_size=16, herd_x=1):
                         v_w = transfer_read(
                             vecTy, sub_w, [c0], identity_map, cst0, [True]
                         )
-                        v_result = arith.mulf(v_x, v_w)
+                        v_normed = arith.mulf(v_x, v_rstd)
+                        v_weighted = arith.mulf(v_normed, v_w)
                         transfer_write(
-                            None, v_result, sub_out, [c0], identity_map, [True]
+                            None,
+                            v_weighted,
+                            sub_out,
+                            [c0],
+                            identity_map,
+                            [True],
                         )
                         yield_([])
+
+                    # DMA: write result row (tile-dependent offset)
                     dma_memcpy_nd(
                         l3_out,
                         l1_out,
@@ -196,10 +181,13 @@ def build_module(M, N, np_dtype, vector_size=16, herd_x=1):
                         dst_sizes=[1, N],
                         dst_strides=[N, 1],
                     )
+
                     yield_([])
+
                 DeallocOp(l1_row)
-                DeallocOp(l1_weight)
                 DeallocOp(l1_out)
+                DeallocOp(l1_weight)
+                DeallocOp(l1_acc)
 
         return  # end of herd_x > 1 path
 
