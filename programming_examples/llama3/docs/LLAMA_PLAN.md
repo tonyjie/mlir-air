@@ -42,18 +42,22 @@ All kernels use multi-launch ELF format. `bo.map()` zero-copy for all reads/writ
   - Static weight BO pre-loading for LM Head
   - **Result: 2.05s total prefill vs IRON 2.744s (25% faster)**
   - See `perf_opt_prefill.md` for full breakdown
-- [x] Phase 5: Decode Phase — FIRST WORKING PIPELINE
+- [x] Phase 5: Decode Phase — OPTIMIZED PIPELINE
   - GEMV kernel: 8-column multi-herd, 1.0-1.4x of IRON at all LLAMA shapes
-  - Decode pipeline: 15 NPU invocations/block + CPU attention + CPU SiLU×mul
+  - Decode pipeline: 10 NPU invocations/block + CPU attention
+  - Multi-launch merges: Q+K+V (3→1), O+Add (2→1), Gate+Up (2→1)
+  - NPU SiLU×mul (moved from CPU), 8-tile eltwise_add
+  - Static weight BO caching (write once, skip on subsequent tokens)
   - KV cache: CPU-managed, populated from CPU prefill
   - Correct text generation: "The capital of France is" → "Paris"
-  - ~500ms/token (vs IRON 370ms) — dominated by Python invoker overhead
-  - NPU kernel time ~62ms/token (vs IRON 132ms standalone — AIR 2x faster)
-  - See `decode/DECODE_PROGRESS.md` for details
+  - **~351ms/token (vs IRON 370ms) — AIR 5% faster**
+  - NPU kernel time ~126ms/token (vs IRON 132ms)
+  - See `decode/DECODE_EXPLANATION.md` for details
 
 ### Remaining Optimization Opportunities
 - Multi-tile RMSNorm (8ms → ~4ms) — blocked by aiecc weight broadcast DMA bug
-- Plan B: NPU transpose launches (5 → 3 invocations) — blocked by BF16 DMA stride limitation
+- FFN full merge (5 launches in 1 ELF) — blocked by memref type mismatch between GEMVs with different tile_m
+- NPU LM Head — currently CPU matmul (~50ms/token)
 - See `issues/` for compiler bug details and reproducers
 
 ---
