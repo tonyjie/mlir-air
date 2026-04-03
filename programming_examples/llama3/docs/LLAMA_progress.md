@@ -33,48 +33,38 @@ python3 ../llama3_decode.py --run-only --n-tokens 100 --profile # full profile
 
 ---
 
-## Prefill Status: Full NPU Pipeline with LM Head (25% faster than IRON)
+## Prefill Status: Full NPU Pipeline (30% faster than IRON)
 
 **All 16 layers + LM Head run end-to-end on NPU**:
 - **Top-1**: " Paris" for prompt "The capital of France is"
-- **Logits correlation**: 0.989 vs CPU F32 reference
-- **Total prefill**: **2.05s** (vs IRON 2.744s — **AIR 25% faster**)
-- **Wall time**: **2.51s** (vs IRON 2.75s — **AIR faster even with weight loading**)
-- **Per-layer avg**: **107ms** (vs IRON 152ms — **30% faster**)
-- **LM Head**: **173ms** (vs IRON 217ms — **20% faster**, 8-launch ELF)
+- **Logits correlation**: 0.993 vs CPU F32 reference
+- **Total prefill**: **1.92s** (vs IRON 2.744s — **AIR 30% faster**)
+- **Total kernel time**: **1.75s** (vs IRON 2.744s)
+- **Per-layer avg**: ~100ms (vs IRON 152ms)
+- **LM Head**: **171ms** (vs IRON 217ms — **21% faster**, 8-launch ELF)
 - **XRT invocations**: **5 per layer** + 1 for LM Head
 - **7 unique kernels** (6 ELF + 1 xclbin)
 
-**All multi-launch merges integrated:**
-- **Merge A**: RoPE Q + RoPE K → `multi_launch_builder/rope_qk_multi.py` (2 herds, 11ms)
-- **Merge B**: O GEMM + Residual Add → `multi_launch_builder/o_proj_add_multi.py` (2 launches, 6ms)
-- **Merge C**: RMSNorm + FFN + Add → `multi_launch_builder/ffn_full_multi.py` (6 launches, 56ms)
-- **Plan A**: RMSNorm + Attn GEMMs → `multi_launch_builder/rms_attn_gemms_multi.py` (4 launches, 14ms)
-- **LM Head**: 8-partition GEMM → `multi_launch_builder/lm_head_multi.py` (8 launches, 173ms)
-
 **Per-layer kernel breakdown (5 invocations):**
 
-| Kernel | Avg (ms) | Type |
-|--------|----------|------|
-| rms_attn_gemms | 14 | ELF (4 launches: RMS+Q+K+V) |
-| rope_qk | 12 | ELF (2 herds: Q+K) |
-| flash_attn | 21 | ELF |
-| o_proj_add | 7 | ELF (2 launches: O GEMM+Add) |
-| ffn_full | 58 | ELF (6 launches: RMS+Gate+Up+SiLU+Down+Add) |
+| Kernel | Avg (ms) | Type | RMSNorm herd |
+|--------|----------|------|--------------|
+| rms_attn_gemms | 9 | ELF (4 launches: RMS+Q+K+V) | [8,1] |
+| rope_qk | 11 | ELF (2 herds: Q+K) | — |
+| flash_attn | 20 | ELF | — |
+| o_proj_add | 6 | ELF (2 launches: O GEMM+Add) | — |
+| ffn_full | 52 | ELF (6 launches: RMS+Gate+Up+SiLU+Down+Add) | [8,1] |
 
-**Investigated but deferred (Plan B — DMA transpose):**
-- Would merge 5 → 3 invocations by adding NPU transpose launches between QKV GEMMs ↔ RoPE and FlashAttn ↔ O GEMM
-- **Blocked by hardware**: AIE DMA requires innermost stride=1 for sub-32b types (BF16). Strided DMA transpose only works for 32b+ data (see `data_transfer_transpose/dma/` vs `dma_bf16/`)
-- Alternative: tiled C++ transpose kernel — viable but adds complexity for ~3-5ms/layer savings
-- See `plans/easy_merges_multi_launch.md` for full analysis
+**Key optimizations:**
+- Multi-launch ELF merges: 10 → 5 invocations/layer
+- 8-tile RMSNorm: broadcast DMA bug fixed, weight DMA to all tiles works
+- NPU LM Head: 8-partition ELF (171ms vs IRON 217ms)
+- `bo.map()` zero-copy for all BO reads/writes
+- Static weight BO pre-loading for LM Head
 
-**NPU LM Head**: 8-launch multi-launch ELF (8 partitions of N=16384). Single XRT invocation. Static weight BOs pre-loaded at init. `bo.map()` zero-copy reads. **173ms** (vs IRON 217ms, vs CPU 1526ms).
-
-**`bo.map()` zero-copy**: All kernels use `bo.map()` for BO reads/writes (matching IRON's approach), eliminating memcpy overhead.
-
-**Remaining optimization opportunities:**
-- Multi-tile RMSNorm (8ms → ~4ms) — blocked by aiecc weight broadcast bug
-- Plan B C++ transpose kernel — would enable 3 invocations/layer
+**Remaining opportunities:**
+- DMA transpose (5 → 3 invocations) — blocked by BF16 stride=1 requirement
+- See `plans/easy_merges_multi_launch.md` for analysis
 
 ---
 

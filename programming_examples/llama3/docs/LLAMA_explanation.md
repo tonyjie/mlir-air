@@ -13,17 +13,17 @@ Python host (llama3_prefill.py)
   ├── Load weights from HuggingFace safetensors
   ├── Compile 7 unique kernel ELFs (one-time, cached)
   ├── For each of 16 layers (5 XRT invocations per layer):
-  │     1. rms_attn_gemms   → RMSNorm + Q/K/V GEMMs    (4 launches, 14ms)
+  │     1. rms_attn_gemms   → RMSNorm + Q/K/V GEMMs    (4 launches, 9ms)
   │     2. rope_qk          → RoPE on Q and K           (2 herds, 11ms)
   │     3. flash_attn       → Flash Attention GQA        (1 launch, 20ms)
   │     4. o_proj_add       → O GEMM + Residual Add      (2 launches, 6ms)
-  │     5. ffn_full         → RMSNorm + FFN + Residual   (6 launches, 56ms)
-  ├── Final RMSNorm (1 invocation)
-  ├── LM Head on NPU (8-launch ELF, 173ms)
+  │     5. ffn_full         → RMSNorm + FFN + Residual   (6 launches, 52ms)
+  ├── Final RMSNorm (1 invocation, 3ms)
+  ├── LM Head on NPU (8-launch ELF, 171ms)
   └── Output: next token prediction (" Paris")
 ```
 
-**Performance**: 2.05s total prefill, **25% faster than IRON** (2.744s).
+**Performance**: 1.92s total prefill, **30% faster than IRON** (2.744s). RMSNorm uses 8-tile herd with broadcast weight DMA.
 
 ---
 

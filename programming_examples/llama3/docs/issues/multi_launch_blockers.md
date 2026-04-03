@@ -1,16 +1,10 @@
 # Multi-Launch Integration — Compiler Blockers
 
-## Blocker 1: Weight Broadcast DMA (RMSNorm multi-tile)
+## ~~Blocker 1: Weight Broadcast DMA (RMSNorm multi-tile)~~ — FIXED
 
-**Affects**: Weighted RMSNorm with herd > [1,1]
+**Status**: **RESOLVED** (2026-04). Fixed upstream in MLIR-AIR. 8-tile RMSNorm with broadcast weight DMA now works. Integrated into prefill pipeline: 6ms → 0.9ms standalone, 57ms → 52ms in ffn_full.
 
-**Error**: `operand #N does not dominate this use` in aiecc
-
-**Root cause**: One-shot DMA of weight vector (`dma_memcpy_nd(l1_weight, l3_weight)`) outside the row loop. When `air-to-aie` replicates the herd to multiple cores, the weight DMA SSA value loses dominance across replicated core regions.
-
-**Workaround**: Use single-tile [1,1] for weighted RMSNorm (6ms vs IRON's 4.3ms)
-
-**Status**: Documented in `kernels/rmsnorm.md`. Not yet fixed upstream.
+See `kernels/rmsnorm.md` and `issues/github_issue_weight_broadcast_dma.md` for details.
 
 ---
 
