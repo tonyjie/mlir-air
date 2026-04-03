@@ -240,11 +240,16 @@ The documentation served as both progress tracking and context restoration: each
 
 | Priority | Task | Expected Impact |
 |----------|------|-----------------|
-| 1 | NPU LM Head for decode | ~40ms/token faster decode |
-| 2 | FFN full merge for decode | ~10ms/token (blocked by type mismatch) |
-| 3 | NPU prefill for KV cache | 16s -> 2s init time |
-| 4 | Unified prefill + decode script | User-facing convenience |
-| 5 | DMA transpose (prefill) | 5 -> 3 invocations/layer (blocked by BF16 stride) |
+| 1 | Variable-length input sequences | Usability — accept any prompt length |
+| 2 | NPU LM Head for decode | ~40ms/token faster decode |
+| 3 | FFN full merge for decode | ~10ms/token (blocked by type mismatch) |
+| 4 | NPU prefill for KV cache | 16s -> 2s init time |
+| 5 | Unified prefill + decode script | User-facing convenience |
+| 6 | DMA transpose (prefill) | 5 -> 3 invocations/layer (blocked by BF16 stride) |
+
+### Variable-Length Input Sequences
+
+Currently our pipeline requires a fixed input sequence length (seq_len=2048). Short prompts are padded with EOS tokens to fill the full 2048 positions, wasting compute on padding. IRON supports arbitrary prompt lengths — investigating how they handle this (likely dynamic shapes or multiple compiled kernel variants) is a key next step for practical usability.
 
 ---
 
