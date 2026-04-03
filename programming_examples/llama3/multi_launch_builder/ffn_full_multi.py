@@ -285,7 +285,9 @@ def build_ffn_full_module(
     # RMSNorm and Eltwise Add generate bare herds (no air.launch wrapper).
     # Multi-launch ELF requires each kernel in an air.launch, so we wrap them.
     print("  [1/6] RMSNorm...")
-    rms_ir = _wrap_ir_in_launch(str(build_rms(seq_len, emb_dim, bfloat16, 16)))
+    rms_ir = _wrap_ir_in_launch(
+        str(build_rms(seq_len, emb_dim, bfloat16, 16, herd_x=8))
+    )
 
     print("  [2/6] Gate GEMM...")
     gate_ir = str(

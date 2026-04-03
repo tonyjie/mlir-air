@@ -639,7 +639,7 @@ def compile_all_kernels(cache, config, seq_len, cpu_attn=True):
 
     cache.compile_and_cache(
         "rmsnorm",
-        build_rms(seq_len, emb_dim, bfloat16, 16),
+        build_rms(seq_len, emb_dim, bfloat16, 16, herd_x=8),
         {"verbose": cache.verbose, "omit_while_true_loop": False},
     )
 
@@ -693,7 +693,7 @@ def compile_all_kernels(cache, config, seq_len, cpu_attn=True):
 
     # 8. Flash Attention GQA (skip if using CPU attention fallback)
     if not cpu_attn:
-        from flash_attention.kernel_fusion_based.attn import (
+        from flash_attention.kernel_fusion_based.attn_npu2 import (
             build_module as build_attn,
         )
 
