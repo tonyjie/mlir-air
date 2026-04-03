@@ -193,7 +193,119 @@ The 1.3-1.4x gap on large shapes is architectural: AIR routes data through L2 (M
 
 ---
 
-## 7. Methodology: Working with Claude Code
+## 7. Verification: Why Strict Testing Matters for Agentic Development
+
+When an AI coding agent writes and iterates on compiler-targeting code, **false positives are the biggest risk**. A kernel that compiles, runs without crashing, and produces values in the right range can still be fundamentally wrong. We developed a multi-layered verification strategy through hard lessons.
+
+### The Correlation Metric: Input-Invariant Correctness
+
+Early in the project, we discovered that **element-wise tolerance tests are insufficient** for detecting algorithmic errors. The Flash Attention kernel illustrated this:
+
+| Config | Correlation vs F32 ref | mean_error | `make run` result |
+|--------|----------------------|-----------|-------------------|
+| 4-head MHA | **0.132** | 0.073 | PASS |
+| 8-head MHA | **0.175** | 0.076 | PASS |
+| LLAMA GQA | **0.287** | 0.064 | FAIL |
+
+The kernel was computing mathematically wrong attention patterns — but the output values were in the correct range (~1.5, since softmax-weighted averages of V cluster around the mean). Element-wise tolerance (`atol=0.15`) couldn't distinguish "correct attention" from "random weighted average." **Correlation caught it immediately**: corr=0.13 means the output has almost no linear relationship to the correct answer.
+
+Why correlation is powerful:
+- **Input-invariant**: Works regardless of input distribution or scale — if the kernel computes the right function, correlation will be high
+- **Pattern-sensitive**: Detects wrong computation even when output values are plausible
+- **One number**: Summarizes correctness across millions of elements (e.g., 2048x2048 = 4M)
+
+We adopted `corr > 0.99` as the primary pass/fail criterion, verified at every step of the 16-layer pipeline (240+ invocations per inference).
+
+### When Correlation Fails: The GEMM Rounding Mode Bug
+
+Correlation has a blind spot: **constant bias**. We discovered this when investigating GEMM precision at LLAMA scale:
+
+| Rounding mode | Mean signed error (K=2048) | Correlation | 4% tolerance fail rate |
+|---------------|---------------------------|-------------|----------------------|
+| `floor` (hardware default) | **-165** | 0.9999 | **100%** |
+| `conv_even` (round-to-nearest) | -0.15 | 0.9999 | 8% |
+
+The `floor` rounding mode introduced a systematic negative bias of -0.065 per K-tile multiplication. At K=2048, this accumulated to a mean error of -165 — every output element was shifted down by ~165. But because the **pattern** was correct (just shifted), correlation remained 0.9999. Only the element-wise tolerance caught this: 100% of elements exceeded 4% relative error.
+
+**Root cause**: The AIE2P hardware's BFP16 emulation uses an internal rounding mode register. The default `floor` rounding truncates toward negative infinity at every block floating point conversion, causing bias that accumulates with K. The fix (upstream in `aievec.srs` lowering, March 2026) sets `conv_even` (round-to-nearest-even), making errors symmetric and self-cancelling.
+
+**Lesson**: Correlation catches wrong patterns. Element-wise tolerance catches systematic bias. **Both are needed.**
+
+### The Full Verification Stack
+
+| Layer | Metric | Threshold | What It Catches |
+|-------|--------|-----------|-----------------|
+| **Algorithmic correctness** | Pearson correlation vs CPU F32 | corr > 0.99 | Wrong computation patterns, DMA errors, buffer addressing bugs |
+| **Numerical precision** | Relative + absolute tolerance | rtol=4%, atol=1e-6 | Rounding mode bias, truncation accumulation, precision loss |
+| **Systematic bias** | Mean signed error | ~0 | Hardware rounding defaults, accumulator overflow |
+| **End-to-end** | Top-1 prediction match | "Paris" | Full pipeline integration correctness |
+| **Exact operations** | rtol=0, atol=0 | Perfect match | DMA transposes, integer kernels |
+
+### Test Input Strategy
+
+Test inputs matter more than they appear. We learned this when initial GEMM tests used `np.arange()` (sequential integers) — which is unrealistic and can mask precision issues:
+
+- **Before**: `A = arange(M*K)`, `rtol=1.0` (100% — meaningless tolerance)
+- **After**: `A = randn(M,K) * 4`, `B = rand(K,N) * 4`, `rtol=0.04` (matching IRON)
+- **Real weights**: Also tested with actual LLAMA weights from HuggingFace to catch weight-range-specific issues
+- **Seed**: `np.random.seed(42)` for reproducibility across test runs
+
+For integer kernels (i8, i16 GEMM), we use `rtol=0` (exact match) since there is no rounding.
+
+### Compiler Fuzzing: Shape Sweeps and Config Testing
+
+Rather than testing one shape and hoping it generalizes, we systematically swept parameters:
+
+**GEMM shape sweep** (all LLAMA shapes at optimal tile config):
+
+| Shape | M | K | N | Status | Precision |
+|-------|---|---|---|--------|-----------|
+| Q/O projection | 2048 | 2048 | 2048 | PASS | corr=0.99992 |
+| K/V projection | 2048 | 2048 | 512 | PASS | corr=0.99996 |
+| FFN gate/up | 2048 | 2048 | 8192 | PASS | corr=0.99994 |
+| FFN down | 2048 | 8192 | 2048 | PASS | corr=0.99990 |
+
+**GEMM tile config sweep** (12 configurations on Q/O 2048^3):
+
+| Tile (m x k_l2 x k_l1 x n) | Latency | GFLOP/s |
+|-----------------------------|---------|---------|
+| 32x64x32x32 | 9,686us | 1,774 |
+| 64x64x32x64 | 3,801us | 4,519 |
+| 64x256x32x64 | 2,935us | 5,854 |
+
+**Flash Attention config sweep** (10 configurations at LLAMA scale):
+- Varied NUM_HEADS (4-32), NUM_KV_HEADS (4-8), causal/non-causal
+- All tested with correlation metric — revealed the precision bug that element-wise tests missed
+
+**GEMV flag sweep** (4 backend flags x 5 LLAMA shapes):
+- `runtime_loop_tiling_sizes`: [4,4] vs [16,16] (26% difference)
+- `omit_pingpong`: ON vs OFF (10% difference for K=2048)
+- Tested at all 5 decode GEMV shapes
+
+### Per-Layer Verification in End-to-End Inference
+
+The `--verify` flag compares every intermediate result against a CPU F32 reference:
+
+```
+Layer 0:
+  [OK] normed:  corr=0.999998  (RMSNorm)
+  [OK] q:      corr=0.999920  (Q GEMM)
+  [OK] k:      corr=0.999960  (K GEMM)
+  [OK] v:      corr=0.999960  (V GEMM)
+  [OK] attn:   corr=0.999842  (Flash Attention)
+  [OK] res1:   corr=0.999984  (O GEMM + Add)
+  [OK] output: corr=0.998257  (FFN Full)
+...
+Layer 15:
+  [OK] output: corr=0.998103
+Final: corr=0.993 vs CPU F32, Top-1=" Paris"
+```
+
+This catches regressions at the exact operation where they occur — critical when optimizations (multi-launch fusion, tile changes, herd size changes) can subtly break correctness.
+
+---
+
+## 8. Methodology
 
 ### Documentation-Driven Development
 
@@ -236,7 +348,7 @@ The documentation served as both progress tracking and context restoration: each
 
 ---
 
-## 8. Remaining Work
+## 9. Remaining Work
 
 | Priority | Task | Expected Impact |
 |----------|------|-----------------|
@@ -253,7 +365,7 @@ Currently our pipeline requires a fixed input sequence length (seq_len=2048). Sh
 
 ---
 
-## 9. How to Run
+## 10. How to Run
 
 ```bash
 cd programming_examples/llama3/build_peano
@@ -269,7 +381,7 @@ python3 ../llama3_decode.py --run-only --n-tokens 100 --profile
 
 ---
 
-## 10. Files
+## 11. Files
 
 ```
 programming_examples/llama3/
