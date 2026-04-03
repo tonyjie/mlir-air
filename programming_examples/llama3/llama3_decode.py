@@ -103,7 +103,7 @@ def compile_decode_kernels(cache, config):
         },
     )
 
-    # 3. Gate + Up GEMV multi-launch (2 launches)
+    # 3. Gate + Up GEMV multi-launch (2 launches) — shared K=2048
     from llama3.multi_launch_builder.ffn_gemv_multi import build_gate_up_gemv_module
 
     cache.compile_and_cache(
@@ -117,7 +117,7 @@ def compile_decode_kernels(cache, config):
         },
     )
 
-    # 4. Down GEMV (single, K=8192)
+    # 4. Down GEMV (single, K=8192 — different backend flags)
     cache.compile_and_cache(
         "gemv_down",
         build_gemv_module(emb_dim, hidden_dim, 2, 1, 8, bfloat16, bfloat16),
@@ -133,16 +133,33 @@ def compile_decode_kernels(cache, config):
         {"verbose": cache.verbose, **_SIMPLE_BACKEND},
     )
 
-    # 6. Eltwise Add: n=2048
+    # 6. Eltwise Add: n=2048, [8,1] herd (same as prefill)
     from eltwise_add.eltwise_add import build_module as build_add
 
     cache.compile_and_cache(
         "add",
-        build_add(emb_dim, 1024, bfloat16, vector_size=16, herd_x=1, herd_y=1),
+        build_add(emb_dim, emb_dim // 8, bfloat16, vector_size=16, herd_x=8, herd_y=1),
         {"verbose": cache.verbose, **_SIMPLE_BACKEND},
     )
 
-    # 7. RoPE Q: (32, 64)
+    # 7. SiLU × mul: n=8192 (NPU, enables FFN multi-launch)
+    import importlib.util
+
+    _silu_path = os.path.join(
+        os.path.dirname(__file__), "ffn_swiglu", "silu_and_mul.py"
+    )
+    _spec = importlib.util.spec_from_file_location("silu_and_mul", _silu_path)
+    _silu_mod = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_silu_mod)
+    cache.compile_and_cache(
+        "silu_mul",
+        _silu_mod.build_module(
+            hidden_dim, hidden_dim // 8, bfloat16, herd_x=8, herd_y=1
+        ),
+        {"verbose": cache.verbose, **_SIMPLE_BACKEND},
+    )
+
+    # 8. RoPE Q: (32, 64)
     from rope_lut.rope_lut import build_module as build_rope
 
     cache.compile_and_cache(
@@ -151,7 +168,7 @@ def compile_decode_kernels(cache, config):
         {"verbose": cache.verbose, **_SIMPLE_BACKEND},
     )
 
-    # 8. RoPE K: (8, 64)
+    # 9. RoPE K: (8, 64)
     cache.compile_and_cache(
         "rope_k",
         build_rope(n_kv_heads, head_dim, bfloat16),
@@ -268,12 +285,6 @@ def run_decode_block(
         "instance_name": "o_gemv_add",
         **_GEMV_K2048_BACKEND,
     }
-    _GU_BACKEND = {
-        "output_format": "elf",
-        "instance_name": "gate_up_gemv",
-        **_GEMV_K2048_BACKEND,
-    }
-
     # 1. RMSNorm (pre-attn)
     x_in = x_bf16.reshape(1, emb_dim).astype(bfloat16)
     w_norm = layer_weights.attn_norm.reshape(emb_dim).astype(bfloat16)
@@ -364,46 +375,52 @@ def run_decode_block(
     normed2 = results[-1].flatten().astype(bfloat16)
 
     # 11-12. Gate + Up GEMV (2-launch ELF)
+    _GU_BACKEND = {
+        "output_format": "elf",
+        "instance_name": "gate_up_gemv",
+        **_GEMV_K2048_BACKEND,
+    }
     w_gate = layer_weights._wgate_t
     w_up = layer_weights._wup_t
-    gate_out = np.zeros(hidden_dim, dtype=bfloat16)
-    up_out = np.zeros(hidden_dim, dtype=bfloat16)
+    gate_buf = np.zeros(hidden_dim, dtype=bfloat16)
+    up_buf = np.zeros(hidden_dim, dtype=bfloat16)
 
     results = _run(
         "gate_up_gemv",
         _GU_BACKEND,
         w_gate,
         normed2,
-        gate_out,
+        gate_buf,
         w_up,
-        up_out,
+        up_buf,
         output_indices=[2, 4],
         static_indices={0, 3},  # w_gate, w_up weights
     )
-    gate = results[2].astype(bfloat16)
-    up = results[4].astype(bfloat16)
+    gate_out = results[2].astype(bfloat16)
+    up_out = results[4].astype(bfloat16)
 
-    # 13. SiLU × mul (CPU for now — decode size is tiny, ~8192 elements)
-    gate_f32 = gate.astype(np.float32)
-    sigmoid = 1.0 / (1.0 + np.exp(-gate_f32))
-    swiglu = (gate_f32 * sigmoid * up.astype(np.float32)).astype(bfloat16)
+    # 13. SiLU × mul (NPU)
+    swiglu_buf = np.zeros(hidden_dim, dtype=bfloat16)
+    results = _run("silu_mul", _SIMPLE_BACKEND, gate_out, up_out, swiglu_buf)
+    swiglu = results[-1].astype(bfloat16)
 
-    # 14. Down GEMV
+    # 14. Down GEMV (single, K=8192)
     w_down = layer_weights._wdown_t
-    down_out = np.zeros(emb_dim, dtype=bfloat16)
+    down_buf = np.zeros(emb_dim, dtype=bfloat16)
     results = _run(
         "gemv_down",
         _GEMV_K8192_BACKEND,
         w_down,
         swiglu,
-        down_out,
+        down_buf,
+        output_indices=[2],
         static_indices={0},  # w_down weight
     )
-    down = results[-1].astype(bfloat16)
+    down_out = results[2].astype(bfloat16)
 
     # 15. Residual Add
-    c_add2 = np.zeros(emb_dim, dtype=bfloat16)
-    results = _run("add", _SIMPLE_BACKEND, res1, down, c_add2)
+    output_buf = np.zeros(emb_dim, dtype=bfloat16)
+    results = _run("add", _SIMPLE_BACKEND, res1, down_out, output_buf)
     output = results[-1].astype(bfloat16)
 
     return output
@@ -626,6 +643,19 @@ if __name__ == "__main__":
     )
     if rope_src.exists() and not Path("rope.o").exists():
         shutil.copy2(rope_src, "rope.o")
+    silu_src = (
+        Path(__file__).parent
+        / "ffn_swiglu"
+        / "build_peano"
+        / "air_project"
+        / "silu_and_mul.o"
+    )
+    if not silu_src.exists():
+        silu_src = (
+            Path(__file__).parent / "build_peano" / "air_project" / "silu_and_mul.o"
+        )
+    if silu_src.exists() and not Path("silu_and_mul.o").exists():
+        shutil.copy2(silu_src, "silu_and_mul.o")
     config = LlamaConfig()
 
     cache_dir = "decode_kernel_cache"
