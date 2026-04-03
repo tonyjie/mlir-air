@@ -1,12 +1,39 @@
 # LLAMA-3.2-1B on MLIR-AIR (NPU2) -- Progress Tracker
 
-**Goal**: Functionally correct LLAMA-3.2-1B BF16 prefill inference on NPU2.
+**Goal**: Functionally correct and performant LLAMA-3.2-1B BF16 inference on NPU2.
 
-**Model config**: 16 layers, emb_dim=2048, n_heads=32, head_dim=64, n_kv_heads=8, hidden_dim=8192, vocab_size=128256, BF16, rope_base=500000, seq_len=2048.
+**Model config**: 16 layers, emb_dim=2048, n_heads=32, head_dim=64, n_kv_heads=8, hidden_dim=8192, vocab_size=128256, BF16, rope_base=500000.
 
 ---
 
-## Current Status: Full NPU Pipeline with LM Head (25% faster than IRON)
+## Decode Status: Optimized Pipeline (5% faster than IRON)
+
+**Single-token autoregressive generation working end-to-end on NPU.**
+
+| Metric | AIR | IRON |
+|---|---|---|
+| **Steady-state** | **351ms/token** | 370ms/token |
+| **Tokens/second** | **2.81** | 2.94 |
+| **NPU calls/block** | 10 | ~12 |
+| **NPU kernel time** | ~126ms | 132ms |
+
+- **9 unique kernels**: 3 multi-launch ELFs (qkv_gemv, o_gemv_add, gate_up_gemv) + 6 single (gemv_down, rmsnorm, add, silu_mul, rope_q, rope_k)
+- **Optimizations applied**: static weight BOs, bo.map() zero-copy, multi-launch merging (15→10 calls), NPU SiLU×mul, 8-tile eltwise_add, GEMV kernel tuning
+- **KV cache**: CPU-managed numpy arrays, populated from CPU prefill
+- **Correct output**: "The capital of France is" → "the capital of France is Paris"
+
+See `decode/DECODE_EXPLANATION.md` for detailed code walkthrough and `decode/DECODE_PROGRESS.md` for optimization history.
+
+```bash
+cd programming_examples/llama3/build_peano
+python3 ../llama3_decode.py --compile-only           # compile 9 kernels
+python3 ../llama3_decode.py --run-only --n-tokens 10 --profile  # quick test
+python3 ../llama3_decode.py --run-only --n-tokens 100 --profile # full profile
+```
+
+---
+
+## Prefill Status: Full NPU Pipeline with LM Head (25% faster than IRON)
 
 **All 16 layers + LM Head run end-to-end on NPU**:
 - **Top-1**: " Paris" for prompt "The capital of France is"
@@ -208,14 +235,15 @@ See `perf_opt_prefill.md` for full profiling breakdown, IRON comparison, and opt
 ```bash
 cd programming_examples/llama3/build_peano
 
-# Compile (one-time, ~5.5 min)
-python3 ../llama3_prefill.py --compile-only --profile
+# --- Prefill ---
+python3 ../llama3_prefill.py --compile-only --profile       # compile (one-time, ~5.5 min)
+python3 ../llama3_prefill.py --run-only --n-layers 16 --verify --profile  # run + verify
+python3 ../llama3_prefill.py --run-only --n-layers 1 --verify             # single layer
 
-# Run + verify
-python3 ../llama3_prefill.py --run-only --n-layers 16 --verify --profile
-
-# Single layer
-python3 ../llama3_prefill.py --run-only --n-layers 1 --verify
+# --- Decode ---
+python3 ../llama3_decode.py --compile-only                  # compile (one-time, ~10s)
+python3 ../llama3_decode.py --run-only --n-tokens 5 --profile             # quick test
+python3 ../llama3_decode.py --run-only --n-tokens 100 --profile           # full profile
 ```
 
-See `perf_opt_prefill.md` for profiling commands (AIR + IRON) .
+See `perf_opt_prefill.md` for prefill profiling and `decode/DECODE_EXPLANATION.md` for decode details.
