@@ -1,4 +1,8 @@
-# GitHub Issue: Broadcast DMA generates `stride=0` in `aie.dma_bd`, rejected by AIE backend
+# [RESOLVED] Broadcast DMA generates `stride=0` in `aie.dma_bd`, rejected by AIE backend
+
+> **Status: FIXED** (2026-04). Recent MLIR-AIR PRs fixed this. Both compilation and runtime work correctly.
+> Multi-tile weighted RMSNorm with broadcast weight DMA: **0.9ms** (herd_x=8) vs 6.0ms (herd_x=1) at M=2048 N=2048.
+> See resolution section at bottom.
 
 ## Title
 
@@ -206,17 +210,34 @@ Both failures have the same root cause: the compiler doesn't properly handle DMA
 
 ## Impact
 
-Blocks multi-tile parallelization for any kernel with shared/broadcast data:
-- **Weighted RMSNorm**: Cannot use herd > [1,1] (6ms vs IRON's 4.3ms with 16 tiles)
-- **Any kernel with shared LUTs, constants, or weights**: Same pattern
+~~Blocks multi-tile parallelization for any kernel with shared/broadcast data.~~
 
-## Workaround
+**RESOLVED**: Multi-tile with broadcast DMA now works. Updated `weighted_rms_norm.py` to use single-herd multi-tile approach (simpler than the old 2-herd workaround, 3 args instead of 4).
 
-Use single-tile herd (`[1,1]`) for kernels with broadcast data. For RMSNorm specifically, an alternative is to split into unweighted RMSNorm (works multi-tile) + separate weight multiply.
+## Resolution (2026-04)
+
+The broadcast DMA bug was fixed in upstream MLIR-AIR PRs. Both compilation and runtime now work correctly for herd > [1,1] with non-tile-dependent DMAs.
+
+**Verification:**
+1. Reproducer script: `herd=[1,1]` PASS, `herd=[2,1]` PASS, `herd=[8,1]` PASS
+2. `weighted_rms_norm.py --herd-x 8 --M 2048 --N 2048 --profile` → **0.9ms** (6.7x faster than herd_x=1)
+3. Functional correctness within BF16 precision (same tolerance as single-tile)
+
+**Performance at LLAMA dims (M=2048, N=2048):**
+
+| Config | Kernel time | Bandwidth | vs IRON |
+|--------|------------|-----------|---------|
+| herd_x=1 (old) | 6.0ms | 2.8 GB/s | 1.4x slower |
+| herd_x=8 (new) | **0.9ms** | 20.3 GB/s | **4.8x faster** |
+| IRON (16 tiles) | 4.3ms | — | baseline |
+
+**Changes made:**
+- `weighted_rms_norm.py`: Replaced 2-herd workaround (unweighted norm + weight multiply, 4 args) with simpler single-herd approach using broadcast weight DMA (3 args)
+- The broadcast DMA `dma_memcpy_nd(l1_weight, l3_weight)` with no tile-dependent offset now compiles and executes correctly
 
 ## Environment
 
-- mlir-air: built from source (current HEAD)
+- mlir-air: built from source (post-fix)
 - mlir-aie: installed from `my_install/mlir-aie/`
 - Target: NPU2 (AIE2P, Strix)
-- Reproducer: `programming_examples/weighted_rms_norm/weighted_rms_norm.py --herd-x 2`
+- Test: `programming_examples/weighted_rms_norm/weighted_rms_norm.py --herd-x 8 --profile`
