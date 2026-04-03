@@ -151,9 +151,154 @@ Same as IRON — both use CPU for decode attention with KV cache lookup.
 
 ---
 
-## 3. Profiling Methodology
+## 3. Detailed Execution Trace
 
-### 3.1 Timer Scope
+What happens when you run `python3 ../llama3_decode.py --run-only --n-tokens 100 --profile`:
+
+### Phase 1: Initialization
+
+```
+1. Copy mv.o, rope.o to cwd (if not present)
+2. KernelCache("decode_kernel_cache") → load manifest.json (8 pre-compiled kernels)
+3. load_weights("meta-llama/Llama-3.2-1B") → safetensors from HuggingFace cache (~1.5s)
+4. Tokenize "The capital of France is" → [128000, 791, 6864, 315, 9822, 374] (6 tokens)
+5. Pad to 2048 tokens with EOS
+6. Generate RoPE LUT for 2148 positions (2048 + 100)
+```
+
+### Phase 2: CPU Prefill for KV Cache (~17s)
+
+We use CPU reference to populate the KV cache. This is slow but ensures numerical accuracy.
+
+```
+7. Embed 2048 tokens → x (2048, 2048) float32
+8. For each of 16 layers:
+     CPU transformer_block() → get intermediates
+     k_roped = intermediates["k_roped"]     post-RoPE K (2048, 512)
+     v = intermediates["v"]                  raw V (2048, 512)
+     Reshape to (8, 2048, 64), store in k_cache[layer], v_cache[layer]
+9. CPU Final RMSNorm + LM Head → logits (2048, 128256)
+10. first_token = argmax(logits[position 5]) = 279 ("the")
+```
+
+### Phase 3: Weight Pre-Transposition (one-time, ~2s)
+
+GEMV expects weight as A[M,K], but weights are stored as (K,M). Transpose all once:
+
+```
+11. For each of 16 layers, transpose 7 weight matrices:
+      _wq_t (2048,2048)     8MB     Q projection
+      _wk_t (512,2048)      2MB     K projection
+      _wv_t (512,2048)      2MB     V projection
+      _wo_t (2048,2048)     8MB     O projection
+      _wgate_t (8192,2048)  32MB    FFN gate
+      _wup_t (8192,2048)    32MB    FFN up
+      _wdown_t (2048,8192)  32MB    FFN down
+      Total: 16 layers × 116MB = ~1.8GB transposed
+12. Tag each layer with _layer_idx = 0..15
+```
+
+### Phase 4: Decode Loop (PROFILED, 100 iterations)
+
+For each token (0..99), timer wraps the ENTIRE body:
+
+```
+─── START TIMER (time.perf_counter) ───────────────────────
+
+13. x = embed_table[previous_token]        (2048,) bf16
+
+For each of 16 transformer layers:
+
+  14. NPU call 1: rmsnorm                   [1,1] herd, xclbin
+      BO write: x_in (4KB) + norm_weight (4KB) + output (4KB)
+      → kernel launch → read output
+      Total per-call: ~0.3ms
+
+  15. NPU call 2: qkv_gemv                  [8,1]×3 launches, ELF
+      TOKEN 0: write 7 args including wq(8MB), wk(2MB), wv(2MB)
+      TOKEN 1+: skip weights (static), write only normed(4KB) + output bufs
+      → 3 GEMV launches execute sequentially on NPU
+      → read q(4KB), k(1KB), v(1KB)
+      Total per-call: ~1.0ms (steady state)
+
+  16. NPU call 3: rope_q                    [1,1] herd, xclbin
+      write: q_heads(4KB) + position_lut(4KB) + output(4KB)
+      → RoPE rotation on 32 heads
+      Total per-call: ~0.3ms
+
+  17. NPU call 4: rope_k                    [1,1] herd, xclbin
+      write: k_heads(1KB) + position_lut(1KB) + output(1KB)
+      Total per-call: ~0.2ms
+
+  18. CPU: KV cache update                   ~0.01ms
+      k_cache[layer, :, pos, :] = k_roped
+      v_cache[layer, :, pos, :] = v
+
+  19. CPU: Attention                          ~2-3ms
+      For 32 Q heads (GQA: 4 Q heads share 1 KV head):
+        scores = Q[h] @ K_cache[kv_h, :pos+1, :].T / sqrt(64)
+        probs = softmax(scores)
+        out[h] = probs @ V_cache[kv_h, :pos+1, :]
+      Grows linearly with sequence length
+
+  20. NPU call 5: o_gemv_add                [8,1]+[1,1], ELF
+      TOKEN 0: write wo(8MB) + inputs + outputs
+      TOKEN 1+: skip wo (static), write attn_out(4KB) + x_residual(4KB)
+      → launch 1: O GEMV, launch 2: residual add
+      Total per-call: ~0.6ms (steady state)
+
+  21. NPU call 6: rmsnorm                   [1,1] herd, xclbin
+      Same as call 1
+      Total per-call: ~0.3ms
+
+  22. NPU call 7: gate_up_gemv              [8,1]×2 launches, ELF
+      TOKEN 0: write w_gate(32MB) + w_up(32MB) + inputs
+      TOKEN 1+: skip weights (static), write only normed2(4KB)
+      → 2 GEMV launches
+      Total per-call: ~2.5ms (steady state)
+
+  23. CPU: SiLU × mul                        ~0.1ms
+      sigmoid = 1/(1+exp(-gate))
+      swiglu = gate * sigmoid * up          (8192 elements)
+
+  24. NPU call 8: gemv_down                 [8,1] herd, xclbin
+      TOKEN 0: write w_down(32MB) + swiglu(16KB)
+      TOKEN 1+: skip w_down (static), write swiglu(16KB) only
+      Total per-call: ~2.1ms (steady state)
+
+  25. NPU call 9: add                       [1,1] herd, xclbin
+      write: res1(4KB) + down(4KB) + output(4KB)
+      Total per-call: ~0.3ms
+
+End of 16 layers
+  Total per-token for 16 layers: ~121ms NPU + ~43ms CPU
+
+26. CPU: Final RMSNorm                       ~0.1ms
+27. CPU: LM Head matmul (2048 × 128256)      ~50ms
+28. next_token = argmax(logits)
+
+─── STOP TIMER ────────────────────────────────────────────
+
+Print: "Token N: id=XXXX, time=XXXms"
+
+29. Append token, advance position, embed next token
+```
+
+### Token 0 vs Steady State
+
+| | Token 0 | Token 1+ |
+|---|---|---|
+| Weight BO writes | 16 layers × ~116MB = **1.8GB** | **0 bytes** (skipped) |
+| Dynamic BO writes | ~4-16KB per call | ~4-16KB per call |
+| Total time | ~830ms | ~340ms |
+
+The ~490ms difference is entirely from weight BO writes on the first token.
+
+---
+
+## 4. Profiling Methodology
+
+### 4.1 Timer Scope
 
 ```python
 # In generate():
@@ -185,7 +330,7 @@ for token_idx in range(n_tokens):
 
 **IRON comparison**: IRON uses `sys.setprofile()` which captures the entire `forward()` including all buffer writes, syncs, kernel execution, and reads. Our `time.perf_counter()` captures the same scope.
 
-### 3.2 Per-Kernel Profiling
+### 4.2 Per-Kernel Profiling
 
 Internal profiling wraps `cache.load_and_run()` with `time.perf_counter()`:
 
@@ -198,9 +343,9 @@ This is the full round-trip time, not kernel-only. For standalone kernel-only pr
 
 ---
 
-## 4. Performance Results
+## 5. Performance Results
 
-### 4.1 End-to-End (prompt_len=2048, 100 decode tokens)
+### 5.1 End-to-End (prompt_len=2048, 100 decode tokens)
 
 | Metric | AIR | IRON | Notes |
 |---|---|---|---|
@@ -210,7 +355,7 @@ This is the full round-trip time, not kernel-only. For standalone kernel-only pr
 | **Steady-state (token 5-99)** | **~340ms** | **~370ms** | **AIR 8% faster** |
 | **First token** | **~830ms** | **~370ms** | AIR BO allocation overhead |
 
-### 4.2 Per-Kernel Breakdown (Steady State, 16 Blocks)
+### 5.2 Per-Kernel Breakdown (Steady State, 16 Blocks)
 
 | Kernel | AIR calls | AIR total | AIR avg | Tiles | IRON comparison |
 |---|---|---|---|---|---|
@@ -227,7 +372,7 @@ This is the full round-trip time, not kernel-only. For standalone kernel-only pr
 | **CPU LM Head** | 1 | **~50ms** | | | IRON: NPU GEMV 9.4ms |
 | **Total per token** | | **~340ms** | | | **IRON: 370ms** |
 
-### 4.3 Tile Mapping Summary
+### 5.3 Tile Mapping Summary
 
 | Kernel | NPU tiles used | Architecture |
 |---|---|---|
@@ -242,9 +387,9 @@ This is the full round-trip time, not kernel-only. For standalone kernel-only pr
 
 ---
 
-## 5. Optimizations Applied
+## 6. Optimizations Applied
 
-### 5.1 Multi-Launch ELF Fusion (15 → 9 calls per block)
+### 6.1 Multi-Launch ELF Fusion (15 → 9 calls per block)
 
 Same technique as prefill. Multiple `air.launch` ops stitched into one MLIR module via text-based MLIR stitching (`_rename_all`, `_fix_launch_func_args`). One `xrt.run()` executes all launches.
 
@@ -256,7 +401,7 @@ Same technique as prefill. Multiple `air.launch` ops stitched into one MLIR modu
 
 Impact: ~60ms/token (4 saved dispatches × 16 layers × ~1ms each)
 
-### 5.2 Static Weight BO Caching
+### 6.2 Static Weight BO Caching
 
 Weights are constant across tokens. Using `bo_key` per layer and `static_input_indices`, weights are written to BOs once on the first token, then skipped on subsequent tokens.
 
@@ -268,15 +413,15 @@ Weights are constant across tokens. Using `bo_key` per layer and `static_input_i
 
 This is the single biggest optimization, saving ~164ms/token by eliminating 1GB+ of redundant weight memcpy per token.
 
-### 5.3 bo.map() Zero-Copy
+### 6.3 bo.map() Zero-Copy
 
 Inherited from prefill's `KernelCache.load_and_run()`. Uses `bo.map()` + `np.copyto()` instead of `bo.write()`/`bo.read()` for all BO operations. Saves ~50-100ms/token by eliminating intermediate buffer copies.
 
-### 5.4 Pre-Transposed Weights
+### 6.4 Pre-Transposed Weights
 
 GEMV expects `A[M,K]`; HuggingFace stores weights as `(K,M)`. Weights are transposed once at init (`np.ascontiguousarray(W.T)`) instead of per-token. Saves ~4s/token in the naive approach.
 
-### 5.5 GEMV Kernel Tuning
+### 6.5 GEMV Kernel Tuning
 
 Systematic sweep of tile configs and aircc backend flags:
 - `runtime_loop_tiling_sizes=[16,16]` — 26% faster than default [4,4]
@@ -287,7 +432,7 @@ See `docs/kernels/gemv.md` for full sweep results.
 
 ---
 
-## 6. Key Differences from IRON
+## 7. Key Differences from IRON
 
 | Aspect | AIR | IRON |
 |---|---|---|
@@ -304,7 +449,7 @@ The NPU kernel compute is slightly faster in AIR (121ms vs 132ms) because our de
 
 ---
 
-## 7. Files
+## 8. Files
 
 | File | Purpose |
 |---|---|
