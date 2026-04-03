@@ -709,7 +709,174 @@ add_bullet(
 
 
 # ============================================================
-# SLIDE 12: Methodology
+# SLIDE 12: Verification — Correlation Metric
+# ============================================================
+slide = prs.slides.add_slide(prs.slide_layouts[LY_CONTENT])
+set_text(slide.placeholders[0], "Strict Verification for Agentic Development")
+
+tf = slide.placeholders[10].text_frame
+tf.clear()
+tf.paragraphs[0].text = (
+    "With AI-assisted development, false positives are the biggest risk"
+)
+tf.paragraphs[0].font.size = Pt(13)
+tf.paragraphs[0].font.bold = True
+
+add_bullet(tf, "", level=0, font_size=4)
+add_bullet(
+    tf,
+    "Correlation: the key metric (input-invariant, pattern-sensitive)",
+    level=0,
+    font_size=14,
+    bold=True,
+    color=AMD_RED,
+)
+add_bullet(
+    tf,
+    "Flash Attention bug: corr=0.13 but element-wise tolerance PASSED (mean_err < atol)",
+    level=1,
+    font_size=12,
+)
+add_bullet(
+    tf,
+    "Softmax output clusters around mean(V) regardless of attention pattern",
+    level=1,
+    font_size=12,
+)
+add_bullet(
+    tf,
+    "Correlation detects wrong patterns; tolerance only checks value ranges",
+    level=1,
+    font_size=12,
+)
+
+add_bullet(
+    tf,
+    "When correlation fails: GEMM rounding mode bug",
+    level=0,
+    font_size=14,
+    bold=True,
+    color=AMD_RED,
+)
+add_bullet(
+    tf,
+    "floor rounding: mean_error=-165 but corr=0.9999 (pattern correct, constant bias)",
+    level=1,
+    font_size=12,
+)
+add_bullet(
+    tf,
+    "conv_even fix: mean_error=-0.15, errors cancel symmetrically",
+    level=1,
+    font_size=12,
+)
+add_bullet(
+    tf,
+    "Lesson: need BOTH correlation (pattern) AND tolerance (bias) checks",
+    level=1,
+    font_size=12,
+)
+
+add_bullet(
+    tf,
+    "Multi-layer verification: 240+ checks per inference (--verify flag)",
+    level=0,
+    font_size=14,
+    bold=True,
+    color=AMD_RED,
+)
+add_bullet(
+    tf,
+    "Per-step correlation vs CPU F32 reference at every operation in every layer",
+    level=1,
+    font_size=12,
+)
+add_bullet(
+    tf,
+    "Catches regressions at the exact operation where they occur",
+    level=1,
+    font_size=12,
+)
+
+
+# ============================================================
+# SLIDE 13: Verification — Testing Strategy
+# ============================================================
+slide = prs.slides.add_slide(prs.slide_layouts[LY_TITLE_ONLY])
+set_text(slide.placeholders[0], "Compiler Fuzzing: Shape Sweeps & Config Testing")
+
+add_table(
+    slide,
+    [
+        ["Layer", "Metric", "Threshold", "What It Catches"],
+        [
+            "Algorithmic",
+            "Pearson correlation",
+            "corr > 0.99",
+            "Wrong patterns, DMA errors",
+        ],
+        [
+            "Numerical",
+            "Relative + absolute tol",
+            "rtol=4%, atol=1e-6",
+            "Rounding bias, precision loss",
+        ],
+        ["Systematic bias", "Mean signed error", "~0", "Hardware rounding defaults"],
+        ["End-to-end", "Top-1 prediction", '"Paris"', "Full pipeline integration"],
+        [
+            "Exact ops",
+            "rtol=0, atol=0",
+            "Perfect match",
+            "DMA transposes, integer kernels",
+        ],
+    ],
+    Inches(0.5),
+    Inches(1.4),
+    Inches(12.0),
+    Inches(2.8),
+    col_widths=[Inches(2.0), Inches(3.0), Inches(3.0), Inches(4.0)],
+    font_size=11,
+)
+
+txBox = slide.shapes.add_textbox(Inches(0.5), Inches(4.5), Inches(11.5), Inches(2.3))
+tf = txBox.text_frame
+tf.word_wrap = True
+items = [
+    (
+        "Test inputs: randn*4 (not arange!), seed=42, also tested with real LLAMA weights",
+        False,
+    ),
+    (
+        "GEMM sweep: 4 LLAMA shapes x 12 tile configs, all with correlation + tolerance",
+        False,
+    ),
+    ("GEMV sweep: 5 shapes x 4 backend flags (tile sizes, pingpong, lock fix)", False),
+    ("Flash Attention sweep: 10 configs (MHA/GQA, causal, varied head counts)", False),
+    (
+        "Tolerance fix: rtol changed from 1.0 (meaningless) to 0.04 (matching IRON)",
+        False,
+    ),
+    ("", False),
+    (
+        "Key insight: realistic inputs + strict thresholds + correlation = find bugs that PASS! hides",
+        True,
+    ),
+]
+for i, (text, is_bold) in enumerate(items):
+    if i == 0:
+        p = tf.paragraphs[0]
+    else:
+        p = tf.add_paragraph()
+    p.text = text
+    p.font.size = Pt(12)
+    p.font.bold = is_bold
+    p.space_after = Pt(3)
+    if is_bold and text:
+        p.font.color.rgb = AMD_RED
+
+
+# ============================================================
+# SLIDE 14: Methodology
 # ============================================================
 slide = prs.slides.add_slide(prs.slide_layouts[LY_CONTENT])
 set_text(slide.placeholders[0], "Methodology: Documentation-Driven Development")
