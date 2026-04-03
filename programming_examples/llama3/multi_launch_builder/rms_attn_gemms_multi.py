@@ -79,7 +79,9 @@ def build_rms_attn_gemms_module(
 
     # Build RMSNorm (needs launch+segment wrapper for multi-launch ELF)
     print("  [1/4] RMSNorm...")
-    rms_ir = _wrap_ir_in_launch(str(build_rms(seq_len, emb_dim, bfloat16, 16)))
+    rms_ir = _wrap_ir_in_launch(
+        str(build_rms(seq_len, emb_dim, bfloat16, 16, herd_x=8))
+    )
 
     # Build Q GEMM
     print("  [2/4] Q GEMM...")
