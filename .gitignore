@@ -40,3 +40,7 @@ CLAUDE.md
 
 # documents
 *.pdf
+*.pptx
+
+# intermediate files
+air.mlir
