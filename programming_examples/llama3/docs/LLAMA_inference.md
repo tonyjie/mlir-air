@@ -245,21 +245,24 @@ Both totals cover: embedding + 16 transformer layers + final RMSNorm + NPU LM He
 
 **Scope difference for decode LM Head**: IRON runs LM Head on NPU (GEMV 128256x2048, 9.4ms). AIR runs it on CPU (numpy matmul, ~50ms). This 41ms gap accounts for the decode speed difference. If AIR implemented NPU LM Head for decode, the expected steady-state would be ~340ms/tok (8% faster than IRON).
 
-**Note**: The standalone decode script (llama3_decode.py, which uses CPU prefill) measures ~351ms/tok. The unified script measures ~390ms due to XRT context sharing overhead between prefill and decode phases.
+**Note**: The standalone decode script (llama3_decode.py, which uses CPU prefill for KV cache) measures ~351ms/tok. The unified script measures ~390ms. The difference is partly from XRT context sharing between prefill and decode, and partly from BF16 precision differences in the KV cache (NPU prefill vs CPU F32 prefill produce slightly different cached K/V values, which affect the attention computation in decode).
 
 ### End-to-End Unified Script (100 tokens)
 
 | Phase | Time | Notes |
 |-------|------|-------|
-| **NPU Prefill** | **5.68s** | Layer 0: 353ms (init), layers 1-15: ~112ms |
+| LM Head weight preload | ~2s | Outside timer (matches standalone/IRON scope) |
+| **NPU Prefill** | **3.54s** | Layer 0: 202ms (BO init), layers 3-15: ~118ms |
 | Weight transpose | ~2s | One-time GEMV weight prep |
-| **Decode token 0** | **982ms** | Weight BO init for decode kernels |
+| **Decode token 0** | **723ms** | Weight BO init for decode kernels |
 | **Decode steady-state** | **~390ms/token** | Tokens 1-99 |
-| **Decode total (100 tokens)** | **39.67s** | 2.52 tok/s |
+| **Decode total (100 tokens)** | **39.35s** | 2.54 tok/s |
 
-The prefill first-run is 5.68s (vs standalone warm 1.92s) due to one-time XRT context creation and BO allocation. This overhead amortizes if multiple prompts are processed.
+The prefill takes 3.54s vs standalone 1.92s because the per-layer kernel BOs (rms_attn_gemms, rope_qk, flash_attn, o_proj_add, ffn_full) are allocated on first use. In the standalone script, these are warm from prior runs in the same process. This overhead amortizes on subsequent inference calls.
 
-**Net benefit vs separate scripts**: Total 5.68s + 39.67s = 45s vs 16s (CPU prefill) + 35.6s = 51.6s. The unified script is **~6s faster** by replacing CPU prefill with NPU prefill.
+**LM Head preload**: Weight partitions (512MB) are pre-loaded into BOs before the timer starts, matching the standalone prefill script and IRON's methodology. Both treat weight loading as one-time initialization, not per-inference cost.
+
+**Net benefit vs separate scripts**: Total 3.54s + 39.35s = 43s vs 16s (CPU prefill) + 35.6s = 51.6s. The unified script is **~9s faster** by replacing CPU prefill with NPU prefill.
 
 ---
 
