@@ -31,6 +31,7 @@ from llama3_prefill import (
     KernelCache,
     compile_all_kernels,
     run_transformer_block,
+    preload_lm_head_weights,
     _run_cached,
     _SIMPLE_BACKEND,
 )
@@ -80,6 +81,10 @@ def run_npu_prefill(
     embed_f32 = weights.embed_table[token_ids].astype(np.float32)
     x_bf16 = embed_f32.astype(bfloat16)
     x_f32 = embed_f32.copy()
+
+    # Pre-load LM Head weights into BOs (outside profiling scope, matching
+    # standalone prefill and IRON methodology — weight loading is one-time init)
+    preload_lm_head_weights(weights, config, prefill_cache, seq_len)
 
     print(f"Running NPU prefill ({config.n_layers} layers, seq_len={seq_len})...")
     t_prefill_start = time.time()
