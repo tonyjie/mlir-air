@@ -205,9 +205,49 @@ NPU predicts "Paris" (the correct factual answer). CPU predicts "the" (a valid b
 
 ---
 
-## 6. Profiling Results
+## 6. Profiling Results & IRON Comparison
 
-### End-to-End (100 tokens, prompt="The capital of France is")
+### Profiling Scope (Apple-to-Apple)
+
+Both AIR and IRON are profiled with the **same scope**: host-side timing that includes buffer I/O, cache coherency ops, and kernel launch/wait. Neither measures pure kernel time only.
+
+| Scope detail | AIR | IRON |
+|---|---|---|
+| Buffer write | `bo.map()` + `np.copyto()` | `bo.map()` + `np.copyto()` |
+| Buffer read | `bo.map()` + `np.frombuffer()` (zero-copy) | `bo.map()` + `np.frombuffer()` (zero-copy) |
+| Cache coherency | `bo.sync(TO_DEVICE)` + `bo.sync(FROM_DEVICE)` | `bo.sync()` |
+| Kernel launch | `run()` + `wait()` | `run_runlist()` |
+| Host overhead | numpy reshape/dtype, Python calls | torch-numpy conversion, Python calls |
+| **Includes embedding** | Yes (prefill) / No (decode) | Yes (prefill) / No (decode) |
+| **Includes LM Head** | Yes (NPU prefill, CPU decode) | Yes (NPU both phases) |
+| **Includes final RMSNorm** | Yes | Yes |
+
+### Prefill: AIR vs IRON
+
+| Metric | AIR | IRON | Notes |
+|--------|-----|------|-------|
+| **Total prefill** | **1.92s** (warm) | 2.744s | **30% faster** |
+| Per-layer avg | ~100ms | 152ms | AIR 34% faster |
+| LM Head | 171ms (NPU 8-launch) | 217ms (NPU GEMM) | AIR 21% faster |
+| XRT invocations/layer | 5 | ~12 | AIR uses multi-launch ELF |
+
+Both totals cover: embedding + 16 transformer layers + final RMSNorm + NPU LM Head.
+
+### Decode: AIR vs IRON
+
+| Metric | AIR | IRON | Notes |
+|--------|-----|------|-------|
+| **Steady-state** | **~390ms/tok** | 370ms/tok | AIR 5% slower (see note) |
+| NPU kernel time | ~126ms | ~132ms | AIR 5% faster at kernel level |
+| CPU attention | ~43ms | ~55ms | Both CPU |
+| LM Head | **~50ms (CPU)** | **~9ms (NPU)** | **Key gap: 41ms** |
+| Python overhead | ~170ms | ~55ms | AIR higher due to more dispatch calls |
+
+**Scope difference for decode LM Head**: IRON runs LM Head on NPU (GEMV 128256x2048, 9.4ms). AIR runs it on CPU (numpy matmul, ~50ms). This 41ms gap accounts for the decode speed difference. If AIR implemented NPU LM Head for decode, the expected steady-state would be ~340ms/tok (8% faster than IRON).
+
+**Note**: The standalone decode script (llama3_decode.py, which uses CPU prefill) measures ~351ms/tok. The unified script measures ~390ms due to XRT context sharing overhead between prefill and decode phases.
+
+### End-to-End Unified Script (100 tokens)
 
 | Phase | Time | Notes |
 |-------|------|-------|
@@ -217,41 +257,259 @@ NPU predicts "Paris" (the correct factual answer). CPU predicts "the" (a valid b
 | **Decode steady-state** | **~390ms/token** | Tokens 1-99 |
 | **Decode total (100 tokens)** | **39.67s** | 2.52 tok/s |
 
-### Prefill Per-Layer Breakdown
+The prefill first-run is 5.68s (vs standalone warm 1.92s) due to one-time XRT context creation and BO allocation. This overhead amortizes if multiple prompts are processed.
 
-| Layer | Time | Notes |
-|-------|------|-------|
-| Layer 0 | 353ms | First-time XRT context + BO allocation |
-| Layer 1-2 | ~147ms | Initial BO syncs |
-| Layer 3-15 | ~112ms | Steady-state |
-
-Steady-state layer time matches standalone prefill (~100ms). The first-layer overhead is from XRT context creation and buffer object allocation (one-time cost).
-
-### Decode Per-Token Breakdown
-
-| Component | Per-Token (steady state) |
-|-----------|------------------------|
-| NPU kernels (10 calls x 16 layers = 160) | ~126ms |
-| CPU attention (16 layers) | ~43ms |
-| CPU LM Head (2048 x 128256) | ~50ms |
-| Python dispatch overhead | ~170ms |
-| **Total** | **~390ms** |
-
-### Comparison with Standalone Scripts
-
-| Metric | Inference Script | Standalone Prefill | Standalone Decode |
-|--------|-----------------|-------------------|-------------------|
-| Prefill | 5.68s (first run) | 1.92s (warm) | N/A (CPU: 16s) |
-| Decode steady-state | ~390ms/tok | N/A | ~351ms/tok |
-| Total (100 tokens) | 39.67s | N/A | 35.6s + 16s CPU prefill |
-
-The unified script's prefill is slower on first run (5.68s vs 1.92s) due to XRT context initialization. On subsequent calls (if the script were to support multiple prompts), it would match the standalone 1.92s. The decode is ~390ms vs standalone 351ms due to XRT context sharing between prefill and decode.
-
-**Net benefit**: Total end-to-end is 5.68s + 39.67s = 45s vs standalone 16s (CPU prefill) + 35.6s = 51.6s. The unified script is **~6s faster** overall by replacing CPU prefill with NPU prefill.
+**Net benefit vs separate scripts**: Total 5.68s + 39.67s = 45s vs 16s (CPU prefill) + 35.6s = 51.6s. The unified script is **~6s faster** by replacing CPU prefill with NPU prefill.
 
 ---
 
-## 7. Key Design Decisions
+## 7. Dataflow Diagram
+
+### Prefill: One Transformer Layer (x16 layers, seq_len=2048)
+
+```
+x_bf16 (2048, 2048) ─── input residual, carried between layers
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  XRT call 1: rms_attn_gemms  [ELF, 4 launches]                     │
+│  Herds: [8,1] RMSNorm + [8,4] Q/K/V GEMMs                         │
+│                                                                     │
+│  Launch 1: RMSNorm (2048,2048) × w(2048,) -> normed (2048,2048)    │
+│  Launch 2: Q GEMM  normed × Wq(2048,2048) -> q (2048,2048)        │
+│  Launch 3: K GEMM  normed × Wk(2048,512)  -> k (2048,512)         │
+│  Launch 4: V GEMM  normed × Wv(2048,512)  -> v (2048,512)         │
+└────────────┬───────────┬──────────────────────────┬─────────────────┘
+             │           │                          │
+             ▼           ▼                          ▼
+          q (2048,2048)  k (2048,512)            v (2048,512)
+             │           │                          │
+     ┌───────┘     ┌─────┘                          │
+     ▼             ▼                                │
+  reshape       reshape                             │
+  (2048,32,64)  (2048,8,64)                         │
+     │             │                                │
+  transpose     transpose                           │
+  (32,2048,64)  (8,2048,64)                         │
+     │             │                                │
+  flatten       flatten                             │
+  (4194304,)    (1048576,)                          │
+     ▼             ▼                                │
+┌─────────────────────────────────────────────┐     │
+│  XRT call 2: rope_qk  [ELF, 2 herds]       │     │
+│  Herds: [8,4] Q-herd + [8,4] K-herd        │     │
+│                                             │     │
+│  Q: (4194304,) × LUT(4194304,)             │     │
+│  K: (1048576,) × LUT(1048576,)             │     │
+└────────────┬──────────┬─────────────────────┘     │
+             │          │                           │
+             ▼          ▼                           │
+     q_roped (4194304,)  k_roped (1048576,)         │
+             │          │                           │
+     reshape(32,2048,64) reshape(8,2048,64)         │
+     transpose(2048,32,64) transpose(2048,8,64)     │
+     reshape(2048,2048) reshape(2048,512)            │
+             │          │                           │
+             │          │  ┌────────────────────────┘
+             │          │  │
+             ▼          ▼  ▼
+          reshape     reshape
+          (32,2048,64) (8,2048,64)
+          transpose   transpose
+          ──── head-first layout ────
+             │          │  │
+             ▼          ▼  ▼
+┌─────────────────────────────────────────────────────┐
+│  XRT call 3: flash_attn  [ELF, 1 launch]           │
+│  Herd: [8,4]                                        │
+│                                                     │
+│  Q(32,2048,64) @ K(8,2048,64)^T -> softmax -> @V   │
+│  GQA: 4 Q heads per KV head, causal mask            │
+│  -> attn_out (32,2048,64)                           │
+└──────────────────────┬──────────────────────────────┘
+                       │
+                       ▼
+                transpose (2048,32,64)
+                reshape (2048,2048)
+                       │
+                       ▼
+┌─────────────────────────────────────────────────────┐
+│  XRT call 4: o_proj_add  [ELF, 2 launches]          │
+│  Herd: [8,4]                                        │
+│                                                     │
+│  Launch 1: O GEMM  attn(2048,2048) × Wo(2048,2048) │
+│  Launch 2: Add     proj + x_residual                │
+│  -> res1 (2048,2048)                                │
+└──────────────────────┬──────────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  XRT call 5: ffn_full  [ELF, 6 launches]                       │
+│  Herds: [8,1] RMSNorm + [8,4] GEMMs + [8,4] SiLU + [8,4] Add │
+│                                                                 │
+│  L1: RMSNorm  res1(2048,2048) × w(2048,) -> normed2(2048,2048)│
+│  L2: Gate GEMM  normed2 × Wg(2048,8192)  -> gate (2048,8192)  │
+│  L3: Up GEMM    normed2 × Wu(2048,8192)  -> up   (2048,8192)  │
+│  L4: SiLU×mul   SiLU(gate) × up          -> swiglu(2048,8192) │
+│  L5: Down GEMM  swiglu × Wd(8192,2048)   -> down (2048,2048)  │
+│  L6: Add        res1 + down              -> output(2048,2048)  │
+└──────────────────────┬─────────────────────────────────────────┘
+                       │
+                       ▼
+              output (2048,2048) ─── next layer input
+```
+
+**After 16 layers:**
+```
+x_bf16 (2048, 2048)
+    │
+    ▼
+┌──────────────────────────────────────┐
+│  XRT call 81: rmsnorm  [xclbin]      │
+│  Herd: [8,1]                         │
+│  (2048,2048) × w(2048,) -> (2048,2048)│
+└──────────────┬───────────────────────┘
+               ▼
+┌──────────────────────────────────────────────────┐
+│  XRT call 82: lm_head  [ELF, 8 launches]         │
+│  Herd: [8,4] per partition                        │
+│                                                   │
+│  8 partitions: (2048,2048) × W_p(2048,16384) each │
+│  Concatenate -> logits (2048, 128256)             │
+└──────────────┬───────────────────────────────────┘
+               ▼
+        argmax(logits[prompt_pos]) -> first_token
+```
+
+### Decode: One Transformer Block (x16 blocks per token)
+
+```
+x_bf16 (2048,) ─── single token hidden state
+    │
+    ▼
+┌──────────────────────────────────────┐
+│  XRT call 1: rmsnorm  [xclbin]       │
+│  Herd: [1,1]  (M=1, can't multi-tile)│
+│  (1,2048) × w(2048,) -> flatten -> normed (2048,)  │
+└──────────────┬───────────────────────┘
+               ▼
+┌──────────────────────────────────────────────────┐
+│  XRT call 2: qkv_gemv  [ELF, 3 launches]         │
+│  Herd: [8,1] x 3 launches (8 AIE columns each)   │
+│                                                   │
+│  L1: normed(2048,) × Wq_t(2048,2048) -> q(2048,) │
+│  L2: normed(2048,) × Wk_t(512,2048)  -> k(512,)  │
+│  L3: normed(2048,) × Wv_t(512,2048)  -> v(512,)  │
+└────────┬──────────┬──────────────────┬────────────┘
+         │          │                  │
+         ▼          ▼                  │
+      q (2048,)  k (512,)             │
+         │          │                  │
+     reshape     reshape               │
+     (32,64)     (8,64)                │
+     flatten     flatten               │
+     (2048,)     (512,)                │
+         │          │                  │
+         ▼          ▼                  │
+┌──────────────────────────┐           │
+│  XRT call 3: rope_q      │           │
+│  Herd: [1,1]             │           │
+│  q(2048,) × LUT(2048,)   │           │
+│  -> q_roped (32,64)      │           │
+└───────────┬──────────────┘           │
+            │                          │
+            │  ┌───────────────────┐   │
+            │  │ XRT call 4: rope_k│   │
+            │  │ Herd: [1,1]       │   │
+            │  │ k(512,) × LUT     │   │
+            │  │ -> k_roped (8,64) │   │
+            │  └────────┬──────────┘   │
+            │           │              │
+            │    ┌──────┘              │
+            │    │  KV cache update:   │
+            │    │  k_cache[:,pos,:] = k_roped (8,64)
+            │    │  v_cache[:,pos,:] = v.reshape(8,64)
+            │    │                     │
+            ▼    ▼                     │
+┌──────────────────────────────────────┘
+│  CPU: decode_attention_cpu
+│  q_roped(2048,) @ K_cache(:pos+1)^T -> softmax -> @ V_cache
+│  GQA: 32 Q heads / 8 KV heads, loop over heads
+│  -> attn_out (2048,)
+└──────────────┬───────────────────────┘
+               ▼
+┌──────────────────────────────────────────────────┐
+│  XRT call 5: o_gemv_add  [ELF, 2 launches]       │
+│  Herd: [8,1] + [8,1]                             │
+│                                                   │
+│  L1: Wo_t(2048,2048) × attn_out(2048,) -> proj   │
+│  L2: x_residual(2048,) + proj -> res1 (2048,)    │
+└──────────────┬───────────────────────────────────┘
+               ▼
+┌──────────────────────────────────────┐
+│  XRT call 6: rmsnorm  [xclbin]       │
+│  Herd: [1,1]                         │
+│  (1,2048) × w(2048,) -> normed2 (2048,)  │
+└──────────────┬───────────────────────┘
+               ▼
+┌──────────────────────────────────────────────────┐
+│  XRT call 7: gate_up_gemv  [ELF, 2 launches]     │
+│  Herd: [8,1] x 2 launches                        │
+│                                                   │
+│  L1: Wg_t(8192,2048) × normed2(2048,) -> gate    │
+│  L2: Wu_t(8192,2048) × normed2(2048,) -> up      │
+└────────┬──────────────────────────┬───────────────┘
+         ▼                          ▼
+      gate (8192,)              up (8192,)
+         │                          │
+         ▼                          ▼
+┌──────────────────────────────────────┐
+│  XRT call 8: silu_mul  [xclbin]      │
+│  Herd: [8,1]                         │
+│  SiLU(gate) × up -> swiglu (8192,)   │
+└──────────────┬───────────────────────┘
+               ▼
+┌──────────────────────────────────────────────────┐
+│  XRT call 9: gemv_down  [xclbin]                  │
+│  Herd: [8,1]                                      │
+│  Wd_t(2048,8192) × swiglu(8192,) -> down (2048,) │
+└──────────────┬───────────────────────────────────┘
+               ▼
+┌──────────────────────────────────────┐
+│  XRT call 10: add  [xclbin]          │
+│  Herd: [8,1]                         │
+│  res1(2048,) + down(2048,)           │
+│  -> output (2048,)                   │
+└──────────────┬───────────────────────┘
+               ▼
+        output (2048,) ─── next block input
+```
+
+**After 16 blocks:**
+```
+x (2048,) -> CPU rms_norm -> x_normed (1,2048)
+          -> CPU matmul   -> logits (1,128256)    # TODO: move to NPU
+          -> argmax       -> next_token
+```
+
+### Summary: Reshape Operations Between Kernels
+
+| Location | Reshape | Why |
+|----------|---------|-----|
+| **Prefill: after QKV, before RoPE** | `(seq,dim)` -> `(seq,n_h,64)` -> transpose `(n_h,seq,64)` -> flatten 1D | RoPE kernel expects head-first flat layout |
+| **Prefill: after RoPE, back to seq-first** | reshape `(n_h,seq,64)` -> transpose `(seq,n_h,64)` -> reshape `(seq,dim)` | Restore seq-first for downstream |
+| **Prefill: before FlashAttn** | `(seq,dim)` -> `(seq,n_h,64)` -> transpose `(n_h,seq,64)` | FlashAttn expects head-first |
+| **Prefill: after FlashAttn** | `(n_h,seq,64)` -> transpose `(seq,n_h,64)` -> reshape `(seq,dim)` | Restore seq-first for O GEMM |
+| **Decode: after QKV, before RoPE** | `(dim,)` -> reshape `(n_h,64)` -> flatten `(dim,)` | RoPE expects flat per-head layout |
+| **Decode: after RoPE** | `(dim,)` -> reshape `(n_h,64)` | For KV cache write |
+| **Decode: RMSNorm in/out** | `(dim,)` -> reshape `(1,dim)` in, flatten `(dim,)` out | RMSNorm expects 2D input |
+| **Decode: weight transpose** | W `(out,in)` -> `.T` -> W_t `(in,out)` | GEMV expects A[M,K], stored as (K,M) |
+
+The most complex reshaping is in prefill between QKV and RoPE/FlashAttention. These convert between **seq-first** `(seq, n_heads*head_dim)` and **head-first** `(n_heads, seq, head_dim)` layouts. Decode is simpler because M=1 eliminates the seq dimension.
+
+---
+
+## 8. Key Design Decisions
 
 ### Why extract KV cache from intermediates (not recompute)?
 
@@ -289,7 +547,7 @@ This avoids per-token transpose overhead (~4s/token without pre-transposing).
 
 ---
 
-## 8. CLI Reference
+## 9. CLI Reference
 
 ```
 python3 ../llama3_inference.py [options]
@@ -307,7 +565,7 @@ Options:
 
 ---
 
-## 9. Files
+## 10. Files
 
 | File | Purpose |
 |------|---------|
