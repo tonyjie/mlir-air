@@ -56,6 +56,7 @@ def run_npu_prefill(
     max_seq,
     cpu_attn=True,
     profile=False,
+    verify=False,
 ):
     """Run NPU prefill and extract KV cache for decode.
 
@@ -95,7 +96,7 @@ def run_npu_prefill(
             config,
             prefill_cache,
             layer_idx=layer_idx,
-            verify=False,
+            verify=verify,
             cpu_attn=cpu_attn,
         )
 
@@ -190,6 +191,68 @@ def run_npu_prefill(
     t_prefill = time.time() - t_prefill_start
     print(f"NPU prefill done in {t_prefill:.2f}s. First token: {prefill_token}")
 
+    # --- Verification: compare against CPU F32 reference ---
+    if verify:
+        print(f"\n{'='*60}")
+        print("Verification: NPU prefill vs CPU F32 reference")
+        print(f"{'='*60}")
+        from llama3_reference import transformer_block as cpu_block, rms_norm
+
+        rope_lut_f32 = rope_lut_bf16[:seq_len].astype(np.float32)
+        x_cpu = weights.embed_table[token_ids].astype(np.float32)
+        for li in range(config.n_layers):
+            x_cpu, cpu_intermediates = cpu_block(
+                x_cpu, weights.layers[li], rope_lut_f32, config
+            )
+            # Compare KV cache for this layer
+            cpu_k = (
+                cpu_intermediates["k_roped"]
+                .astype(np.float32)
+                .reshape(seq_len, n_kv_heads, head_dim)
+                .transpose(1, 0, 2)
+            )
+            cpu_v = (
+                cpu_intermediates["v"]
+                .astype(np.float32)
+                .reshape(seq_len, n_kv_heads, head_dim)
+                .transpose(1, 0, 2)
+            )
+            npu_k = k_cache[li, :, :seq_len, :].astype(np.float32)
+            npu_v = v_cache[li, :, :seq_len, :].astype(np.float32)
+
+            k_corr = np.corrcoef(npu_k.flatten(), cpu_k.flatten())[0, 1]
+            v_corr = np.corrcoef(npu_v.flatten(), cpu_v.flatten())[0, 1]
+            k_maxerr = np.max(np.abs(npu_k - cpu_k))
+            v_maxerr = np.max(np.abs(npu_v - cpu_v))
+            k_meanerr = np.mean(np.abs(npu_k - cpu_k))
+            v_meanerr = np.mean(np.abs(npu_v - cpu_v))
+
+            k_status = "OK" if k_corr > 0.99 else "WARN"
+            v_status = "OK" if v_corr > 0.99 else "WARN"
+            print(
+                f"  Layer {li:2d} K_cache: [{k_status}] corr={k_corr:.6f}, "
+                f"max_err={k_maxerr:.4f}, mean_err={k_meanerr:.4f}"
+            )
+            print(
+                f"  Layer {li:2d} V_cache: [{v_status}] corr={v_corr:.6f}, "
+                f"max_err={v_maxerr:.4f}, mean_err={v_meanerr:.4f}"
+            )
+
+        # Compare logits
+        x_cpu_normed = rms_norm(x_cpu, weights.final_norm.astype(np.float32))
+        cpu_logits = x_cpu_normed @ weights.lm_head.astype(np.float32).T
+        cpu_pred = int(np.argmax(cpu_logits[pred_pos]))
+        logit_corr = np.corrcoef(logits_f32[pred_pos], cpu_logits[pred_pos])[0, 1]
+        logit_maxerr = np.max(np.abs(logits_f32[pred_pos] - cpu_logits[pred_pos]))
+        logit_meanerr = np.mean(np.abs(logits_f32[pred_pos] - cpu_logits[pred_pos]))
+        print(
+            f"\n  Logits (pos {pred_pos}): corr={logit_corr:.6f}, "
+            f"max_err={logit_maxerr:.4f}, mean_err={logit_meanerr:.4f}"
+        )
+        print(f"  NPU top-1: {prefill_token} ({_tok.decode([prefill_token])})")
+        print(f"  CPU top-1: {cpu_pred} ({_tok.decode([cpu_pred])})")
+        print(f"  Match: {'YES' if prefill_token == cpu_pred else 'NO'}")
+
     return prefill_token, k_cache, v_cache, prompt_len
 
 
@@ -207,21 +270,10 @@ def generate(
     rope_lut_bf16,
     n_tokens=10,
     profile=False,
+    verify=False,
     cpu_attn=True,
 ):
-    """Run NPU prefill + NPU decode generation.
-
-    Args:
-        prompt_tokens: list of token IDs (padded to seq_len)
-        weights: LlamaWeights
-        config: LlamaConfig
-        prefill_cache: KernelCache for prefill kernels
-        decode_cache: KernelCache for decode kernels
-        rope_lut_bf16: (max_seq, head_dim) RoPE LUT
-        n_tokens: number of tokens to generate
-        profile: print per-token timing
-        cpu_attn: use CPU attention for prefill
-    """
+    """Run NPU prefill + NPU decode generation."""
     seq_len = len(prompt_tokens)
     emb_dim = config.emb_dim
     n_heads = config.n_heads
@@ -243,6 +295,7 @@ def generate(
         max_seq,
         cpu_attn=cpu_attn,
         profile=profile,
+        verify=verify,
     )
 
     # --- Phase 2: NPU Decode ---
@@ -339,6 +392,9 @@ if __name__ == "__main__":
     parser.add_argument("--run-only", action="store_true")
     parser.add_argument("--n-tokens", type=int, default=10)
     parser.add_argument("--profile", action="store_true")
+    parser.add_argument(
+        "--verify", action="store_true", help="Compare against CPU F32 reference"
+    )
     parser.add_argument(
         "--cpu-attn", action="store_true", help="Use CPU attention for prefill"
     )
@@ -458,6 +514,7 @@ if __name__ == "__main__":
         rope_lut_bf16,
         n_tokens=args.n_tokens,
         profile=args.profile,
+        verify=args.verify,
         cpu_attn=args.cpu_attn,
     )
 
