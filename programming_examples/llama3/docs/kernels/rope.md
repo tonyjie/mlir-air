@@ -1,0 +1,227 @@
+# RoPE (Rotary Position Embeddings) Kernel — Analysis
+
+## Formula
+
+RoPE encodes position by rotating pairs of elements in each head:
+
+```
+For input x of shape (num_rows, head_dim) and precomputed LUT:
+
+  y[r, 2i]   = x[r, 2i]   * cos(θ_r,i) - x[r, 2i+1] * sin(θ_r,i)
+  y[r, 2i+1] = x[r, 2i]   * sin(θ_r,i) + x[r, 2i+1] * cos(θ_r,i)
+
+where θ_r,i = r / (10000^(2i / head_dim))
+```
+
+The cos/sin values are precomputed on the host into a LUT with interleaved `[cos, sin, cos, sin, ...]` layout per row. The kernel does element-wise multiply-add — no trig at runtime.
+
+Each row is one (head, position) pair. Rows are completely independent — no cross-row dependencies.
+
+---
+
+## Implementation: Two Layers
+
+### Layer 1: C++ Kernel (`rope.cc`) — Processes One Row
+
+**File**: `programming_examples/rope_lut/rope.cc` (also at `mlir-aie/aie_kernels/aie2p/rope.cc`)
+
+```cpp
+void rope(bfloat16 *input, bfloat16 *lut, bfloat16 *output, int32_t dims) {
+    // dims = head_dim = 64
+    for (int v = 0; v < dims; v += 16) {        // vectorized, 16 elements at a time
+        x      = load_v<16>(input + v);          // [x0, x1, x2, x3, ...]
+        cache  = load_v<16>(lut + v);            // [cos0, sin0, cos1, sin1, ...]
+
+        x_even  = filter_even(x);                // [x0, x2, x4, ...]
+        x_odd   = filter_odd(x);                 // [x1, x3, x5, ...]
+        cos_val = filter_even(cache);            // [cos0, cos1, cos2, ...]
+        sin_val = filter_odd(cache);             // [sin0, sin1, sin2, ...]
+
+        out_even = x_even * cos - x_odd * sin;
+        out_odd  = x_even * sin + x_odd * cos;
+
+        y = interleave_zip(out_even, out_odd);   // [e0, o0, e1, o1, ...]
+        store_v(output + v, y);
+    }
+}
+```
+
+This processes exactly **one row of `head_dim=64` elements** on a single AIE tile. It uses AIE vector intrinsics (`filter_even/odd`, `interleave_zip`) for efficient BF16 computation. The kernel has no concept of multiple rows or tiles.
+
+**Compiled to**: `rope.o` (precompiled, copied to build directory at runtime)
+
+### Layer 2: AIR Wrapper (`rope_lut.py`) — DMA Loop + Herd
+
+**File**: `programming_examples/rope_lut/rope_lut.py`
+
+```python
+build_module(seq_len, embed_dim, np_dtype_in)
+# seq_len = number of rows (NOT the transformer sequence length!)
+# embed_dim = head_dim = 64
+# total = seq_len * embed_dim
+```
+
+```python
+@herd(name="herd_0", sizes=[1, 1], operands=[l3_in, l3_lut, l3_out])
+def herd_body(_tx, _ty, ...):
+    l1_in  = alloc(embed_dim)      # L1 buffer for one row
+    l1_lut = alloc(embed_dim)      # L1 buffer for one LUT row
+    l1_out = alloc(embed_dim)      # L1 buffer for output row
+
+    for row_offset in range_(0, total, embed_dim):    # loops num_rows times
+        DMA: L3[row_offset : row_offset+64] → L1 (input)
+        DMA: L3[row_offset : row_offset+64] → L1 (lut)
+        call rope(l1_in, l1_lut, l1_out, 64)          # C++ kernel
+        DMA: L1 → L3[row_offset : row_offset+64]      # output
+```
+
+The AIR wrapper is the **loop driver**: it DMAs one row at a time between L3 and L1, calls the C++ kernel, and writes the result back. The single [1,1] herd processes all rows sequentially.
+
+---
+
+## Shapes in LLAMA-3.2-1B Pipeline
+
+### How Q/K get reshaped before RoPE
+
+The GEMM/GEMV outputs are in **(seq_len, emb_dim)** layout. RoPE needs **(num_rows, head_dim)** where each row is one (head, position) pair:
+
+**Prefill reshape (before RoPE Q)**:
+```
+Q from GEMM:  (2048, 2048)                     ← seq-first, heads interleaved
+  reshape  →  (2048, 32, 64)                    ← split into 32 heads
+  transpose → (32, 2048, 64)                    ← head-first
+  reshape  →  (65536, 64)                       ← flatten to 2D: 65536 rows
+  flatten  →  (4194304,)                        ← 1D for kernel memref
+```
+
+**Decode reshape (before RoPE Q)**:
+```
+Q from GEMV:  (2048,)                           ← single token
+  reshape  →  (32, 64)                          ← 32 heads of 64 elements
+  flatten  →  (2048,)                           ← 1D for kernel memref
+```
+
+### Shapes passed to `build_module()`
+
+| Context | `seq_len` param | Actual meaning | Rows | head_dim | Total elements | Loop iterations |
+|---------|----------------|----------------|------|----------|---------------|-----------------|
+| **Decode RoPE Q** | 32 | n_heads | 32 | 64 | 2,048 | 32 |
+| **Decode RoPE K** | 8 | n_kv_heads | 8 | 64 | 512 | 8 |
+| **Prefill RoPE Q** | 65,536 | n_heads × seq_len | 65,536 | 64 | 4,194,304 | 65,536 |
+| **Prefill RoPE K** | 16,384 | n_kv_heads × seq_len | 16,384 | 64 | 1,048,576 | 16,384 |
+
+Note: the `seq_len` parameter of `build_module()` is the number of **rows**, not the transformer sequence length. For prefill, it's `n_heads × transformer_seq_len` because each (head, position) pair is one row.
+
+### How RoPE is called in the pipeline
+
+**Decode** — two separate xclbin kernels:
+
+```python
+# llama3_decode.py, compile_decode_kernels()
+cache.compile_and_cache("rope_q", build_rope(n_heads=32,     head_dim=64, bfloat16), ...)
+cache.compile_and_cache("rope_k", build_rope(n_kv_heads=8,   head_dim=64, bfloat16), ...)
+
+# run_decode_block() — 2 XRT invocations
+_run("rope_q", ..., q_heads.flatten(), lut_q, q_roped_out)    # 32 rows
+_run("rope_k", ..., k_heads.flatten(), lut_k, k_roped_out)    # 8 rows
+```
+
+**Prefill** — two herds stitched into one ELF via `rope_qk_multi.py`:
+
+```python
+# multi_launch_builder/rope_qk_multi.py, build_rope_qk_module()
+q_ir = str(build_rope(N_Q=65536, head_dim=64, bfloat16))     # 65536 rows
+k_ir = str(build_rope(N_K=16384, head_dim=64, bfloat16))     # 16384 rows
+# → Text-stitch into one func @rope_qk with 6 args, 2 sequential herds
+
+# run_transformer_block() — 1 XRT invocation
+_run_cached(cache, "rope_qk", ..., q_in, lut_q_in, k_in, lut_k_in, q_out, k_out)
+```
+
+---
+
+## Current Performance
+
+| Context | Herd | Rows | Time | Notes |
+|---------|------|------|------|-------|
+| Decode RoPE Q | [1,1] | 32 | ~0.3ms | Fast enough (tiny workload) |
+| Decode RoPE K | [1,1] | 8 | ~0.2ms | Fast enough |
+| Prefill RoPE Q+K | [1,1] × 2 | 65,536 + 16,384 | **~11ms** | **65K rows on 1 tile** |
+
+Prefill RoPE is 11ms/layer × 16 layers = **176ms total**, about 9% of prefill time.
+
+---
+
+## Multi-Tile Improvement Opportunity
+
+### Why it's straightforward
+
+Each row's RoPE is completely independent — row `r` only reads `x[r,:]` and `lut[r,:]`. No cross-row dependency, no shared data to broadcast. This is the simplest possible parallelism pattern.
+
+The existing `rope.cc` C++ kernel doesn't need any changes — it processes one row at a time regardless of which tile calls it.
+
+### What needs to change in `rope_lut.py`
+
+```python
+# Current: [1,1] herd, all rows sequential
+@herd(name="herd_0", sizes=[1, 1], operands=[...])
+def herd_body(_tx, _ty, ...):
+    for row_offset in range_(0, total, embed_dim):         # 65536 iterations
+        DMA + rope() + DMA
+
+# Multi-tile: [herd_x, 1] herd, rows distributed
+@herd(name="herd_0", sizes=[herd_x, 1], operands=[...])
+def herd_body(_tx, _ty, ...):
+    rows_per_tile = seq_len // herd_x                      # 65536/8 = 8192
+    for local_row in range_(rows_per_tile):                 # 8192 iterations per tile
+        row = local_row + _tx * rows_per_tile              # tile-dependent offset
+        row_offset = row * embed_dim
+        DMA + rope() + DMA
+```
+
+Changes needed:
+1. Add `herd_x` parameter to `build_module()`
+2. Change `sizes=[1,1]` to `sizes=[herd_x, 1]`
+3. Compute `rows_per_tile = seq_len // herd_x`
+4. Add tile-dependent offset: `row = local_row + _tx * rows_per_tile`
+5. Adjust loop bound from `total` to `rows_per_tile * embed_dim`
+
+This is the same pattern as the 8-tile RMSNorm fix (which also distributes rows with tile-dependent offsets). No broadcast DMA needed — each row has its own LUT entry, so all DMAs are tile-dependent.
+
+### Expected improvement
+
+| Config | Rows/tile | Estimated time | Speedup |
+|--------|-----------|---------------|---------|
+| [1,1] (current) | 65,536 | ~11ms | 1x |
+| [2,1] | 32,768 | ~6ms | ~2x |
+| [4,1] | 16,384 | ~3ms | ~4x |
+| [8,1] | 8,192 | **~2ms** | **~6x** |
+
+With 8 tiles: prefill RoPE drops from 11ms to ~2ms per layer, saving ~9ms × 16 = **~144ms total** (7% of prefill).
+
+### Impact on decode
+
+Decode RoPE processes only 32/8 rows — too small to benefit from multi-tile. The dispatch overhead of setting up an 8-tile herd would exceed the compute savings. Decode RoPE stays at [1,1].
+
+### Integration into prefill pipeline
+
+The prefill uses `rope_qk_multi.py` which stitches two `build_rope()` calls via text-based MLIR. After adding `herd_x` to `rope_lut.py`, the multi-launch builder would call:
+
+```python
+q_ir = str(build_rope(N_Q, head_dim, bfloat16, herd_x=8))    # was herd_x=1
+k_ir = str(build_rope(N_K, head_dim, bfloat16, herd_x=8))
+```
+
+No changes needed to the multi-launch stitching logic — it just renames and remaps args as before.
+
+---
+
+## Files
+
+| File | Purpose |
+|------|---------|
+| `programming_examples/rope_lut/rope_lut.py` | AIR kernel builder (herd + DMA loop) |
+| `programming_examples/rope_lut/rope.cc` | C++ kernel (one row, vectorized BF16) |
+| `llama3/multi_launch_builder/rope_qk_multi.py` | Prefill multi-launch: Q+K in one ELF |
+| `llama3/llama3_decode.py` | Decode: compiles `rope_q` and `rope_k` separately |
+| `llama3/llama3_prefill.py` | Prefill: calls `rope_qk_multi.build_rope_qk_module()` |
