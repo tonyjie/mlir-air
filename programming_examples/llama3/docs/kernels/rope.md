@@ -140,79 +140,84 @@ _run_cached(cache, "rope_qk", ..., q_in, lut_q_in, k_in, lut_k_in, q_out, k_out)
 
 ---
 
-## Current Performance
+## Performance: Single-Tile vs Multi-Tile
 
-| Context | Herd | Rows | Time | Notes |
-|---------|------|------|------|-------|
-| Decode RoPE Q | [1,1] | 32 | ~0.3ms | Fast enough (tiny workload) |
-| Decode RoPE K | [1,1] | 8 | ~0.2ms | Fast enough |
-| Prefill RoPE Q+K | [1,1] × 2 | 65,536 + 16,384 | **~11ms** | **65K rows on 1 tile** |
+Profiled with C++ harness (`test.cpp`): 10 warmup + 20 measured iterations, microsecond precision. Timer scope: kernel dispatch + `run.wait()` only (no BO sync).
 
-Prefill RoPE is 11ms/layer × 16 layers = **176ms total**, about 9% of prefill time.
+### Standalone kernel profiling (C++ harness)
+
+| Shape | Rows | herd=[1,1] | herd=[8,1] | Speedup | Bandwidth |
+|-------|------|-----------|-----------|---------|-----------|
+| **Prefill Q** | 65,536 | 6717 us | **913 us** | **7.4x** | 27.6 GB/s |
+| **Prefill K** | 16,384 | 1716 us | **268 us** | **6.4x** | 23.5 GB/s |
+| **Combined Q+K** | — | 8433 us | **1181 us** | **7.1x** | — |
+| Decode Q | 32 | 100 us | N/A | — | — |
+| Decode K | 8 | 100 us | N/A | — | — |
+
+Correctness: correlation = 0.999992 at all shapes and herd sizes.
+
+### In LLAMA prefill pipeline context
+
+The prefill `rope_qk` multi-launch ELF stitches Q and K into one XRT call. In-pipeline timing (from `llama3_prefill.py --profile`) includes host overhead:
+
+| Config | rope_qk per layer | 16 layers total |
+|--------|-------------------|-----------------|
+| herd=[1,1] (old) | ~11ms | ~176ms |
+| herd=[8,1] (with multi-tile) | **~2ms** (estimated) | **~32ms** |
+| **Savings** | **~9ms/layer** | **~144ms** |
+
+### Decode: stays at [1,1]
+
+Decode RoPE processes only 32/8 rows — too small to benefit from multi-tile. Decode RoPE stays at [1,1] (~0.1ms per call).
 
 ---
 
-## Multi-Tile Improvement Opportunity
+## Multi-Tile Architecture
 
-### Why it's straightforward
+Each row's RoPE is completely independent — row `r` only reads `x[r,:]` and `lut[r,:]`. No cross-row dependency, no shared data to broadcast.
 
-Each row's RoPE is completely independent — row `r` only reads `x[r,:]` and `lut[r,:]`. No cross-row dependency, no shared data to broadcast. This is the simplest possible parallelism pattern.
-
-The existing `rope.cc` C++ kernel doesn't need any changes — it processes one row at a time regardless of which tile calls it.
-
-### What needs to change in `rope_lut.py`
+The `rope.cc` C++ kernel is unchanged — it processes one row at a time. Only the AIR wrapper (`rope_lut.py`) distributes rows across tiles:
 
 ```python
-# Current: [1,1] herd, all rows sequential
-@herd(name="herd_0", sizes=[1, 1], operands=[...])
-def herd_body(_tx, _ty, ...):
-    for row_offset in range_(0, total, embed_dim):         # 65536 iterations
-        DMA + rope() + DMA
-
-# Multi-tile: [herd_x, 1] herd, rows distributed
 @herd(name="herd_0", sizes=[herd_x, 1], operands=[...])
 def herd_body(_tx, _ty, ...):
     rows_per_tile = seq_len // herd_x                      # 65536/8 = 8192
     for local_row in range_(rows_per_tile):                 # 8192 iterations per tile
-        row = local_row + _tx * rows_per_tile              # tile-dependent offset
-        row_offset = row * embed_dim
-        DMA + rope() + DMA
+        row_offset = affine_apply(                          # tile-dependent offset
+            (local_row + _tx * rows_per_tile) * embed_dim)
+        DMA input[row_offset] → L1
+        DMA lut[row_offset] → L1
+        call rope(l1_in, l1_lut, l1_out, embed_dim)
+        DMA L1 → output[row_offset]
 ```
 
-Changes needed:
-1. Add `herd_x` parameter to `build_module()`
-2. Change `sizes=[1,1]` to `sizes=[herd_x, 1]`
-3. Compute `rows_per_tile = seq_len // herd_x`
-4. Add tile-dependent offset: `row = local_row + _tx * rows_per_tile`
-5. Adjust loop bound from `total` to `rows_per_tile * embed_dim`
+Unified code path for all herd sizes (herd_x=1 is just the general case with `rows_per_tile = seq_len`). No separate single-tile branch needed.
 
-This is the same pattern as the 8-tile RMSNorm fix (which also distributes rows with tile-dependent offsets). No broadcast DMA needed — each row has its own LUT entry, so all DMAs are tile-dependent.
+### Profiling infrastructure
 
-### Expected improvement
+```bash
+cd programming_examples/rope_lut
 
-| Config | Rows/tile | Estimated time | Speedup |
-|--------|-----------|---------------|---------|
-| [1,1] (current) | 65,536 | ~11ms | 1x |
-| [2,1] | 32,768 | ~6ms | ~2x |
-| [4,1] | 16,384 | ~3ms | ~4x |
-| [8,1] | 8,192 | **~2ms** | **~6x** |
+# Correctness test
+make run SEQ_LEN=65536 EMBED_DIM=64 HERD_X=8
 
-With 8 tiles: prefill RoPE drops from 11ms to ~2ms per layer, saving ~9ms × 16 = **~144ms total** (7% of prefill).
+# C++ profiling (10 warmup + 20 measured, microsecond precision)
+make profile SEQ_LEN=65536 EMBED_DIM=64 HERD_X=8
 
-### Impact on decode
-
-Decode RoPE processes only 32/8 rows — too small to benefit from multi-tile. The dispatch overhead of setting up an 8-tile herd would exceed the compute savings. Decode RoPE stays at [1,1].
+# LLAMA shapes: correctness + profiling for both Q and K
+make run_llama
+```
 
 ### Integration into prefill pipeline
 
-The prefill uses `rope_qk_multi.py` which stitches two `build_rope()` calls via text-based MLIR. After adding `herd_x` to `rope_lut.py`, the multi-launch builder would call:
+The prefill uses `rope_qk_multi.py` which stitches two `build_rope()` calls via text-based MLIR. To enable multi-tile:
 
 ```python
 q_ir = str(build_rope(N_Q, head_dim, bfloat16, herd_x=8))    # was herd_x=1
 k_ir = str(build_rope(N_K, head_dim, bfloat16, herd_x=8))
 ```
 
-No changes needed to the multi-launch stitching logic — it just renames and remaps args as before.
+No changes needed to the multi-launch stitching logic.
 
 ---
 
@@ -236,8 +241,11 @@ There is another RoPE implementation at `programming_examples/rope_sincos/` that
 
 | File | Purpose |
 |------|---------|
-| `programming_examples/rope_lut/rope_lut.py` | AIR kernel builder (herd + DMA loop) |
+| `programming_examples/rope_lut/rope_lut.py` | AIR kernel builder (herd_x + DMA loop) |
 | `programming_examples/rope_lut/rope.cc` | C++ kernel (one row, vectorized BF16) |
+| `programming_examples/rope_lut/test.cpp` | C++ profiling harness (XRT, microsecond) |
+| `programming_examples/rope_lut/Makefile` | Build: `run`, `profile`, `run_llama` targets |
+| `programming_examples/rope_lut/run_llama_shape_peano.lit` | LIT test at LLAMA Q+K shapes |
 | `llama3/multi_launch_builder/rope_qk_multi.py` | Prefill multi-launch: Q+K in one ELF |
 | `llama3/llama3_decode.py` | Decode: compiles `rope_q` and `rope_k` separately |
 | `llama3/llama3_prefill.py` | Prefill: calls `rope_qk_multi.build_rope_qk_module()` |
