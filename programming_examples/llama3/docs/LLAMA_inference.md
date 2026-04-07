@@ -617,7 +617,67 @@ Options:
 
 ---
 
-## 10. Files
+## 10. Future Optimization Opportunities
+
+### A. Herd Utilization — Current Audit
+
+Most kernels are already well-sized. The real constraints:
+
+| Kernel | Current Herd | Can Improve? | Reason |
+|--------|-------------|--------------|--------|
+| Decode RMSNorm | [1,1] | No | M=1, can't split 1 row |
+| Decode RoPE Q/K | [1,1] | Maybe | External C++ kernel is single-tile by design. Multi-tile needs a new kernel |
+| Decode GEMV (all) | [8,1] | No | M=1, only 1 tile per column does real work |
+| Prefill RoPE | [1,1] per herd | Maybe | Same C++ kernel limitation. 11ms/layer — savings ~5ms if multi-tiled |
+| Decode Add/SiLU | [8,1] | Already optimal | 2048-8192 elements across 8 tiles |
+| Prefill GEMMs | [8,4] | Already optimal | M=2048 across 32 tiles |
+| Prefill RMSNorm | [8,1] | Already optimal | M=2048 across 8 tiles |
+
+**Key insight**: Decode GEMV at batch=1 is fundamentally limited — with M=1, the 8-column herd splits 1 output row across 8 tiles, but only 1 tile has real work. The performance gap is not herd size but the data path (L2 staging overhead vs IRON's direct DDR→L1).
+
+### B. Data Layout Transpose Reduction
+
+The most complex reshaping is between QKV GEMMs → RoPE → FlashAttention, converting between **seq-first** and **head-first** layouts:
+
+| Location | Transpose | Est. Cost | Could Avoid? |
+|----------|-----------|----------|-------------|
+| Prefill: QKV → RoPE | `(seq,dim)` → `(seq,n_h,64)` → transpose `(n_h,seq,64)` → flatten | ~1ms | Yes, if RoPE accepted seq-first |
+| Prefill: RoPE → FlashAttn | Undo above, redo for head-first 3D | ~1ms | Yes, if RoPE output head-first directly |
+| Prefill: FlashAttn → O proj | `(n_h,seq,64)` → transpose → `(seq,dim)` | ~0.5ms | Yes, if O GEMM accepted head-first |
+| Decode: RMSNorm | `(dim,)` → `(1,dim)` → flatten | ~0.01ms | Trivial, not worth fixing |
+
+**Potential approach**: Modify kernel IR generators so QKV/RoPE/FlashAttn agree on head-first layout throughout. This eliminates 2-3 numpy transpose/reshape per layer. Estimated savings: ~3ms/layer in prefill (~48ms total).
+
+### C. Further Kernel Merging
+
+| Merge | Saves | Difficulty | Blocker |
+|-------|-------|-----------|---------|
+| **Decode RoPE Q+K** → 1 ELF (2 launches) | 1 dispatch × 16 = ~16ms | Easy (same pattern as prefill rope_qk) | None |
+| **Decode RMSNorm + QKV** → 1 ELF (4 launches) | 1 dispatch × 16 = ~16ms | Medium (like rms_attn_gemms but with GEMV) | None |
+| **Decode RMSNorm + Gate/Up** → same | 1 dispatch × 16 = ~16ms | Medium | None |
+| **Decode FFN full** (5 launches) | 3 dispatches × 16 = ~48ms | Hard | `linalg_fill_bf16` type mismatch (tile_m=8 vs tile_m=2) |
+| **Decode NPU LM Head** (GEMV 128256×2048) | ~40ms (replace CPU matmul) | Medium | None — straightforward GEMV |
+| **Prefill DMA transpose** (5→3 inv/layer) | ~3-5ms/layer | Blocked | BF16 stride=1 hardware limit |
+
+**Highest-impact, no blockers**: Decode NPU LM Head (~40ms) and Decode RoPE merge (~16ms).
+
+### D. Variable-Length Input Sequences
+
+Currently padds all prompts to fixed seq_len=2048. Short prompts waste compute on padding. IRON handles arbitrary lengths. Investigating their approach (likely multiple compiled kernel variants or dynamic shapes) is key for practical usability.
+
+### E. Code & Build Artifacts Cleanup
+
+| Issue | Current State | Proposed Fix |
+|-------|--------------|-------------|
+| Duplicate cache dirs | `llama3/kernel_cache/` AND `build_peano/kernel_cache/` | Use single absolute-path cache per kernel set |
+| Scattered .o files | `mv.o`, `rope.o`, etc. copied to `build_peano/` at runtime | Build to a shared `external_kernels/` dir, reference by absolute path |
+| Stale `air.mlir` files | 6 files scattered across `programming_examples/` | Add `air.mlir` to `.gitignore` (already done), clean existing |
+| `air_project/` dirs | Intermediate build dirs left by aircc in various locations | Add to `.gitignore`, clean existing |
+| `cd build_peano` requirement | Scripts must run from `build_peano/` | Make scripts work from `llama3/` dir by using absolute paths |
+
+---
+
+## 11. Files
 
 | File | Purpose |
 |------|---------|
