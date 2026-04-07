@@ -5,14 +5,15 @@
 """LLAMA-3.2-1B BF16 Inference on MLIR-AIR (NPU2).
 
 Unified script: NPU prefill + NPU decode.
-- Prefill: runs full prompt through 16 transformer layers on NPU (~1.92s)
-- Decode: generates tokens one at a time using GEMV kernels on NPU (~351ms/tok)
+- Prefill: runs full prompt through 16 transformer layers on NPU (~2.5s)
+- Decode: generates tokens one at a time using GEMV kernels on NPU (~400ms/tok)
 
 Usage:
     cd build_peano
     python3 ../llama3_inference.py --compile-only
     python3 ../llama3_inference.py --run-only --n-tokens 10 --profile
     python3 ../llama3_inference.py --run-only --n-tokens 100 --profile
+    python3 ../llama3_inference.py --run-only --n-tokens 5 --verify
 """
 
 import argparse
@@ -44,6 +45,86 @@ from llama3_decode import (
 )
 
 # ---------------------------------------------------------------------------
+# Runtime preparation (all one-time init, outside profiling scope)
+# ---------------------------------------------------------------------------
+
+
+def prepare_runtime(
+    prefill_cache,
+    decode_cache,
+    weights,
+    config,
+    seq_len,
+):
+    """One-time runtime initialization. Called before any timed inference.
+
+    Mirrors IRON's prepare_runtime(): all heavyweight setup that should not
+    be counted toward inference latency.
+
+    Does:
+        1. Pre-load LM Head weight partitions into BOs (512MB, warmup kernel)
+        2. Pre-transpose decode GEMV weights (GEMV expects A[M,K], stored as (K,M))
+        3. Tag layers with index for per-layer BO isolation
+
+    Args:
+        prefill_cache: KernelCache with prefill kernels loaded
+        decode_cache: KernelCache with decode kernels loaded
+        weights: LlamaWeights (modified in-place)
+        config: LlamaConfig
+        seq_len: prompt sequence length (for LM Head BO sizing)
+    """
+    print(f"\n{'='*60}")
+    print("Preparing runtime (one-time init, outside profiling scope)...")
+    print(f"{'='*60}")
+    t0 = time.time()
+
+    # 1. Pre-load LM Head weight partitions into BOs
+    #    - Transposes 8 weight partitions (128K vocab -> 8 x 16K)
+    #    - Allocates XRT context + BOs
+    #    - Runs warmup kernel to trigger JIT setup
+    preload_lm_head_weights(weights, config, prefill_cache, seq_len)
+
+    # 2. Pre-transpose all decode GEMV weights
+    #    - GEMV kernel expects A[M,K] but HuggingFace stores (out_features, in_features) = (K,M)
+    #    - Each weight: np.ascontiguousarray(W.reshape(...).T) -> contiguous transposed
+    emb_dim = config.emb_dim
+    kv_dim = config.n_kv_heads * config.head_dim
+    hidden_dim = config.hidden_dim
+    if not hasattr(weights, "_decode_weights_transposed"):
+        print("  Pre-transposing weights for GEMV...")
+        for lw in weights.layers:
+            lw._wq_t = np.ascontiguousarray(
+                lw.wq.astype(bfloat16).reshape(emb_dim, emb_dim).T
+            )
+            lw._wk_t = np.ascontiguousarray(
+                lw.wk.astype(bfloat16).reshape(emb_dim, kv_dim).T
+            )
+            lw._wv_t = np.ascontiguousarray(
+                lw.wv.astype(bfloat16).reshape(emb_dim, kv_dim).T
+            )
+            lw._wo_t = np.ascontiguousarray(
+                lw.wo.astype(bfloat16).reshape(emb_dim, emb_dim).T
+            )
+            lw._wgate_t = np.ascontiguousarray(
+                lw.w_gate.astype(bfloat16).reshape(emb_dim, hidden_dim).T
+            )
+            lw._wup_t = np.ascontiguousarray(
+                lw.w_up.astype(bfloat16).reshape(emb_dim, hidden_dim).T
+            )
+            lw._wdown_t = np.ascontiguousarray(
+                lw.w_down.astype(bfloat16).reshape(hidden_dim, emb_dim).T
+            )
+        weights._decode_weights_transposed = True
+
+    # 3. Tag layers with index for per-layer BO key isolation
+    for i, lw in enumerate(weights.layers):
+        lw._layer_idx = i
+
+    t_prep = time.time() - t0
+    print(f"  Runtime prepared in {t_prep:.1f}s")
+
+
+# ---------------------------------------------------------------------------
 # NPU Prefill with KV cache extraction
 # ---------------------------------------------------------------------------
 
@@ -55,7 +136,7 @@ def run_npu_prefill(
     prefill_cache,
     rope_lut_bf16,
     max_seq,
-    tokenizer=None,
+    tokenizer,
     cpu_attn=True,
     profile=False,
     verify=False,
@@ -70,7 +151,6 @@ def run_npu_prefill(
     """
     seq_len = len(token_ids)
     emb_dim = config.emb_dim
-    n_heads = config.n_heads
     n_kv_heads = config.n_kv_heads
     head_dim = config.head_dim
 
@@ -83,10 +163,7 @@ def run_npu_prefill(
     x_bf16 = embed_f32.astype(bfloat16)
     x_f32 = embed_f32.copy()
 
-    # Pre-load LM Head weights into BOs (outside profiling scope, matching
-    # standalone prefill and IRON methodology — weight loading is one-time init)
-    preload_lm_head_weights(weights, config, prefill_cache, seq_len)
-
+    # ---- TIMED SECTION START ----
     print(f"Running NPU prefill ({config.n_layers} layers, seq_len={seq_len})...")
     t_prefill_start = time.time()
 
@@ -107,8 +184,6 @@ def run_npu_prefill(
         )
 
         # Extract KV cache from intermediates
-        # k_roped: (seq_len, kv_dim) — post-RoPE K
-        # v: (seq_len, kv_dim) — raw V projection
         k_roped = intermediates["k_roped"]
         v_raw = intermediates["v"]
 
@@ -138,18 +213,6 @@ def run_npu_prefill(
     vocab_size = weights.lm_head.shape[0]
     n_part = 16384
     n_partitions = 8
-
-    if not hasattr(weights, "_lm_weight_parts"):
-        weights._lm_weight_parts = []
-        for p in range(n_partitions):
-            n_start = p * n_part
-            n_end = min(n_start + n_part, vocab_size)
-            n_actual = n_end - n_start
-            w = np.zeros((emb_dim, n_part), dtype=bfloat16)
-            w[:, :n_actual] = np.ascontiguousarray(
-                weights.lm_head[n_start:n_end, :].T
-            ).astype(bfloat16)
-            weights._lm_weight_parts.append(w)
 
     _LM_HEAD_BACKEND = {
         "omit_while_true_loop": False,
@@ -192,6 +255,7 @@ def run_npu_prefill(
     prefill_token = int(np.argmax(logits_f32[pred_pos]))
 
     t_prefill = time.time() - t_prefill_start
+    # ---- TIMED SECTION END ----
     print(f"NPU prefill done in {t_prefill:.2f}s. First token: {prefill_token}")
 
     # --- Verification: compare against CPU F32 reference ---
@@ -207,7 +271,6 @@ def run_npu_prefill(
             x_cpu, cpu_intermediates = cpu_block(
                 x_cpu, weights.layers[li], rope_lut_f32, config
             )
-            # Compare KV cache for this layer
             cpu_k = (
                 cpu_intermediates["k_roped"]
                 .astype(np.float32)
@@ -271,6 +334,7 @@ def generate(
     prefill_cache,
     decode_cache,
     rope_lut_bf16,
+    tokenizer,
     n_tokens=10,
     profile=False,
     verify=False,
@@ -279,9 +343,6 @@ def generate(
     """Run NPU prefill + NPU decode generation."""
     seq_len = len(prompt_tokens)
     emb_dim = config.emb_dim
-    n_heads = config.n_heads
-    n_kv_heads = config.n_kv_heads
-    head_dim = config.head_dim
     max_seq = seq_len + n_tokens
 
     print(f"\n{'='*60}")
@@ -289,10 +350,6 @@ def generate(
     print(f"{'='*60}\n")
 
     # --- Phase 1: NPU Prefill ---
-    from transformers import AutoTokenizer
-
-    _tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B")
-
     prefill_token, k_cache, v_cache, prompt_len = run_npu_prefill(
         prompt_tokens,
         weights,
@@ -300,46 +357,15 @@ def generate(
         prefill_cache,
         rope_lut_bf16,
         max_seq,
-        tokenizer=_tokenizer,
+        tokenizer=tokenizer,
         cpu_attn=cpu_attn,
         profile=profile,
         verify=verify,
     )
 
     # --- Phase 2: NPU Decode ---
-    # Pre-transpose weights for GEMV (done once)
-    kv_dim = n_kv_heads * head_dim
-    hidden_dim = config.hidden_dim
-    if not hasattr(weights, "_decode_weights_transposed"):
-        print("Pre-transposing weights for GEMV...")
-        for lw in weights.layers:
-            lw._wq_t = np.ascontiguousarray(
-                lw.wq.astype(bfloat16).reshape(emb_dim, emb_dim).T
-            )
-            lw._wk_t = np.ascontiguousarray(
-                lw.wk.astype(bfloat16).reshape(emb_dim, kv_dim).T
-            )
-            lw._wv_t = np.ascontiguousarray(
-                lw.wv.astype(bfloat16).reshape(emb_dim, kv_dim).T
-            )
-            lw._wo_t = np.ascontiguousarray(
-                lw.wo.astype(bfloat16).reshape(emb_dim, emb_dim).T
-            )
-            lw._wgate_t = np.ascontiguousarray(
-                lw.w_gate.astype(bfloat16).reshape(emb_dim, hidden_dim).T
-            )
-            lw._wup_t = np.ascontiguousarray(
-                lw.w_up.astype(bfloat16).reshape(emb_dim, hidden_dim).T
-            )
-            lw._wdown_t = np.ascontiguousarray(
-                lw.w_down.astype(bfloat16).reshape(hidden_dim, emb_dim).T
-            )
-        weights._decode_weights_transposed = True
-    for i, lw in enumerate(weights.layers):
-        lw._layer_idx = i
-
     generated_tokens = [prefill_token]
-    current_pos = prompt_len  # Next position after actual prompt
+    current_pos = prompt_len
     x_decode = weights.embed_table[prefill_token].astype(bfloat16)
 
     print(f"\nDecoding {n_tokens} tokens...")
@@ -348,7 +374,6 @@ def generate(
     for token_idx in range(n_tokens):
         t_token_start = time.perf_counter()
 
-        # Run 16 transformer blocks
         x = x_decode.copy()
         for layer_idx in range(config.n_layers):
             x = run_decode_block(
@@ -414,7 +439,7 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    # Copy external kernel .o files to cwd
+    # --- Step 1: Copy external kernel .o files ---
     import shutil
     from pathlib import Path
 
@@ -473,8 +498,7 @@ if __name__ == "__main__":
     config = LlamaConfig()
     seq_len = 2048
 
-    # Separate caches for prefill and decode (use absolute paths matching
-    # the standalone scripts' defaults)
+    # --- Step 2: Compile or load kernel caches ---
     llama_dir = Path(__file__).resolve().parent
     prefill_cache = KernelCache(str(llama_dir / "kernel_cache"), verbose=args.verbose)
     decode_cache = KernelCache("decode_kernel_cache", verbose=args.verbose)
@@ -492,7 +516,7 @@ if __name__ == "__main__":
         prefill_cache.load_manifest()
         decode_cache.load_manifest()
 
-    # Load weights and tokenizer
+    # --- Step 3: Load model weights and tokenizer ---
     print("\nLoading weights...")
     weights = load_weights("meta-llama/Llama-3.2-1B")
 
@@ -501,8 +525,6 @@ if __name__ == "__main__":
     tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B")
     prompt_tokens = tokenizer.encode(args.prompt)
     prompt_len_actual = len(prompt_tokens)
-
-    # Pad to seq_len
     if len(prompt_tokens) < seq_len:
         prompt_tokens = prompt_tokens + [tokenizer.eos_token_id] * (
             seq_len - len(prompt_tokens)
@@ -513,6 +535,10 @@ if __name__ == "__main__":
         seq_len=seq_len + args.n_tokens,
     ).astype(bfloat16)
 
+    # --- Step 4: Prepare runtime (one-time init, outside profiling) ---
+    prepare_runtime(prefill_cache, decode_cache, weights, config, seq_len)
+
+    # --- Step 5: Run inference (timed) ---
     generated = generate(
         prompt_tokens,
         weights,
@@ -520,13 +546,14 @@ if __name__ == "__main__":
         prefill_cache,
         decode_cache,
         rope_lut_bf16,
+        tokenizer=tokenizer,
         n_tokens=args.n_tokens,
         profile=args.profile,
         verify=args.verify,
         cpu_attn=args.cpu_attn,
     )
 
-    # Decode tokens
+    # --- Step 6: Print output ---
     print(f"\n{'='*60}")
     print(f"Generated text:")
     print(f"{'='*60}")
