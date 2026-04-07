@@ -30,25 +30,65 @@ External `.o` files needed: `mv.o`, `rope.o`, `silu_and_mul.o`, `attn_npu2.o`. T
 
 ```
 llama3_inference.py
+  ├── prepare_runtime()         one-time init: LM Head preload, weight transpose
   ├── run_npu_prefill()         NPU prefill + KV cache extraction + verification
   ├── generate()                orchestrates prefill -> decode
-  └── __main__                  CLI, weight loading, kernel cache setup
+  └── __main__                  6-step flow (see below)
 ```
 
 ### What it imports
 
 ```python
-from llama3_prefill import KernelCache, compile_all_kernels, run_transformer_block
+from llama3_prefill import KernelCache, compile_all_kernels, run_transformer_block,
+                           preload_lm_head_weights
 from llama3_decode  import compile_decode_kernels, run_decode_block
 ```
 
-The script does not duplicate kernel-building code. It reuses the existing prefill and decode pipelines, adding only the glue logic to chain them together and extract the KV cache.
+The script does not duplicate kernel-building code. It reuses the existing prefill and decode pipelines, adding only `prepare_runtime()` and the glue logic to chain them together and extract the KV cache.
+
+### Main Flow (`__main__`)
+
+```
+Step 1: Copy external .o files (mv.o, rope.o, silu_and_mul.o, attn_npu2.o)
+Step 2: Compile or load kernel caches (7 prefill + 9 decode kernels)
+Step 3: Load model weights (HuggingFace safetensors) and tokenizer
+Step 4: prepare_runtime()    <-- all heavyweight init, outside profiling scope
+Step 5: generate()           <-- timed inference (prefill + decode)
+Step 6: Print generated text
+```
 
 ---
 
 ## 3. Execution Flow
 
-### Phase 1: NPU Prefill (`run_npu_prefill()`)
+### Step 4: `prepare_runtime()` — One-Time Init (Outside Timer)
+
+All heavyweight setup that should not count toward inference latency, mirroring IRON's `prepare_runtime()`:
+
+```
+prepare_runtime(prefill_cache, decode_cache, weights, config, seq_len)
+    |
+    | [1] Pre-load LM Head weight partitions into BOs (~2.4s)
+    |     - Transpose 8 weight partitions (128K vocab -> 8 x 16K x 2048)
+    |     - Allocate XRT context + buffer objects
+    |     - Run warmup LM Head kernel (triggers JIT, BO setup)
+    |     - Total: 512MB of weights written to BOs
+    |
+    | [2] Pre-transpose all decode GEMV weights (~2s)
+    |     - GEMV expects A[M,K] but HuggingFace stores W as (K,M)
+    |     - For each of 16 layers: transpose Wq, Wk, Wv, Wo, Wgate, Wup, Wdown
+    |     - np.ascontiguousarray(W.reshape(...).T) for contiguous memory
+    |
+    | [3] Tag layers with index for per-layer BO isolation
+    |     - layer_weights._layer_idx = i
+    |     - Used by decode's bo_key naming (e.g., "qkv_gemv_L0")
+    v
+    Runtime prepared in ~7s (one-time cost)
+```
+
+**Why this matters for profiling**: Both IRON and the standalone AIR prefill script exclude weight loading, BO allocation, and warmup from the timed section. Without `prepare_runtime()`, these costs inflate the reported prefill time (e.g., 5.68s instead of 2.47s). The 3-second difference was from `AutoTokenizer.from_pretrained()` being inside the timer (now fixed) and the LM Head warmup.
+
+### Step 5a: NPU Prefill (`run_npu_prefill()`)
 
 ```
 Token IDs (padded to 2048)
@@ -79,7 +119,7 @@ Outputs: first_token, k_cache, v_cache, prompt_len
 
 **KV cache extraction**: The existing `run_transformer_block()` always stores `intermediates["k_roped"]` (post-RoPE K, shape `(seq_len, kv_dim)`) and `intermediates["v"]` (raw V projection, shape `(seq_len, kv_dim)`). These are reshaped to `(n_kv_heads, seq_len, head_dim)` and written into the cache arrays. No changes to the prefill pipeline were needed — the intermediates were already there but previously discarded by `run_full_model()`.
 
-### Phase 2: NPU Decode (inside `generate()`)
+### Step 5b: NPU Decode (inside `generate()`)
 
 ```
 first_token
@@ -511,6 +551,17 @@ The most complex reshaping is in prefill between QKV and RoPE/FlashAttention. Th
 ---
 
 ## 8. Key Design Decisions
+
+### Why `prepare_runtime()` exists
+
+Without it, the reported prefill time was 5.68s instead of 2.47s — a 3.2s difference from LM Head BO warmup (2.4s) and tokenizer loading (0.8s) being inside the timer. Both IRON and the standalone prefill script exclude these from the timed section:
+
+| Init step | IRON | AIR standalone | AIR inference |
+|-----------|------|---------------|---------------|
+| Weight loading | Before timing | Before timing | Step 3 (before timing) |
+| LM Head BO preload | `prepare_runtime()` | `preload_lm_head_weights()` | `prepare_runtime()` |
+| Tokenizer loading | Before timing | `__main__` | Step 3 (before timing) |
+| GEMV weight transpose | N/A (IRON uses different format) | Inside `generate()` | `prepare_runtime()` |
 
 ### Why extract KV cache from intermediates (not recompute)?
 
