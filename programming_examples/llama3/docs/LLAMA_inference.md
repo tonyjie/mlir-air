@@ -625,7 +625,7 @@ Most kernels are already well-sized. The real constraints:
 
 | Kernel | Current Herd | Can Improve? | Reason |
 |--------|-------------|--------------|--------|
-| Decode RMSNorm | [1,1] | No | M=1, can't split 1 row |
+| Decode RMSNorm | [1,1] | Yes (column-parallel) | Current kernel distributes rows — M=1 can't split. But N=2048 can be split across tiles with L2 cross-tile reduction (see below) |
 | Decode RoPE Q/K | [1,1] | Maybe | External C++ kernel is single-tile by design. Multi-tile needs a new kernel |
 | Decode GEMV (all) | [8,1] | No | M=1, only 1 tile per column does real work |
 | Prefill RoPE | [1,1] per herd | Maybe | Same C++ kernel limitation. 11ms/layer — savings ~5ms if multi-tiled |
@@ -633,7 +633,18 @@ Most kernels are already well-sized. The real constraints:
 | Prefill GEMMs | [8,4] | Already optimal | M=2048 across 32 tiles |
 | Prefill RMSNorm | [8,1] | Already optimal | M=2048 across 8 tiles |
 
-**Key insight**: Decode GEMV at batch=1 is fundamentally limited — with M=1, the 8-column herd splits 1 output row across 8 tiles, but only 1 tile has real work. The performance gap is not herd size but the data path (L2 staging overhead vs IRON's direct DDR→L1).
+**Decode RMSNorm — why [1,1] and how to improve**:
+
+RMSNorm formula: `y[i] = x[i] * rsqrt(mean(x^2) + eps) * weight[i]`. For decode (M=1, N=2048), it's a single row of 2048 elements. The current kernel parallelizes across **rows** (`rows_per_tile = M // herd_x`), which requires M >= herd_x. With M=1, only 1 tile can work.
+
+An alternative: **column-parallel** — distribute the N=2048 columns across 8 tiles:
+1. Each tile computes partial sum of x^2 for its N/8 = 256 elements
+2. Cross-tile reduction via L2: all tiles write partial sums → one tile sums them → broadcasts rstd
+3. Each tile computes `y = x * rstd * weight` for its 256 columns
+
+This requires a new kernel with L2-mediated reduction, since the current design assumes each tile processes complete independent rows. The eltwise_add and silu_mul kernels already use this column-parallel pattern (they distribute N across tiles), but they don't have a reduction step.
+
+**Decode GEMV**: Fundamentally limited at batch=1. The performance gap is not herd size but the data path (L2 staging overhead vs IRON's direct DDR→L1).
 
 ### B. Data Layout Transpose Reduction
 
