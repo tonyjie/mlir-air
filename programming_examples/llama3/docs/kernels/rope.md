@@ -216,6 +216,22 @@ No changes needed to the multi-launch stitching logic — it just renames and re
 
 ---
 
+## Alternative: `rope_sincos/` (On-Chip Sin/Cos)
+
+There is another RoPE implementation at `programming_examples/rope_sincos/` that computes sin/cos **on-chip** via Chebyshev polynomial approximation instead of using a precomputed LUT.
+
+| Aspect | `rope_lut/` (ours) | `rope_sincos/` |
+|--------|-------------------|----------------|
+| Sin/cos | Precomputed host LUT, DMA'd per row | Computed on-chip (4th-order Chebyshev) |
+| Input format | Separate Q, K buffers | Packed QKV per head (`3 × head_size`) |
+| Herd | [1,1] (sequential rows) | [1, herd_n] (parallel across heads) |
+| head_dim | Any (64 for LLAMA) | Hardcoded 48 (freq table size) |
+| Compiler | Peano (our toolchain) | Chess-only (`::shuffle` intrinsics) |
+
+**Not usable for LLAMA** due to: head_dim=48 hardcoded (LLAMA needs 64), Chess-only intrinsics (we use Peano), and packed QKV layout mismatch. The on-chip sin/cos idea could save LUT DMA bandwidth, but the real bottleneck is 65K rows on 1 tile — multi-tiling `rope_lut` is the higher-impact fix.
+
+---
+
 ## Files
 
 | File | Purpose |
