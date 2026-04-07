@@ -55,6 +55,7 @@ def run_npu_prefill(
     prefill_cache,
     rope_lut_bf16,
     max_seq,
+    tokenizer=None,
     cpu_attn=True,
     profile=False,
     verify=False,
@@ -186,10 +187,7 @@ def run_npu_prefill(
     logits_f32 = logits.astype(np.float32)
 
     # Find actual prompt length and predict first token
-    from transformers import AutoTokenizer
-
-    _tok = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B")
-    prompt_len = len([t for t in token_ids if t != _tok.eos_token_id])
+    prompt_len = len([t for t in token_ids if t != tokenizer.eos_token_id])
     pred_pos = prompt_len - 1
     prefill_token = int(np.argmax(logits_f32[pred_pos]))
 
@@ -254,8 +252,8 @@ def run_npu_prefill(
             f"\n  Logits (pos {pred_pos}): corr={logit_corr:.6f}, "
             f"max_err={logit_maxerr:.4f}, mean_err={logit_meanerr:.4f}"
         )
-        print(f"  NPU top-1: {prefill_token} ({_tok.decode([prefill_token])})")
-        print(f"  CPU top-1: {cpu_pred} ({_tok.decode([cpu_pred])})")
+        print(f"  NPU top-1: {prefill_token} ({tokenizer.decode([prefill_token])})")
+        print(f"  CPU top-1: {cpu_pred} ({tokenizer.decode([cpu_pred])})")
         print(f"  Match: {'YES' if prefill_token == cpu_pred else 'NO'}")
 
     return prefill_token, k_cache, v_cache, prompt_len
@@ -291,6 +289,10 @@ def generate(
     print(f"{'='*60}\n")
 
     # --- Phase 1: NPU Prefill ---
+    from transformers import AutoTokenizer
+
+    _tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B")
+
     prefill_token, k_cache, v_cache, prompt_len = run_npu_prefill(
         prompt_tokens,
         weights,
@@ -298,6 +300,7 @@ def generate(
         prefill_cache,
         rope_lut_bf16,
         max_seq,
+        tokenizer=_tokenizer,
         cpu_attn=cpu_attn,
         profile=profile,
         verify=verify,
