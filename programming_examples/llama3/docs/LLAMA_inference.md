@@ -251,18 +251,16 @@ Both totals cover: embedding + 16 transformer layers + final RMSNorm + NPU LM He
 
 | Phase | Time | Notes |
 |-------|------|-------|
-| LM Head weight preload | ~2s | Outside timer (matches standalone/IRON scope) |
-| **NPU Prefill** | **3.54s** | Layer 0: 202ms (BO init), layers 3-15: ~118ms |
+| LM Head weight preload | ~2.4s | Outside timer (matches standalone/IRON scope) |
+| **NPU Prefill** | **2.47s** | Matches standalone 2.43s (same scope) |
 | Weight transpose | ~2s | One-time GEMV weight prep |
-| **Decode token 0** | **723ms** | Weight BO init for decode kernels |
-| **Decode steady-state** | **~390ms/token** | Tokens 1-99 |
-| **Decode total (100 tokens)** | **39.35s** | 2.54 tok/s |
+| **Decode token 0** | **~840ms** | Weight BO init for decode kernels |
+| **Decode steady-state** | **~400ms/token** | Tokens 1-99 |
+| **Decode total (100 tokens)** | **40.16s** | 2.49 tok/s |
 
-The prefill takes 3.54s vs standalone 1.92s because the per-layer kernel BOs (rms_attn_gemms, rope_qk, flash_attn, o_proj_add, ffn_full) are allocated on first use. In the standalone script, these are warm from prior runs in the same process. This overhead amortizes on subsequent inference calls.
+**Profiling scope matches standalone and IRON**: LM Head weights are pre-loaded (BO allocation + 512MB write + warmup kernel) and tokenizer is loaded outside the timer. The timed section covers only: embedding + 16 layers + final RMSNorm + LM Head inference.
 
-**LM Head preload**: Weight partitions (512MB) are pre-loaded into BOs before the timer starts, matching the standalone prefill script and IRON's methodology. Both treat weight loading as one-time initialization, not per-inference cost.
-
-**Net benefit vs separate scripts**: Total 3.54s + 39.35s = 43s vs 16s (CPU prefill) + 35.6s = 51.6s. The unified script is **~9s faster** by replacing CPU prefill with NPU prefill.
+**Net benefit vs separate scripts**: Total 2.47s + 40.16s = 43s vs 16s (CPU prefill) + 35.6s = 51.6s. The unified script is **~9s faster** by replacing CPU prefill with NPU prefill.
 
 ---
 
