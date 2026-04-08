@@ -36,12 +36,16 @@ range_ = for_
 
 
 @module_builder
-def build_module(seq_len, embed_dim, np_dtype_in, herd_x=1):
+def build_module(seq_len, embed_dim, np_dtype_in, herd_x=1, herd_y=1):
     xrt_dtype = type_mapper(np_dtype_in)
     total = seq_len * embed_dim
+    total_tiles = herd_x * herd_y
     assert (
         embed_dim % 16 == 0
     ), "embed_dim must be divisible by 16 (kernel vector width)"
+    assert (
+        seq_len % total_tiles == 0
+    ), f"seq_len ({seq_len}) must be divisible by total tiles ({total_tiles})"
 
     # L3 types
     l3DataTy = MemRefType.get([total], xrt_dtype)
@@ -59,21 +63,25 @@ def build_module(seq_len, embed_dim, np_dtype_in, herd_x=1):
     rope_func.attributes["link_with"] = StringAttr.get("rope.o")
     rope_func.attributes["llvm.emit_c_interface"] = UnitAttr.get()
 
-    assert (
-        seq_len % herd_x == 0
-    ), f"seq_len ({seq_len}) must be divisible by herd_x ({herd_x})"
-    rows_per_tile = seq_len // herd_x
+    rows_per_tile = seq_len // total_tiles
 
-    # Affine map: row_offset = (local_row + _tx * rows_per_tile) * embed_dim
+    # Affine map: tile_id = _tx * herd_y + _ty
+    # row_offset = (local_row + tile_id * rows_per_tile) * embed_dim
     row_offset_map = AffineMap.get(
         0,
-        2,
+        3,  # s0=local_row, s1=_tx, s2=_ty
         [
             AffineExpr.get_mul(
                 AffineExpr.get_add(
-                    AffineSymbolExpr.get(0),
+                    AffineSymbolExpr.get(0),  # local_row
                     AffineExpr.get_mul(
-                        AffineSymbolExpr.get(1),
+                        AffineExpr.get_add(
+                            AffineExpr.get_mul(
+                                AffineSymbolExpr.get(1),  # _tx
+                                AffineConstantExpr.get(herd_y),
+                            ),
+                            AffineSymbolExpr.get(2),  # _ty
+                        ),
                         AffineConstantExpr.get(rows_per_tile),
                     ),
                 ),
@@ -86,7 +94,7 @@ def build_module(seq_len, embed_dim, np_dtype_in, herd_x=1):
     def rope_lut(arg0, arg1, arg2):
         # arg0 = input [total], arg1 = lut [total], arg2 = output [total]
 
-        @herd(name="herd_0", sizes=[herd_x, 1], operands=[arg0, arg1, arg2])
+        @herd(name="herd_0", sizes=[herd_x, herd_y], operands=[arg0, arg1, arg2])
         def herd_body(_tx, _ty, _sx, _sy, l3_in, l3_lut, l3_out):
             l1_in = AllocOp(l1RowTy, [], [])
             l1_lut = AllocOp(l1RowTy, [], [])
@@ -95,7 +103,7 @@ def build_module(seq_len, embed_dim, np_dtype_in, herd_x=1):
             dim_i32 = ConstantOp(T.i32(), embed_dim)
 
             for local_row in range_(rows_per_tile):
-                row_offset = affine_apply(row_offset_map, [local_row, _tx])
+                row_offset = affine_apply(row_offset_map, [local_row, _tx, _ty])
 
                 dma_memcpy_nd(
                     l1_in,
@@ -170,7 +178,13 @@ if __name__ == "__main__":
         "--herd-x",
         type=int,
         default=1,
-        help="Number of tiles (1=single, 8=multi-tile)",
+        help="Herd X dimension (columns)",
+    )
+    parser.add_argument(
+        "--herd-y",
+        type=int,
+        default=1,
+        help="Herd Y dimension (rows)",
     )
     parser.add_argument(
         "--compile-mode",
@@ -191,9 +205,14 @@ if __name__ == "__main__":
     seq_len = args.seq_len
     embed_dim = args.embed_dim
     herd_x = args.herd_x
-    print(f"RoPE LUT: seq_len={seq_len}, embed_dim={embed_dim}, herd=[{herd_x},1]")
+    herd_y = args.herd_y
+    print(
+        f"RoPE LUT: seq_len={seq_len}, embed_dim={embed_dim}, herd=[{herd_x},{herd_y}]"
+    )
 
-    mlir_module = build_module(seq_len, embed_dim, bfloat16, herd_x=herd_x)
+    mlir_module = build_module(
+        seq_len, embed_dim, bfloat16, herd_x=herd_x, herd_y=herd_y
+    )
     if args.print_module_only:
         print(mlir_module)
         exit(0)

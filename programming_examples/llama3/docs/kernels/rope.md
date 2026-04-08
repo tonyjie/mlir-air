@@ -221,6 +221,56 @@ No changes needed to the multi-launch stitching logic.
 
 ---
 
+## 2D Scaling Investigation (herd_x × herd_y)
+
+We investigated using 2D herds (e.g. [8,4] = 32 tiles) to push beyond the 8-tile [8,1] configuration. NPU2 has 8 columns × 4 compute rows = 32 tiles total.
+
+### Results summary
+
+| Config | Path | Tiles | LLAMA Q (65536x64) | Small (512x64) |
+|--------|------|-------|--------------------|----------------|
+| [1,1] | Direct | 1 | 6716 us | — |
+| **[8,1]** | **Direct** | **8** | **912 us (7.4x)** | **67 us** |
+| [4,2] | Direct | 8 | 912 us | 68 us |
+| [8,2] | Direct | 16 | FAIL: out of shim DMA channels | — |
+| [8,4] | Direct | 32 | FAIL: out of shim DMA channels | — |
+| [8,2] | L2 tiled | 16 | FAIL: outer loop bug (only 1st batch) | 59 us (single batch) |
+| [4,4] | L2 tiled | 16 | FAIL: outer loop bug | 55 us (single batch) |
+| [8,4] | L2 tiled | 32 | FAIL: zeros even at small scale | FAIL |
+
+### Blockers for >8 tiles
+
+**1. Direct path (DDR→L1): shim DMA channel exhaustion**
+
+Each tile needs 3 DMA channels (input, LUT, output). With >8 tiles, the shim DMA channels (limited per column) are exhausted. The `air-to-aie` pass reports: `'air.channel.put' op failed to map to shim dma channels: out of channels`.
+
+**2. L2 path: segment-level outer loop only executes first iteration**
+
+L2 staging (DDR→L2→L1) is needed to reduce shim channel pressure. But the tiled outer loop (`scf.for` at segment level wrapping a `herd`) only produces correct output for the first batch — subsequent batches output zeros. This appears to be a runtime/compiler issue with repeated herd invocations inside a segment-level loop.
+
+Verified: single-batch L2 PASS, 2-batch L2 FAIL (same data, same herd config).
+
+**3. [8,4] herd (32 tiles): zeros even without outer loop**
+
+At small scale with a single batch, [8,4] still produces zeros. This affects any config where `herd_x = 8` and `herd_y >= 3` (24+ tiles). Configs up to 16 tiles ([8,2], [4,4]) work correctly. Root cause unclear — may be MemTile lock or BD exhaustion at 24+ concurrent tile connections.
+
+### Why GEMM works with [8,4] but RoPE doesn't
+
+GEMM's L2 buffers are structured so each buffer's DMA depends on only **one** tile coordinate:
+- A: `[herd_m, 1, tile_m, tile_k_l2]` — L2→L1 uses `_tx` only (A is broadcast across `_ty`)
+- B: `[1, herd_n, tile_k_l2, tile_n]` — L2→L1 uses `_ty` only (B is broadcast across `_tx`)
+- Result: 8 + 4 = 12 BDs per buffer at MemTile level
+
+RoPE has no natural broadcasting — every tile reads unique data (unique row). Each DMA needs both `_tx` AND `_ty` → 32 BDs per buffer → overflow.
+
+### Conclusion
+
+**[8,1] direct at 912us is the practical optimum** for this kernel. The kernel is bandwidth-limited at ~27.6 GB/s with 8 tiles. L2 staging with 16 tiles shows 18% improvement at small scale (55us vs 67us) but is blocked at LLAMA scale by the outer loop bug. Filing this as a future compiler issue.
+
+Experimental L2 tiled implementation: `rope_lut_l2_tiled.py` (kept for reference).
+
+---
+
 ## Alternative: `rope_sincos/` (On-Chip Sin/Cos)
 
 There is another RoPE implementation at `programming_examples/rope_sincos/` that computes sin/cos **on-chip** via Chebyshev polynomial approximation instead of using a precomputed LUT.
@@ -241,7 +291,8 @@ There is another RoPE implementation at `programming_examples/rope_sincos/` that
 
 | File | Purpose |
 |------|---------|
-| `programming_examples/rope_lut/rope_lut.py` | AIR kernel builder (herd_x + DMA loop) |
+| `programming_examples/rope_lut/rope_lut.py` | AIR kernel builder (direct DDR→L1, herd_x) |
+| `programming_examples/rope_lut/rope_lut_l2_tiled.py` | Experimental L2-staging version (2D herd, blocked at scale) |
 | `programming_examples/rope_lut/rope.cc` | C++ kernel (one row, vectorized BF16) |
 | `programming_examples/rope_lut/test.cpp` | C++ profiling harness (XRT, microsecond) |
 | `programming_examples/rope_lut/Makefile` | Build: `run`, `profile`, `run_llama` targets |
