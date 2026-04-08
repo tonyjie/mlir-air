@@ -276,31 +276,22 @@ def build_module(
                 lz = ConstantOp(index_type, 0)
 
             # Compute Q offset from launch iteration index
-            # SEQ-FIRST launch offsets: row offset in seq-first layout
-            affine_map_q_launch = AffineMap.get(
+            # SEQ-FIRST launch offsets: ROW offset only (not flat)
+            # q_launch_row = lx * lqp (which row to start from)
+            affine_map_q_launch_row = AffineMap.get(
                 0,
                 1,
                 [
                     AffineExpr.get_mul(
                         AffineSymbolExpr.get(0),
-                        AffineConstantExpr.get(lqp * num_heads * dk),
+                        AffineConstantExpr.get(lqp),
                     )
                 ],
             )
-            q_launch_off = affine_apply(affine_map_q_launch, [lx])
+            q_launch_row = affine_apply(affine_map_q_launch_row, [lx])
 
-            # Output launch offset (seq-first)
-            affine_map_out_launch = AffineMap.get(
-                0,
-                1,
-                [
-                    AffineExpr.get_mul(
-                        AffineSymbolExpr.get(0),
-                        AffineConstantExpr.get(lqp * num_heads * dv),
-                    )
-                ],
-            )
-            out_launch_off = affine_apply(affine_map_out_launch, [lx])
+            # Output launch row offset
+            out_launch_row = q_launch_row  # same row offset
 
             # Compute head base from head group index (ly)
             # head_base = ly * num_heads_per_unroll
@@ -438,67 +429,60 @@ def build_module(
 
                 head_offset_idx = ConstantOp(index_type, head_local)
 
-                # Combined Q offset = head_q_off + q_launch_off
-                q_combined = affine_apply(affine_map_add, [head_q_off, q_launch_off])
-                # Combined output offset (uses dv stride, not dk)
-                out_combined = affine_apply(
-                    affine_map_add, [head_out_off, out_launch_off]
-                )
+                # SEQ-FIRST: separate row (launch) and column (head) offsets
+                q_col_off = head_q_off  # head * dk
+                out_col_off = head_out_off  # head * dv
 
-                # Q puts: SEQ-FIRST — row stride is num_heads*dk (not dk)
-                # Each tile reads tile_size_q rows, dk columns, strided by emb_dim
+                # Q puts: SEQ-FIRST 2D memref [lq, num_heads*dk]
+                # Use 2D offsets: [row=q_launch_row, col=q_col_off]
+                # Read NQ tiles of (tile_size_q, dk_tile) with proper strides
                 emb_dim_q = num_heads * dk
                 for stage in range(NS):
                     ChannelPut(
                         f"QKIn_{stage}",
                         q,
                         indices=[head_offset_idx],
-                        offsets=[0, q_combined],
+                        offsets=[q_launch_row, q_col_off],
                         sizes=[NQ, dk_chunks, tile_size_q, dk_tile],
                         strides=[tile_size_q * emb_dim_q, dk_tile, emb_dim_q, 1],
                     )
 
-                # K puts: SEQ-FIRST — row stride is num_kv_heads*dk
+                # K puts: SEQ-FIRST 2D memref [lk, num_kv_heads*dk]
+                # 2D offsets: [row=stage*lk_per_stage, col=head_k_off]
                 emb_dim_k = num_kv_heads * dk
                 for stage in range(NS):
-                    k_stage_off_val = stage * lk_per_stage * emb_dim_k
-                    k_combined = affine_apply(
-                        affine_map_add,
-                        [head_k_off, ConstantOp(index_type, k_stage_off_val)],
-                    )
+                    k_stage_row = ConstantOp(index_type, stage * lk_per_stage)
                     ChannelPut(
                         f"QKIn_{stage}",
                         k,
                         indices=[head_offset_idx],
-                        offsets=[0, k_combined],
+                        offsets=[k_stage_row, head_k_off],
                         sizes=[chunks_per_stage, dk_chunks, lkp, dk_tile],
                         strides=[lkp * emb_dim_k, dk_tile, emb_dim_k, 1],
                     )
 
-                # V puts: SEQ-FIRST — row stride is num_kv_heads*dv
+                # V puts: SEQ-FIRST 2D memref [lk, num_kv_heads*dv]
+                # 2D offsets: [row=stage*lk_per_stage, col=head_v_off]
                 emb_dim_v = num_kv_heads * dv
                 for stage in range(NS):
-                    v_stage_off_val = stage * lk_per_stage * emb_dim_v
-                    v_combined = affine_apply(
-                        affine_map_add,
-                        [head_v_off, ConstantOp(index_type, v_stage_off_val)],
-                    )
+                    v_stage_row = ConstantOp(index_type, stage * lk_per_stage)
                     ChannelPut(
                         f"VIn_{stage}",
                         v,
                         indices=[head_offset_idx],
-                        offsets=[0, 0, v_combined],
+                        offsets=[v_stage_row, head_v_off],
                         sizes=[chunks_per_stage, lkp, dv_tile],
                         strides=[lkp * emb_dim_v, emb_dim_v, 1],
                     )
 
-                # Output get: SEQ-FIRST — strided write (row stride = num_heads*dv)
+                # Output get: SEQ-FIRST 2D memref [lq, num_heads*dv]
+                # 2D offsets: [row=out_launch_row, col=out_col_off]
                 emb_dim_out = num_heads * dv
                 ChannelGet(
                     "GpOut",
                     gp,
                     indices=[head_offset_idx],
-                    offsets=[out_combined],
+                    offsets=[out_launch_row, out_col_off],
                     sizes=[lqp, dv_tile],
                     strides=[emb_dim_out, 1],
                 )
