@@ -2,7 +2,7 @@
 
 ## Context
 
-Prefill (seq_len=2048) is complete on AIR: 1.92s (30% faster than IRON).
+Prefill (seq_len=2048) is complete on AIR: 1.84s (33% faster than IRON).
 Decode pipeline is operational: **351ms/token (5% faster than IRON's 370ms)**.
 
 **IRON baseline**: 2.94 tok/s, 370 ms/token.

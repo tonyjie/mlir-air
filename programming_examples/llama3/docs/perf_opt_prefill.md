@@ -14,8 +14,8 @@ Reference: IRON (`/home/jiajli/apps/IRON`). IRON profiling data: `/home/jiajli/a
 |--------|--------------|------------|------|-------|
 | **16 transformer layers** | **1.58s** | 1.71s | **2.44s** | **35% faster than IRON** |
 | **LM Head** | **171ms** | 173ms | **217ms** | AIR 21% faster (8-launch ELF, static weight BOs) |
-| **Total prefill** | **1.92s** | 2.05s | **2.744s** | **30% faster** (same scope: layers + norm + LM Head) |
-| **Wall time** | **2.38s** | 2.51s | **2.75s** | AIR faster (includes weight loading) |
+| **Total prefill** | **1.84s** | 2.05s | **2.744s** | **33% faster** (same scope: layers + norm + LM Head) |
+| **Wall time** | **2.35s** | 2.51s | **2.75s** | AIR faster (includes weight loading) |
 | Per-layer avg | **~100ms** | 107ms | 152ms | **0.66× (AIR faster)** |
 | XRT invocations/layer | **5** | 5 | ~12 | All merges integrated |
 | Top-1 prediction | " Paris" ✓ | — | — | Correct factual answer |
@@ -43,14 +43,14 @@ Both scopes include host overhead. See `host_optimization.md` for detailed BO wr
 | Weight loading | ~1.5s (in wall time) | Separate (before `model.forward`) | |
 
 IRON `model.forward` = embedding + 16 layers + final norm + NPU LM Head = 2.744s.
-AIR total prefill = embedding + 16 layers + final norm + NPU LM Head = **1.92s**.
+AIR total prefill = embedding + 16 layers + final norm + NPU LM Head = **1.84s**.
 
 ### Per-Block Breakdown (per layer)
 
 | Block | AIR (current) | IRON | Notes |
 |-------|--------------|------|-------|
 | RMSNorm + QKV GEMMs | **9ms** | ~15ms | 4-launch ELF, 8-tile RMSNorm |
-| RoPE Q+K | **11ms** | ~11ms | 2-herd ELF |
+| RoPE Q+K | **4ms** | ~11ms | 2-herd ELF, 8-tile RoPE |
 | FlashAttention | **20ms** | ~31ms | ELF, AIR 35% faster |
 | O GEMM + Residual Add | **6ms** | ~15ms | 2-launch ELF |
 | FFN Full (RMS+Gate+Up+SiLU+Down+Add) | **52ms** | **66ms** | 6-launch ELF, 8-tile RMSNorm |
@@ -187,14 +187,16 @@ AIR GEMM kernels are **23-32% faster** than IRON standalone. Eltwise add is matc
 
 +LMHead+bomap (2026-03-31): NPU LM Head (8-launch ELF, 173ms vs IRON 217ms). `bo.map()` zero-copy for all kernels. Static weight BO pre-loading. AIR 25% faster than IRON overall (2.05s vs 2.744s).
 
-+8tileRMS (2026-04-02): 8-tile RMSNorm with broadcast weight DMA (bug fixed upstream). rms_attn_gemms 14→9ms, ffn_full 57→52ms, standalone rmsnorm 6→3ms. **AIR 30% faster than IRON** overall (1.92s vs 2.744s).
++8tileRMS (2026-04-02): 8-tile RMSNorm with broadcast weight DMA (bug fixed upstream). rms_attn_gemms 14→9ms, ffn_full 57→52ms, standalone rmsnorm 6→3ms. AIR 30% faster than IRON overall (1.92s vs 2.744s).
+
++8tileRoPE (2026-04-07): 8-tile RoPE (row-parallel, herd_x=8). rope_qk 11→4ms per layer. **AIR 33% faster than IRON** overall (1.84s vs 2.744s).
 
 ### Per-Kernel Breakdown (current, per-invocation avg, ms)
 
 | Kernel | Invocations/layer | Avg (ms) | Notes |
 |--------|-------------------|----------|-------|
 | rms_attn_gemms | ×1 | 9 | ELF, 4 launches (RMS[8-tile]+Q+K+V) |
-| rope_qk | ×1 | 11 | ELF, 2 herds (Merge A) |
+| rope_qk | ×1 | 4 | ELF, 2 herds [8,1] (8-tile RoPE) |
 | flash_attn | ×1 | 20 | ELF, NPU |
 | o_proj_add | ×1 | 6 | ELF, 2 launches (Merge B) |
 | ffn_full | ×1 | 52 | ELF, 6 launches (RMS[8-tile]+FFN+Add) |

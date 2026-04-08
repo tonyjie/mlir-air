@@ -266,7 +266,7 @@ Both AIR and IRON are profiled with the **same scope**: host-side timing that in
 
 | Metric | AIR | IRON | Notes |
 |--------|-----|------|-------|
-| **Total prefill** | **1.92s** (warm) | 2.744s | **30% faster** |
+| **Total prefill** | **1.84s** (warm) | 2.744s | **33% faster** |
 | Per-layer avg | ~100ms | 152ms | AIR 34% faster |
 | LM Head | 171ms (NPU 8-launch) | 217ms (NPU GEMM) | AIR 21% faster |
 | XRT invocations/layer | 5 | ~12 | AIR uses multi-launch ELF |

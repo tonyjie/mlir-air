@@ -33,13 +33,13 @@ python3 ../llama3_decode.py --run-only --n-tokens 100 --profile # full profile
 
 ---
 
-## Prefill Status: Full NPU Pipeline (30% faster than IRON)
+## Prefill Status: Full NPU Pipeline (33% faster than IRON)
 
 **All 16 layers + LM Head run end-to-end on NPU**:
 - **Top-1**: " Paris" for prompt "The capital of France is"
 - **Logits correlation**: 0.993 vs CPU F32 reference
-- **Total prefill**: **1.92s** (vs IRON 2.744s — **AIR 30% faster**)
-- **Total kernel time**: **1.75s** (vs IRON 2.744s)
+- **Total prefill**: **1.84s** (vs IRON 2.744s — **AIR 33% faster**)
+- **Total kernel time**: **1.65s** (vs IRON 2.744s)
 - **Per-layer avg**: ~100ms (vs IRON 152ms)
 - **LM Head**: **171ms** (vs IRON 217ms — **21% faster**, 8-launch ELF)
 - **XRT invocations**: **5 per layer** + 1 for LM Head
@@ -50,7 +50,7 @@ python3 ../llama3_decode.py --run-only --n-tokens 100 --profile # full profile
 | Kernel | Avg (ms) | Type | RMSNorm herd |
 |--------|----------|------|--------------|
 | rms_attn_gemms | 9 | ELF (4 launches: RMS+Q+K+V) | [8,1] |
-| rope_qk | 11 | ELF (2 herds: Q+K) | — |
+| rope_qk | 4 | ELF (2 herds [8,1]: Q+K) | [8,1] |
 | flash_attn | 20 | ELF | — |
 | o_proj_add | 6 | ELF (2 launches: O GEMM+Add) | — |
 | ffn_full | 52 | ELF (6 launches: RMS+Gate+Up+SiLU+Down+Add) | [8,1] |
@@ -58,6 +58,7 @@ python3 ../llama3_decode.py --run-only --n-tokens 100 --profile # full profile
 **Key optimizations:**
 - Multi-launch ELF merges: 10 → 5 invocations/layer
 - 8-tile RMSNorm: broadcast DMA bug fixed, weight DMA to all tiles works
+- 8-tile RoPE: row-parallel herd_x=8, rope_qk 11ms → 4ms per layer
 - NPU LM Head: 8-partition ELF (171ms vs IRON 217ms)
 - `bo.map()` zero-copy for all BO reads/writes
 - Static weight BO pre-loading for LM Head

@@ -54,7 +54,7 @@ At project start, MLIR-AIR had:
 
 | Phase | AIR | IRON | Improvement |
 |-------|-----|------|-------------|
-| **Prefill** (seq_len=2048) | **1.92s** | 2.744s | **30% faster** |
+| **Prefill** (seq_len=2048) | **1.84s** | 2.744s | **33% faster** |
 | **Decode** (steady-state) | **351ms/token** | 370ms/token | **5% faster** |
 
 Correctness: Top-1 = "Paris" for "The capital of France is" (logits correlation 0.993 vs CPU F32 reference).
@@ -64,7 +64,7 @@ Correctness: Top-1 = "Paris" for "The capital of France is" (logits correlation 
 | # | Operation | Kernel | Launches | Time |
 |---|-----------|--------|----------|------|
 | 1 | RMSNorm + Q/K/V GEMMs | `rms_attn_gemms` | 4 | 9ms |
-| 2 | RoPE Q+K | `rope_qk` | 2 herds | 11ms |
+| 2 | RoPE Q+K | `rope_qk` | 2 herds [8,1] | 4ms |
 | 3 | Flash Attention GQA | `flash_attn` | 1 | 20ms |
 | 4 | O GEMM + Residual Add | `o_proj_add` | 2 | 6ms |
 | 5 | RMSNorm + FFN + Add | `ffn_full` | 6 | 52ms |
@@ -91,7 +91,7 @@ Correctness: Top-1 = "Paris" for "The capital of France is" (logits correlation 
 
 ## 3. Prefill: The Optimization Journey
 
-### From 18.67s to 1.92s (10x improvement)
+### From 18.67s to 1.84s (10x improvement)
 
 Starting from a naive Python-driven pipeline with scalar F32 computation, we systematically optimized across kernel, host, and dispatch levels:
 
@@ -115,7 +115,8 @@ Starting from a naive Python-driven pipeline with scalar F32 computation, we sys
 | +QKV multi-launch | 3 GEMMs in 1 ELF | 0.14s | 2.45s | 0.92x |
 | +All merges | 5 inv/layer | 0.11s | 1.81s | 0.74x |
 | +NPU LM Head + bo.map | 8-launch ELF, zero-copy | 0.107s | 2.05s | 0.75x |
-| **+8-tile RMSNorm** | **Broadcast DMA fixed** | **~0.10s** | **1.92s** | **0.70x** |
+| +8-tile RMSNorm | Broadcast DMA fixed | ~0.10s | 1.92s | 0.70x |
+| **+8-tile RoPE** | **Row-parallel herd_x=8** | **~0.10s** | **1.84s** | **0.67x** |
 
 ### Key Optimization Techniques
 
