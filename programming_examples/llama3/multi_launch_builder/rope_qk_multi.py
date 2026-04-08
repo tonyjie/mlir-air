@@ -132,10 +132,10 @@ def build_rope_qk_module(
     k_total = N_K * head_dim
 
     print(f"  [1/2] RoPE Q (N={N_Q}, head_dim={head_dim}, total={q_total})...")
-    q_ir = str(build_rope(N_Q, head_dim, bfloat16))
+    q_ir = str(build_rope(N_Q, head_dim, bfloat16, herd_x=8))
 
     print(f"  [2/2] RoPE K (N={N_K}, head_dim={head_dim}, total={k_total})...")
-    k_ir = str(build_rope(N_K, head_dim, bfloat16))
+    k_ir = str(build_rope(N_K, head_dim, bfloat16, herd_x=8))
 
     # Extract func bodies (between func signature and return).
     # Func arg layout (outputs last, for XRTRunner compatibility):
@@ -144,21 +144,29 @@ def build_rope_qk_module(
     # Sub-func arg 0 = in, 1 = lut, 2 = out
     # Q herd: {0→0, 1→1, 2→4}
     # K herd: {0→2, 1→3, 2→5}
-    bodies = []
+    def _extract_affine_maps(ir_text):
+        """Extract top-level #map declarations from MLIR text."""
+        return [l for l in ir_text.split("\n") if l.startswith("#")]
+
+    bodies, maps_all = [], []
     for ir, prefix, arg_map in [
         (q_ir, "q", {0: 0, 1: 1, 2: 4}),
         (k_ir, "k", {0: 2, 1: 3, 2: 5}),
     ]:
         body = _extract_between_func_and_return(ir)
+        maps = _extract_affine_maps(ir)
         body = _rename_all(body, prefix)
+        maps = [_rename_all(m, prefix) for m in maps]
         body = _fix_herd_func_args(body, prefix, arg_map)
         bodies.append(body)
+        maps_all.extend(maps)
 
     # The @rope private declaration is the same for both Q and K (same head_dim).
     # Include it once from the Q module.
     privates = _extract_private_funcs(q_ir)
 
-    combined = f"""module {{
+    combined = "\n".join(maps_all) + f"""
+module {{
   {"  ".join(p.strip() + chr(10) for p in privates)}  func.func @rope_qk(
     %arg0: memref<{q_total}xbf16>,
     %arg1: memref<{q_total}xbf16>,
