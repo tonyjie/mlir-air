@@ -266,8 +266,8 @@ Both AIR and IRON are profiled with the **same scope**: host-side timing that in
 
 | Metric | AIR | IRON | Notes |
 |--------|-----|------|-------|
-| **Total prefill** | **1.84s** (warm) | 2.744s | **33% faster** |
-| Per-layer avg | ~95ms | 152ms | AIR 37% faster |
+| **Total prefill** | **1.77s** (warm) | 2.744s | **35% faster** |
+| Per-layer avg | ~92ms | 152ms | AIR 39% faster |
 | LM Head | 171ms (NPU 8-launch) | 217ms (NPU GEMM) | AIR 21% faster |
 | XRT invocations/layer | 5 | ~12 | AIR uses multi-launch ELF |
 
@@ -310,7 +310,7 @@ Both totals cover: embedding + 16 transformer layers + final RMSNorm + NPU LM He
 
 ```
 x_bf16 (2048, 2048) ─── input residual, carried between layers
-    │
+    │                    ALL DATA IN SEQ-FIRST LAYOUT
     ▼
 ┌─────────────────────────────────────────────────────────────────────┐
 │  XRT call 1: rms_attn_gemms  [ELF, 4 launches]                     │
@@ -324,46 +324,33 @@ x_bf16 (2048, 2048) ─── input residual, carried between layers
              │           │                          │
              ▼           ▼                          ▼
           q (2048,2048)  k (2048,512)            v (2048,512)
-             │           │                          │
-     ┌───────┘     ┌─────┘                          │
-     ▼             ▼                                │
-  TRANSPOSE 1a  TRANSPOSE 1b                        │
-  (2048,32,64)  (2048,8,64)                         │
-  → (32,2048,64) → (8,2048,64)                     │
-  → flatten     → flatten                           │
-  (4194304,)    (1048576,)                          │
-     ▼             ▼                                │
+             │           │                          │  all seq-first
+             │  (no transpose — seq-first RoPE)     │
+             ▼           ▼                          │
 ┌─────────────────────────────────────────────┐     │
 │  XRT call 2: rope_qk  [ELF, 2 herds [8,1]] │     │
+│  Seq-first: LUT is repeat-ordered           │     │
 │                                             │     │
-│  Q: (4194304,) × LUT(4194304,)             │     │
-│  K: (1048576,) × LUT(1048576,)             │     │
+│  Q: (2048*2048,) × LUT   → q_roped         │     │
+│  K: (2048*512,) × LUT    → k_roped         │     │
 └────────────┬──────────┬─────────────────────┘     │
              │          │                           │
              ▼          ▼                           │
-     q_roped_hf         k_roped_hf                  │
-     reshape only:      reshape only:               │
-     (32,2048,64)       (8,2048,64)                 │
-             │          │                           │
-             │          │  ┌────────────────────────┘
-             │          │  │
-             │          │  TRANSPOSE V
-             │          │  (2048,8,64) → (8,2048,64)
-             │          │  │
-             ▼          ▼  ▼
+     q_roped (2048,2048) k_roped (2048,512)         │
+             │          │                           │  all seq-first
+             │  (no transpose — seq-first FlashAttn)│
+             ▼          ▼                           ▼
 ┌─────────────────────────────────────────────────────┐
-│  XRT call 3: flash_attn  [ELF, 1 launch]           │
+│  XRT call 3: flash_attn  [ELF, seq-first]           │
 │  Herd: [8,4]                                        │
+│  Kernel handles per-head extraction via strided DMA │
 │                                                     │
-│  Q(32,2048,64) @ K(8,2048,64)^T -> softmax -> @V   │
+│  Q(2048,2048) K(2048,512) V(2048,512)  → seq-first │
 │  GQA: 4 Q heads per KV head, causal mask            │
-│  -> attn_out (32,2048,64)                           │
+│  -> attn_out (2048,2048)               → seq-first  │
 └──────────────────────┬──────────────────────────────┘
                        │
-                       ▼
-                TRANSPOSE 4
-                (32,2048,64) → (2048,32,64) → (2048,2048)
-                       │
+                       │  (no transpose — output is seq-first)
                        ▼
 ┌─────────────────────────────────────────────────────┐
 │  XRT call 4: o_proj_add  [ELF, 2 launches]          │
@@ -524,29 +511,27 @@ x (2048,) -> CPU rms_norm -> x_normed (1,2048)
           -> argmax       -> next_token
 ```
 
-### Summary: Transpose Operations Between Kernels
+### Summary: Layout Transposes
 
-**Prefill** (4 transposes per layer, labeled in diagram above):
+**Prefill: ZERO host-side transposes.** The entire pipeline operates in seq-first layout:
 
-| # | Location | Operation | Data size | Could eliminate? |
-|---|----------|-----------|----------|------------------|
-| 1a | QKV → RoPE (Q) | `(seq,32,64)` → transpose `(32,seq,64)` → flatten | 16 MB | If RoPE accepted seq-first, or QKV output head-first |
-| 1b | QKV → RoPE (K) | `(seq,8,64)` → transpose `(8,seq,64)` → flatten | 4 MB | Same |
-| V | V → FlashAttn | `(seq,8,64)` → transpose `(8,seq,64)` | 4 MB | If FlashAttn accepted V in seq-first |
-| 4 | FlashAttn → O GEMM | `(32,seq,64)` → transpose `(seq,32,64)` → reshape | 16 MB | If O GEMM accepted head-first |
-| ~~2~~ | ~~RoPE → seq-first~~ | ~~removed~~ | — | ~~Was redundant round-trip~~ |
-| ~~3~~ | ~~seq-first → FlashAttn~~ | ~~removed~~ | — | ~~Cancelled with #2~~ |
+| Step | Layout In | Kernel | Layout Out | Transpose? |
+|------|----------|--------|-----------|------------|
+| QKV GEMM | (seq, emb_dim) | rms_attn_gemms | (seq, emb_dim/kv_dim) | No |
+| RoPE | (seq, emb_dim/kv_dim) flat | rope_qk (seq-first LUT) | (seq, emb_dim/kv_dim) | No |
+| FlashAttn | (seq, emb_dim/kv_dim) | flash_attn (seq-first DMA) | (seq, emb_dim) | No |
+| O GEMM + Add | (seq, emb_dim) | o_proj_add | (seq, emb_dim) | No |
+| FFN | (seq, emb_dim) | ffn_full | (seq, emb_dim) | No |
 
-**Decode** (no real transposes — only reshapes that are zero-copy views at M=1):
+The per-head extraction (needed for attention computation) happens inside the FlashAttention kernel via strided shim DMA — no host CPU involvement.
 
-| Location | Operation | Data copy? |
-|----------|-----------|-----------|
-| After QKV, before RoPE | `(dim,)` → reshape `(n_h,64)` → flatten | No (view) |
-| After RoPE | `(dim,)` → reshape `(n_h,64)` | No (view) |
-| RMSNorm in/out | `(dim,)` → reshape `(1,dim)` / flatten | No (view) |
-| Weight transpose | W `(K,M)` → `.T` → W_t `(M,K)` | Once in `prepare_runtime()` |
+**Decode**: no transposes (only zero-copy reshapes at M=1).
 
-The remaining 4 prefill transposes convert between **seq-first** `(seq, n_heads*head_dim)` and **head-first** `(n_heads, seq, head_dim)`. Eliminating them requires kernel-level changes (QKV GEMM output layout, RoPE input layout, or O GEMM input layout).
+**Optimization history**:
+- ~~Transpose 1a/1b~~: eliminated by seq-first RoPE (LUT reordering)
+- ~~Transpose 2/3~~: eliminated by removing redundant head↔seq round-trip
+- ~~Transpose V~~: eliminated by seq-first FlashAttention
+- ~~Transpose 4~~: eliminated by seq-first FlashAttention output
 
 ---
 
