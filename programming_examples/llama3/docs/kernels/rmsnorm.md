@@ -20,13 +20,13 @@ y = x * rsqrt(mean(x^2, axis=-1) + eps) * weight
 
 ### Config summary
 
-| Usage | Kernel | Shape (M × N) | herd | Standalone | In pipeline | Rationale |
-|-------|--------|--------------|------|-----------|-------------|-----------|
-| **Prefill pre-attn** | `rms_attn_gemms` ELF (launch 1 of 4) | 2048 × 2048 | **[8,1]** | **0.9ms** | embedded in 9ms | 8 tiles, broadcast weight DMA |
-| **Prefill pre-FFN** | `ffn_full` ELF (launch 1 of 6) | 2048 × 2048 | **[8,1]** | **0.9ms** | embedded in 52ms | Same kernel, different multi-launch |
-| **Prefill final** | `rmsnorm` xclbin | 2048 × 2048 | **[8,1]** | **0.9ms** | **3ms** | Standalone, before LM Head |
-| **Decode pre-attn** | `rmsnorm` xclbin | 1 × 2048 | **[1,1]** | — | **0.3ms** | M=1, can't row-parallel (see below) |
-| **Decode pre-FFN** | `rmsnorm` xclbin | 1 × 2048 | **[1,1]** | — | **0.3ms** | Same kernel, called twice per block |
+| Usage | Kernel | Shape (M × N) | herd | Standalone (C++) | In pipeline | Rationale |
+|-------|--------|--------------|------|-----------------|-------------|-----------|
+| **Prefill pre-attn** | `rms_attn_gemms` ELF (launch 1 of 4) | 2048 × 2048 | **[8,1]** | **798 us** | embedded in 9ms | 8 tiles, broadcast weight DMA |
+| **Prefill pre-FFN** | `ffn_full` ELF (launch 1 of 6) | 2048 × 2048 | **[8,1]** | **798 us** | embedded in 52ms | Same kernel, different multi-launch |
+| **Prefill final** | `rmsnorm` xclbin | 2048 × 2048 | **[8,1]** | **798 us** | **3ms** | Standalone, before LM Head |
+| **Decode pre-attn** | `rmsnorm` xclbin | 1 × 2048 | **[1,1]** | **50 us** | **0.3ms** | M=1, can't row-parallel (see below) |
+| **Decode pre-FFN** | `rmsnorm` xclbin | 1 × 2048 | **[1,1]** | **50 us** | **0.3ms** | Same kernel, called twice per block |
 
 ### Prefill: why [8,1]
 
@@ -43,13 +43,14 @@ build_rms(seq_len, emb_dim, bfloat16, 16, herd_x=8)    # embedded in 4-launch EL
 build_rms(seq_len, emb_dim, bfloat16, 16, herd_x=8)    # embedded in 6-launch ELF
 ```
 
-**Profiling (Python harness, `weighted_rms_norm.py --profile`):**
+**Profiling (C++ harness, `make profile-cpp`, 10 warmup + 20 measured):**
 
-| Config | Herd | Standalone | Bandwidth | vs IRON |
-|--------|------|-----------|-----------|---------|
-| Single tile (old) | [1,1] | 6.0ms | 2.8 GB/s | 1.4x slower |
-| **8-tile (current)** | **[8,1]** | **0.9ms** | 20.3 GB/s | **4.8x faster** |
-| IRON reference | 16 tiles | 4.3ms | — | baseline |
+| Config | Herd | Standalone (min/avg) | Bandwidth | vs IRON |
+|--------|------|---------------------|-----------|---------|
+| Single tile (old) | [1,1] | 5962 / 5968 us | 2.81 GB/s | 1.4x slower |
+| **8-tile (current)** | **[8,1]** | **798 / 799 us** | **21.0 GB/s** | **5.4x faster** |
+| Decode (M=1) | [1,1] | 50 / 50 us | 0.25 GB/s | — |
+| IRON reference | 16 tiles | 4300 us | — | baseline |
 
 **In-pipeline impact** (from `llama3_prefill.py --profile`):
 - `rms_attn_gemms`: 14ms → **9ms** (5ms saved from 8-tile RMSNorm launch)
