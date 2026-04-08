@@ -693,7 +693,7 @@ def compile_all_kernels(cache, config, seq_len, cpu_attn=True):
 
     # 8. Flash Attention GQA (skip if using CPU attention fallback)
     if not cpu_attn:
-        from flash_attention.kernel_fusion_based.attn_npu2 import (
+        from flash_attention.kernel_fusion_based.attn_npu2_seqfirst import (
             build_module as build_attn,
         )
 
@@ -961,9 +961,6 @@ def run_transformer_block(
     # RoPE output is seq-first: (seq*n_h*head_dim,) flat = (seq, emb_dim) contiguous
     q_roped = results[4].reshape(seq_len, n_heads * head_dim).astype(bfloat16)
     k_roped = results[5].reshape(seq_len, n_kv_heads * head_dim).astype(bfloat16)
-    # Head-first views for FlashAttention
-    q_roped_hf = q_roped.reshape(seq_len, n_heads, head_dim).transpose(1, 0, 2)
-    k_roped_hf = k_roped.reshape(seq_len, n_kv_heads, head_dim).transpose(1, 0, 2)
     if verify:
         lut_f32 = rope_lut_bf16[:seq_len].astype(np.float32)
         q_heads_f32 = q.astype(np.float32).reshape(seq_len, n_heads, head_dim)
@@ -997,18 +994,16 @@ def run_transformer_block(
         ).astype(bfloat16)
     else:
         print(
-            f"    Step 7: Flash Attention GQA [NPU] ({n_heads}Q/{n_kv_heads}KV heads)"
+            f"    Step 7: Flash Attention GQA [NPU, seq-first] ({n_heads}Q/{n_kv_heads}KV heads)"
         )
-        # q_roped_hf and k_roped_hf are already head-first (n_h, seq, 64)
-        # — no redundant seq-first → head-first transpose needed
-        q_attn = np.ascontiguousarray(q_roped_hf)
-        k_attn = np.ascontiguousarray(k_roped_hf)
-        v_attn = np.ascontiguousarray(
-            v.reshape(seq_len, n_kv_heads, head_dim).transpose(1, 0, 2).astype(bfloat16)
-        )
-        # Causal masking is applied internally by the kernel (causal=True).
-        # No external mask argument — kernel handles causal masking.
-        attn_output = np.zeros((n_heads, seq_len, head_dim), dtype=bfloat16)
+        # Seq-first FlashAttention: pass Q/K/V directly in seq-first layout
+        # NO transposes needed — kernel handles strided per-head access via DMA
+        q_attn = np.ascontiguousarray(q_roped)  # (seq, num_heads*dk) seq-first
+        k_attn = np.ascontiguousarray(k_roped)  # (seq, num_kv_heads*dk) seq-first
+        v_attn = np.ascontiguousarray(v)  # (seq, num_kv_heads*dv) seq-first
+        attn_output = np.zeros(
+            (seq_len, n_heads * head_dim), dtype=bfloat16
+        )  # seq-first output
         attn_bk = _attn_backend_kwargs(head_dim)
         results = _run_cached(
             cache,
@@ -1019,10 +1014,7 @@ def run_transformer_block(
             v_attn,
             attn_output,
         )
-        attn_out_heads = results[-1].reshape(n_heads, seq_len, head_dim)
-        attn_out = attn_out_heads.transpose(1, 0, 2).reshape(
-            seq_len, n_heads * head_dim
-        )
+        attn_out = results[-1].reshape(seq_len, n_heads * head_dim).astype(bfloat16)
     _compare("attn_out", attn_out)
 
     # 8-9. O Projection + Residual Add [multi-launch: 2 launches in one ELF]

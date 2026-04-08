@@ -90,10 +90,10 @@ python3 test_precision.py --num-heads 32 --num-kv-heads 8 --causal
 
 ### Motivation
 
-The LLAMA prefill pipeline has 4 remaining numpy transposes per layer, all at the FlashAttention boundary:
+The LLAMA prefill pipeline has 4 numpy transposes per layer at the FlashAttention boundary, converting between seq-first (used by GEMMs, RoPE) and head-first (used by FlashAttention):
 
 ```
-QKV GEMM output: (seq, emb_dim)      ← seq-first
+RoPE output:     (seq, emb_dim)       ← seq-first
     ↓ TRANSPOSE Q: (seq,32,64) → (32,seq,64)     16 MB
     ↓ TRANSPOSE K: (seq,8,64) → (8,seq,64)       4 MB
     ↓ TRANSPOSE V: (seq,8,64) → (8,seq,64)       4 MB
@@ -102,72 +102,77 @@ FlashAttention:  (n_h, seq, 64)       ← head-first
 O GEMM input:   (seq, emb_dim)       ← seq-first
 ```
 
-These are pure data movement (no compute), costing ~40ms across 16 layers. If FlashAttention accepted seq-first layout directly, all 4 transposes would be eliminated.
+Total: ~40MB data movement × 16 layers = ~2.5ms/layer host CPU time.
 
-### What seq-first means for FlashAttention
+### Fundamental insight: the transpose is unavoidable
 
-**Head-first** `[num_heads, seq, head_dim]`: each head's data is a contiguous `(seq, 64)` block. The DMA reads one big contiguous chunk per head.
+FlashAttention computes `Q[h] @ K[h]^T` per head — each head's data must be gathered together at the compute level. In seq-first layout, per-head data is interleaved across positions. The layout conversion **must happen somewhere**:
 
-```
-Memory: [h0_pos0_d0..d63 | h0_pos1_d0..d63 | ... | h0_pos2047 | h1_pos0 | h1_pos1 | ...]
-         ←── head 0: contiguous 2048×64 block ──→  ←── head 1 ──→
-```
+| Level | Method | Cost |
+|-------|--------|------|
+| **Host CPU** | `np.transpose` in Python | ~2.5ms/layer |
+| **Shim DMA (L3→L2)** | Strided read per head | ~1.5ms/layer extra vs head-first |
+| **MemTile DMA (L2→L1)** | Contiguous L3→L2, strided L2→L1 extract | ~0ms (on-chip SRAM) |
 
-**Seq-first** `[seq, num_heads * head_dim]`: heads are interleaved at each position. To read head 0's data, the DMA must read 64 elements, skip `(num_heads-1) * 64 = 1984` elements, read next 64, etc.
+The MemTile approach would be ideal (contiguous DDR access + free on-chip extraction), but requires significant kernel restructuring. The shim DMA approach works today.
 
-```
-Memory: [pos0_h0 | pos0_h1 | ... | pos0_h31 | pos1_h0 | pos1_h1 | ... | pos1_h31 | ...]
-         ←64B→    skip 1984B                   ←64B→    skip 1984B
-```
+### Implementation: `attn_npu2_seqfirst.py`
 
-This is a **strided DMA pattern** with row stride = `num_heads * head_dim = 2048` between positions for a given head.
+Created a seq-first variant with these changes:
 
-### What we changed in `attn_npu2_seqfirst.py`
+1. **L3 memref types**: `[num_heads, lq, dk]` → `[lq, num_heads * dk]`
+2. **Head offset maps**: `head * lq * dk` → `head * dk` (column offset)
+3. **Launch offset maps**: row-only `lx * lqp` (not flat offset)
+4. **DMA offsets**: 2D `[row, col]` instead of 1D flat (critical for compiler)
+5. **DMA strides**: row stride = `num_heads * dk` (strided per-head access)
 
-Created a copy of `attn_npu2.py` with these modifications:
+**Key fix**: using proper 2D offsets `[row_offset, col_offset]` for the 2D seq-first memref. Initial attempt with flattened 1D offsets crashed the compiler (`willBeValidAffineMap` assertion). The 2D offset approach compiles and runs correctly.
 
-1. **L3 memref types**: `[num_heads, lq, dk]` → `[lq, num_heads * dk]` (seq-first 2D)
-2. **Head offset maps**: `head * lq * dk` → `head * dk` (column offset, not row offset)
-3. **Launch offset maps**: `lx * lqp * dk` → `lx * lqp * num_heads * dk` (row offset in wider array)
-4. **Q DMA strides**: `[tile_size_q * dk, ...]` → `[tile_size_q * num_heads * dk, ...]` (row stride = emb_dim)
-5. **K DMA strides**: same pattern with `num_kv_heads * dk`
-6. **V DMA strides**: same pattern with `num_kv_heads * dv`
-7. **Output DMA**: contiguous `[lqp * dv_tile]` → strided `[lqp, dv_tile]` with stride `num_heads * dv`
+### Profiling: head-first vs seq-first kernel (C++ harness, LLAMA shape)
 
-### Result: compiler assertion failure
+| Metric | Head-First | Seq-First | Diff |
+|--------|-----------|----------|------|
+| **Correctness** | corr=0.9976 | corr=0.9976 | Identical |
+| **Min latency** | **15188 us** | 16647 us | +9.6% |
+| **Avg latency** | **15196 us** | 16796 us | +10.5% |
+| **GFLOPS** | **2261** | 2046 | -9.5% |
 
-```
-aircc: Assertion `willBeValidAffineMap(dimCount, symbolCount, {result})' failed.
-```
+Profiled with correct data layouts: head-first harness generates `[32, 2048, 64]`, seq-first harness generates `[2048, 2048]`. Both with 10 warmup + 20 measured iterations.
 
-The crash occurs in the `air-to-aie` lowering pipeline when the compiler tries to construct an AffineMap from the combined dynamic offset + strided DMA pattern. Specifically:
+### Why seq-first kernel is 10% slower
 
-- The offset `q_combined = head_idx * 64 + launch_iter * 524288` is a valid affine expression
-- The strides `[tile_size_q * 2048, dk_tile, 2048, 1]` are valid constants
-- But when the compiler combines these during channel-to-DMA lowering, the resulting expression fails affine map validation
+The overhead comes from **strided DDR access** at the L3→L2 (shim DMA) level:
 
-**This is a compiler limitation, not a hardware limitation.** The NPU hardware supports 4D buffer descriptors with arbitrary strides that could express this pattern. The `air-to-aie` pass's affine map construction doesn't handle the combination of dynamic offsets with large strided access patterns.
+**Head-first**: each head's Q data is a contiguous `[tile_size_q, dk]` = 8KB block. DMA reads one large sequential burst. DDR prefetcher works perfectly.
 
-### Why head-first works
+**Seq-first**: each head's Q data is scattered — 64 elements per position, then skip 1984 elements (other heads), then 64 more. The DMA issues 64 separate 128-byte reads, each 4KB apart. This causes:
+- 64 separate DMA requests vs 1 large burst
+- DDR prefetcher can't predict the strided pattern
+- NoC per-request overhead
 
-Head-first strides are `[tile_size_q * 64, dk_tile, 64, 1]` — the row stride (64) equals `head_dim`, which means the DMA reads a contiguous 2D block. The compiler can express this as a simple base+offset BD.
+### Net effect in LLAMA pipeline
 
-Seq-first strides are `[tile_size_q * 2048, dk_tile, 2048, 1]` — the row stride (2048) equals `num_heads * head_dim`, meaning the DMA must skip over other heads' data between rows. This strided non-contiguous access requires more complex BD configuration that the compiler can't construct from its affine map framework.
+| Factor | Impact |
+|--------|--------|
+| Kernel overhead (strided DMA) | +1.6ms/layer × 16 = **+25.6ms** |
+| Host transpose eliminated | -2.5ms/layer × 16 = **-40ms** |
+| **Net savings** | **~14ms** |
 
-### What would fix this
+### Future: MemTile extraction approach
 
-1. **Compiler fix**: teach `air-to-aie` to handle strided DMA patterns where the offset and stride are both affine functions of loop variables and constants. The hardware BD supports this — the gap is in the compiler's affine map construction.
+To eliminate the DMA overhead entirely:
+1. L3→L2: read full contiguous rows `[tile_size_q, emb_dim]` to MemTile
+2. L2→L1: extract per-head `[tile_size_q, dk]` from wider L2 buffer (on-chip, fast)
 
-2. **L2 staging workaround**: use L2 (MemTile) as an intermediate — DMA the full seq-first row to L2, then extract per-head data from L2 to L1 using MemTile's more flexible DMA. This adds a hop but avoids the problematic L3 strided access.
-
-3. **Host-side transpose (current)**: keep the `np.transpose` in Python between RoPE and FlashAttention. Cost: ~40ms across 16 layers.
+This makes DDR access identical to head-first. Challenge: L2 capacity — `tile_size_q * emb_dim * 2 = 256KB` fills one MemTile. Would need to tile the Q rows into smaller batches.
 
 ### Files
 
 | File | Purpose |
 |------|---------|
-| `attn_npu2_seqfirst.py` | Experimental seq-first variant (blocked by compiler) |
-| `test_seqfirst.py` | Host-side transpose validation test |
+| `attn_npu2_seqfirst.py` | Seq-first variant (working, 10% slower) |
+| `test_seqfirst.py` | Host-side validation test |
+| `test_elf_npu2_seqfirst.cpp` | C++ profiling harness with seq-first data |
 
 ---
 
