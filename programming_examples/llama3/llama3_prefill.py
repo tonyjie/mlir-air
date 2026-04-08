@@ -929,19 +929,18 @@ def run_transformer_block(
         _compare("v", v)
 
     # 5-6. RoPE Q+K [multi-launch: 2 herds in one ELF]
-    print(f"    Steps 5-6: RoPE Q+K [multi-launch]")
-    q_heads = q.reshape(seq_len, n_heads, head_dim)
-    q_flat = q_heads.transpose(1, 0, 2).reshape(n_heads * seq_len, head_dim)
-    rope_lut_q = np.tile(rope_lut_bf16[:seq_len], (n_heads, 1))
+    # Seq-first: pass Q/K directly (no transpose!), use repeat-ordered LUT
+    print(f"    Steps 5-6: RoPE Q+K [multi-launch, seq-first]")
     total_q = n_heads * seq_len * head_dim
-    q_in = np.asarray(q_flat, dtype=bfloat16).flatten()
-    lut_q_in = np.asarray(rope_lut_q, dtype=bfloat16).flatten()
-
-    k_heads = k.reshape(seq_len, n_kv_heads, head_dim)
-    k_flat = k_heads.transpose(1, 0, 2).reshape(n_kv_heads * seq_len, head_dim)
-    rope_lut_k = np.tile(rope_lut_bf16[:seq_len], (n_kv_heads, 1))
     total_k = n_kv_heads * seq_len * head_dim
-    k_in = np.asarray(k_flat, dtype=bfloat16).flatten()
+    # Seq-first LUT: repeat each position's LUT for n_heads consecutive chunks
+    rope_lut_q = np.repeat(rope_lut_bf16[:seq_len], n_heads, axis=0)
+    rope_lut_k = np.repeat(rope_lut_bf16[:seq_len], n_kv_heads, axis=0)
+    q_in = np.asarray(
+        q, dtype=bfloat16
+    ).flatten()  # (seq, emb_dim) flat — no transpose!
+    lut_q_in = np.asarray(rope_lut_q, dtype=bfloat16).flatten()
+    k_in = np.asarray(k, dtype=bfloat16).flatten()  # (seq, kv_dim) flat — no transpose!
     lut_k_in = np.asarray(rope_lut_k, dtype=bfloat16).flatten()
 
     q_out = np.zeros(total_q, dtype=bfloat16)
@@ -959,13 +958,12 @@ def run_transformer_block(
         k_out,
         output_indices=[4, 5],
     )
-    # RoPE outputs in head-first layout (n_h, seq, 64) — keep it head-first
-    # for FlashAttention (avoids redundant head-first → seq-first → head-first round-trip)
-    q_roped_hf = results[4].reshape(n_heads, seq_len, head_dim).astype(bfloat16)
-    k_roped_hf = results[5].reshape(n_kv_heads, seq_len, head_dim).astype(bfloat16)
-    # seq-first views for intermediates dict and CPU attention fallback
-    q_roped = q_roped_hf.transpose(1, 0, 2).reshape(seq_len, n_heads * head_dim)
-    k_roped = k_roped_hf.transpose(1, 0, 2).reshape(seq_len, n_kv_heads * head_dim)
+    # RoPE output is seq-first: (seq*n_h*head_dim,) flat = (seq, emb_dim) contiguous
+    q_roped = results[4].reshape(seq_len, n_heads * head_dim).astype(bfloat16)
+    k_roped = results[5].reshape(seq_len, n_kv_heads * head_dim).astype(bfloat16)
+    # Head-first views for FlashAttention
+    q_roped_hf = q_roped.reshape(seq_len, n_heads, head_dim).transpose(1, 0, 2)
+    k_roped_hf = k_roped.reshape(seq_len, n_kv_heads, head_dim).transpose(1, 0, 2)
     if verify:
         lut_f32 = rope_lut_bf16[:seq_len].astype(np.float32)
         q_heads_f32 = q.astype(np.float32).reshape(seq_len, n_heads, head_dim)
