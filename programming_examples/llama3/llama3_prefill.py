@@ -959,10 +959,13 @@ def run_transformer_block(
         k_out,
         output_indices=[4, 5],
     )
-    q_roped_flat = results[4].reshape(n_heads, seq_len, head_dim)
-    q_roped = q_roped_flat.transpose(1, 0, 2).reshape(seq_len, n_heads * head_dim)
-    k_roped_flat = results[5].reshape(n_kv_heads, seq_len, head_dim)
-    k_roped = k_roped_flat.transpose(1, 0, 2).reshape(seq_len, n_kv_heads * head_dim)
+    # RoPE outputs in head-first layout (n_h, seq, 64) — keep it head-first
+    # for FlashAttention (avoids redundant head-first → seq-first → head-first round-trip)
+    q_roped_hf = results[4].reshape(n_heads, seq_len, head_dim).astype(bfloat16)
+    k_roped_hf = results[5].reshape(n_kv_heads, seq_len, head_dim).astype(bfloat16)
+    # seq-first views for intermediates dict and CPU attention fallback
+    q_roped = q_roped_hf.transpose(1, 0, 2).reshape(seq_len, n_heads * head_dim)
+    k_roped = k_roped_hf.transpose(1, 0, 2).reshape(seq_len, n_kv_heads * head_dim)
     if verify:
         lut_f32 = rope_lut_bf16[:seq_len].astype(np.float32)
         q_heads_f32 = q.astype(np.float32).reshape(seq_len, n_heads, head_dim)
@@ -983,7 +986,7 @@ def run_transformer_block(
 
     # 7. Flash Attention GQA
     if cpu_attn:
-        # CPU fallback for debugging/comparison
+        # CPU fallback — expects seq-first (seq, n_h * head_dim)
         print(
             f"    Step 7: Attention GQA [CPU fallback] ({n_heads}Q/{n_kv_heads}KV heads)"
         )
@@ -998,18 +1001,10 @@ def run_transformer_block(
         print(
             f"    Step 7: Flash Attention GQA [NPU] ({n_heads}Q/{n_kv_heads}KV heads)"
         )
-        # Reshape to (heads, seq, dim) — kernel expects unscaled Q
-        # (scaling by 1/sqrt(dk) is handled internally by the kernel)
-        q_attn = np.ascontiguousarray(
-            q_roped.reshape(seq_len, n_heads, head_dim)
-            .transpose(1, 0, 2)
-            .astype(bfloat16)
-        )
-        k_attn = np.ascontiguousarray(
-            k_roped.reshape(seq_len, n_kv_heads, head_dim)
-            .transpose(1, 0, 2)
-            .astype(bfloat16)
-        )
+        # q_roped_hf and k_roped_hf are already head-first (n_h, seq, 64)
+        # — no redundant seq-first → head-first transpose needed
+        q_attn = np.ascontiguousarray(q_roped_hf)
+        k_attn = np.ascontiguousarray(k_roped_hf)
         v_attn = np.ascontiguousarray(
             v.reshape(seq_len, n_kv_heads, head_dim).transpose(1, 0, 2).astype(bfloat16)
         )
