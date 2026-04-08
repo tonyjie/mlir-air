@@ -148,8 +148,8 @@ _run_cached(cache, "rope_qk", ..., q_in, lut_q_in, k_in, lut_k_in, q_out, k_out)
 |-------|--------|-------------------|------|-----------------|-------------|-----------|
 | **Prefill Q** | `rope_qk` ELF | 65536 × 64 | **[8,1]** | **912 us** | ~2ms | 8 tiles saturate bandwidth at 27.6 GB/s |
 | **Prefill K** | `rope_qk` ELF | 16384 × 64 | **[8,1]** | **268 us** | ~1ms | Same kernel, stitched via multi-launch |
-| **Decode Q** | `rope_q` xclbin | 32 × 64 | **[1,1]** | **50 us** | ~0.3ms | Too few rows; [8,1] is 14% slower (57us) |
-| **Decode K** | `rope_k` xclbin | 8 × 64 | **[1,1]** | **52 us** | ~0.2ms | Too few rows; [8,1] is 15% slower (60us) |
+| **Decode Q** | `rope_q` xclbin | 32 × 64 | **[1,1]** | **49 us** | ~0.3ms | Too few rows; [8,1] is 27% slower (62us) |
+| **Decode K** | `rope_k` xclbin | 8 × 64 | **[1,1]** | **54 us** | ~0.2ms | Too few rows; [8,1] is 6% slower (57us) |
 
 ### Prefill: why [8,1]
 
@@ -178,14 +178,14 @@ Correctness: correlation = 0.999992 at all shapes and herd sizes.
 
 ### Decode: why [1,1]
 
-**Profiling (C++ harness):**
+**Profiling (C++ harness, 10 warmup + 20 measured):**
 
-| Shape | herd=[1,1] | herd=[8,1] | Result |
-|-------|-----------|-----------|--------|
-| Q: 32 × 64 | **50 us** | 57 us | [8,1] is **14% slower** |
-| K: 8 × 64 | **52 us** | 60 us | [8,1] is **15% slower** |
+| Shape | herd=[1,1] (min/avg) | herd=[8,1] (min/avg) | Overhead |
+|-------|---------------------|---------------------|----------|
+| Q: 32 × 64 | **49 / 54 us** | 62 / 62 us | **+27% slower** |
+| K: 8 × 64 | **54 / 54 us** | 57 / 58 us | **+6% slower** |
 
-With only 32/8 rows, the 8-tile herd setup overhead (configuring DMAs, synchronization) exceeds the compute savings. The kernel dispatch time (~50us) dominates at this scale.
+With only 32/8 rows, the 8-tile herd setup overhead (configuring DMAs for 8 tiles, synchronization) exceeds any compute savings. The kernel dispatch time (~50us) dominates at this scale — the actual row processing is negligible.
 
 ```python
 # llama3_decode.py, compile_decode_kernels()
