@@ -140,35 +140,70 @@ _run_cached(cache, "rope_qk", ..., q_in, lut_q_in, k_in, lut_k_in, q_out, k_out)
 
 ---
 
-## Performance: Single-Tile vs Multi-Tile
+## LLAMA-3.2-1B Configurations
 
-Profiled with C++ harness (`test.cpp`): 10 warmup + 20 measured iterations, microsecond precision. Timer scope: kernel dispatch + `run.wait()` only (no BO sync).
+### Config summary
 
-### Standalone kernel profiling (C++ harness)
+| Usage | Kernel | Shape (rows × dim) | herd | Standalone (C++) | In pipeline | Rationale |
+|-------|--------|-------------------|------|-----------------|-------------|-----------|
+| **Prefill Q** | `rope_qk` ELF | 65536 × 64 | **[8,1]** | **912 us** | ~2ms | 8 tiles saturate bandwidth at 27.6 GB/s |
+| **Prefill K** | `rope_qk` ELF | 16384 × 64 | **[8,1]** | **268 us** | ~1ms | Same kernel, stitched via multi-launch |
+| **Decode Q** | `rope_q` xclbin | 32 × 64 | **[1,1]** | **50 us** | ~0.3ms | Too few rows; [8,1] is 14% slower (57us) |
+| **Decode K** | `rope_k` xclbin | 8 × 64 | **[1,1]** | **52 us** | ~0.2ms | Too few rows; [8,1] is 15% slower (60us) |
 
-| Shape | Rows | herd=[1,1] | herd=[8,1] | Speedup | Bandwidth |
-|-------|------|-----------|-----------|---------|-----------|
-| **Prefill Q** | 65,536 | 6717 us | **913 us** | **7.4x** | 27.6 GB/s |
-| **Prefill K** | 16,384 | 1716 us | **268 us** | **6.4x** | 23.5 GB/s |
-| **Combined Q+K** | — | 8433 us | **1181 us** | **7.1x** | — |
-| Decode Q | 32 | 100 us | N/A | — | — |
-| Decode K | 8 | 100 us | N/A | — | — |
+### Prefill: why [8,1]
+
+Each of the 65,536 rows is independent — perfect row-parallel. With 8 tiles, each processes 8,192 rows.
+
+```python
+# multi_launch_builder/rope_qk_multi.py
+q_ir = str(build_rope(N_Q, head_dim, bfloat16, herd_x=8))
+k_ir = str(build_rope(N_K, head_dim, bfloat16, herd_x=8))
+```
+
+**Profiling (C++ harness, 10 warmup + 20 measured):**
+
+| Shape | herd=[1,1] | herd=[8,1] | Speedup | Bandwidth |
+|-------|-----------|-----------|---------|-----------|
+| Q: 65536 × 64 | 6717 us | **912 us** | **7.4x** | 27.6 GB/s |
+| K: 16384 × 64 | 1716 us | **268 us** | **6.4x** | 23.5 GB/s |
+| Combined Q+K | 8433 us | **1181 us** | **7.1x** | — |
 
 Correctness: correlation = 0.999992 at all shapes and herd sizes.
 
-### In LLAMA prefill pipeline context
+**In-pipeline impact** (from `llama3_prefill.py --profile`):
+- rope_qk per layer: 11ms → **4ms** (2.75x faster)
+- 16 layers: 176ms → **64ms** (112ms saved)
+- Total prefill: 1.92s → **1.84s**
 
-The prefill `rope_qk` multi-launch ELF stitches Q and K into one XRT call. In-pipeline timing (from `llama3_prefill.py --profile`) includes host overhead:
+### Decode: why [1,1]
 
-| Config | rope_qk per layer | 16 layers total |
-|--------|-------------------|-----------------|
-| herd=[1,1] (old) | ~11ms | ~176ms |
-| herd=[8,1] (with multi-tile) | **~2ms** (estimated) | **~32ms** |
-| **Savings** | **~9ms/layer** | **~144ms** |
+**Profiling (C++ harness):**
 
-### Decode: stays at [1,1]
+| Shape | herd=[1,1] | herd=[8,1] | Result |
+|-------|-----------|-----------|--------|
+| Q: 32 × 64 | **50 us** | 57 us | [8,1] is **14% slower** |
+| K: 8 × 64 | **52 us** | 60 us | [8,1] is **15% slower** |
 
-Decode RoPE processes only 32/8 rows — too small to benefit from multi-tile. Decode RoPE stays at [1,1] (~0.1ms per call).
+With only 32/8 rows, the 8-tile herd setup overhead (configuring DMAs, synchronization) exceeds the compute savings. The kernel dispatch time (~50us) dominates at this scale.
+
+```python
+# llama3_decode.py, compile_decode_kernels()
+cache.compile_and_cache("rope_q", build_rope(n_heads=32,   head_dim=64, bfloat16))  # herd_x=1 default
+cache.compile_and_cache("rope_k", build_rope(n_kv_heads=8, head_dim=64, bfloat16))  # herd_x=1 default
+```
+
+### Compile-time parameters
+
+| Parameter | Prefill Q | Prefill K | Decode Q | Decode K |
+|-----------|----------|----------|---------|---------|
+| `seq_len` (rows) | 65536 | 16384 | 32 | 8 |
+| `embed_dim` | 64 | 64 | 64 | 64 |
+| `herd_x` | 8 | 8 | 1 | 1 |
+| `herd_y` | 1 | 1 | 1 | 1 |
+| `rows_per_tile` | 8192 | 2048 | 32 | 8 |
+| Output format | ELF (multi-launch) | ELF (multi-launch) | xclbin | xclbin |
+| Backend flags | `runtime_loop_tiling_sizes=[4,4]` | same | same | same |
 
 ---
 
