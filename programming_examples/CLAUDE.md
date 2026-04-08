@@ -204,7 +204,7 @@ Type mapping: `xrt_dtype = type_mapper(np_dtype)` (from `air.backend.xrt_runner`
 
 End-to-end LLAMA-3.2-1B BF16 prefill inference (seq_len=2048, 16 layers) on NPU2.
 
-**Status**: Full NPU pipeline (FlashAttention + NPU LM Head + 8-tile RMSNorm). Top-1 = " Paris". **30% faster than IRON** (1.92s vs 2.744s total prefill). 5 XRT invocations/layer + 1 for LM Head. Decode: 351ms/token (5% faster than IRON's 370ms).
+**Status**: Full NPU pipeline (FlashAttention + NPU LM Head + 8-tile RMSNorm). Top-1 = " Paris". **33% faster than IRON** (1.84s vs 2.744s total prefill). 5 XRT invocations/layer + 1 for LM Head. Decode: 351ms/token (5% faster than IRON's 370ms).
 
 **Key files**:
 - `llama3/llama3_prefill.py` — Main orchestrator: KernelCache + transformer block pipeline
