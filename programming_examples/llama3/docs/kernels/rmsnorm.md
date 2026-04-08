@@ -71,6 +71,12 @@ build_rms(1, emb_dim, bfloat16, 16)    # herd_x=1 default, M=1
 Called **twice per block** (pre-attention + pre-FFN) × 16 blocks = 32 calls per token.
 At 0.3ms each, total decode RMSNorm = ~10ms/token (~3% of steady-state).
 
+**Optimization path**: The 50us kernel time is dwarfed by ~250us dispatch overhead per call. The improvement isn't faster RMSNorm — it's **fewer dispatches** by merging into adjacent kernels:
+- Merge pre-attn RMSNorm + QKV GEMV → 1 ELF (saves 1 dispatch × 16 = ~5ms)
+- Merge pre-FFN RMSNorm + Gate/Up GEMV → 1 ELF (saves 1 dispatch × 16 = ~5ms)
+
+The `rms_qkv_gemv_multi.py` builder already supports this pattern (4-launch ELF with RMS+Q+K+V) but the decode runtime calls them separately. See `LLAMA_inference.md` section 10C.
+
 ### Compile-time parameters
 
 | Parameter | Prefill (all 3) | Decode |
