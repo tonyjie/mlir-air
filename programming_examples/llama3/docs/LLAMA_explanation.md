@@ -14,8 +14,8 @@ Python host (llama3_prefill.py)
   ├── Compile 7 unique kernel ELFs (one-time, cached)
   ├── For each of 16 layers (5 XRT invocations per layer):
   │     1. rms_attn_gemms   → RMSNorm + Q/K/V GEMMs    (4 launches, 9ms)
-  │     2. rope_qk          → RoPE on Q and K           (2 herds [8,1], 4ms))
-  │     3. flash_attn       → Flash Attention GQA        (1 launch, 20ms)
+  │     2. rope_qk          → RoPE on Q and K           (2 herds [8,1], 4ms, seq-first)
+  │     3. flash_attn       → Flash Attention GQA        (1 launch, 22ms, seq-first)
   │     4. o_proj_add       → O GEMM + Residual Add      (2 launches, 6ms)
   │     5. ffn_full         → RMSNorm + FFN + Residual   (6 launches, 52ms)
   ├── Final RMSNorm (1 invocation, 3ms)
@@ -23,7 +23,7 @@ Python host (llama3_prefill.py)
   └── Output: next token prediction (" Paris")
 ```
 
-**Performance**: 1.84s total prefill, **33% faster than IRON** (2.744s). RMSNorm uses 8-tile herd with broadcast weight DMA.
+**Performance**: 1.84s total prefill, **35% faster than IRON** (2.744s). Entire attention subgraph uses seq-first layout (zero host transposes). RMSNorm uses 8-tile herd.
 
 ---
 
