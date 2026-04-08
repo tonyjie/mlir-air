@@ -12,7 +12,7 @@
 
 | Phase | AIR | IRON | Notes |
 |-------|-----|------|-------|
-| **Prefill** (seq_len=2048) | **1.92s** | 2.744s | **30% faster** |
+| **Prefill** (seq_len=2048) | **1.84s** | 2.744s | **33% faster** |
 | **Decode** (steady-state) | **351ms/token** | 370ms/token | **5% faster** |
 
 ---
@@ -22,7 +22,7 @@
 | # | Operation | Kernel | Launches | Avg Time |
 |---|-----------|--------|----------|----------|
 | 1 | RMSNorm + Q/K/V GEMMs | `rms_attn_gemms` | 4 | 9ms |
-| 2 | RoPE Q+K | `rope_qk` | 2 herds | 11ms |
+| 2 | RoPE Q+K | `rope_qk` | 2 herds [8,1] | 4ms |
 | 3 | Flash Attention GQA | `flash_attn` | 1 | 20ms |
 | 4 | O GEMM + Residual Add | `o_proj_add` | 2 | 6ms |
 | 5 | RMSNorm + FFN + Residual Add | `ffn_full` | 6 | 52ms |
@@ -63,7 +63,8 @@ After 16 blocks: Final RMSNorm + LM Head (CPU, ~50ms).
   - `bo.map()` zero-copy for all kernels
   - Static weight BO pre-loading for LM Head
   - 8-tile RMSNorm (broadcast DMA bug fixed): 6ms → 0.9ms standalone
-  - **Result: 1.92s total prefill vs IRON 2.744s (30% faster)**
+  - 8-tile RoPE (row-parallel): rope_qk 11ms → 4ms per layer
+  - **Result: 1.84s total prefill vs IRON 2.744s (33% faster)**
 - [x] Phase 5: Decode Phase — OPTIMIZED PIPELINE
   - GEMV kernel: 8-column multi-herd, 1.0-1.4x of IRON at all LLAMA shapes
   - Multi-launch merges: Q+K+V (3→1), O+Add (2→1), Gate+Up (2→1)
