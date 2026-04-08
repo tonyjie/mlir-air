@@ -12,7 +12,7 @@
 
 | Phase | AIR | IRON | Notes |
 |-------|-----|------|-------|
-| **Prefill** (seq_len=2048) | **1.84s** | 2.744s | **33% faster** |
+| **Prefill** (seq_len=2048) | **1.77s** | 2.744s | **35% faster** |
 | **Decode** (steady-state) | **351ms/token** | 370ms/token | **5% faster** |
 
 ---
@@ -64,7 +64,8 @@ After 16 blocks: Final RMSNorm + LM Head (CPU, ~50ms).
   - Static weight BO pre-loading for LM Head
   - 8-tile RMSNorm (broadcast DMA bug fixed): 6ms → 0.9ms standalone
   - 8-tile RoPE (row-parallel): rope_qk 11ms → 4ms per layer
-  - **Result: 1.84s total prefill vs IRON 2.744s (33% faster)**
+  - Seq-first layout: RoPE + FlashAttention accept seq-first, zero host transposes
+  - **Result: 1.77s total prefill vs IRON 2.744s (35% faster)**
 - [x] Phase 5: Decode Phase — OPTIMIZED PIPELINE
   - GEMV kernel: 8-column multi-herd, 1.0-1.4x of IRON at all LLAMA shapes
   - Multi-launch merges: Q+K+V (3→1), O+Add (2→1), Gate+Up (2→1)
