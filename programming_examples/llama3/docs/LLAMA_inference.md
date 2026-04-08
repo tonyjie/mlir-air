@@ -327,37 +327,28 @@ x_bf16 (2048, 2048) ─── input residual, carried between layers
              │           │                          │
      ┌───────┘     ┌─────┘                          │
      ▼             ▼                                │
-  reshape       reshape                             │
+  TRANSPOSE 1a  TRANSPOSE 1b                        │
   (2048,32,64)  (2048,8,64)                         │
-     │             │                                │
-  transpose     transpose                           │
-  (32,2048,64)  (8,2048,64)                         │
-     │             │                                │
-  flatten       flatten                             │
+  → (32,2048,64) → (8,2048,64)                     │
+  → flatten     → flatten                           │
   (4194304,)    (1048576,)                          │
      ▼             ▼                                │
 ┌─────────────────────────────────────────────┐     │
-│  XRT call 2: rope_qk  [ELF, 2 herds]       │     │
-│  Herds: [8,1] Q-herd + [8,1] K-herd        │     │
+│  XRT call 2: rope_qk  [ELF, 2 herds [8,1]] │     │
 │                                             │     │
 │  Q: (4194304,) × LUT(4194304,)             │     │
 │  K: (1048576,) × LUT(1048576,)             │     │
 └────────────┬──────────┬─────────────────────┘     │
              │          │                           │
              ▼          ▼                           │
-     q_roped (4194304,)  k_roped (1048576,)         │
-             │          │                           │
-     reshape(32,2048,64) reshape(8,2048,64)         │
-     transpose(2048,32,64) transpose(2048,8,64)     │
-     reshape(2048,2048) reshape(2048,512)            │
+     q_roped_hf         k_roped_hf                  │
+     reshape only:      reshape only:               │
+     (32,2048,64)       (8,2048,64)                 │
              │          │                           │
              │          │  ┌────────────────────────┘
              │          │  │
-             ▼          ▼  ▼
-          reshape     reshape
-          (32,2048,64) (8,2048,64)
-          transpose   transpose
-          ──── head-first layout ────
+             │          │  TRANSPOSE V
+             │          │  (2048,8,64) → (8,2048,64)
              │          │  │
              ▼          ▼  ▼
 ┌─────────────────────────────────────────────────────┐
@@ -370,8 +361,8 @@ x_bf16 (2048, 2048) ─── input residual, carried between layers
 └──────────────────────┬──────────────────────────────┘
                        │
                        ▼
-                transpose (2048,32,64)
-                reshape (2048,2048)
+                TRANSPOSE 4
+                (32,2048,64) → (2048,32,64) → (2048,2048)
                        │
                        ▼
 ┌─────────────────────────────────────────────────────┐
@@ -533,20 +524,29 @@ x (2048,) -> CPU rms_norm -> x_normed (1,2048)
           -> argmax       -> next_token
 ```
 
-### Summary: Reshape Operations Between Kernels
+### Summary: Transpose Operations Between Kernels
 
-| Location | Reshape | Why |
-|----------|---------|-----|
-| **Prefill: after QKV, before RoPE** | `(seq,dim)` -> `(seq,n_h,64)` -> transpose `(n_h,seq,64)` -> flatten 1D | RoPE kernel expects head-first flat layout |
-| **Prefill: after RoPE, back to seq-first** | reshape `(n_h,seq,64)` -> transpose `(seq,n_h,64)` -> reshape `(seq,dim)` | Restore seq-first for downstream |
-| **Prefill: before FlashAttn** | `(seq,dim)` -> `(seq,n_h,64)` -> transpose `(n_h,seq,64)` | FlashAttn expects head-first |
-| **Prefill: after FlashAttn** | `(n_h,seq,64)` -> transpose `(seq,n_h,64)` -> reshape `(seq,dim)` | Restore seq-first for O GEMM |
-| **Decode: after QKV, before RoPE** | `(dim,)` -> reshape `(n_h,64)` -> flatten `(dim,)` | RoPE expects flat per-head layout |
-| **Decode: after RoPE** | `(dim,)` -> reshape `(n_h,64)` | For KV cache write |
-| **Decode: RMSNorm in/out** | `(dim,)` -> reshape `(1,dim)` in, flatten `(dim,)` out | RMSNorm expects 2D input |
-| **Decode: weight transpose** | W `(out,in)` -> `.T` -> W_t `(in,out)` | GEMV expects A[M,K], stored as (K,M) |
+**Prefill** (4 transposes per layer, labeled in diagram above):
 
-The most complex reshaping is in prefill between QKV and RoPE/FlashAttention. These convert between **seq-first** `(seq, n_heads*head_dim)` and **head-first** `(n_heads, seq, head_dim)` layouts. Decode is simpler because M=1 eliminates the seq dimension.
+| # | Location | Operation | Data size | Could eliminate? |
+|---|----------|-----------|----------|------------------|
+| 1a | QKV → RoPE (Q) | `(seq,32,64)` → transpose `(32,seq,64)` → flatten | 16 MB | If RoPE accepted seq-first, or QKV output head-first |
+| 1b | QKV → RoPE (K) | `(seq,8,64)` → transpose `(8,seq,64)` → flatten | 4 MB | Same |
+| V | V → FlashAttn | `(seq,8,64)` → transpose `(8,seq,64)` | 4 MB | If FlashAttn accepted V in seq-first |
+| 4 | FlashAttn → O GEMM | `(32,seq,64)` → transpose `(seq,32,64)` → reshape | 16 MB | If O GEMM accepted head-first |
+| ~~2~~ | ~~RoPE → seq-first~~ | ~~removed~~ | — | ~~Was redundant round-trip~~ |
+| ~~3~~ | ~~seq-first → FlashAttn~~ | ~~removed~~ | — | ~~Cancelled with #2~~ |
+
+**Decode** (no real transposes — only reshapes that are zero-copy views at M=1):
+
+| Location | Operation | Data copy? |
+|----------|-----------|-----------|
+| After QKV, before RoPE | `(dim,)` → reshape `(n_h,64)` → flatten | No (view) |
+| After RoPE | `(dim,)` → reshape `(n_h,64)` | No (view) |
+| RMSNorm in/out | `(dim,)` → reshape `(1,dim)` / flatten | No (view) |
+| Weight transpose | W `(K,M)` → `.T` → W_t `(M,K)` | Once in `prepare_runtime()` |
+
+The remaining 4 prefill transposes convert between **seq-first** `(seq, n_heads*head_dim)` and **head-first** `(n_heads, seq, head_dim)`. Eliminating them requires kernel-level changes (QKV GEMM output layout, RoPE input layout, or O GEMM input layout).
 
 ---
 
