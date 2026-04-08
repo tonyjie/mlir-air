@@ -155,7 +155,7 @@ Two separate kernel caches, compiled independently:
 | Kernel | Type | Launches | What It Does |
 |--------|------|----------|-------------|
 | `rms_attn_gemms` | ELF | 4 | RMSNorm[8-tile] + Q/K/V GEMMs |
-| `rope_qk` | ELF | 2 herds | RoPE on Q and K |
+| `rope_qk` | ELF | 2 herds [8,1] | RoPE on Q and K (8-tile row-parallel) |
 | `flash_attn` | ELF | 1 | Flash Attention GQA (32Q/8KV) |
 | `o_proj_add` | ELF | 2 | O GEMM + Residual Add |
 | `ffn_full` | ELF | 6 | RMSNorm[8-tile] + Gate + Up + SiLU + Down + Add |
@@ -267,7 +267,7 @@ Both AIR and IRON are profiled with the **same scope**: host-side timing that in
 | Metric | AIR | IRON | Notes |
 |--------|-----|------|-------|
 | **Total prefill** | **1.84s** (warm) | 2.744s | **33% faster** |
-| Per-layer avg | ~100ms | 152ms | AIR 34% faster |
+| Per-layer avg | ~95ms | 152ms | AIR 37% faster |
 | LM Head | 171ms (NPU 8-launch) | 217ms (NPU GEMM) | AIR 21% faster |
 | XRT invocations/layer | 5 | ~12 | AIR uses multi-launch ELF |
 
@@ -338,7 +338,7 @@ x_bf16 (2048, 2048) ─── input residual, carried between layers
      ▼             ▼                                │
 ┌─────────────────────────────────────────────┐     │
 │  XRT call 2: rope_qk  [ELF, 2 herds]       │     │
-│  Herds: [8,4] Q-herd + [8,4] K-herd        │     │
+│  Herds: [8,1] Q-herd + [8,1] K-herd        │     │
 │                                             │     │
 │  Q: (4194304,) × LUT(4194304,)             │     │
 │  K: (1048576,) × LUT(1048576,)             │     │
@@ -628,7 +628,7 @@ Most kernels are already well-sized. The real constraints:
 | Decode RMSNorm | [1,1] | Yes (column-parallel) | Current kernel distributes rows — M=1 can't split. But N=2048 can be split across tiles with L2 cross-tile reduction (see below) |
 | Decode RoPE Q/K | [1,1] | No (tiny workload) | Only 32/8 rows of 64 elements. [1,1] is sufficient |
 | Decode GEMV (all) | [8,1] | No | M=1, only 1 tile per column does real work |
-| Prefill RoPE | [1,1] per herd | **Yes** | 65K rows (Q) + 16K rows (K) processed sequentially on 1 tile. Row-parallel like RMSNorm — no new kernel needed, just add herd_x + tile-dependent offset to `rope_lut.py` |
+| Prefill RoPE | **[8,1] per herd** | **Done** | Was [1,1]. Now 8-tile row-parallel: rope_qk 11ms → 4ms per layer |
 | Decode Add/SiLU | [8,1] | Already optimal | 2048-8192 elements across 8 tiles |
 | Prefill GEMMs | [8,4] | Already optimal | M=2048 across 32 tiles |
 | Prefill RMSNorm | [8,1] | Already optimal | M=2048 across 8 tiles |
@@ -644,18 +644,18 @@ An alternative: **column-parallel** — distribute the N=2048 columns across 8 t
 
 This requires a new kernel with L2-mediated reduction, since the current design assumes each tile processes complete independent rows. The eltwise_add and silu_mul kernels already use this column-parallel pattern (they distribute N across tiles), but they don't have a reduction step.
 
-**Prefill RoPE — why [1,1] and how to improve**:
+**Prefill RoPE — [DONE] upgraded from [1,1] to [8,1]**:
 
-The `rope_lut.py` kernel uses `herd(sizes=[1, 1])` and loops over rows sequentially. The `seq_len` parameter in `build_module(seq_len, embed_dim)` is actually the *number of rows*, not the sequence length:
+The `rope_lut.py` kernel now uses `herd_x=8` for prefill, distributing rows across 8 tiles with tile-dependent offsets. Each row's RoPE is independent — no cross-row dependency, no broadcast DMA needed.
 
-| Context | `seq_len` param | Actual rows | Total elements | Herd | Time |
-|---------|----------------|-------------|---------------|------|------|
-| Decode RoPE Q | n_heads=32 | 32 | 2,048 | [1,1] OK | ~0.3ms |
-| Decode RoPE K | n_kv_heads=8 | 8 | 512 | [1,1] OK | ~0.2ms |
-| **Prefill RoPE Q** | n_heads×seq_len=65536 | **65,536** | **4,194,304** | **[1,1] slow** | **~5-6ms** |
-| **Prefill RoPE K** | n_kv_heads×seq_len=16384 | **16,384** | **1,048,576** | **[1,1] slow** | **~2-3ms** |
+| Context | Rows | Herd | Standalone (C++) | In pipeline |
+|---------|------|------|-----------------|-------------|
+| Decode RoPE Q | 32 | [1,1] (unchanged) | ~100 us | ~0.3ms |
+| Decode RoPE K | 8 | [1,1] (unchanged) | ~100 us | ~0.2ms |
+| Prefill RoPE Q | 65,536 | **[8,1]** | **912 us** (was 6717) | **~2ms** |
+| Prefill RoPE K | 16,384 | **[8,1]** | **268 us** (was 1716) | **~1ms** |
 
-For prefill, a single tile processes 65K rows sequentially — a straightforward candidate for row-parallel multi-tile. Each row's RoPE is independent (no cross-row dependency). The external `rope.cc` kernel doesn't need changes — only the AIR wrapper needs `herd(sizes=[herd_x, 1])` with tile-dependent row offsets, the same pattern used for the 8-tile RMSNorm broadcast DMA fix.
+2D scaling beyond [8,1] was investigated (see `docs/kernels/rope.md`): direct path limited by shim DMA channels, L2 staging blocked by compiler issues. [8,1] at ~27 GB/s is bandwidth-limited and is the practical optimum.
 
 **Decode GEMV**: Fundamentally limited at batch=1. The performance gap is not herd size but the data path (L2 staging overhead vs IRON's direct DDR→L1).
 
