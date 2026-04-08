@@ -86,6 +86,91 @@ python3 test_precision.py --num-heads 32 --num-kv-heads 8 --causal
 
 ---
 
+## Seq-First Layout Investigation (2026-04)
+
+### Motivation
+
+The LLAMA prefill pipeline has 4 remaining numpy transposes per layer, all at the FlashAttention boundary:
+
+```
+QKV GEMM output: (seq, emb_dim)      ← seq-first
+    ↓ TRANSPOSE Q: (seq,32,64) → (32,seq,64)     16 MB
+    ↓ TRANSPOSE K: (seq,8,64) → (8,seq,64)       4 MB
+    ↓ TRANSPOSE V: (seq,8,64) → (8,seq,64)       4 MB
+FlashAttention:  (n_h, seq, 64)       ← head-first
+    ↓ TRANSPOSE output: (32,seq,64) → (seq,32,64) 16 MB
+O GEMM input:   (seq, emb_dim)       ← seq-first
+```
+
+These are pure data movement (no compute), costing ~40ms across 16 layers. If FlashAttention accepted seq-first layout directly, all 4 transposes would be eliminated.
+
+### What seq-first means for FlashAttention
+
+**Head-first** `[num_heads, seq, head_dim]`: each head's data is a contiguous `(seq, 64)` block. The DMA reads one big contiguous chunk per head.
+
+```
+Memory: [h0_pos0_d0..d63 | h0_pos1_d0..d63 | ... | h0_pos2047 | h1_pos0 | h1_pos1 | ...]
+         ←── head 0: contiguous 2048×64 block ──→  ←── head 1 ──→
+```
+
+**Seq-first** `[seq, num_heads * head_dim]`: heads are interleaved at each position. To read head 0's data, the DMA must read 64 elements, skip `(num_heads-1) * 64 = 1984` elements, read next 64, etc.
+
+```
+Memory: [pos0_h0 | pos0_h1 | ... | pos0_h31 | pos1_h0 | pos1_h1 | ... | pos1_h31 | ...]
+         ←64B→    skip 1984B                   ←64B→    skip 1984B
+```
+
+This is a **strided DMA pattern** with row stride = `num_heads * head_dim = 2048` between positions for a given head.
+
+### What we changed in `attn_npu2_seqfirst.py`
+
+Created a copy of `attn_npu2.py` with these modifications:
+
+1. **L3 memref types**: `[num_heads, lq, dk]` → `[lq, num_heads * dk]` (seq-first 2D)
+2. **Head offset maps**: `head * lq * dk` → `head * dk` (column offset, not row offset)
+3. **Launch offset maps**: `lx * lqp * dk` → `lx * lqp * num_heads * dk` (row offset in wider array)
+4. **Q DMA strides**: `[tile_size_q * dk, ...]` → `[tile_size_q * num_heads * dk, ...]` (row stride = emb_dim)
+5. **K DMA strides**: same pattern with `num_kv_heads * dk`
+6. **V DMA strides**: same pattern with `num_kv_heads * dv`
+7. **Output DMA**: contiguous `[lqp * dv_tile]` → strided `[lqp, dv_tile]` with stride `num_heads * dv`
+
+### Result: compiler assertion failure
+
+```
+aircc: Assertion `willBeValidAffineMap(dimCount, symbolCount, {result})' failed.
+```
+
+The crash occurs in the `air-to-aie` lowering pipeline when the compiler tries to construct an AffineMap from the combined dynamic offset + strided DMA pattern. Specifically:
+
+- The offset `q_combined = head_idx * 64 + launch_iter * 524288` is a valid affine expression
+- The strides `[tile_size_q * 2048, dk_tile, 2048, 1]` are valid constants
+- But when the compiler combines these during channel-to-DMA lowering, the resulting expression fails affine map validation
+
+**This is a compiler limitation, not a hardware limitation.** The NPU hardware supports 4D buffer descriptors with arbitrary strides that could express this pattern. The `air-to-aie` pass's affine map construction doesn't handle the combination of dynamic offsets with large strided access patterns.
+
+### Why head-first works
+
+Head-first strides are `[tile_size_q * 64, dk_tile, 64, 1]` — the row stride (64) equals `head_dim`, which means the DMA reads a contiguous 2D block. The compiler can express this as a simple base+offset BD.
+
+Seq-first strides are `[tile_size_q * 2048, dk_tile, 2048, 1]` — the row stride (2048) equals `num_heads * head_dim`, meaning the DMA must skip over other heads' data between rows. This strided non-contiguous access requires more complex BD configuration that the compiler can't construct from its affine map framework.
+
+### What would fix this
+
+1. **Compiler fix**: teach `air-to-aie` to handle strided DMA patterns where the offset and stride are both affine functions of loop variables and constants. The hardware BD supports this — the gap is in the compiler's affine map construction.
+
+2. **L2 staging workaround**: use L2 (MemTile) as an intermediate — DMA the full seq-first row to L2, then extract per-head data from L2 to L1 using MemTile's more flexible DMA. This adds a hop but avoids the problematic L3 strided access.
+
+3. **Host-side transpose (current)**: keep the `np.transpose` in Python between RoPE and FlashAttention. Cost: ~40ms across 16 layers.
+
+### Files
+
+| File | Purpose |
+|------|---------|
+| `attn_npu2_seqfirst.py` | Experimental seq-first variant (blocked by compiler) |
+| `test_seqfirst.py` | Host-side transpose validation test |
+
+---
+
 ## Historical Investigation (resolved)
 
 ### Previous Bug: corr=0.13-0.34 (before 2026-03-26 fix)
