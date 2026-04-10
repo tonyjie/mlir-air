@@ -276,6 +276,7 @@ def load_weights(
             config.hidden_dim,
             config.emb_dim,
         ), f"Layer {layer_idx} w_down: {layer.w_down.shape}"
+
         layers.append(layer)
 
     # --- Load final RMSNorm ---
@@ -325,14 +326,14 @@ def generate_rope_lut(
 ) -> np.ndarray:
     """Generate a pre-computed RoPE (Rotary Position Embedding) look-up table.
 
-    The LUT contains interleaved [cos, sin, cos, sin, ...] values for each
-    position, matching the layout expected by the RoPE kernel.
+    The LUT uses concatenated layout: [cos_0, ..., cos_{half-1}, sin_0, ..., sin_{half-1}]
+    matching the half-split RoPE kernel (rope_halfsplit.cc) and HuggingFace Llama convention.
 
     For position *pos* and dimension index *i* (0-indexed, i < head_dim/2):
-        freq_i     = 1.0 / (theta ^ (2*i / head_dim))
-        angle      = pos * freq_i
-        LUT[pos, 2*i]   = cos(angle)
-        LUT[pos, 2*i+1] = sin(angle)
+        freq_i           = 1.0 / (theta ^ (2*i / head_dim))
+        angle            = pos * freq_i
+        LUT[pos, i]             = cos(angle)
+        LUT[pos, i + head_dim/2] = sin(angle)
 
     Args:
         config: Model config (uses rope_base and head_dim). Defaults to
@@ -341,12 +342,13 @@ def generate_rope_lut(
         dtype: Output dtype. Default is bfloat16.
 
     Returns:
-        np.ndarray of shape (seq_len, head_dim) with interleaved cos/sin.
+        np.ndarray of shape (seq_len, head_dim) with concatenated [cos..., sin...].
     """
     if config is None:
         config = LlamaConfig()
 
     head_dim = config.head_dim
+    half = head_dim // 2
     theta = config.rope_base
 
     # Compute inverse frequencies: shape (head_dim/2,)
@@ -361,10 +363,10 @@ def generate_rope_lut(
     cos_vals = np.cos(angles)  # (seq_len, head_dim/2)
     sin_vals = np.sin(angles)  # (seq_len, head_dim/2)
 
-    # Interleave: [cos_0, sin_0, cos_1, sin_1, ...]
+    # Concatenate: [cos_0, ..., cos_{half-1}, sin_0, ..., sin_{half-1}]
     lut = np.empty((seq_len, head_dim), dtype=np.float64)
-    lut[:, 0::2] = cos_vals
-    lut[:, 1::2] = sin_vals
+    lut[:, :half] = cos_vals
+    lut[:, half:] = sin_vals
 
     return lut.astype(dtype)
 

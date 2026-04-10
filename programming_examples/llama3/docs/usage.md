@@ -61,10 +61,17 @@ Compiles all NPU kernels from source and caches them to disk.
 Runs the unified inference pipeline with default settings (100 tokens).
 
 ```bash
-make run                              # 100 tokens, default prompt
+make run                              # 100 tokens, default prompt (base model)
 make run N_TOKENS=50                  # Generate 50 tokens
 make run PROMPT="Once upon a time"    # Custom prompt
+make run MODEL=instruct PROMPT="What is the capital of France?"  # Instruct model (Q&A)
 ```
+
+**Model variants** (`MODEL=base` or `MODEL=instruct`):
+- `base` (default): Text completion model. Continues the prompt.
+- `instruct`: Instruction-following model. Answers questions using chat template.
+  Same architecture and kernels — only the weights differ.
+  Stops generation automatically on `<|eot_id|>` token.
 
 What happens internally:
 1. Loads model weights from HuggingFace cache
