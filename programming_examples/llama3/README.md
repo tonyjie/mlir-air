@@ -36,6 +36,9 @@ make run
 # Run with custom prompt
 make run PROMPT="In 1969, the first man to walk on"
 
+# Run with instruct model (Q&A)
+make run MODEL=instruct PROMPT="What is the capital of France?"
+
 # Run with profiling breakdown
 make profile
 

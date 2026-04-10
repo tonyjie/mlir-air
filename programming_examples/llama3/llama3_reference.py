@@ -45,37 +45,32 @@ def rms_norm(x, weight, eps=1e-5):
 def apply_rope(x, lut):
     """Apply Rotary Position Embedding using a precomputed LUT.
 
-    The LUT contains interleaved [cos, sin, cos, sin, ...] values.
-    For each pair of elements (x[r, 2i], x[r, 2i+1]):
-        out[r, 2i]   = x[r, 2i] * cos - x[r, 2i+1] * sin
-        out[r, 2i+1] = x[r, 2i] * sin + x[r, 2i+1] * cos
+    Uses half-split convention (matching HuggingFace Llama):
+    pairs (x[i], x[i + dim//2]) with rotation angle theta_i.
+
+    LUT layout: [cos_0, ..., cos_{half-1}, sin_0, ..., sin_{half-1}]
 
     Args:
-        x: (seq_len, embed_dim) input with interleaved pairs.
-        lut: (seq_len, embed_dim) with interleaved [cos, sin, cos, sin, ...].
+        x: (seq_len, head_dim) input for one head.
+        lut: (seq_len, head_dim) with concatenated [cos..., sin...].
 
     Returns:
-        (seq_len, embed_dim) with RoPE applied.
+        (seq_len, head_dim) with RoPE applied.
     """
     x = np.asarray(x, dtype=np.float32)
     lut = np.asarray(lut, dtype=np.float32)
+    dim = x.shape[-1]
+    half = dim // 2
 
-    # Extract cos and sin from interleaved LUT
-    cos_vals = lut[:, 0::2]  # (seq_len, embed_dim // 2)
-    sin_vals = lut[:, 1::2]  # (seq_len, embed_dim // 2)
+    cos_vals = lut[:, :half]
+    sin_vals = lut[:, half:]
 
-    # Extract even and odd elements from x
-    x_even = x[:, 0::2]  # (seq_len, embed_dim // 2)
-    x_odd = x[:, 1::2]  # (seq_len, embed_dim // 2)
+    x1 = x[:, :half]
+    x2 = x[:, half:]
 
-    # Apply rotation
-    out_even = x_even * cos_vals - x_odd * sin_vals
-    out_odd = x_even * sin_vals + x_odd * cos_vals
-
-    # Interleave back
     out = np.empty_like(x)
-    out[:, 0::2] = out_even
-    out[:, 1::2] = out_odd
+    out[:, :half] = x1 * cos_vals - x2 * sin_vals
+    out[:, half:] = x1 * sin_vals + x2 * cos_vals
     return out
 
 

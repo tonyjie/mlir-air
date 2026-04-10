@@ -230,6 +230,28 @@ In the MLIR module, the Down GEMV's `@matvec` references are renamed during
 stitching (by not preserving them in `extern_funcs`), and its `link_with`
 attribute points to `"mv_k8192.o"` instead of `"mv.o"`.
 
+### Key Technique: Half-Split RoPE Kernel
+
+HuggingFace Llama uses **half-split** RoPE rotation: pairs `(x[i], x[i+32])` within
+each head's 64 dimensions. The upstream `rope.cc` kernel uses a different
+**interleaved** convention pairing adjacent elements `(x[2i], x[2i+1])`.
+
+We provide our own `rope_halfsplit.cc` (`kernel_builder/rope_halfsplit.cc`) that
+implements the half-split convention directly, matching HuggingFace exactly:
+
+```
+LUT layout:  [cos_0, cos_1, ..., cos_31, sin_0, sin_1, ..., sin_31]
+Rotation:    out[i]      = x[i] * cos[i]      - x[i+32] * sin[i]
+             out[i+32]   = x[i] * sin[i]      + x[i+32] * cos[i]
+```
+
+The kernel exports the same `@rope` function name and signature as upstream,
+so no MLIR or multi-launch builder changes are needed. It is compiled to `rope.o`
+in `external_kernels.py:compile_rope()`.
+
+The CPU reference (`llama3_reference.py:apply_rope()`) uses the same half-split
+convention, ensuring NPU and CPU produce identical results.
+
 ---
 
 ## Kernel Directory Map

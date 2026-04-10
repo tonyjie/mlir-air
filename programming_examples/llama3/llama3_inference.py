@@ -651,16 +651,20 @@ def generate(
         x_decode = weights.embed_table[next_token].astype(bfloat16)
 
         if profile:
-            # Token 0 = prefill output. Decode tokens start at 1.
             print(
                 f"  Token {token_idx + 1}: id={next_token}, time={t_token*1000:.0f}ms"
             )
 
-    t_decode = time.time() - t_decode_start
+        # Stop on EOS or EOT (instruct model emits <|eot_id|> = 128009)
+        if next_token in (tokenizer.eos_token_id, 128009):
+            break
 
-    print(f"\nGenerated {n_tokens} tokens in {t_decode:.2f}s")
-    print(f"Tokens/second: {n_tokens / t_decode:.2f}")
-    print(f"Time/token: {t_decode / n_tokens * 1000:.0f}ms")
+    t_decode = time.time() - t_decode_start
+    n_generated = len(generated_tokens) - 1  # exclude prefill token
+
+    print(f"\nGenerated {n_generated} tokens in {t_decode:.2f}s")
+    print(f"Tokens/second: {n_generated / t_decode:.2f}")
+    print(f"Time/token: {t_decode / n_generated * 1000:.0f}ms")
 
     return generated_tokens
 
@@ -710,6 +714,13 @@ if __name__ == "__main__":
         type=str,
         default="The capital of France is",
     )
+    parser.add_argument(
+        "--model",
+        type=str,
+        choices=["base", "instruct"],
+        default="base",
+        help="Model variant: base (completion) or instruct (Q&A)",
+    )
     args = parser.parse_args()
 
     config = LlamaConfig()
@@ -734,13 +745,26 @@ if __name__ == "__main__":
         decode_cache.load_manifest()
 
     # --- Step 2: Load model weights and tokenizer ---
-    print("\nLoading weights...")
-    weights = load_weights("meta-llama/Llama-3.2-1B")
+    model_id = (
+        "meta-llama/Llama-3.2-1B-Instruct"
+        if args.model == "instruct"
+        else "meta-llama/Llama-3.2-1B"
+    )
+    print(f"\nLoading weights ({model_id})...")
+    weights = load_weights(model_id)
 
     from transformers import AutoTokenizer
 
-    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B")
-    prompt_tokens = tokenizer.encode(args.prompt)
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    if args.model == "instruct":
+        # Format prompt with chat template for instruct model
+        messages = [{"role": "user", "content": args.prompt}]
+        chat_text = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        prompt_tokens = tokenizer.encode(chat_text)
+    else:
+        prompt_tokens = tokenizer.encode(args.prompt)
     prompt_len_actual = len(prompt_tokens)
     if len(prompt_tokens) < seq_len:
         prompt_tokens = prompt_tokens + [tokenizer.eos_token_id] * (
@@ -774,7 +798,12 @@ if __name__ == "__main__":
 
     # --- Step 5: Print output ---
     print(f"\n{'='*60}")
-    print(f"Generated text:")
-    print(f"{'='*60}")
-    all_tokens = prompt_tokens[:prompt_len_actual] + generated
-    print(tokenizer.decode(all_tokens))
+    if args.model == "instruct":
+        response = tokenizer.decode(generated, skip_special_tokens=True).strip()
+        print(f"Q: {args.prompt}")
+        print(f"A: {response}")
+    else:
+        print(f"Generated text:")
+        print(f"{'='*60}")
+        all_tokens = prompt_tokens[:prompt_len_actual] + generated
+        print(tokenizer.decode(all_tokens))

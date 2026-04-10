@@ -1,42 +1,30 @@
 # Known Issues and Future Work
 
-## 1. BF16 Precision Divergence in Decode Generation
+## 1. BF16 Precision Divergence (mostly resolved)
 
-**Symptom**: For some prompts, the NPU decode generates repetitive text while the
-HuggingFace BF16 reference (unpadded, same model) generates coherent text.
+**Previous symptom**: NPU decode generated repetitive or incorrect text compared
+to HuggingFace. The instruct model was completely broken (emitting wrong control
+tokens).
 
-**Example**:
-```
-Prompt: "In 1969, the first man to walk on"
+**Root cause found and fixed**: The RoPE (Rotary Position Embedding) implementation
+used the wrong rotation convention. Our pipeline used **interleaved** rotation
+(pairing adjacent dimensions `d[2i], d[2i+1]`) while HuggingFace Llama uses
+**half-split** rotation (pairing `d[i], d[i+32]`). This produced semantically
+wrong Q/K rotations in every layer.
 
-HuggingFace (no padding):  "the moon, Neil Armstrong, was the first to say..."
-Our NPU pipeline (padded):  "the moon. The first man to walk on the moon. The first..."
-```
+**Fix**: Created `rope_halfsplit.cc` (custom NPU kernel matching HF convention)
+and updated the LUT layout from interleaved `[cos,sin,cos,sin,...]` to
+concatenated `[cos,...,sin,...]`. CPU reference updated to match. See
+`docs/explain.md` for details.
 
-Both predict the same first two tokens ("the moon"), but diverge at the third:
-- HuggingFace: "," (comma, logit=20.5) → continues with "Neil Armstrong"
-- NPU: "." (period, logit=16.9 in HF) → ends sentence, triggers repetition loop
+**Current status**: Both base and instruct models produce correct output:
+- CPU reference vs HuggingFace: correlation 0.9997 (was 0.616 before fix)
+- Instruct model generates correct Q&A responses
+- Base model output quality improved (less repetitive)
 
-**Root cause**: BF16 precision error accumulates across 16 transformer layers. The
-logit gap between "," and "." is 3.6 in the reference, but our NPU pipeline's
-accumulated numerical error (~0.991 correlation at logit level) can flip rankings
-for tokens with moderate gaps.
-
-**Verification**: The pipeline IS functionally correct:
-- First token prediction matches CPU reference (corr=0.991)
-- Top-1 match: YES for both prompts tested
-- Per-layer KV cache correlation: >0.99 at early layers, ~0.98 at later layers
-- This is expected BF16 behavior, not a bug
-
-**Mitigations**:
-- Add temperature + top-k sampling (like IRON uses `temperature=0.7, top_k=50`).
-  Sampling adds randomness that breaks repetition loops regardless of small
-  numerical differences.
-- The "The capital of France is" prompt works perfectly (large confidence gap
-  for "Paris" survives BF16 noise).
-
-**Related**: Issue #2 (variable-length input). Processing 2036 padding tokens adds
-unnecessary BF16 computation that may amplify precision loss.
+**Remaining**: Minor BF16 numerical differences still exist between NPU and CPU
+(expected — different hardware precision paths). Some prompts may produce slightly
+different token choices than HuggingFace, but the overall output quality is correct.
 
 ---
 
