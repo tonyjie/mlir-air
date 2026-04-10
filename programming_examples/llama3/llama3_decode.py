@@ -26,19 +26,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from llama3_weights import LlamaConfig, load_weights, generate_rope_lut
-from llama3_prefill import KernelCache, prepare_air_project, _build_gemm_module
-
-# ---------------------------------------------------------------------------
-# GEMV module builder (wraps matrix_vector_multiplication)
-# ---------------------------------------------------------------------------
-
-sys.path.insert(
-    0,
-    os.path.join(
-        os.path.dirname(__file__), "..", "matrix_vector_multiplication", "bf16"
-    ),
-)
-from matvec import build_module as build_gemv_module
+from llama3.kernel_builder.cache import KernelCache, prepare_air_project
+from llama3.kernel_builder.gemm_builder import _build_gemm_module
 
 # ---------------------------------------------------------------------------
 # Decode kernel compilation
@@ -62,8 +51,64 @@ _GEMV_K8192_BACKEND = {
 _SIMPLE_BACKEND = {"omit_while_true_loop": False}
 
 
+def _ensure_mv_k8192_o():
+    """Ensure mv_k8192.o exists in CWD for the o_gemv_ffn merged kernel.
+
+    The Down GEMV (K=8192) shares the same C++ source as mv.o but needs a
+    renamed entry point (@dg_matvec_vectorized_bf16_bf16) to avoid type
+    conflicts with K=2048 GEMVs in the same ELF.  We compile with:
+      -Dmatvec_vectorized_bf16_bf16=dg_matvec_vectorized_bf16_bf16
+      -DDIM_M_OUTPUT=2  (tile_m=2 for K=8192)
+    """
+    from pathlib import Path
+
+    if Path("mv_k8192.o").exists():
+        return
+
+    mv_src = (
+        Path(__file__).parent.parent / "matrix_vector_multiplication" / "bf16" / "mv.cc"
+    )
+    if not mv_src.exists():
+        raise FileNotFoundError(f"Cannot find mv.cc at {mv_src}")
+
+    peano_dir = os.environ.get("PEANO_INSTALL_DIR", "")
+    clang = os.path.join(peano_dir, "bin", "clang++") if peano_dir else "clang++"
+
+    import subprocess
+
+    aieopt_dir = os.path.dirname(
+        os.path.dirname(
+            subprocess.check_output(["which", "aie-opt"], text=True).strip()
+        )
+    )
+    flags = [
+        "-O2",
+        "-std=c++20",
+        "--target=aie2p-none-unknown-elf",
+        "-Wno-parentheses",
+        "-Wno-attributes",
+        "-Wno-macro-redefined",
+        "-Wno-empty-body",
+        "-DNDEBUG",
+        f"-I{aieopt_dir}/include",
+        "-DDIM_M_OUTPUT=2",
+        "-Dmatvec_vectorized_bf16_bf16=dg_matvec_vectorized_bf16_bf16",
+        "-Dlinalg_fill_bf16=dg_linalg_fill_bf16",
+        "-c",
+        str(mv_src),
+        "-o",
+        "mv_k8192.o",
+    ]
+    print(f"  Compiling mv_k8192.o (Down GEMV K=8192 renamed symbols)...")
+    subprocess.check_call([clang] + flags)
+
+
 def compile_decode_kernels(cache, config):
-    """Compile all unique decode kernel configs."""
+    """Compile the 3 merged decode kernels."""
+    from llama3.kernel_builder.external_kernels import compile_all_external_kernels
+
+    compile_all_external_kernels(head_dim=config.head_dim)
+
     emb_dim = config.emb_dim
     n_heads = config.n_heads
     n_kv_heads = config.n_kv_heads
@@ -72,107 +117,58 @@ def compile_decode_kernels(cache, config):
     kv_dim = n_kv_heads * head_dim
 
     print(f"\n{'='*60}")
-    print(f"Compiling decode kernels...")
+    print(f"Compiling decode kernels (2-call merged pipeline)...")
     print(f"{'='*60}\n")
 
-    # 1. QKV GEMV multi-launch: Q + K + V in one ELF (3 launches)
-    from llama3.multi_launch_builder.rms_qkv_gemv_multi import build_rms_qkv_gemv_module
+    # Ensure mv_k8192.o exists for the o_gemv_ffn kernel
+    _ensure_mv_k8192_o()
+
+    # 1. rms_gemv_rope: RMSNorm + QKV GEMV + RoPE Q+K (6 launches, 13 args)
+    from llama3.multi_launch_builder.rms_gemv_rope_multi import (
+        build_rms_gemv_rope_module,
+    )
 
     cache.compile_and_cache(
-        "qkv_gemv",
-        build_rms_qkv_gemv_module(emb_dim, kv_dim),
+        "rms_gemv_rope",
+        build_rms_gemv_rope_module(emb_dim, kv_dim, n_heads, n_kv_heads, head_dim),
         {
             "verbose": cache.verbose,
             "output_format": "elf",
-            "instance_name": "qkv_gemv",
+            "instance_name": "rms_gemv_rope",
             **_GEMV_K2048_BACKEND,
         },
     )
 
-    # 2. O GEMV + Add multi-launch: O projection + residual (2 launches)
-    from llama3.multi_launch_builder.o_gemv_add_multi import build_o_gemv_add_module
+    # 2. o_gemv_ffn: O GEMV + Add + RMSNorm + Gate/Up GEMV + SiLU*mul
+    #                + Down GEMV + Add (8 launches, 15 args)
+    from llama3.multi_launch_builder.o_gemv_ffn_multi import build_o_gemv_ffn_module
 
     cache.compile_and_cache(
-        "o_gemv_add",
-        build_o_gemv_add_module(emb_dim),
+        "o_gemv_ffn",
+        build_o_gemv_ffn_module(emb_dim, hidden_dim),
         {
             "verbose": cache.verbose,
             "output_format": "elf",
-            "instance_name": "o_gemv_add",
-            **_GEMV_K2048_BACKEND,
+            "instance_name": "o_gemv_ffn",
+            "omit_pingpong": "all",
+            **{k: v for k, v in _GEMV_K2048_BACKEND.items() if k != "omit_pingpong"},
         },
     )
 
-    # 3. Gate + Up GEMV multi-launch (2 launches) — shared K=2048
-    from llama3.multi_launch_builder.ffn_gemv_multi import build_gate_up_gemv_module
+    # 3. LM Head GEMV multi-launch: 8-partition GEMV in one ELF
+    from llama3.multi_launch_builder.lm_head_gemv_multi import (
+        build_lm_head_gemv_module,
+    )
 
     cache.compile_and_cache(
-        "gate_up_gemv",
-        build_gate_up_gemv_module(emb_dim, hidden_dim),
+        "lm_head_gemv",
+        build_lm_head_gemv_module(emb_dim),
         {
             "verbose": cache.verbose,
             "output_format": "elf",
-            "instance_name": "gate_up_gemv",
+            "instance_name": "lm_head_gemv",
             **_GEMV_K2048_BACKEND,
         },
-    )
-
-    # 4. Down GEMV (single, K=8192 — different backend flags)
-    cache.compile_and_cache(
-        "gemv_down",
-        build_gemv_module(emb_dim, hidden_dim, 2, 1, 8, bfloat16, bfloat16),
-        {"verbose": cache.verbose, **_GEMV_K8192_BACKEND},
-    )
-
-    # 5. RMSNorm: M=1, N=2048
-    from weighted_rms_norm.weighted_rms_norm import build_module as build_rms
-
-    cache.compile_and_cache(
-        "rmsnorm",
-        build_rms(1, emb_dim, bfloat16, 16),
-        {"verbose": cache.verbose, **_SIMPLE_BACKEND},
-    )
-
-    # 6. Eltwise Add: n=2048, [8,1] herd (same as prefill)
-    from eltwise_add.eltwise_add import build_module as build_add
-
-    cache.compile_and_cache(
-        "add",
-        build_add(emb_dim, emb_dim // 8, bfloat16, vector_size=16, herd_x=8, herd_y=1),
-        {"verbose": cache.verbose, **_SIMPLE_BACKEND},
-    )
-
-    # 7. SiLU × mul: n=8192 (NPU, enables FFN multi-launch)
-    import importlib.util
-
-    _silu_path = os.path.join(
-        os.path.dirname(__file__), "ffn_swiglu", "silu_and_mul.py"
-    )
-    _spec = importlib.util.spec_from_file_location("silu_and_mul", _silu_path)
-    _silu_mod = importlib.util.module_from_spec(_spec)
-    _spec.loader.exec_module(_silu_mod)
-    cache.compile_and_cache(
-        "silu_mul",
-        _silu_mod.build_module(
-            hidden_dim, hidden_dim // 8, bfloat16, herd_x=8, herd_y=1
-        ),
-        {"verbose": cache.verbose, **_SIMPLE_BACKEND},
-    )
-
-    # 8. RoPE Q: (32, 64)
-    from rope_lut.rope_lut import build_module as build_rope
-
-    cache.compile_and_cache(
-        "rope_q",
-        build_rope(n_heads, head_dim, bfloat16),
-        {"verbose": cache.verbose, **_SIMPLE_BACKEND},
-    )
-
-    # 9. RoPE K: (8, 64)
-    cache.compile_and_cache(
-        "rope_k",
-        build_rope(n_kv_heads, head_dim, bfloat16),
-        {"verbose": cache.verbose, **_SIMPLE_BACKEND},
     )
 
     cache._save_manifest()
@@ -275,70 +271,60 @@ def run_decode_block(
             **kwargs,
         )
 
-    _QKV_BACKEND = {
+    # --- Call 1: rms_gemv_rope (6 launches, 13 args) ---
+    # RMSNorm + Q/K/V GEMV + RoPE Q + RoPE K
+    _RGR_BACKEND = {
         "output_format": "elf",
-        "instance_name": "qkv_gemv",
+        "instance_name": "rms_gemv_rope",
         **_GEMV_K2048_BACKEND,
     }
-    _OA_BACKEND = {
-        "output_format": "elf",
-        "instance_name": "o_gemv_add",
-        **_GEMV_K2048_BACKEND,
-    }
-    # 1. RMSNorm (pre-attn)
-    x_in = x_bf16.reshape(1, emb_dim).astype(bfloat16)
-    w_norm = layer_weights.attn_norm.reshape(emb_dim).astype(bfloat16)
-    y_out = np.zeros((1, emb_dim), dtype=bfloat16)
-    results = _run("rmsnorm", _SIMPLE_BACKEND, x_in, w_norm, y_out)
-    normed = results[-1].flatten().astype(bfloat16)
 
-    # 2-4. Q/K/V GEMV (3-launch ELF, single XRT call)
+    x_in = x_bf16.flatten().astype(bfloat16)
+    w_norm = layer_weights.attn_norm.reshape(emb_dim).astype(bfloat16)
+    normed_buf = np.zeros(emb_dim, dtype=bfloat16)
     wq = layer_weights._wq_t
+    q_buf = np.zeros(emb_dim, dtype=bfloat16)
     wk = layer_weights._wk_t
+    k_buf = np.zeros(kv_dim, dtype=bfloat16)
     wv = layer_weights._wv_t
-    q_out = np.zeros(emb_dim, dtype=bfloat16)
-    k_out = np.zeros(kv_dim, dtype=bfloat16)
-    v_out = np.zeros(kv_dim, dtype=bfloat16)
+    v_buf = np.zeros(kv_dim, dtype=bfloat16)
+
+    # RoPE LUT for current position
+    rope_lut_pos = rope_lut_bf16[current_pos : current_pos + 1]  # (1, 64)
+    lut_q = np.tile(rope_lut_pos, (n_heads, 1)).flatten().astype(bfloat16)
+    lut_k = np.tile(rope_lut_pos, (n_kv_heads, 1)).flatten().astype(bfloat16)
+    q_roped_buf = np.zeros(emb_dim, dtype=bfloat16)
+    k_roped_buf = np.zeros(kv_dim, dtype=bfloat16)
 
     results = _run(
-        "qkv_gemv",
-        _QKV_BACKEND,
-        normed,
-        wq,
-        q_out,
-        wk,
-        k_out,
-        wv,
-        v_out,
-        output_indices=[2, 4, 6],
-        static_indices={1, 3, 5},  # weights: wq, wk, wv
+        "rms_gemv_rope",
+        _RGR_BACKEND,
+        x_in,  # arg0
+        w_norm,  # arg1
+        normed_buf,  # arg2 (intermediate)
+        wq,  # arg3 (static)
+        q_buf,  # arg4 (intermediate)
+        wk,  # arg5 (static)
+        k_buf,  # arg6 (intermediate)
+        wv,  # arg7 (static)
+        v_buf,  # arg8 (intermediate/output)
+        lut_q,  # arg9
+        lut_k,  # arg10
+        q_roped_buf,  # arg11 (intermediate/output)
+        k_roped_buf,  # arg12 (intermediate/output)
+        output_indices=[8, 11, 12],
+        static_indices={3, 5, 7},
+        intermediate_indices={2, 4, 6, 8, 11, 12},
     )
-    q = results[2].astype(bfloat16)
-    k = results[4].astype(bfloat16)
-    v = results[6].astype(bfloat16)
-
-    # 5-6. RoPE on Q and K (single position)
-    q_heads = q.reshape(n_heads, head_dim)  # (32, 64)
-    k_heads = k.reshape(n_kv_heads, head_dim)  # (8, 64)
-
-    # LUT for current position only
-    rope_lut_pos = rope_lut_bf16[current_pos : current_pos + 1]  # (1, 64)
-    lut_q = np.tile(rope_lut_pos, (n_heads, 1)).flatten().astype(bfloat16)  # (32, 64)
-    lut_k = np.tile(rope_lut_pos, (n_kv_heads, 1)).flatten().astype(bfloat16)  # (8, 64)
-
-    q_roped_out = np.zeros(n_heads * head_dim, dtype=bfloat16)
-    k_roped_out = np.zeros(n_kv_heads * head_dim, dtype=bfloat16)
-
-    results = _run("rope_q", _SIMPLE_BACKEND, q_heads.flatten(), lut_q, q_roped_out)
-    q_roped = results[-1].reshape(n_heads, head_dim).astype(bfloat16)
-    results = _run("rope_k", _SIMPLE_BACKEND, k_heads.flatten(), lut_k, k_roped_out)
-    k_roped = results[-1].reshape(n_kv_heads, head_dim).astype(bfloat16)
+    v = results[8].astype(bfloat16)
+    q_roped = results[11].reshape(n_heads, head_dim).astype(bfloat16)
+    k_roped = results[12].reshape(n_kv_heads, head_dim).astype(bfloat16)
 
     # Update KV cache
     k_cache_layer[:, current_pos, :] = k_roped
     v_cache_layer[:, current_pos, :] = v.reshape(n_kv_heads, head_dim)
 
-    # 7. CPU Attention
+    # --- CPU Attention ---
     attn_out = decode_attention_cpu(
         q_roped.flatten(),
         k_cache_layer,
@@ -349,79 +335,53 @@ def run_decode_block(
         head_dim,
     )
 
-    # 8-9. O GEMV + Residual Add (2-launch ELF)
+    # --- Call 2: o_gemv_ffn (8 launches, 15 args) ---
+    # O GEMV + Add + RMSNorm + Gate/Up GEMV + SiLU*mul + Down GEMV + Add
+    _OGF_BACKEND = {
+        "output_format": "elf",
+        "instance_name": "o_gemv_ffn",
+        "omit_pingpong": "all",
+        **{k: v for k, v in _GEMV_K2048_BACKEND.items() if k != "omit_pingpong"},
+    }
+
     wo = layer_weights._wo_t
     proj_buf = np.zeros(emb_dim, dtype=bfloat16)
     x_residual = x_bf16.flatten().astype(bfloat16)
     res1_buf = np.zeros(emb_dim, dtype=bfloat16)
-    results = _run(
-        "o_gemv_add",
-        _OA_BACKEND,
-        wo,
-        attn_out,
-        proj_buf,
-        x_residual,
-        res1_buf,
-        output_indices=[4],
-        static_indices={0},  # wo weight
-    )
-    res1 = results[4].astype(bfloat16)
-
-    # 10. RMSNorm (pre-FFN)
-    x_in2 = res1.reshape(1, emb_dim).astype(bfloat16)
     w_norm2 = layer_weights.ffn_norm.reshape(emb_dim).astype(bfloat16)
-    y_out2 = np.zeros((1, emb_dim), dtype=bfloat16)
-    results = _run("rmsnorm", _SIMPLE_BACKEND, x_in2, w_norm2, y_out2)
-    normed2 = results[-1].flatten().astype(bfloat16)
-
-    # 11-12. Gate + Up GEMV (2-launch ELF)
-    _GU_BACKEND = {
-        "output_format": "elf",
-        "instance_name": "gate_up_gemv",
-        **_GEMV_K2048_BACKEND,
-    }
+    normed2_buf = np.zeros(emb_dim, dtype=bfloat16)
     w_gate = layer_weights._wgate_t
-    w_up = layer_weights._wup_t
     gate_buf = np.zeros(hidden_dim, dtype=bfloat16)
+    w_up = layer_weights._wup_t
     up_buf = np.zeros(hidden_dim, dtype=bfloat16)
-
-    results = _run(
-        "gate_up_gemv",
-        _GU_BACKEND,
-        w_gate,
-        normed2,
-        gate_buf,
-        w_up,
-        up_buf,
-        output_indices=[2, 4],
-        static_indices={0, 3},  # w_gate, w_up weights
-    )
-    gate_out = results[2].astype(bfloat16)
-    up_out = results[4].astype(bfloat16)
-
-    # 13. SiLU × mul (NPU)
     swiglu_buf = np.zeros(hidden_dim, dtype=bfloat16)
-    results = _run("silu_mul", _SIMPLE_BACKEND, gate_out, up_out, swiglu_buf)
-    swiglu = results[-1].astype(bfloat16)
-
-    # 14. Down GEMV (single, K=8192)
     w_down = layer_weights._wdown_t
     down_buf = np.zeros(emb_dim, dtype=bfloat16)
-    results = _run(
-        "gemv_down",
-        _GEMV_K8192_BACKEND,
-        w_down,
-        swiglu,
-        down_buf,
-        output_indices=[2],
-        static_indices={0},  # w_down weight
-    )
-    down_out = results[2].astype(bfloat16)
-
-    # 15. Residual Add
     output_buf = np.zeros(emb_dim, dtype=bfloat16)
-    results = _run("add", _SIMPLE_BACKEND, res1, down_out, output_buf)
-    output = results[-1].astype(bfloat16)
+
+    results = _run(
+        "o_gemv_ffn",
+        _OGF_BACKEND,
+        wo,  # arg0 (static)
+        attn_out,  # arg1
+        proj_buf,  # arg2 (intermediate)
+        x_residual,  # arg3
+        res1_buf,  # arg4 (intermediate)
+        w_norm2,  # arg5
+        normed2_buf,  # arg6 (intermediate)
+        w_gate,  # arg7 (static)
+        gate_buf,  # arg8 (intermediate)
+        w_up,  # arg9 (static)
+        up_buf,  # arg10 (intermediate)
+        swiglu_buf,  # arg11 (intermediate)
+        w_down,  # arg12 (static)
+        down_buf,  # arg13 (intermediate)
+        output_buf,  # arg14 (intermediate/output)
+        output_indices=[14],
+        static_indices={0, 7, 9, 12},
+        intermediate_indices={2, 4, 6, 8, 10, 11, 13, 14},
+    )
+    output = results[14].astype(bfloat16)
 
     return output
 
@@ -546,14 +506,170 @@ def generate(
     for i, lw in enumerate(weights.layers):
         lw._layer_idx = i
 
+    # Pre-load ALL decode weights into per-layer BOs (outside profiling scope)
+    vocab_size = weights.lm_head.shape[0]  # 128256
+    n_part = 16384
+    n_lm_partitions = 8
+
+    if not hasattr(weights, "_decode_weights_preloaded_to_bos"):
+        print("Pre-loading decode weights into per-layer BOs...")
+
+        # 1. Transformer block weights (rms_gemv_rope + o_gemv_ffn per layer)
+        _RGR_BACKEND = {
+            "output_format": "elf",
+            "instance_name": "rms_gemv_rope",
+            **_GEMV_K2048_BACKEND,
+        }
+        _OGEMV_FFN_BACKEND = {
+            "output_format": "elf",
+            "instance_name": "o_gemv_ffn",
+            "omit_while_true_loop": False,
+            "omit_pingpong": "all",
+            "runtime_loop_tiling_sizes": [16, 16],
+            "use_lock_race_condition_fix": False,
+        }
+        rope_lut_pos_dummy = np.zeros(n_heads * head_dim, dtype=bfloat16)
+        rope_lut_k_dummy = np.zeros(n_kv_heads * head_dim, dtype=bfloat16)
+
+        for layer_idx in range(config.n_layers):
+            lw = weights.layers[layer_idx]
+            # rms_gemv_rope: allocate + write weights
+            cache.load_and_run(
+                "rms_gemv_rope",
+                _RGR_BACKEND,
+                np.zeros(emb_dim, dtype=bfloat16),  # x_in
+                lw.attn_norm.reshape(emb_dim).astype(bfloat16),  # norm_w
+                np.zeros(emb_dim, dtype=bfloat16),  # normed
+                lw._wq_t,  # wq
+                np.zeros(emb_dim, dtype=bfloat16),  # q
+                lw._wk_t,  # wk
+                np.zeros(kv_dim, dtype=bfloat16),  # k
+                lw._wv_t,  # wv
+                np.zeros(kv_dim, dtype=bfloat16),  # v
+                rope_lut_pos_dummy,  # lut_q
+                rope_lut_k_dummy,  # lut_k
+                np.zeros(emb_dim, dtype=bfloat16),  # q_roped
+                np.zeros(kv_dim, dtype=bfloat16),  # k_roped
+                output_indices=[8, 11, 12],
+                static_input_indices={1, 3, 5, 7},
+                intermediate_indices={2, 4, 6, 8, 11, 12},
+                bo_key=f"rms_gemv_rope_L{layer_idx}",
+            )
+            # o_gemv_ffn: allocate + write weights
+            cache.load_and_run(
+                "o_gemv_ffn",
+                _OGEMV_FFN_BACKEND,
+                lw._wo_t,  # wo
+                np.zeros(emb_dim, dtype=bfloat16),  # attn_out
+                np.zeros(emb_dim, dtype=bfloat16),  # proj
+                np.zeros(emb_dim, dtype=bfloat16),  # x_residual
+                np.zeros(emb_dim, dtype=bfloat16),  # res1
+                lw.ffn_norm.reshape(emb_dim).astype(bfloat16),  # ffn_norm_w
+                np.zeros(emb_dim, dtype=bfloat16),  # normed2
+                lw._wgate_t,  # wgate
+                np.zeros(hidden_dim, dtype=bfloat16),  # gate
+                lw._wup_t,  # wup
+                np.zeros(hidden_dim, dtype=bfloat16),  # up
+                np.zeros(hidden_dim, dtype=bfloat16),  # swiglu
+                lw._wdown_t,  # wdown
+                np.zeros(emb_dim, dtype=bfloat16),  # down
+                np.zeros(emb_dim, dtype=bfloat16),  # output
+                output_indices=[14],
+                static_input_indices={0, 5, 7, 9, 12},
+                intermediate_indices={2, 4, 6, 8, 10, 11, 13, 14},
+                bo_key=f"o_gemv_ffn_L{layer_idx}",
+            )
+
+        # 2. LM Head GEMV weights (8 partitions)
+        weights._lm_weight_parts_gemv = []
+        for p in range(n_lm_partitions):
+            n_start = p * n_part
+            n_end = min(n_start + n_part, vocab_size)
+            w = np.zeros((n_part, emb_dim), dtype=bfloat16)
+            w[: n_end - n_start, :] = np.ascontiguousarray(
+                weights.lm_head[n_start:n_end, :]
+            ).astype(bfloat16)
+            weights._lm_weight_parts_gemv.append(w)
+
+        _LM_GEMV_BACKEND = {
+            "output_format": "elf",
+            "instance_name": "lm_head_gemv",
+            **_GEMV_K2048_BACKEND,
+        }
+        lm_inputs = [np.zeros(emb_dim, dtype=bfloat16)]
+        for p in range(n_lm_partitions):
+            lm_inputs.append(weights._lm_weight_parts_gemv[p])
+            lm_inputs.append(np.zeros(n_part, dtype=bfloat16))
+        cache.load_and_run(
+            "lm_head_gemv",
+            _LM_GEMV_BACKEND,
+            *lm_inputs,
+            output_indices=[2 + 2 * p for p in range(n_lm_partitions)],
+            static_input_indices={1 + 2 * p for p in range(n_lm_partitions)},
+            intermediate_indices={2 + 2 * p for p in range(n_lm_partitions)},
+        )
+
+        weights._decode_weights_preloaded_to_bos = True
+        total_mb = (
+            config.n_layers
+            * (
+                emb_dim * emb_dim * 2
+                + kv_dim * emb_dim * 2 * 2  # wq, wk, wv
+                + emb_dim * emb_dim * 2  # wo
+                + hidden_dim * emb_dim * 2 * 2
+                + emb_dim * hidden_dim * 2  # w_gate, w_up, w_down
+            )
+            // 1024
+            // 1024
+        )
+        print(f"  Pre-loaded {config.n_layers} layers + LM Head ({total_mb + 512}MB)")
+
     # --- Decode phase ---
+    # Token 0 was generated by prefill (prefill_token)
     generated_tokens = [prefill_token]
     current_pos = prompt_len  # Next position to fill (after actual prompt)
 
     # Use the prefill_token as input to first decode step
     x_decode = weights.embed_table[prefill_token].astype(bfloat16)
 
-    print(f"\nDecoding {n_tokens} tokens...")
+    # NPU warmup: run full decode pass (blocks + LM Head) to warm up
+    # NPU power state + XRT kernel contexts + instruction caches
+    _LM_GEMV_BACKEND = {
+        "output_format": "elf",
+        "instance_name": "lm_head_gemv",
+        **_GEMV_K2048_BACKEND,
+    }
+    x_warmup = x_decode.copy()
+    for layer_idx in range(config.n_layers):
+        x_warmup = run_decode_block(
+            x_warmup,
+            weights.layers[layer_idx],
+            cache,
+            config,
+            k_cache[layer_idx],
+            v_cache[layer_idx],
+            current_pos,
+            rope_lut_bf16,
+        )
+    # Also warm up LM Head
+    x_normed_warmup = rms_norm(
+        x_warmup.astype(np.float32).reshape(1, emb_dim),
+        weights.final_norm.astype(np.float32),
+    )
+    lm_warmup = [x_normed_warmup.flatten().astype(bfloat16)]
+    for p in range(n_lm_partitions):
+        lm_warmup.append(weights._lm_weight_parts_gemv[p])
+        lm_warmup.append(np.zeros(n_part, dtype=bfloat16))
+    cache.load_and_run(
+        "lm_head_gemv",
+        _LM_GEMV_BACKEND,
+        *lm_warmup,
+        output_indices=[2 + 2 * p for p in range(n_lm_partitions)],
+        static_input_indices={1 + 2 * p for p in range(n_lm_partitions)},
+        intermediate_indices={2 + 2 * p for p in range(n_lm_partitions)},
+    )
+
+    print(f"\nDecoding {n_tokens} tokens (token 1 to {n_tokens})...")
     t_decode_start = time.time()
 
     for token_idx in range(n_tokens):
@@ -579,8 +695,35 @@ def generate(
             weights.final_norm.astype(np.float32),
         )
 
-        # LM Head (CPU for now)
-        logits = x_normed @ weights.lm_head.astype(np.float32).T  # (1, vocab)
+        # LM Head (NPU — 8-partition GEMV, single XRT call)
+        _LM_GEMV_BACKEND = {
+            "output_format": "elf",
+            "instance_name": "lm_head_gemv",
+            **_GEMV_K2048_BACKEND,
+        }
+        x_lm = x_normed.flatten().astype(bfloat16)
+        lm_inputs = [x_lm]
+        lm_output_indices = []
+        for p in range(n_lm_partitions):
+            lm_inputs.append(weights._lm_weight_parts_gemv[p])
+            lm_inputs.append(np.zeros(n_part, dtype=bfloat16))
+            lm_output_indices.append(2 + 2 * p)
+        lm_results = cache.load_and_run(
+            "lm_head_gemv",
+            _LM_GEMV_BACKEND,
+            *lm_inputs,
+            output_indices=lm_output_indices,
+            static_input_indices={1 + 2 * p for p in range(n_lm_partitions)},
+            intermediate_indices={2 + 2 * p for p in range(n_lm_partitions)},
+        )
+        # Assemble logits from partitions
+        logits = np.zeros((1, vocab_size), dtype=np.float32)
+        for p in range(n_lm_partitions):
+            n_start = p * n_part
+            n_end = min(n_start + n_part, vocab_size)
+            logits[0, n_start:n_end] = lm_results[2 + 2 * p][: n_end - n_start].astype(
+                np.float32
+            )
         next_token = int(np.argmax(logits[0]))
 
         t_token = time.perf_counter() - t_token_start
@@ -590,7 +733,10 @@ def generate(
         x_decode = weights.embed_table[next_token].astype(bfloat16)
 
         if profile:
-            print(f"  Token {token_idx}: id={next_token}, time={t_token*1000:.0f}ms")
+            # Token 0 = prefill output. Decode tokens start at 1.
+            print(
+                f"  Token {token_idx + 1}: id={next_token}, time={t_token*1000:.0f}ms"
+            )
 
     t_decode = time.time() - t_decode_start
 
@@ -620,42 +766,8 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    # Copy external kernel .o files to cwd so aircc can find them.
-    # aircc's prepare_air_project() copies *.o from cwd to air_project/.
-    import shutil
-    from pathlib import Path
-
-    mv_src = (
-        Path(__file__).parent.parent
-        / "matrix_vector_multiplication"
-        / "bf16"
-        / "build_peano"
-        / "mv.o"
-    )
-    if mv_src.exists() and not Path("mv.o").exists():
-        shutil.copy2(mv_src, "mv.o")
-    rope_src = (
-        Path(__file__).parent.parent
-        / "rope_lut"
-        / "test_llama_dims"
-        / "build_peano"
-        / "rope.o"
-    )
-    if rope_src.exists() and not Path("rope.o").exists():
-        shutil.copy2(rope_src, "rope.o")
-    silu_src = (
-        Path(__file__).parent
-        / "ffn_swiglu"
-        / "build_peano"
-        / "air_project"
-        / "silu_and_mul.o"
-    )
-    if not silu_src.exists():
-        silu_src = (
-            Path(__file__).parent / "build_peano" / "air_project" / "silu_and_mul.o"
-        )
-    if silu_src.exists() and not Path("silu_and_mul.o").exists():
-        shutil.copy2(silu_src, "silu_and_mul.o")
+    # External .o files are compiled from source by compile_decode_kernels()
+    # via compile_all_external_kernels(). No manual copying needed.
     config = LlamaConfig()
 
     cache_dir = "decode_kernel_cache"
