@@ -15,6 +15,7 @@ OUTPUT_FORMAT_FLAG = --output-format $(OUTPUT_FORMAT)
 SEQ_LEN ?= 64
 EMBED_DIM ?= 64
 HERD_X ?= 1
+HERD_Y ?= 1
 
 WARNING_FLAGS = -Wno-parentheses -Wno-attributes -Wno-macro-redefined -Wno-empty-body
 PEANOWRAP2P_FLAGS = -O2 -std=c++20 --target=aie2p-none-unknown-elf ${WARNING_FLAGS} -DNDEBUG -I ${AIEOPT_DIR}/include
@@ -23,7 +24,7 @@ all: run
 
 print:
 	${powershell} python3 ${srcdir}/rope_lut.py $(OUTPUT_FORMAT_FLAG) \
-		--seq-len $(SEQ_LEN) --embed-dim $(EMBED_DIM) --herd-x $(HERD_X) -p
+		--seq-len $(SEQ_LEN) --embed-dim $(EMBED_DIM) --herd-x $(HERD_X) --herd-y $(HERD_Y) -p
 
 compile-kernel:
 	mkdir -p $(BUILD_DIR)
@@ -41,14 +42,14 @@ compile-xclbin: compile-kernel
 	cp $(BUILD_DIR)/rope.o $(BUILD_DIR)/air_project/rope.o
 	PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) cd $(BUILD_DIR) && \
 		${powershell} python3 ${srcdir}/rope_lut.py --output-format xclbin --compile-mode compile-only \
-		--seq-len $(SEQ_LEN) --embed-dim $(EMBED_DIM) --herd-x $(HERD_X)
+		--seq-len $(SEQ_LEN) --embed-dim $(EMBED_DIM) --herd-x $(HERD_X) --herd-y $(HERD_Y)
 
 run: compile-kernel
 	mkdir -p $(BUILD_DIR)/air_project
 	cp $(BUILD_DIR)/rope.o $(BUILD_DIR)/air_project/rope.o
 	PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) cd $(BUILD_DIR) && \
 		${powershell} python3 ${srcdir}/rope_lut.py $(OUTPUT_FORMAT_FLAG) \
-		--seq-len $(SEQ_LEN) --embed-dim $(EMBED_DIM) --herd-x $(HERD_X)
+		--seq-len $(SEQ_LEN) --embed-dim $(EMBED_DIM) --herd-x $(HERD_X) --herd-y $(HERD_Y)
 
 # C++ profiling harness (10 warmup + 20 measured iterations, microsecond precision)
 profile: compile-xclbin build-test-exe

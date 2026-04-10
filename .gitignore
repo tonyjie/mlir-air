@@ -36,7 +36,7 @@ sandbox
 libadf.a
 *.elf
 *.elf.*
-CLAUDE.md
+# CLAUDE.md
 
 # documents
 *.pdf
