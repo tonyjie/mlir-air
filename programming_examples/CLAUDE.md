@@ -200,65 +200,13 @@ Type mapping: `xrt_dtype = type_mapper(np_dtype)` (from `air.backend.xrt_runner`
 - Configurable tile sizes, herd shapes, sweep infrastructure
 - C++ profiling harness
 
-## LLAMA-3.2-1B Prefill on NPU2 (`llama3/`)
+## LLAMA-3.2-1B on NPU2 (`llama3/`)
 
-End-to-end LLAMA-3.2-1B BF16 prefill inference (seq_len=2048, 16 layers) on NPU2.
-
-**Status**: Full NPU pipeline (FlashAttention + NPU LM Head + 8-tile RMSNorm). Top-1 = " Paris". **35% faster than IRON** (1.84s vs 2.744s total prefill). 5 XRT invocations/layer + 1 for LM Head. Decode: 351ms/token (5% faster than IRON's 370ms).
-
-**Key files**:
-- `llama3/llama3_prefill.py` — Main orchestrator: KernelCache + transformer block pipeline
-- `llama3/llama3_weights.py` — Weight loading from HuggingFace safetensors + RoPE LUT
-- `llama3/llama3_reference.py` — CPU F32 reference (per-step + full model)
-- `llama3/multi_launch_builder/` — Multi-launch ELF builders:
-  - `rms_attn_gemms_multi.py` — RMSNorm + QKV GEMMs (4 launches)
-  - `rope_qk_multi.py` — RoPE Q+K (2 herds)
-  - `o_proj_add_multi.py` — O GEMM + Add (2 launches)
-  - `ffn_full_multi.py` — RMSNorm + FFN + Add (6 launches)
-  - `lm_head_multi.py` — LM Head (8 launches)
-- `llama3/ffn_swiglu/` — SiLU×mul kernel + FFN sub-module builder
-- `llama3/docs/` — Documentation (plan, progress, performance, issues)
-
-**Quick start** (requires cached kernels from prior `--compile-only` run):
-```bash
-cd programming_examples/llama3/build_peano
-python3 ../llama3_prefill.py --run-only --n-layers 16 --verify --profile
-```
-
-**Architecture**: 7 unique kernel configs compiled once via `KernelCache`: rms_attn_gemms (4-launch ELF), rope_qk (2-herd ELF), flash_attn (ELF), o_proj_add (2-launch ELF), ffn_full (6-launch ELF), lm_head (8-launch ELF), rmsnorm (xclbin). Uses `bo.map()` zero-copy and static weight BO pre-loading.
-
-See `llama3/docs/LLAMA_PLAN.md` for full plan and `llama3/docs/LLAMA_progress.md` for session log.
-
-## LLAMA-3.2-1B GEMM — Validated Parameters (NPU2, BF16, direct-codegen)
-
-All LLAMA-3.2-1B GEMM shapes validated on NPU2 hardware with `--direct-codegen` mode.
-
-### Tile configuration (conservative, fits L1=64KB, L2=256KB)
-
-| Projection | M | K | N | tile_m | tile_k_l2 | tile_k_l1 | tile_n | herd_m | herd_n | Status |
-|------------|---|---|---|--------|-----------|-----------|--------|--------|--------|--------|
-| Q/O-proj | 128 | 2048 | 2048 | 32 | 64 | 32 | 32 | 4 | 4 | PASS |
-| K/V-proj | 128 | 2048 | 512 | 32 | 64 | 32 | 32 | 4 | 4 | PASS |
-| Gate/Up FFN | 128 | 2048 | 8192 | 32 | 64 | 32 | 32 | 4 | 4 | PASS |
-| Down FFN | 128 | 8192 | 2048 | 32 | 64 | 32 | 32 | 4 | 4 | PASS |
-| Q/O-proj | 64 | 2048 | 2048 | 32 | 64 | 32 | 32 | 2 | 4 | PASS |
-| Q/O-proj | 256 | 2048 | 2048 | 32 | 64 | 32 | 32 | 4 | 4 | PASS |
-
-### Memory budget per config above
-
-- **L1 per tile**: A=32x32x2=2KB + B=32x32x2=2KB = 4KB (of 64KB)
-- **L2 per segment**: A=4x32x64x2=16KB + B=4x64x32x2=16KB + C=4x4x32x32x2=32KB = 64KB (of 256KB)
-
-### Key constraint: M=64 requires herd_m=2
-
-For M=64 with tile_m=32: `launch_size[0] = 64 // (32 * herd_m)` must be >= 1, so `herd_m <= 2`.
-
-### Run command template
+End-to-end LLAMA-3.2-1B BF16 inference (prefill + decode) on NPU2. Prefill: 1.30s kernel / 1.54s wall (2.1x faster than IRON). Decode: 92ms/token (4.0x faster than IRON).
 
 ```bash
-python3 programming_examples/matrix_multiplication/bf16/run.py \
-  --m M --k K --n N \
-  --tile-m 32 --tile-k-l2 64 --tile-k-l1 32 --tile-n 32 \
-  --herd-m 4 --herd-n 4 \
-  --arch aie2p --compile-mode compile-and-run --direct-codegen
+cd programming_examples/llama3
+make compile && make run
 ```
+
+See `llama3/CLAUDE.md` for full architecture, file map, design patterns, and GEMM tile configs.

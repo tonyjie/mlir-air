@@ -1,142 +1,134 @@
+# ============================================================
+# LLAMA-3.2-1B BF16 Inference on NPU2 (MLIR-AIR)
+# ============================================================
+#
+# Quick start:
+#   make compile        — Compile all kernels (~4 min, cached to disk)
+#   make run            — Run inference: NPU prefill + NPU decode
+#   make profile        — Run with per-kernel profiling breakdown
+#
+# Performance (NPU2, AMD Strix):
+#   Prefill:  1.26s (seq_len=2048, 16 layers)
+#   Decode:   92ms/token (10.8 tokens/sec)
+#
 # Copyright (C) 2026, Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
-srcdir := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
-progdir := $(realpath $(srcdir)/..)
+# ============================================================
 
-# Determine build dir based on whether PEANO_INSTALL_DIR is set
+srcdir := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
+
+# Build directory
 ifdef PEANO_INSTALL_DIR
   BUILD_DIR := build_peano
 else
   BUILD_DIR := build_chess
 endif
 
-OUTPUT_FORMAT ?= xclbin
-OUTPUT_FORMAT_FLAG = --output-format $(OUTPUT_FORMAT)
+# Configurable parameters
+N_TOKENS ?= 100
+PROMPT   ?= The capital of France is
 
-# SwiGLU kernel parameters
-SWIGLU_N ?= 65536
-SWIGLU_TILE_N ?= 1024
-
-# Peano compiler flags
-AIEOPT_DIR = $(shell realpath $(dir $(shell which aie-opt))/..)
-WARNING_FLAGS = -Wno-parentheses -Wno-attributes -Wno-macro-redefined -Wno-empty-body
-PEANOWRAP2P_FLAGS = -O2 -std=c++20 --target=aie2p-none-unknown-elf ${WARNING_FLAGS} -DNDEBUG -I ${AIEOPT_DIR}/include
-
-# Flash attention parameters (for kernel compilation)
-LQP ?= 256
-LQP_TILE := $(shell echo $$(($(LQP) / 4)))
-LKP ?= 64
-DK ?= 64
-DV ?= 64
-
-all: run-swiglu
+.PHONY: help compile run profile verify clean \
+        compile-prefill compile-decode run-prefill run-decode
 
 # ============================================================
-# External kernel compilation (needed for prefill)
+# Help
 # ============================================================
 
-compile-external-kernels:
-	mkdir -p $(BUILD_DIR)
-	@echo "=== Compiling external kernels ==="
-	@if [ -z "$(PEANO_INSTALL_DIR)" ]; then \
-		echo "Error: PEANO_INSTALL_DIR is required."; exit 1; \
-	fi
-	@echo "  [1/3] silu_and_mul.o"
-	$(PEANO_INSTALL_DIR)/bin/clang++ ${PEANOWRAP2P_FLAGS} -c ${srcdir}/ffn_swiglu/silu_and_mul.cc -o $(BUILD_DIR)/silu_and_mul.o
-	@echo "  [2/3] rope.o"
-	$(PEANO_INSTALL_DIR)/bin/clang++ ${PEANOWRAP2P_FLAGS} -c ${progdir}/rope_lut/rope.cc -o $(BUILD_DIR)/rope.o
-	@echo "  [3/3] attn.o"
-	$(PEANO_INSTALL_DIR)/bin/clang++ ${PEANOWRAP2P_FLAGS} -DBIT_WIDTH=8 -c ${progdir}/flash_attention/kernel_fusion_based/attn.cc -o $(BUILD_DIR)/attn.o \
-		-Dlqp=$(LQP_TILE) -Dlkp=$(LKP) -Ddk=$(DK) -Ddv=$(DV) -DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16
-	@echo "=== External kernels compiled ==="
-	@echo "  Copying to air_project/ for aircc..."
-	mkdir -p $(BUILD_DIR)/air_project
-	cp $(BUILD_DIR)/silu_and_mul.o $(BUILD_DIR)/air_project/
-	cp $(BUILD_DIR)/rope.o $(BUILD_DIR)/air_project/
-	cp $(BUILD_DIR)/attn.o $(BUILD_DIR)/air_project/
+help:
+	@echo "============================================================"
+	@echo " LLAMA-3.2-1B Inference on NPU2 (MLIR-AIR)"
+	@echo "============================================================"
+	@echo ""
+	@echo "Quick start:"
+	@echo "  make compile          Compile all kernels (~4 min, one-time)"
+	@echo "  make run              Run inference ($(N_TOKENS) tokens)"
+	@echo "  make profile          Run with profiling breakdown"
+	@echo ""
+	@echo "Unified pipeline (recommended):"
+	@echo "  make compile          Compile prefill + decode kernels"
+	@echo "  make run              NPU prefill + NPU decode"
+	@echo "  make profile          With per-kernel timing"
+	@echo "  make verify           With CPU reference verification"
+	@echo ""
+	@echo "Individual pipelines:"
+	@echo "  make compile-prefill  Compile prefill kernels only"
+	@echo "  make compile-decode   Compile decode kernels only"
+	@echo "  make run-prefill      Run prefill only (16 layers)"
+	@echo "  make run-decode       Run decode only (CPU prefill + NPU decode)"
+	@echo ""
+	@echo "Maintenance:"
+	@echo "  make clean            Remove all build artifacts"
+	@echo ""
+	@echo "Options (override with make VAR=value):"
+	@echo "  N_TOKENS=100          Number of decode tokens"
+	@echo "  PROMPT=\"...\"          Input prompt text"
+	@echo ""
+	@echo "Examples:"
+	@echo "  make run N_TOKENS=50"
+	@echo "  make profile PROMPT=\"The meaning of life is\""
+	@echo "  make verify N_TOKENS=10"
 
 # ============================================================
-# SwiGLU activation kernel (standalone test)
+# Unified Pipeline (NPU prefill + NPU decode)
 # ============================================================
 
-compile-swiglu-kernel:
-	mkdir -p $(BUILD_DIR)
-	@if [ -n "$(PEANO_INSTALL_DIR)" ]; then \
-		echo "Using clang++ from PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR)"; \
-		$(PEANO_INSTALL_DIR)/bin/clang++ ${PEANOWRAP2P_FLAGS} -c ${srcdir}/ffn_swiglu/silu_and_mul.cc -o $(BUILD_DIR)/silu_and_mul.o; \
-	else \
-		echo "Error: PEANO_INSTALL_DIR is required for SwiGLU kernel compilation."; \
-		exit 1; \
-	fi
+## Compile all kernels (prefill + decode, ~4 min)
+compile:
+	@mkdir -p $(BUILD_DIR)
+	cd $(BUILD_DIR) && python3 $(srcdir)/llama3_inference.py --compile-only
 
-run-swiglu: compile-swiglu-kernel
-	mkdir -p $(BUILD_DIR)
-	PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) cd $(BUILD_DIR) && ${powershell} python3 ${srcdir}/ffn_swiglu/silu_and_mul.py \
-		--n $(SWIGLU_N) --tile-n $(SWIGLU_TILE_N) $(OUTPUT_FORMAT_FLAG)
+## Run unified inference
+run:
+	cd $(BUILD_DIR) && python3 $(srcdir)/llama3_inference.py \
+		--run-only --n-tokens $(N_TOKENS) --prompt "$(PROMPT)"
 
-print-swiglu:
-	${powershell} python3 ${srcdir}/ffn_swiglu/silu_and_mul.py $(OUTPUT_FORMAT_FLAG) -p
+## Run with detailed profiling breakdown
+profile:
+	cd $(BUILD_DIR) && python3 $(srcdir)/llama3_inference.py \
+		--run-only --n-tokens $(N_TOKENS) --profile --prompt "$(PROMPT)"
+
+## Run with CPU reference verification
+verify:
+	cd $(BUILD_DIR) && python3 $(srcdir)/llama3_inference.py \
+		--run-only --n-tokens $(N_TOKENS) --verify --profile --prompt "$(PROMPT)"
+
+## Compile and run in one step
+all: compile profile
 
 # ============================================================
-# CPU reference (no NPU needed)
+# Individual Pipelines
 # ============================================================
 
+## Compile prefill kernels only (~4 min)
+compile-prefill:
+	@mkdir -p $(BUILD_DIR)
+	cd $(BUILD_DIR) && python3 $(srcdir)/llama3_prefill.py --compile-only --profile
+
+## Compile decode kernels only (~25s)
+compile-decode:
+	@mkdir -p $(BUILD_DIR)
+	cd $(BUILD_DIR) && python3 $(srcdir)/llama3_decode.py --compile-only
+
+## Run prefill only (16 layers, no decode)
+run-prefill:
+	cd $(BUILD_DIR) && python3 $(srcdir)/llama3_prefill.py \
+		--run-only --n-layers 16 --profile
+
+## Run decode only (CPU prefill for KV cache + NPU decode)
+run-decode:
+	cd $(BUILD_DIR) && python3 $(srcdir)/llama3_decode.py \
+		--run-only --n-tokens $(N_TOKENS) --profile
+
+## Run CPU-only reference (no NPU)
 run-reference:
-	python3 ${srcdir}/llama3_reference.py
-
-run-reference-verify:
-	python3 ${srcdir}/llama3_reference.py --verify
+	python3 $(srcdir)/llama3_reference.py
 
 # ============================================================
-# Weight loading test
+# Clean
 # ============================================================
 
-test-weights:
-	python3 ${srcdir}/llama3_weights.py
-
-# ============================================================
-# Full LLAMA prefill (Phase 2+)
-# ============================================================
-
-# LLAMA model path (HuggingFace ID or local dir)
-LLAMA_MODEL ?= /home/jiajli/.cache/huggingface/hub/models--meta-llama--Llama-3.2-1B/snapshots/4e20de362430cd3b72f300e6b0f18e50e7166e08
-SEQ_LEN ?= 2048
-N_LAYERS ?= 16
-
-# Single-block test (1 layer, with verification)
-run-prefill-1layer: compile-external-kernels
-	PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) cd $(BUILD_DIR) && ${powershell} python3 ${srcdir}/llama3_prefill.py \
-		--model $(LLAMA_MODEL) --seq-len $(SEQ_LEN) --n-layers 1 --verify
-
-# Full model prefill (16 layers)
-run-prefill: compile-external-kernels
-	PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) cd $(BUILD_DIR) && ${powershell} python3 ${srcdir}/llama3_prefill.py \
-		--model $(LLAMA_MODEL) --seq-len $(SEQ_LEN) --n-layers $(N_LAYERS)
-
-# Full model prefill with verification
-run-prefill-verify: compile-external-kernels
-	PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) cd $(BUILD_DIR) && ${powershell} python3 ${srcdir}/llama3_prefill.py \
-		--model $(LLAMA_MODEL) --seq-len $(SEQ_LEN) --n-layers $(N_LAYERS) --verify
-
-# Compile-only: pre-compile all 10 kernels to cache
-compile-prefill-kernels: compile-external-kernels
-	PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) cd $(BUILD_DIR) && ${powershell} python3 ${srcdir}/llama3_prefill.py \
-		--model $(LLAMA_MODEL) --seq-len $(SEQ_LEN) --compile-only --profile
-
-# Run-only: use cached kernels (skip compilation)
-run-prefill-cached: compile-external-kernels
-	PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) cd $(BUILD_DIR) && ${powershell} python3 ${srcdir}/llama3_prefill.py \
-		--model $(LLAMA_MODEL) --seq-len $(SEQ_LEN) --n-layers $(N_LAYERS) --run-only --profile
-
-# Full model with profiling (compile + run)
-run-prefill-profile: compile-external-kernels
-	PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) cd $(BUILD_DIR) && ${powershell} python3 ${srcdir}/llama3_prefill.py \
-		--model $(LLAMA_MODEL) --seq-len $(SEQ_LEN) --n-layers $(N_LAYERS) --profile
-
-# Single-layer cached run with verification
-run-prefill-1layer-cached: compile-external-kernels
-	PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) cd $(BUILD_DIR) && ${powershell} python3 ${srcdir}/llama3_prefill.py \
-		--model $(LLAMA_MODEL) --seq-len $(SEQ_LEN) --n-layers 1 --run-only --verify --profile
-
+## Remove all build artifacts
 clean:
-	rm -rf $(BUILD_DIR) __pycache__ kernel_cache
+	rm -r $(BUILD_DIR) 2>/dev/null || true
+	@echo "Build directory removed. Run 'make compile' to rebuild."
