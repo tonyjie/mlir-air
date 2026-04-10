@@ -9,6 +9,21 @@ End-to-end LLAMA-3.2-1B (1B parameter, BF16) inference running on AMD NPU2 (AIE2
 | Prefill (2048 tokens) | 1.30s kernel / 1.54s wall | 2.1x faster |
 | Decode | 92ms/token (10.8 tok/s) | 4.0x faster |
 
+## Prerequisites
+
+1. **MLIR-AIR environment**: AMD NPU2 hardware, Peano compiler, `source utils/env_setup.sh ...`
+
+2. **Model weights** (one-time setup):
+   ```bash
+   # Install dependencies
+   pip install safetensors huggingface_hub transformers ml_dtypes
+
+   # Accept Meta's license at https://huggingface.co/meta-llama/Llama-3.2-1B
+   # then log in:
+   huggingface-cli login
+   ```
+   Weights (~2.5GB) are auto-downloaded on first `make run` and cached at `~/.cache/huggingface/`.
+
 ## Quick Start
 
 ```bash

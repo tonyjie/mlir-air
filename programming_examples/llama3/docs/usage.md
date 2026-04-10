@@ -2,10 +2,31 @@
 
 ## Prerequisites
 
+### Hardware & Toolchain
 - AMD NPU2 hardware (Strix, AIE2P)
 - MLIR-AIR installed with Peano compiler (`PEANO_INSTALL_DIR` set)
-- Python environment with: `numpy`, `ml_dtypes`, `safetensors`, `transformers`, `filelock`
-- HuggingFace access to `meta-llama/Llama-3.2-1B` (or local weights)
+- Python environment with: `numpy`, `ml_dtypes`, `safetensors`, `transformers`, `huggingface_hub`, `filelock`
+
+### Model Weights & Tokenizer (one-time setup)
+
+The pipeline uses `meta-llama/Llama-3.2-1B` from HuggingFace. This is a gated model
+that requires accepting Meta's license.
+
+```bash
+# 1. Install Python dependencies (if not already in your venv)
+pip install safetensors huggingface_hub transformers ml_dtypes
+
+# 2. Accept Meta's license agreement:
+#    Go to https://huggingface.co/meta-llama/Llama-3.2-1B
+#    Click "Accept" (requires a HuggingFace account, approval is usually instant)
+
+# 3. Log in to HuggingFace CLI:
+huggingface-cli login
+#    Paste a token from https://huggingface.co/settings/tokens (needs "Read" permission)
+
+# 4. First `make run` auto-downloads weights (~2.5GB) and tokenizer.
+#    Cached at ~/.cache/huggingface/hub/ for future runs.
+```
 
 ## Quick Start
 
