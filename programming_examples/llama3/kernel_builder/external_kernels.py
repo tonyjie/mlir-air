@@ -106,32 +106,13 @@ def compile_silu_and_mul():
 
 
 def compile_rope():
-    """Compile rope.o from aie_kernels/rope.cc."""
-    # rope.cc is in the mlir-aie install path
-    candidates = [
-        _PROJ_ROOT.parent
-        / "my_install"
-        / "mlir-aie"
-        / "install"
-        / "include"
-        / "aie_kernels"
-        / "aie2p"
-        / "rope.cc",
-        _PROJ_ROOT.parent
-        / "my_install"
-        / "mlir-aie"
-        / "aie_kernels"
-        / "aie2p"
-        / "rope.cc",
-    ]
-    src = None
-    for p in candidates:
-        if p.exists():
-            src = p
-            break
-    if src is None:
-        # aiecc will compile from its own search path
-        return
+    """Compile rope.o from our half-split RoPE kernel.
+
+    Uses rope_halfsplit.cc (half-split rotation matching HuggingFace Llama)
+    instead of upstream rope.cc (interleaved rotation). Same function name
+    (@rope) and signature, so no MLIR changes needed.
+    """
+    src = Path(__file__).resolve().parent / "rope_halfsplit.cc"
     _compile_kernel(src, "rope.o")
 
 

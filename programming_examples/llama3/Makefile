@@ -27,6 +27,7 @@ endif
 # Configurable parameters
 N_TOKENS ?= 100
 PROMPT   ?= The capital of France is
+MODEL    ?= base
 
 .PHONY: help compile run profile verify clean \
         compile-prefill compile-decode run-prefill run-decode
@@ -63,10 +64,12 @@ help:
 	@echo "Options (override with make VAR=value):"
 	@echo "  N_TOKENS=100          Number of decode tokens"
 	@echo "  PROMPT=\"...\"          Input prompt text"
+	@echo "  MODEL=base|instruct   Model variant (default: base)"
 	@echo ""
 	@echo "Examples:"
 	@echo "  make run N_TOKENS=50"
 	@echo "  make profile PROMPT=\"The meaning of life is\""
+	@echo "  make run MODEL=instruct PROMPT=\"What is the capital of France?\""
 	@echo "  make verify N_TOKENS=10"
 
 # ============================================================
@@ -81,17 +84,17 @@ compile:
 ## Run unified inference
 run:
 	cd $(BUILD_DIR) && python3 $(srcdir)/llama3_inference.py \
-		--run-only --n-tokens $(N_TOKENS) --prompt "$(PROMPT)"
+		--run-only --n-tokens $(N_TOKENS) --prompt "$(PROMPT)" --model $(MODEL)
 
 ## Run with detailed profiling breakdown
 profile:
 	cd $(BUILD_DIR) && python3 $(srcdir)/llama3_inference.py \
-		--run-only --n-tokens $(N_TOKENS) --profile --prompt "$(PROMPT)"
+		--run-only --n-tokens $(N_TOKENS) --profile --prompt "$(PROMPT)" --model $(MODEL)
 
 ## Run with CPU reference verification
 verify:
 	cd $(BUILD_DIR) && python3 $(srcdir)/llama3_inference.py \
-		--run-only --n-tokens $(N_TOKENS) --verify --profile --prompt "$(PROMPT)"
+		--run-only --n-tokens $(N_TOKENS) --verify --profile --prompt "$(PROMPT)" --model $(MODEL)
 
 ## Compile and run in one step
 all: compile profile

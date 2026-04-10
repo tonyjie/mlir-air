@@ -71,6 +71,7 @@ generate() decode loop     ← per token: 16 layers × 3 kernel calls + LM Head 
 - **`intermediate_indices`**: Skip BO write for buffers the kernel overwrites.
 - **External kernel rename**: K=8192 Down GEMV uses `mv_k8192.o` (compiled with `-D` renamed symbols) to coexist with K=2048 GEMVs in one ELF.
 - **Seq-first layout**: RoPE + FlashAttention accept `(seq, heads×dim)` natively — zero host transposes.
+- **Half-split RoPE kernel**: Custom `rope_halfsplit.cc` matches HuggingFace Llama's rotation convention `(d[i], d[i+32])`. LUT layout is `[cos..., sin...]` (concatenated). Replaces upstream interleaved `rope.cc`. See `docs/explain.md`.
 
 ## Documentation
 
