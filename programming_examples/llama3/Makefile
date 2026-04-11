@@ -28,6 +28,7 @@ endif
 N_TOKENS ?= 100
 PROMPT   ?= The capital of France is
 MODEL    ?= base
+QUANTIZE ?= bf16
 
 .PHONY: help compile run profile verify clean \
         compile-prefill compile-decode run-prefill run-decode
@@ -65,11 +66,13 @@ help:
 	@echo "  N_TOKENS=100          Number of decode tokens"
 	@echo "  PROMPT=\"...\"          Input prompt text"
 	@echo "  MODEL=base|instruct   Model variant (default: base)"
+	@echo "  QUANTIZE=bf16|q4      Weight precision (default: bf16)"
 	@echo ""
 	@echo "Examples:"
 	@echo "  make run N_TOKENS=50"
 	@echo "  make profile PROMPT=\"The meaning of life is\""
 	@echo "  make run MODEL=instruct PROMPT=\"What is the capital of France?\""
+	@echo "  make run QUANTIZE=q4   Run with 4-bit quantized weights"
 	@echo "  make verify N_TOKENS=10"
 
 # ============================================================
@@ -84,17 +87,17 @@ compile:
 ## Run unified inference
 run:
 	cd $(BUILD_DIR) && python3 $(srcdir)/llama3_inference.py \
-		--run-only --n-tokens $(N_TOKENS) --prompt "$(PROMPT)" --model $(MODEL)
+		--run-only --n-tokens $(N_TOKENS) --prompt "$(PROMPT)" --model $(MODEL) --quantize $(QUANTIZE)
 
 ## Run with detailed profiling breakdown
 profile:
 	cd $(BUILD_DIR) && python3 $(srcdir)/llama3_inference.py \
-		--run-only --n-tokens $(N_TOKENS) --profile --prompt "$(PROMPT)" --model $(MODEL)
+		--run-only --n-tokens $(N_TOKENS) --profile --prompt "$(PROMPT)" --model $(MODEL) --quantize $(QUANTIZE)
 
 ## Run with CPU reference verification
 verify:
 	cd $(BUILD_DIR) && python3 $(srcdir)/llama3_inference.py \
-		--run-only --n-tokens $(N_TOKENS) --verify --profile --prompt "$(PROMPT)" --model $(MODEL)
+		--run-only --n-tokens $(N_TOKENS) --verify --profile --prompt "$(PROMPT)" --model $(MODEL) --quantize $(QUANTIZE)
 
 ## Compile and run in one step
 all: compile profile

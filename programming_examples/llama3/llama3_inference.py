@@ -721,6 +721,13 @@ if __name__ == "__main__":
         default="base",
         help="Model variant: base (completion) or instruct (Q&A)",
     )
+    parser.add_argument(
+        "--quantize",
+        type=str,
+        choices=["bf16", "q4"],
+        default="bf16",
+        help="Weight precision: bf16 (full) or q4 (4-bit quantize→dequant)",
+    )
     args = parser.parse_args()
 
     config = LlamaConfig()
@@ -752,6 +759,11 @@ if __name__ == "__main__":
     )
     print(f"\nLoading weights ({model_id})...")
     weights = load_weights(model_id)
+
+    if args.quantize == "q4":
+        from llama3.kernel_builder.quantize import quantize_all_weights
+
+        quantize_all_weights(weights, config)
 
     from transformers import AutoTokenizer
 
