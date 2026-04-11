@@ -1,12 +1,10 @@
 //===- mv_q4.cc - Q4 GEMV kernel for AIE2P ----------------------*- C++ -*-===//
 //
-// Matrix-vector multiplication with on-the-fly Q4_1 dequantization.
-// Single interleaved weight buffer: each block is [q4_packed | scale | min].
+// Q4 GEMV using reformulated math:
+//   sum((min + q*scale) * b) = min * sum(b) + scale * dot(q, b)
 //
-// C[M] = dequant(A_q4[M,K]) @ B[K]
-//
-// Uses per-block 16-entry LUT for dequant: lut[i] = min + i * scale.
-// Then dequant is 2 LUT lookups per byte (no float arithmetic per element).
+// q nibbles → bf16 via global LUT, then vector MAC for dot(q, b).
+// sum(b) computed via MAC with ones vector.
 //
 // Copyright (C) 2026, Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
@@ -32,16 +30,37 @@
 #define Q4_PACKED_PER_BLOCK 16
 #define Q4_BLOCK_BYTES 20
 
+// Global LUT: integer 0-15 as bfloat16
+static const bfloat16 Q4_LUT[16] = {
+    static_cast<bfloat16>(0.0f),  static_cast<bfloat16>(1.0f),
+    static_cast<bfloat16>(2.0f),  static_cast<bfloat16>(3.0f),
+    static_cast<bfloat16>(4.0f),  static_cast<bfloat16>(5.0f),
+    static_cast<bfloat16>(6.0f),  static_cast<bfloat16>(7.0f),
+    static_cast<bfloat16>(8.0f),  static_cast<bfloat16>(9.0f),
+    static_cast<bfloat16>(10.0f), static_cast<bfloat16>(11.0f),
+    static_cast<bfloat16>(12.0f), static_cast<bfloat16>(13.0f),
+    static_cast<bfloat16>(14.0f), static_cast<bfloat16>(15.0f),
+};
+
 void q4_matvec(uint32_t m, uint32_t k, const uint8_t *__restrict a_q4,
                const bfloat16 *__restrict b, bfloat16 *__restrict c) {
   ::aie::set_rounding(aie::rounding_mode::conv_even);
 
   const int blocks_per_row = k / Q4_BLOCK_SIZE;
   const int row_bytes = blocks_per_row * Q4_BLOCK_BYTES;
-  alignas(64) bfloat16 dequant_buf[Q4_BLOCK_SIZE];
+  alignas(64) bfloat16 q_buf[Q4_BLOCK_SIZE];
+
+  // Ones vector for computing sum(b) via MAC
+  aie::vector<bfloat16, 16> ones =
+      aie::broadcast<bfloat16, 16>(static_cast<bfloat16>(1.0f));
 
   for (uint32_t row = 0; row < m; row++) {
-    aie::accum<accfloat, 32> acc = aie::zeros<accfloat, 32>();
+    // Two accumulators: one for dot(q, b), one for sum(b)
+    aie::accum<accfloat, 16> dot_acc = aie::zeros<accfloat, 16>();
+    aie::accum<accfloat, 16> sum_acc = aie::zeros<accfloat, 16>();
+    float min_sum = 0.0f;
+    float scale_dot = 0.0f;
+
     const uint8_t *row_data = a_q4 + row * row_bytes;
 
     for (int blk = 0; blk < blocks_per_row; blk++) {
@@ -49,31 +68,38 @@ void q4_matvec(uint32_t m, uint32_t k, const uint8_t *__restrict a_q4,
 
       const bfloat16 *meta =
           reinterpret_cast<const bfloat16 *>(blk_ptr + Q4_PACKED_PER_BLOCK);
-      float s = static_cast<float>(meta[0]);
-      float mn = static_cast<float>(meta[1]);
+      float scale = static_cast<float>(meta[0]);
+      float min_val = static_cast<float>(meta[1]);
 
-      // Precompute 16-entry LUT (16 float→bf16 conversions per block)
-      bfloat16 lut[16];
-      for (int i = 0; i < 16; i++) {
-        lut[i] = static_cast<bfloat16>(mn + i * s);
-      }
-
-      // Dequant via LUT (just table lookups, no float math)
+      // Convert q nibbles → bf16 via global LUT
       for (int i = 0; i < Q4_PACKED_PER_BLOCK; i++) {
         uint8_t byte = blk_ptr[i];
-        dequant_buf[2 * i] = lut[byte & 0x0F];
-        dequant_buf[2 * i + 1] = lut[(byte >> 4) & 0x0F];
+        q_buf[2 * i] = Q4_LUT[byte & 0x0F];
+        q_buf[2 * i + 1] = Q4_LUT[(byte >> 4) & 0x0F];
       }
 
-      // Vector MAC
-      aie::vector<bfloat16, 32> a_vec = aie::load_v<32>(dequant_buf);
-      aie::vector<bfloat16, 32> b_vec =
-          aie::load_v<32>(b + blk * Q4_BLOCK_SIZE);
-      acc = aie::mac(acc, a_vec, b_vec);
+      const bfloat16 *blk_b = b + blk * Q4_BLOCK_SIZE;
+      aie::vector<bfloat16, 16> q_lo = aie::load_v<16>(q_buf);
+      aie::vector<bfloat16, 16> q_hi = aie::load_v<16>(q_buf + 16);
+      aie::vector<bfloat16, 16> b_lo = aie::load_v<16>(blk_b);
+      aie::vector<bfloat16, 16> b_hi = aie::load_v<16>(blk_b + 16);
+
+      // dot(q, b) for this block
+      aie::accum<accfloat, 16> blk_dot = aie::mul(q_lo, b_lo);
+      blk_dot = aie::mac(blk_dot, q_hi, b_hi);
+      float dot_qb = aie::reduce_add(blk_dot.template to_vector<float>());
+
+      // sum(b) for this block via MAC with ones
+      aie::accum<accfloat, 16> blk_sum = aie::mul(b_lo, ones);
+      blk_sum = aie::mac(blk_sum, b_hi, ones);
+      float sum_b = aie::reduce_add(blk_sum.template to_vector<float>());
+
+      // Accumulate per-block contribution
+      min_sum += min_val * sum_b;
+      scale_dot += scale * dot_qb;
     }
 
-    c[row] =
-        static_cast<bfloat16>(aie::reduce_add(acc.template to_vector<float>()));
+    c[row] = static_cast<bfloat16>(min_sum + scale_dot);
   }
 }
 
