@@ -75,25 +75,66 @@ Only fusing dequant into the GEMV inner loop avoids the DDR round-trip.
 **Why decode first**: Decode GEMV is bandwidth-bound (92ms/token). Q4 = 4x less
 weight data from DDR. Prefill GEMM is compute-bound — less bandwidth benefit.
 
-**AIE2P has native `uint4` type**: The `aie::unpack` intrinsic converts uint4 → bfloat16
-efficiently in hardware. The kernel loads Q4 packed data to L1 (4x smaller),
-unpacks + dequants in-register, then feeds into BF16 MAC.
+#### Fused Kernel Approach (attempted)
 
-**Design**:
-1. `kernel_builder/mv_q4.cc` — fused Q4 GEMV kernel with signature:
-   `q4_matvec_bf16(m, k, row_offset, a_q4, scales, mins, b_in, c_out)`
-2. `kernel_builder/quantize.py` — add `pack_q4_for_npu()` packing utility
-3. New multi-launch builders for Q4 variant decode kernels
-4. `--quantize q4-npu` flag for on-NPU dequant path
+Created `kernel_builder/mv_q4.cc` — fused Q4 dequant + GEMV in one kernel.
+Interleaved weight format: each block = `[16B packed | 2B scale | 2B min]` = 20B.
+Single weight buffer (same DMA channel count as BF16). Validated all LLAMA GEMV shapes
+on NPU hardware (PASS).
 
-**BO layout**: Each weight BO stores `[packed_q4 | scales | mins]` concatenated.
-DMA transfers the appropriate slices to L1.
+**Performance results** (M=2048, K=2048, [8,1] herd):
 
-**Challenges**:
-- 4-bit unpacking in AIE inner loop (uint8 → 2×uint4 → bfloat16)
-- L1 layout: Q4 weight + scale/min metadata DMA patterns
-- Function signature change: 8→6 args → multi-launch arg mapping complexity
-- Separate `mv_q4.o` / `mv_q4_k8192.o` object files
+| Version | Compile | Correct | Time | vs BF16 |
+|---------|---------|---------|------|---------|
+| BF16 GEMV (baseline) | OK | PASS | 2.9ms | 1.0x |
+| Q4 v1: scalar dequant (`a_vec[i]=`) | OK | PASS | 97ms | 33x slower |
+| Q4 v2: scalar to temp buf + vec load | OK | PASS | 95ms | 32x slower |
+| Q4 v3: 16-entry LUT per block | OK | PASS | 41ms | 14x slower |
+| Q4 v4: vector `bit_and` + `downshift` | **Crash** | — | — | Compiler backend crash |
+| Q4 v5: native `uint4` load + `unpack` | OK | **FAIL** | — | Nibble ordering mismatch |
+
+**Root cause**: Scalar dequantization (byte-by-byte nibble extraction + float conversion)
+is ~14-33x more instructions than vectorized BF16 MAC. The 3.2x DDR bandwidth
+reduction is overwhelmed by compute overhead.
+
+**Vectorization blockers**:
+- `aie::bit_and()` on `vector<uint8, 16>` crashes the Peano compiler backend
+  (`unable to legalize instruction: G_AND <4 x s32>`)
+- Native `uint4` load via `aie::load_v<32>(uint4*)` compiles but produces wrong
+  nibble ordering — needs deeper investigation
+- No direct `uint4/uint8 × bfloat16` mixed-precision MAC in AIE2P hardware
+
+#### FastFlowLM Architecture (for comparison)
+
+FLM uses a **separate dequant kernel**, not a fused approach:
+```
+Q4 weights (DDR) → dequant.xclbin (NPU) → BF16 in L2/memtile → mm.xclbin (NPU)
+```
+
+Key differences from our fused approach:
+- Dequant and GEMM are **separate NPU invocations** with L2 as staging buffer
+- Q4→BF16 conversion happens in a dedicated kernel optimized purely for unpacking
+- BF16 data stays **on-chip (L2)** between dequant and GEMM — no DDR round-trip
+- The actual dequant kernel implementation is proprietary (in `.so` / `.xclbin`)
+
+FLM format: `weight_bf16 = scale * (q_value - zero_point)` with `buffer<u32>` packed
+weights, `buffer<bf16>` scales, `buffer<i32>` zero-points. Block size = 32.
+
+#### Potential Next Steps
+
+1. **Two-launch approach** (matching FLM): dequant launch → L2 buffer → GEMV launch.
+   Challenge: `air.launch` writes results back to DDR by default. Would need L2-only
+   intermediate (possibly via `air.segment`-level buffering or shared L2 allocation).
+
+2. **Fix uint4 nibble ordering**: Debug the native `uint4` load to get correct element
+   order. If fixed, the vectorized unpack chain (`uint4→uint8→int16→bfloat16`) could
+   be fast enough.
+
+3. **Compiler bug report**: File a bug for the `G_AND` crash on `vector<uint8>` in the
+   Peano/LLVM-AIE backend. Once fixed, vector bitwise dequant would work.
+
+4. **Use IRON's dequant**: If IRON (mlir-aie) has a working Q4 dequant kernel, we could
+   use it directly (like FLM does).
 
 **Performance target**: Match or approach FLM's decode throughput on the same model/hardware.
 

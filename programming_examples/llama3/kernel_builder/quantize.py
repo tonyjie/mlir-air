@@ -182,7 +182,7 @@ def pack_q4_interleaved(weight, block_size=_Q4_BLOCK_SIZE):
             # Quantize
             q = np.clip(np.round((blk_vals - mn) / scale), 0, 15).astype(np.uint8)
 
-            # Pack 2 values per byte
+            # Pack 2 values per byte (lo nibble = even index, hi nibble = odd)
             packed = (q[0::2] & 0x0F) | ((q[1::2] & 0x0F) << 4)
 
             # Write block: [packed(16B) | scale(2B) | min(2B)]
