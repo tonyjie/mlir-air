@@ -28,7 +28,7 @@ from air.backend.xrt import XRTBackend
 range_ = for_
 
 BLOCK_SIZE = 32
-BLOCK_BYTES = 20  # 16 packed + 2 scale + 2 min
+BLOCK_BYTES = 20  # 16B packed Q4 + 2B scale + 2B min
 
 
 def row_bytes(k):

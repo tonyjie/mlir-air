@@ -145,23 +145,26 @@ def q4_dequant_reference(packed, scales, mins, M, K, block_size=32):
 
 
 # ---------------------------------------------------------------------------
-# Interleaved Q4 format (for NPU kernel mv_q4.cc)
+# Unpacked Q4 format (for NPU kernel mv_q4.cc)
+# Each Q4 value stored as uint8 (no nibble packing). Enables fully vectorized
+# dequant on AIE via load_v<16>(uint8*) → unpack → to_float.
+# Block: [32 uint8 q-values | 2B scale (bf16) | 2B min (bf16)] = 36 bytes
 # ---------------------------------------------------------------------------
 
 _Q4_BLOCK_SIZE = 32
 _Q4_PACKED_PER_BLOCK = 16  # bytes (32 values / 2)
-_Q4_BLOCK_BYTES = 20  # 16 packed + 2 scale + 2 min
+_Q4_BLOCK_BYTES = 20  # 16 packed + 2B scale + 2B min
 
 
 def q4_row_bytes(k, block_size=_Q4_BLOCK_SIZE):
-    """Bytes per row in interleaved Q4 format."""
+    """Bytes per row in unpacked Q4 format."""
     return (k // block_size) * _Q4_BLOCK_BYTES
 
 
 def pack_q4_interleaved(weight, block_size=_Q4_BLOCK_SIZE):
     """Pack BF16 weight to interleaved Q4 format for NPU mv_q4.cc.
 
-    Each block of 32 values → 20 bytes: [16B packed | 2B scale | 2B min].
+    Each block of 32 values → 20 bytes: [16B packed nibbles | 2B scale | 2B min].
     Returns a single (M, row_bytes) uint8 array.
     """
     w = weight.astype(np.float32)
@@ -179,7 +182,6 @@ def pack_q4_interleaved(weight, block_size=_Q4_BLOCK_SIZE):
             mx = float(blk_vals.max())
             scale = (mx - mn) / 15.0 if mx != mn else 1.0
 
-            # Quantize
             q = np.clip(np.round((blk_vals - mn) / scale), 0, 15).astype(np.uint8)
 
             # Pack 2 values per byte (lo nibble = even index, hi nibble = odd)
