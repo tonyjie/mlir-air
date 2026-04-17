@@ -35,15 +35,80 @@ test -d /home/jiajli/apps/mlir-air/programming_examples/_llm_shared && echo "_ll
 
 If missing, the one-time lift refactor has not been done. **Halt and instruct the human:** "Run the lift refactor first (see Plan Task 2). This is a one-time setup that lifts `kernel_builder/` from `llama3/` to `_llm_shared/`."
 
-### Step 4: Scaffold `<model>/` directory
-```bash
-cp -r /home/jiajli/apps/mlir-air/programming_examples/llama3 /home/jiajli/apps/mlir-air/programming_examples/<dirname>
+### Step 4: Scaffold `<model>/` directory — minimal, sys.path-imports
+
+**Do NOT `cp -r llama3 <model>`.** That copies ~500 KB of unused `llama3_*.py`,
+`multi_launch_builder/`, and `test/` files that the per-model scripts never
+import (they resolve via sys.path to `../llama3/`). Stale duplicates cause
+confusion as the shared code evolves and bloat git blame.
+
+The minimal Tier-A scaffold is **6 files**:
+
+```
+<dirname>/
+├── .gitignore                       # copy from llama3/.gitignore + add *.o, *kernel_cache/
+├── Makefile                         # template-render with model name
+├── README.md                        # placeholder; final version written by finalize-deployment
+├── CLAUDE.md                        # model-specific guide (template below)
+├── TODO.md                          # phase status (template in Step 5)
+└── docs/development_progress/
+    ├── progress.md                  # header-only
+    ├── LESSONS.md                   # header-only
+    └── debug_log.md                 # header-only
 ```
 
-Then within `<dirname>/`:
-- Rename `llama3_*.py` files → `<model>_*.py` (preserve content for now; phase 0 will adapt)
-- Update Makefile model-name references
-- Clear `prefill_kernel_cache/` and `build_peano/` (they'll be regenerated)
+**At runtime**, every per-model script needs this sys.path block to resolve
+imports from the llama3 reference and `_llm_shared/`:
+
+```python
+from pathlib import Path
+import sys
+_THIS_DIR = Path(__file__).resolve().parent
+_EXAMPLES_DIR = _THIS_DIR.parent
+for p in (_EXAMPLES_DIR, _EXAMPLES_DIR / "llama3", _THIS_DIR):
+    if str(p) not in sys.path:
+        sys.path.insert(0, str(p))
+
+# Now these resolve to ../llama3/ and ../_llm_shared/:
+from llama3_prefill import KernelCache, run_transformer_block, ...
+from llama3_decode import run_decode_block, compile_decode_kernels
+import llama3_inference  # for _preload_decode_weights, etc.
+from _llm_shared.kernel_builder.external_kernels import compile_all_external_kernels
+```
+
+**Per-phase skills produce these SmolLM2-specific files in this dir**:
+- Phase 0 (`bootstrap-model-config`): `<model>_weights.py`, `<model>_reference.py`
+- Phases 2-5: `<model>_phaseN_test.py` (one per validation phase)
+- Post-Phase 5 (or in `finalize-deployment`): `<model>_inference.py` —
+  the end-to-end NPU runner (NPU prefill with K/V extraction → NPU LM Head →
+  NPU decode loop). Modeled on `llama3_inference.run_npu_prefill` + `generate`.
+
+**Makefile template** (mirror llama3's UX, llama3-style targets):
+- `make compile` (all kernels) / `compile-prefill` / `compile-decode`
+- `make run` → `<model>_inference.py` (end-to-end NPU)
+- `make profile` → prefill perf
+- `make verify` → decode with NPU/CPU top-1 check
+- `make run-{block,full,prefill,reference,decode-only}` → individual phase scripts
+- Env vars: `PROMPT`, `N_TOKENS`, `SEQ_LEN`, `MAX_SEQ`, `MODEL` plumbed through
+- `make clean` → remove `*kernel_cache/`, `air_project/`, `build_*/`, `*.o`, etc.
+- See `programming_examples/smollm2_1_7b/Makefile` for the canonical template.
+
+**Why minimal scaffold + sys.path imports**:
+- Lesson from smollm2_1_7b deployment (2026-04-17): a `cp -r` scaffold copied
+  47 files, only 22 of which were actually used. The 25 unused files
+  (`llama3_*.py`, `multi_launch_builder/`, `test/`) caused these issues:
+  1. `python -c "from llama3_prefill import ..."` resolved to the LOCAL stale
+     copy (because `_THIS_DIR` is first in sys.path), not the shared `../llama3/`
+     code — silently using outdated logic.
+  2. Bug fixes in `../llama3/` wouldn't propagate to the per-model dir.
+  3. ~500 KB of duplicated code per deployment.
+- The minimal-scaffold pattern with sys.path imports keeps per-model dirs
+  small (~22 files), guarantees freshness from `../llama3/`, and makes
+  divergences in per-model code explicit (you only see what's actually
+  SmolLM2-specific).
+- For models that NEED to fork llama3_prefill (true arch divergence), copy
+  ONLY the file being forked, rename it `<model>_prefill.py`, and import the
+  rest from `../llama3/`. Don't bulk-copy.
 
 ### Step 5: Initialize `<model>/TODO.md`
 Create with this template (filled in with config from Step 2):

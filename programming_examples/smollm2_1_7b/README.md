@@ -134,19 +134,29 @@ python3 smollm2_weights.py        # ~10 s after download — no NPU activity
 
 ## File structure
 
+This directory contains **only SmolLM2-specific code**. The orchestration helpers
+and multi-launch ELF builders are imported from `../llama3/` at runtime via
+`sys.path` (see the import block at the top of each script). This keeps the
+per-model directory small and avoids stale duplicates as the shared code evolves.
+
 | File | Purpose |
 |--|--|
 | `smollm2_inference.py` | **End-to-end NPU inference** — prefill (with K/V extraction) + decode |
 | `smollm2_weights.py` | Config dataclass, HF safetensors loader, RoPE LUT generator |
-| `smollm2_reference.py` | Pure-NumPy F32 reference forward pass (used as ground truth) |
+| `smollm2_reference.py` | Pure-NumPy F32 reference forward pass (ground truth) |
 | `smollm2_phase2_test.py` | Single-transformer-block NPU correctness |
 | `smollm2_phase3_test.py` | Full 24-layer NPU prefill + CPU LM Head |
 | `smollm2_phase4_test.py` | Prefill perf (cold vs warm with `preload_prefill_weights`) |
-| `smollm2_phase5_test.py` | Decode loop with CPU-prefill-seed + NPU LM Head GEMV |
-| `llama3_*.py` | Inherited orchestration helpers (config-driven; reused as-is per LESSONS.md Lesson 1 — not renamed to avoid cross-file import friction) |
-| `multi_launch_builder/` | Inherited multi-launch ELF builders (config-driven) |
-| `CLAUDE.md` | Model-specific guide (divergences from llama3, file conventions) |
-| `TODO.md` | Phase status (all 7 PASSED) |
+| `smollm2_phase5_test.py` | CPU-prefill-seed + NPU decode (older path; kept for comparison) |
+| `Makefile` | `make help` lists all targets |
+| `README.md` / `CLAUDE.md` / `TODO.md` | docs |
+| `docs/development_progress/` | per-phase reports + LESSONS + perf summary |
+
+**Imported from `../llama3/`** (not duplicated here):
+`llama3_prefill.run_transformer_block`, `llama3_decode.run_decode_block`,
+`llama3_inference._preload_decode_weights`, `KernelCache`, `prepare_air_project`,
+all `multi_launch_builder/` ELF builders, and the external-kernel compile helpers
+in `_llm_shared/kernel_builder/`.
 
 ## Documentation
 
@@ -169,7 +179,6 @@ python3 smollm2_weights.py        # ~10 s after download — no NPU activity
 |--|--|--|
 | LM Head GEMV right-sizing (`n_partitions=3` exact for vocab=49152) | Perf, ~3 ms/token (~2%) | 1-2 h |
 | Reduce per-layer K/V-extraction overhead in NPU prefill (currently ~15 ms/layer) | Perf, ~0.4 s on prefill | 1-2 h |
-| Cleanup: drop the inherited `llama3_*.py` files now that tests work via `../llama3/` imports | Hygiene | 30 min |
 
 See [`docs/development_progress/phase6_finalize.md`](docs/development_progress/phase6_finalize.md)
 for the full follow-up list.

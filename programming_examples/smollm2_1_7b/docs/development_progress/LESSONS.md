@@ -80,6 +80,39 @@ brought re-run compile time to ~0s for cached kernels.
 `compile_and_cache` could check `if name in self.artifacts: return self.artifacts[name]`
 at the top. Low-risk improvement; would speed up every iterative Phase 2/3/4 cycle.
 
+## Lesson 5 — `cp -r llama3 <model>` scaffold copies 25 unused files; use minimal scaffold + sys.path imports
+
+**What happened**: The original `deploy-new-llm` Step 4 said `cp -r llama3 <model>`.
+That copied 47 files into `smollm2_1_7b/`. Of those, only 22 were actually used:
+- `llama3_decode.py`, `llama3_inference.py`, `llama3_prefill.py`,
+  `llama3_reference.py`, `llama3_weights.py` (~164 KB)
+- `multi_launch_builder/` (18 files, ~324 KB)
+- `test/llama_3.2_*.py` (2 files, ~12 KB)
+
+…were never imported by any SmolLM2 script (the scripts use `sys.path.insert(0, _EXAMPLES_DIR / "llama3")`
+to import from `../llama3/` directly).
+
+**Worse**: `_THIS_DIR` came first in sys.path, so `from llama3_prefill import ...`
+silently resolved to the LOCAL stale copy, not the shared `../llama3/` code.
+Bug fixes in `../llama3/` would NOT propagate.
+
+**Workaround applied**: Deleted the 25 unused files (`git rm`), bringing the dir
+from 47 → 21 files. Verified `make compile` (cache hit) and `make run`
+(end-to-end NPU prefill+decode → ` Paris`) still work — sys.path correctly
+falls through to `../llama3/`.
+
+**Skill update applied**: `.claude/skills/deploy-new-llm/SKILL.md` Step 4
+rewritten to scaffold ONLY the 6 essential files (.gitignore, Makefile,
+README.md, CLAUDE.md, TODO.md, docs/development_progress/{progress,LESSONS,debug_log}.md).
+Per-model scripts add the standard sys.path block to import from
+`../llama3/` and `../_llm_shared/`. Documented the rationale + canonical
+sys.path snippet inline in the skill.
+
+**How to apply**: For any Tier-A or Tier-B deployment (kernels reusable from
+llama3 with config tweaks), use the minimal scaffold. Only fork a llama3_*.py
+file when there's TRUE divergence — and even then, fork ONLY that one file,
+not the whole dir.
+
 ## Lesson 4 — SmolLM2 was genuinely Tier-A: zero algorithm changes required
 
 **What happened**: Phases 0 (bootstrap) and 2 (single-block) needed only

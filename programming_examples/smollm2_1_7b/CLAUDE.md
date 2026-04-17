@@ -38,9 +38,14 @@ hidden_dim=8192, **vocab=49152**, BF16, **rope_θ=130000**, **tied embeddings**.
 
 ## File layout convention
 
-Inherited `llama3_*.py` filenames are kept per Lesson 1 of the smoke test
-(rename is high-friction; the existing config-driven helpers worked unchanged
-for SmolLM2). SmolLM2-specific code:
+This directory contains **only SmolLM2-specific code**. All llama3
+orchestration helpers and multi-launch ELF builders are imported from
+`../llama3/` at runtime (each script's top adds `_EXAMPLES_DIR / "llama3"` to
+`sys.path`). This is the recommended pattern for Tier-A model deployments
+(see `deploy-new-llm` skill — `cp -r llama3 <model>` was retired in favor of
+a minimal scaffold + sys.path imports).
+
+SmolLM2-specific code:
 
 - `smollm2_weights.py` — config dataclass + HF safetensors loader + RoPE LUT
 - `smollm2_reference.py` — CPU F32 reference forward pass
@@ -49,6 +54,17 @@ for SmolLM2). SmolLM2-specific code:
 - `smollm2_phaseN_test.py` — per-phase validation scripts (used during deploy);
   individually invokable via `make run-block` / `run-full` / `run-prefill` /
   `run-decode-only` / `run-reference`.
+
+Imported from `../llama3/` (do not copy):
+- `llama3_prefill.run_transformer_block`, `preload_prefill_weights`
+- `llama3_decode.run_decode_block`, `compile_decode_kernels`
+- `llama3_inference._preload_decode_weights`, `_LM_N_PARTITIONS`, `_LM_GEMV_BACKEND`
+- `multi_launch_builder.{rms_gemms_rope,o_ffn,lm_head_gemv,...}` (via the
+  `llama3.multi_launch_builder.*` package import)
+
+Imported from `../_llm_shared/`:
+- `KernelCache`, `prepare_air_project`
+- `compile_all_external_kernels` (silu_and_mul, rope_halfsplit, attn_npu2, mv)
 
 ## Documentation
 
