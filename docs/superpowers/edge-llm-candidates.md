@@ -8,17 +8,29 @@ Inventory of decoder-only LLMs we could deploy on AMD NPU2, mapped against our c
 
 ## TL;DR — Recommended pilot sequence
 
-| Order | Model | Tier | Why |
-|-------|-------|------|-----|
-| **1** | `HuggingFaceTB/SmolLM2-1.7B` | A | Architectural twin to Llama-3.2-1B (same emb/head_dim/hidden/RoPE/RMSNorm/SwiGLU). Only differences: tied embeddings, MHA (handled as degenerate GQA), smaller vocab. Validates pipeline portability with **near-zero kernel work**. |
-| **2** | `TinyLlama/TinyLlama-1.1B-Chat-v1.0` | A/B | Same emb_dim=2048 and head_dim=64. New `hidden_dim=5632` GEMM shape and 32:4 GQA ratio. Easy second data point. |
-| **3** | `HuggingFaceTB/SmolLM2-135M` and `360M` | A/B | Tiny — useful for fast iteration / debugging / profiling. Same kernel set, smaller shapes. Optional. |
-| **4** | `meta-llama/Llama-3.2-3B` | B | Same family + tooling. Forces **head_dim=128 RoPE+FA** generalization — the single most reusable kernel upgrade — which unlocks Qwen2.5, Llama-3.1, OLMo-2, InternLM2.5, Phi-4-mini. Memory tight (~6.4 GB BF16). |
-| **5** | `deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B` | C | Reasoning-distilled, rides on Qwen2.5-1.5B arch. Adds **QKV bias** epilogue + needs head_dim=128 from #4. Demonstrates "reasoning model" support. |
-| **6** | `Qwen/Qwen2.5-1.5B` (or `0.5B`) | C | Most popular sub-2B Llama alternative. Same QKV-bias change unlocks all of Qwen2.5 family. |
-| **7** | `google/gemma-3-1b-it` | D | Smallest "frontier" architecture: GeGLU + head_dim=256 + MQA + QK-Norm + 5:1 sliding-window. Stretch goal — bundles three reusable additions (GeGLU, QK-Norm, SWA) that also enable Qwen3 and OLMo-2. |
+| Order | Model | Tier | Status | Why |
+|-------|-------|------|--------|-----|
+| **1** | `meta-llama/Llama-3.2-1B` | A | ✅ **deployed** (reference: `programming_examples/llama3/`) | Initial pilot. Establishes the kernel inventory + multi-launch ELF infra. |
+| **2** | `HuggingFaceTB/SmolLM2-1.7B` | A | ✅ **deployed 2026-04-17** (`programming_examples/smollm2_1_7b/`) | Architectural twin to Llama-3.2-1B (same emb/head_dim/hidden/RoPE/RMSNorm/SwiGLU). Only differences: tied embeddings, MHA (handled as degenerate GQA), smaller vocab. Validated pipeline portability with **zero new kernel work** — confirmed Tier-A classification is trustworthy. |
+| **3** | `meta-llama/Llama-3.2-3B` | B | 🎯 **NEXT** (planned 2026-04-17) | Same family + tooling. Forces **head_dim=128 RoPE+FA** generalization — the single most reusable kernel upgrade — which unlocks Qwen2.5, Llama-3.1, OLMo-2, InternLM2.5, Phi-4-mini, R1-Distill-Qwen. Memory tight (~6.4 GB BF16 + ~5 GB transposed for decode → ~11 GB; close to NPU2's 16 GB ceiling). Also exercises Llama-3 RoPE scaling (mostly inert ≤ 8192 seq_len). |
+| **4** | `Qwen/Qwen2.5-1.5B` (or `0.5B`) | C | 📋 planned (after #3) | Most popular sub-2B Llama alternative. Drops in on top of #3's head_dim=128. Adds **QKV bias** epilogue (trivial — eltwise add post-GEMM). Different rope_θ=1e6 + larger vocab=151936. Unlocks the entire Qwen2.5 family + R1-Distill-Qwen (which is Qwen2.5-Math-1.5B). |
+| **5** | `deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B` | C | 📋 planned | Reasoning-distilled, identical arch to Qwen2.5-1.5B → if #4 works, this is config-only. Demonstrates "reasoning model" support. |
+| **6** | `HuggingFaceTB/SmolLM2-135M` and `360M` | A/B | 📋 optional | Tiny models, useful for fast iteration / debugging / profiling. Same kernel set as deployed SmolLM2-1.7B, smaller shapes. Use for skill-chain regression testing without long compile cycles. |
+| **7** | `TinyLlama/TinyLlama-1.1B-Chat-v1.0` | A/B | 📋 optional | Same emb_dim=2048 and head_dim=64 as deployed models. New `hidden_dim=5632` GEMM shape and 32:4 GQA ratio. Easy second Llama-2-arch data point if needed. |
+| **8** | `google/gemma-3-1b-it` | D | 📋 stretch (after #4-5 stabilize) | Smallest "frontier" architecture: GeGLU + head_dim=256 + MQA + QK-Norm + 5:1 sliding-window. Bundles three reusable additions (GeGLU, QK-Norm, SWA) that also enable Qwen3 and OLMo-2. Recommend doing #3 (head_dim=128) first to make 64→128→256 a 2-step ladder rather than a single 64→256 leap. |
 
-**Sequencing logic:** 1–3 prove portability with zero/minimal new kernels. 4 generalizes head_dim=128 (the gating dependency for almost everything else). 5–6 add QKV-bias (a small epilogue). 7 is the first true "new architecture family" investment.
+**Active plan (Path A — agreed 2026-04-17):**
+
+> **Llama-3.2-3B → Qwen2.5-1.5B → R1-Distill-Qwen-1.5B → (re-evaluate; consider Gemma-3-1B)**
+
+Linear ladder, one major new kernel feature per step:
+
+1. **Llama-3.2-3B** validates `head_dim=128` (RoPE generalization + FA generalization) in the most-familiar Llama-family context.
+2. **Qwen2.5-1.5B** adds QKV bias on top of validated head_dim=128 — a trivial eltwise-add epilogue change. Different rope_θ (1e6) and larger vocab (151936) are routine.
+3. **R1-Distill-Qwen-1.5B** is identical arch to #2 (Qwen2.5-Math-1.5B) → near-zero new work; demonstrates reasoning-model deployment.
+4. **Re-evaluate** — by this point we have head_dim=128 + QKV bias + Qwen2.5 ecosystem coverage. Decide whether to (a) push down the Llama family into Llama-3.1-8B (memory-tight), (b) tackle Gemma-3 (multi-feature stretch), or (c) implement Q4 dequantization to unlock 7B+ models.
+
+**Sequencing logic:** every step exercises ONE new architectural feature against a known-working baseline so failures are easy to bisect. Avoids the multi-failure-cascade risk of jumping straight to Tier-D.
 
 **Out of scope (this iteration):** all gpt-oss (MoE+MXFP4+attention sinks), DeepSeek-V*/R1 base (MLA+MoE), Gemma 3 ≥4B (vision tower), all 7B+ BF16 (memory-infeasible without Q4 — currently shelved).
 

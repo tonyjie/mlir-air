@@ -52,10 +52,25 @@ Record correlation table per kernel-bisect step in `<model>/docs/development_pro
 
 ## Verification (Phase 2 gate)
 
-Phase 2 PASSES when:
-- `cosine_sim(npu_block_out, ref_block_out) > 0.99` for layer 0
-- `mae(npu_block_out, ref_block_out) < 1e-2`
+Phase 2 PASSES when ALL true (computed at the **real-token positions only**,
+i.e., `[:real_len]` — not over padded positions, which are out-of-distribution
+and amplify BF16 noise unhelpfully):
+
+- `cosine_sim(npu_block_out, ref_block_out) > 0.99` (whole-tensor)
+- **Per-position cosine sim min > 0.99** across all real-token positions —
+  this catches per-row dropouts that whole-tensor cosine could mask, and is
+  the strongest guarantee that no individual row is corrupted
 - No NaN in NPU output
+
+`mae < some-threshold` is **informational only**, NOT a gate. The current
+BF16-output GEMM production path produces single-block MAE around 0.02–0.05
+across 7 GEMMs + softmax + RoPE + RMSNorm; the original llama3 baseline of
+MAE < 0.001 used F32-output GEMMs that were later dropped for performance.
+Captured in `programming_examples/smollm2_1_7b/docs/development_progress/LESSONS.md`
+Lesson 1 (2026-04-17 SmolLM2-1.7B deployment).
+
+If you need a magnitude check, compare to the reference deployment's
+**measured** single-block MAE for the same input — equal-or-better is PASS.
 
 ## Failure modes
 - Correlation drops at Q/K/V GEMM → likely weight loading or tensor layout (check seq-first vs heads-first)

@@ -242,6 +242,14 @@ class KernelCache:
             backend_kwargs: Dict of kwargs for XRTBackend constructor
             output_binary_name: Base name for output binary
         """
+        # Short-circuit if this kernel is already in the in-memory cache
+        # (e.g., loaded from disk via load_manifest). Captured as Lesson 3 from
+        # the SmolLM2-1.7B deployment 2026-04-17 — saved ~80s/kernel on
+        # iterative Phase 2/3/4 cycles.
+        if name in self.artifacts:
+            self._log(f"Skipping compile of {name} (already in cache)")
+            return self.artifacts[name]
+
         from air.backend.xrt import XRTBackend
 
         self._log(f"Compiling {name}...")
