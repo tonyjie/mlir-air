@@ -44,14 +44,16 @@ Copy `programming_examples/llama3/llama3_reference.py` to `<model>/<model>_refer
 - For unfamiliar architectures (different attention masking, etc.) — adapt carefully
 
 ### Step 5: Smoke-test the reference
-Run the CPU reference on a canonical prompt:
+Run the CPU reference on a canonical prompt. The reference script (mirrored from `llama3_reference.py`) predicts the next token via single-shot forward pass:
 
 ```bash
 cd programming_examples/<model>
-python3 <model>_reference.py --prompt "The capital of France is" --n-tokens 5
+python3 <model>_reference.py --prompt "The capital of France is"
 ```
 
-Expected: produces lexically sensible token output.
+Expected: prints the next token logits and top-k predictions. The top-1 token should be lexically sensible (e.g., " Paris" for the example prompt).
+
+If the new model's reference needs multi-token generation for sanity-checking, extend the script to support `--n-tokens N` (the LLAMA reference is single-shot only).
 
 ## Verification (Phase 0 gate)
 
