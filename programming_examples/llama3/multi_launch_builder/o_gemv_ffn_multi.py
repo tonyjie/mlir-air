@@ -50,7 +50,7 @@ sys.path.insert(
     ),
 )
 
-from llama3.kernel_builder.stitching import (
+from _llm_shared.kernel_builder.stitching import (
     _extract_between_func_and_return,
     _extract_affine_maps,
     _extract_private_funcs,
@@ -355,7 +355,9 @@ def build_o_gemv_ffn_module(
     """
     from matvec import build_module as build_gemv
     from eltwise_add.eltwise_add import build_module as build_add
-    from llama3.kernel_builder.ffn_swiglu.silu_and_mul import build_module as build_silu
+    from _llm_shared.kernel_builder.ffn_swiglu.silu_and_mul import (
+        build_module as build_silu,
+    )
 
     # ------- L1: O GEMV (M=2048, K=2048) -------
     print("  [1/8] O GEMV...")
