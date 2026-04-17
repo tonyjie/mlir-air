@@ -77,14 +77,15 @@ the skills that should be updated:
 
 ## Open follow-ups (for future SmolLM2 work or skill authors)
 
-| Item | Type | Priority | Estimated effort |
+| Item | Type | Priority | Status / Estimated effort |
 |--|--|--|--|
-| LM Head GEMV right-sizing (`n_partitions=3` exact for vocab=49152) | Perf | Low | 1-2 hours; ~3 ms/token saving (~2%) |
-| Skill update: `integrate-single-block` MAE gate | Skill | Medium | 30 min — change one gate condition |
-| Skill update: `KernelCache.compile_and_cache` short-circuit | Infra | Low | 15 min |
-| Edge-LLM survey: SmolLM2-1.7B `rope_θ` was listed as 10k, actual is 130k | Doc | Trivial | (fixed in this finalize) |
-| Production-mode: NPU prefill seeds KV cache (vs Phase 5's CPU prefill seed) | Perf | Medium | 2-3 hours — extract K/V from FA intermediates |
-| Decode flash_attn validation in Phase 5 (currently CPU attention) | Perf | Low | NPU FA was validated in Phase 2; using CPU attention for decode matches llama3's design |
+| LM Head GEMV right-sizing (`n_partitions=3` exact for vocab=49152) | Perf | Low | OPEN — 1-2 hours; ~3 ms/token saving (~2%) |
+| Skill update: `integrate-single-block` MAE gate | Skill | Medium | OPEN — 30 min, change one gate condition |
+| Skill update: `KernelCache.compile_and_cache` short-circuit | Infra | Low | OPEN — 15 min |
+| Edge-LLM survey: SmolLM2-1.7B `rope_θ` was listed as 10k, actual is 130k | Doc | Trivial | **DONE** (fixed in this finalize) |
+| Production-mode: NPU prefill seeds KV cache (vs Phase 5's CPU prefill seed) | Perf | Medium | **DONE 2026-04-17** — `smollm2_inference.py` extracts K/V from `rms_gemms_rope` intermediates. End-to-end: 2.25 s prefill / 137 ms-per-token decode. Per-layer K/V-reshape overhead is ~15 ms/layer (new minor follow-up below). |
+| Decode flash_attn validation in Phase 5 (currently CPU attention) | Perf | Low | OPEN (low-priority — NPU FA validated in Phase 2; CPU attention for decode matches llama3's design) |
+| Reduce per-layer K/V-extraction overhead in NPU prefill (~15 ms/layer = ~0.4 s on 24-layer prefill) | Perf | Low | OPEN — NEW after end-to-end runner. Could land K/V directly in `(n_kv_heads, max_seq, head_dim)`-layout BO during the kernel, or vectorize the host reshape. |
 
 ## Files added by this deployment
 

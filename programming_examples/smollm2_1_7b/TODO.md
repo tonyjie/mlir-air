@@ -26,8 +26,13 @@ deferred until Phase 0 confirms divergence depth).
 - [x] 5: Decode perf (PASSED 2026-04-17 — 136.4 ms/token, 7.3 tok/s; 3/3 NPU/CPU match; "The capital of France is Paris.\n\nThe capital of France"; 5/5 patterns; per-layer rate at parity with llama3)
 - [x] 6: Finalize (PASSED 2026-04-17 — see docs/development_progress/phase6_finalize.md; survey corrected; deployment complete)
 
+## Post-deployment additions (2026-04-17)
+- [x] End-to-end NPU runner: `smollm2_inference.py` (NPU prefill with K/V extraction → NPU LM Head GEMV → NPU decode). Wired to `make run`. Cleared the "Production NPU prefill seeds KV cache" follow-up from `phase6_finalize.md`.
+- [x] Makefile: llama3-style targets (`make run|profile|verify|compile|clean` + `run-prefill`/`run-block`/`run-full`/`run-reference`); env-var overrides for `PROMPT`, `N_TOKENS`, `SEQ_LEN`, `MODEL`.
+- [x] README.md: full usage guide with custom-prompt examples and per-phase target descriptions.
+
 ## Active blockers
-(none yet)
+(none)
 
 ## Resolved config (pulled from HF `config.json`)
 ```

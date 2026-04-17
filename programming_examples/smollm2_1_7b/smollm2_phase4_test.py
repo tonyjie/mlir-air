@@ -103,6 +103,11 @@ def main():
         default=3,
         help="Number of timed runs after preload (default: 3)",
     )
+    parser.add_argument(
+        "--compile-only",
+        action="store_true",
+        help="Compile prefill kernels and exit (skip weight load + inference)",
+    )
     args = parser.parse_args()
 
     os.chdir(_THIS_DIR)
@@ -114,6 +119,20 @@ def main():
     print(f"Attention: {'CPU' if args.cpu_attn else 'NPU FA'}")
     print(f"seq_len:   {args.seq_len}\n")
 
+    # Compile kernels first so --compile-only can exit before the 9s weight load.
+    prepare_air_project()
+    cache_dir = _THIS_DIR / args.cache_dir
+    cache = KernelCache(cache_dir=str(cache_dir), verbose=False)
+    if (cache_dir / "manifest.json").exists():
+        cache.load_manifest()
+    compile_all_external_kernels(head_dim=config.head_dim)
+    compile_block_kernels(cache, config, args.seq_len, cpu_attn=args.cpu_attn)
+    print()
+
+    if args.compile_only:
+        print("--compile-only: kernels compiled, exiting before weight load.")
+        return 0
+
     print("Loading weights...")
     weights = load_weights(args.model, config=config)
 
@@ -124,15 +143,6 @@ def main():
     rope_lut_bf16 = generate_rope_lut(
         config=config, seq_len=args.seq_len, dtype=bfloat16
     )
-
-    prepare_air_project()
-    cache_dir = _THIS_DIR / args.cache_dir
-    cache = KernelCache(cache_dir=str(cache_dir), verbose=False)
-    if (cache_dir / "manifest.json").exists():
-        cache.load_manifest()
-    compile_all_external_kernels(head_dim=config.head_dim)
-    compile_block_kernels(cache, config, args.seq_len, cpu_attn=args.cpu_attn)
-    print()
 
     x_bf16, _, real_len = _embed_and_pad(PROMPT, tokenizer, weights, args.seq_len)
     print(f"Input: {PROMPT!r}  ({real_len} real tokens, padded to {args.seq_len})\n")

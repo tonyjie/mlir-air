@@ -163,12 +163,33 @@ def main():
         default=2,
         help="Discard first N tokens for timing average (NPU warmup)",
     )
+    parser.add_argument(
+        "--compile-only",
+        action="store_true",
+        help="Compile decode kernels and exit (skip weight load + decode)",
+    )
     args = parser.parse_args()
 
     os.chdir(_THIS_DIR)
 
     config = LlamaConfig()
     print(f"SmolLM2 config: {config}")
+
+    # Compile kernels first so --compile-only can exit before the 9s weight load.
+    if args.compile_only:
+        prepare_air_project()
+        cache_dir = _THIS_DIR / args.cache_dir
+        decode_cache = KernelCache(cache_dir=str(cache_dir))
+        if (cache_dir / "manifest.json").exists():
+            decode_cache.load_manifest()
+        needed = ["rms_gemv_rope", "o_gemv_ffn", "lm_head_gemv"]
+        if not all(k in decode_cache.artifacts for k in needed):
+            print("\nCompiling decode kernels for SmolLM2 shapes...")
+            compile_decode_kernels(decode_cache, config)
+        else:
+            print("\nDecode kernels already cached.")
+        print("--compile-only: kernels compiled, exiting before weight load.")
+        return 0
 
     print("\nLoading weights...")
     t = time.time()

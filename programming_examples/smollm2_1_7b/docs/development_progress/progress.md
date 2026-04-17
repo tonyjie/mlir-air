@@ -13,9 +13,13 @@ tied embeddings.
 
 ## Current status (2026-04-17)
 
-**🎉 Deployment complete.** All 7 phases (0–6) passed. End-to-end NPU2 inference working:
-prefill **1.88s** (24 layers, ~79 ms/layer), decode **136.4 ms/token (7.3 tok/s)**.
-Per-layer rates at parity with llama3 baseline despite MHA's 4× larger K/V GEMVs.
+**🎉 Deployment complete + end-to-end runner wired.** All 7 phases (0–6) passed
+and a unified `smollm2_inference.py` does NPU prefill (with K/V extraction) +
+NPU LM Head GEMV + NPU decode in one process. `make run` is the entry point.
+
+End-to-end NPU inference: prefill **2.25 s** (94 ms/layer with K/V extraction;
+1.88 s / 79 ms/layer standalone), decode **137 ms/token (7.3 tok/s)**. Per-layer
+rates at parity with llama3 despite MHA's 4× larger K/V GEMVs.
 
 ## Phase log
 
@@ -112,3 +116,29 @@ Per-layer rates at parity with llama3 baseline despite MHA's 4× larger K/V GEMV
   4. SmolLM2 was genuinely Tier-A — minimal-change pattern confirmed
 - 1 bug fix: `_llm_shared/kernel_builder/external_kernels.py:99` stale path
 - Open follow-up: LM Head GEMV right-sizing (8 → 3 partitions for vocab=49152, ~3 ms/token saving)
+
+### Post-Phase 6 — End-to-end NPU runner (2026-04-17)
+- Added `smollm2_inference.py`: unified NPU prefill (with K/V extraction from
+  `rms_gemms_rope` intermediates) + NPU LM Head GEMV (reuses the decode kernel
+  for the single-vector first-token prediction) + NPU decode loop. Modeled on
+  `llama3_inference.run_npu_prefill` + `generate`.
+- **End-to-end measured**: NPU prefill 2.25 s (94 ms/layer — includes 15 ms
+  per-layer K/V reshape overhead vs Phase 4's 79 ms/layer raw); first LM Head
+  GEMV 17 ms; decode 137 ms/token; total 8-token wall = 3.2 s.
+- Output matches CPU reference: `' Paris'` first token, then the same
+  `"Paris.\n\nThe capital of France"` continuation as Phase 5.
+- Wired to `make run` (default `--profile`); custom inputs via
+  `make run PROMPT="..." N_TOKENS=N` and `MODEL=<id|path>`.
+- Closes the **"Production NPU prefill seeds KV cache"** open follow-up
+  in `phase6_finalize.md`.
+
+### Post-Phase 6 — Make/CLI parity with llama3 (2026-04-17)
+- `Makefile` rewritten with llama3-style targets: `compile`, `run`, `profile`,
+  `verify`, `clean`, plus `compile-prefill`/`compile-decode` and individual
+  per-phase runners (`run-prefill`, `run-block`, `run-full`, `run-decode-only`,
+  `run-reference`). Env-var overrides for `PROMPT`, `N_TOKENS`, `SEQ_LEN`, `MODEL`.
+- Added `--compile-only` flag to `smollm2_phase4_test.py`,
+  `smollm2_phase5_test.py`, and `smollm2_inference.py` — exits cleanly after
+  kernel compile (skips the 9 s weight load), used by `make compile-*` targets.
+- README.md rewritten with the perf table at top, full Make usage guide,
+  custom-prompt examples, per-phase target descriptions.

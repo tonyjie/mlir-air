@@ -8,7 +8,15 @@ patterns apply unchanged here; this file documents only what *differs*.
 
 ## Status
 
-Bootstrapping. See `TODO.md` and `docs/development_progress/progress.md`.
+**Deployed and operational** (2026-04-17). All 7 phases of `deploy-new-llm`
+passed; end-to-end NPU inference (prefill + decode) is wired up via
+`smollm2_inference.py` (entry point for `make run`).
+
+Performance (validated):
+- **Prefill**: 2.25 s for 24 layers + KV-cache extraction (94 ms/layer);
+  standalone Phase-4 prefill (no extraction) is 1.88 s / 79 ms-per-layer
+- **Decode**: 137 ms/token (7.3 tok/s); per-layer rate at parity with llama3
+- See `docs/development_progress/phase6_finalize.md` for the perf summary.
 
 ## Model config
 
@@ -30,24 +38,26 @@ hidden_dim=8192, **vocab=49152**, BF16, **rope_θ=130000**, **tied embeddings**.
 
 ## File layout convention
 
-Inherited `llama3_*.py` filenames are kept temporarily per Lesson 1 of the
-smoke test (rename is high-friction; defer until Phase 0 confirms the actual
-divergence depth in code paths). Phase 0 produces:
-- `smollm2_weights.py` — config dataclass, HF weight loader, RoPE LUT
-- `smollm2_reference.py` — CPU F32 reference
+Inherited `llama3_*.py` filenames are kept per Lesson 1 of the smoke test
+(rename is high-friction; the existing config-driven helpers worked unchanged
+for SmolLM2). SmolLM2-specific code:
 
-If the inference / prefill / decode entry points need real divergence (e.g.,
-to handle MHA layout differently), Phase 0 will either parameterize the
-existing files or fork them — that decision is logged in this file's
-"Divergences" section above.
+- `smollm2_weights.py` — config dataclass + HF safetensors loader + RoPE LUT
+- `smollm2_reference.py` — CPU F32 reference forward pass
+- `smollm2_inference.py` — **end-to-end NPU runner** (prefill with K/V extraction
+  + first-token NPU LM Head + decode loop). Entry point for `make run`.
+- `smollm2_phaseN_test.py` — per-phase validation scripts (used during deploy);
+  individually invokable via `make run-block` / `run-full` / `run-prefill` /
+  `run-decode-only` / `run-reference`.
 
 ## Documentation
 
 | Doc | Content |
 |-----|---------|
-| [README.md](README.md) | Newcomer overview + arch comparison table |
+| [README.md](README.md) | Newcomer overview, perf, usage, arch comparison |
 | [TODO.md](TODO.md) | Phase status and active blockers |
 | [docs/development_progress/progress.md](docs/development_progress/progress.md) | Phase log |
+| [docs/development_progress/phase6_finalize.md](docs/development_progress/phase6_finalize.md) | End-to-end perf summary + reusable-pattern audit |
 | [docs/development_progress/LESSONS.md](docs/development_progress/LESSONS.md) | Novel failures + root-cause fixes |
 | [docs/development_progress/debug_log.md](docs/development_progress/debug_log.md) | Debug-recipe firings |
 | `../llama3/CLAUDE.md` | Canonical kernel sequence, multi-launch design, profile patterns |

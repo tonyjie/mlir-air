@@ -1,15 +1,18 @@
 # ============================================================
-# LLAMA-3.2-1B BF16 Inference on NPU2 (MLIR-AIR)
+# SmolLM2-1.7B BF16 Inference on NPU2 (MLIR-AIR)
 # ============================================================
 #
 # Quick start:
-#   make compile        — Compile all kernels (~4 min, cached to disk)
-#   make run            — Run inference: NPU prefill + NPU decode
-#   make profile        — Run with per-kernel profiling breakdown
+#   make compile         — Compile prefill + decode kernels (one-time, ~2 min)
+#   make run             — End-to-end demo: NPU prefill seed + NPU decode + NPU LM Head
+#   make profile         — Prefill perf measurement (cold vs warm with preload)
+#   make verify          — Decode with NPU/CPU top-1 verification
 #
-# Performance (NPU2, AMD Strix):
-#   Prefill:  1.26s (seq_len=2048, 16 layers)
-#   Decode:   92ms/token (10.8 tokens/sec)
+# Performance (NPU2, AMD Strix, validated 2026-04-17):
+#   Prefill:  1.88s NPU layers / 2.41s wall (24 layers, seq_len=2048)
+#   Decode:   136 ms/token (7.3 tok/s)
+#
+# Per-layer rates at parity with Llama-3.2-1B despite MHA's 4x larger K/V GEMVs.
 #
 # Copyright (C) 2026, Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
@@ -17,20 +20,24 @@
 
 srcdir := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
 
-# Build directory
-ifdef PEANO_INSTALL_DIR
-  BUILD_DIR := build_peano
-else
-  BUILD_DIR := build_chess
-endif
-
-# Configurable parameters
-N_TOKENS ?= 100
+# Configurable parameters (override via `make VAR=value`)
+N_TOKENS ?= 8
 PROMPT   ?= The capital of France is
-MODEL    ?= base
+SEQ_LEN  ?= 2048
+MAX_SEQ  ?= 128
+MODEL    ?= HuggingFaceTB/SmolLM2-1.7B
+
+# Phase test scripts
+PHASE0     := smollm2_reference.py
+PHASE2     := smollm2_phase2_test.py
+PHASE3     := smollm2_phase3_test.py
+PHASE4     := smollm2_phase4_test.py
+PHASE5     := smollm2_phase5_test.py
+INFERENCE  := smollm2_inference.py
 
 .PHONY: help compile run profile verify clean \
-        compile-prefill compile-decode run-prefill run-decode
+        compile-prefill compile-decode \
+        run-prefill run-decode run-block run-full run-reference run-decode-only
 
 # ============================================================
 # Help
@@ -38,100 +45,111 @@ MODEL    ?= base
 
 help:
 	@echo "============================================================"
-	@echo " LLAMA-3.2-1B Inference on NPU2 (MLIR-AIR)"
+	@echo " SmolLM2-1.7B Inference on NPU2 (MLIR-AIR)"
 	@echo "============================================================"
 	@echo ""
 	@echo "Quick start:"
-	@echo "  make compile          Compile all kernels (~4 min, one-time)"
-	@echo "  make run              Run inference ($(N_TOKENS) tokens)"
-	@echo "  make profile          Run with profiling breakdown"
+	@echo "  make compile         Compile prefill + decode kernels (~2 min, one-time)"
+	@echo "  make run             End-to-end NPU inference: prefill + decode ($(N_TOKENS) tokens)"
+	@echo "  make profile         Prefill perf measurement (cold + warm)"
+	@echo "  make verify          Decode with NPU/CPU top-1 match check"
 	@echo ""
-	@echo "Unified pipeline (recommended):"
-	@echo "  make compile          Compile prefill + decode kernels"
-	@echo "  make run              NPU prefill + NPU decode"
-	@echo "  make profile          With per-kernel timing"
-	@echo "  make verify           With CPU reference verification"
+	@echo "Compile only:"
+	@echo "  make compile         All kernels (prefill + decode)"
+	@echo "  make compile-prefill Prefill kernels only (~80 s first time)"
+	@echo "  make compile-decode  Decode kernels only (~22 s first time)"
 	@echo ""
-	@echo "Individual pipelines:"
-	@echo "  make compile-prefill  Compile prefill kernels only"
-	@echo "  make compile-decode   Compile decode kernels only"
-	@echo "  make run-prefill      Run prefill only (16 layers)"
-	@echo "  make run-decode       Run decode only (CPU prefill + NPU decode)"
+	@echo "Individual run targets:"
+	@echo "  make run             smollm2_inference.py — NPU prefill (with KV extraction) + NPU decode"
+	@echo "  make run-prefill     Phase 4  — NPU prefill perf (cold vs warm) — no decode"
+	@echo "  make run-decode-only Phase 5  — CPU prefill SEED + NPU decode (older path; uses CPU prefill)"
+	@echo "  make run-block       Phase 2  — single-block correctness (NPU FA)"
+	@echo "  make run-full        Phase 3  — full 24-layer prefill + top-1 match (3 prompts)"
+	@echo "  make run-reference   Phase 0  — CPU reference vs HuggingFace F32"
 	@echo ""
 	@echo "Maintenance:"
-	@echo "  make clean            Remove all build artifacts"
+	@echo "  make clean           Remove kernel caches and build artifacts"
 	@echo ""
-	@echo "Options (override with make VAR=value):"
-	@echo "  N_TOKENS=100          Number of decode tokens"
-	@echo "  PROMPT=\"...\"          Input prompt text"
-	@echo "  MODEL=base|instruct   Model variant (default: base)"
+	@echo "Options (override with 'make VAR=value'):"
+	@echo "  N_TOKENS=$(N_TOKENS)         Decode tokens to generate"
+	@echo "  PROMPT='...'         Input prompt (default: '$(PROMPT)')"
+	@echo "  SEQ_LEN=$(SEQ_LEN)       Prefill sequence length"
+	@echo "  MAX_SEQ=$(MAX_SEQ)         Decode max position (run-decode-only only)"
+	@echo "  MODEL=$(MODEL)"
+	@echo "                       HF model id or local snapshot path"
 	@echo ""
 	@echo "Examples:"
-	@echo "  make run N_TOKENS=50"
-	@echo "  make profile PROMPT=\"The meaning of life is\""
-	@echo "  make run MODEL=instruct PROMPT=\"What is the capital of France?\""
-	@echo "  make verify N_TOKENS=10"
+	@echo "  make run N_TOKENS=20"
+	@echo "  make profile PROMPT='The meaning of life is'"
+	@echo "  make verify N_TOKENS=4    # CPU verify is slow (~25 s/token)"
 
 # ============================================================
-# Unified Pipeline (NPU prefill + NPU decode)
+# Compile (one-time, ~2 min total)
 # ============================================================
 
-## Compile all kernels (prefill + decode, ~4 min)
+## Compile all kernels (prefill + decode)
 compile:
-	@mkdir -p $(BUILD_DIR)
-	cd $(BUILD_DIR) && python3 $(srcdir)/llama3_inference.py --compile-only
+	python3 $(srcdir)/$(INFERENCE) --compile-only --seq-len $(SEQ_LEN)
 
-## Run unified inference
-run:
-	cd $(BUILD_DIR) && python3 $(srcdir)/llama3_inference.py \
-		--run-only --n-tokens $(N_TOKENS) --prompt "$(PROMPT)" --model $(MODEL)
-
-## Run with detailed profiling breakdown
-profile:
-	cd $(BUILD_DIR) && python3 $(srcdir)/llama3_inference.py \
-		--run-only --n-tokens $(N_TOKENS) --profile --prompt "$(PROMPT)" --model $(MODEL)
-
-## Run with CPU reference verification
-verify:
-	cd $(BUILD_DIR) && python3 $(srcdir)/llama3_inference.py \
-		--run-only --n-tokens $(N_TOKENS) --verify --profile --prompt "$(PROMPT)" --model $(MODEL)
-
-## Compile and run in one step
-all: compile profile
-
-# ============================================================
-# Individual Pipelines
-# ============================================================
-
-## Compile prefill kernels only (~4 min)
+## Compile prefill kernels only (rms_gemms_rope + o_ffn + flash_attn)
 compile-prefill:
-	@mkdir -p $(BUILD_DIR)
-	cd $(BUILD_DIR) && python3 $(srcdir)/llama3_prefill.py --compile-only --profile
+	python3 $(srcdir)/$(PHASE4) --compile-only --seq-len $(SEQ_LEN)
 
-## Compile decode kernels only (~25s)
+## Compile decode kernels only (rms_gemv_rope + o_gemv_ffn + lm_head_gemv)
 compile-decode:
-	@mkdir -p $(BUILD_DIR)
-	cd $(BUILD_DIR) && python3 $(srcdir)/llama3_decode.py --compile-only
+	python3 $(srcdir)/$(PHASE5) --compile-only
 
-## Run prefill only (16 layers, no decode)
+# ============================================================
+# Run (uses cached kernels if present)
+# ============================================================
+
+## End-to-end NPU inference: NPU prefill + KV extraction + NPU decode + NPU LM Head
+run:
+	python3 $(srcdir)/$(INFERENCE) --n-tokens $(N_TOKENS) --prompt "$(PROMPT)" \
+		--seq-len $(SEQ_LEN) --model $(MODEL) --profile
+
+## Alias kept for back-compat (older Phase-5-only decode path with CPU prefill seed)
+run-decode-only:
+	python3 $(srcdir)/$(PHASE5) --n-tokens $(N_TOKENS) --prompt "$(PROMPT)" \
+		--max-seq $(MAX_SEQ) --model $(MODEL) --no-cpu-verify
+
+## Alias for run (back-compat with previous Makefile)
+run-decode: run
+
+## Phase 4 — prefill perf (cold + warm with preload_prefill_weights)
 run-prefill:
-	cd $(BUILD_DIR) && python3 $(srcdir)/llama3_prefill.py \
-		--run-only --n-layers 16 --profile
+	python3 $(srcdir)/$(PHASE4) --seq-len $(SEQ_LEN) --model $(MODEL)
 
-## Run decode only (CPU prefill for KV cache + NPU decode)
-run-decode:
-	cd $(BUILD_DIR) && python3 $(srcdir)/llama3_decode.py \
-		--run-only --n-tokens $(N_TOKENS) --profile
+## Phase 2 — single transformer block on NPU (uses NPU FlashAttention)
+run-block:
+	python3 $(srcdir)/$(PHASE2) --no-preload --npu-attn --seq-len $(SEQ_LEN) --model $(MODEL)
 
-## Run CPU-only reference (no NPU)
+## Phase 3 — full 24-layer NPU prefill, NPU/CPU top-1 match on 3 canonical prompts
+run-full:
+	python3 $(srcdir)/$(PHASE3) --seq-len $(SEQ_LEN) --model $(MODEL)
+
+## Phase 0 — CPU reference forward pass + HuggingFace F32 verification
 run-reference:
-	python3 $(srcdir)/llama3_reference.py
+	python3 $(srcdir)/$(PHASE0) --prompt "$(PROMPT)" --model $(MODEL) --verify
+
+# ============================================================
+# Profile / Verify wrappers
+# ============================================================
+
+## Prefill perf measurement (alias for run-prefill — Phase 4 already prints timings)
+profile: run-prefill
+
+## Decode with NPU/CPU top-1 verification (slow: ~25 s/token CPU verify; default 4 tokens)
+verify:
+	python3 $(srcdir)/$(PHASE5) --n-tokens 4 --prompt "$(PROMPT)" --max-seq $(MAX_SEQ) \
+		--model $(MODEL) --cpu-verify
 
 # ============================================================
 # Clean
 # ============================================================
 
-## Remove all build artifacts
+## Remove kernel caches and build artifacts (keeps source + docs)
 clean:
-	rm -r $(BUILD_DIR) 2>/dev/null || true
-	@echo "Build directory removed. Run 'make compile' to rebuild."
+	rm -rf prefill_kernel_cache decode_kernel_cache air_project build_peano build_chess __pycache__
+	rm -f *.o air.elf air.mlir air.xclbin air.insts.bin
+	@echo "Caches cleared. Run 'make compile' to rebuild."
