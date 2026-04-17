@@ -137,15 +137,15 @@ Phi-3 family is actually MHA (not GQA) — distinct from Llama 3.x. **head_dim=9
 | Model | Params | L | emb | nH | nKV | head_dim | hidden | vocab | rope_θ | Norm | FFN | Special | BF16 | Tier | Mem |
 |-------|--------|---|-----|----|----|----------|--------|-------|--------|------|-----|---------|------|------|-----|
 | `TinyLlama/TinyLlama-1.1B` | 1.1B | 22 | 2048 | 32 | 4 | 64 | 5632 | 32000 | 10k | RMSNorm | SwiGLU | Llama-2 arch | 2.2 GB | **A/B** | ✅ |
-| `HuggingFaceTB/SmolLM2-135M` | 135M | 30 | 576 | 9 | 3 | 64 | 1536 | 49152 | 10k | RMSNorm | SwiGLU | tied emb, depth>width | 0.27 GB | A/B | ✅ |
-| `HuggingFaceTB/SmolLM2-360M` | 360M | 32 | 960 | 15 | 5 | 64 | 2560 | 49152 | 10k | RMSNorm | SwiGLU | tied emb | 0.72 GB | A/B | ✅ |
-| `HuggingFaceTB/SmolLM2-1.7B` | 1.7B | 24 | 2048 | 32 | 32 (MHA) | 64 | 8192 | 49152 | 10k | RMSNorm | SwiGLU | tied emb, MHA | 3.4 GB | **A** | ✅ |
+| `HuggingFaceTB/SmolLM2-135M` | 135M | 30 | 576 | 9 | 3 | 64 | 1536 | 49152 | 100k | RMSNorm | SwiGLU | tied emb, depth>width | 0.27 GB | A/B | ✅ |
+| `HuggingFaceTB/SmolLM2-360M` | 360M | 32 | 960 | 15 | 5 | 64 | 2560 | 49152 | 100k | RMSNorm | SwiGLU | tied emb | 0.72 GB | A/B | ✅ |
+| `HuggingFaceTB/SmolLM2-1.7B` | 1.7B | 24 | 2048 | 32 | 32 (MHA) | 64 | 8192 | 49152 | 130k | RMSNorm | SwiGLU | tied emb, MHA | 3.4 GB | **A** | ✅ deployed 2026-04-17 |
 | `allenai/OLMo-2-0425-1B` | 1.5B | 16 | 2048 | 16 | 16 (MHA) | 128 | 8192 | 100k+ | 500k | RMSNorm | SwiGLU | **post-norm**, **QK-Norm** | 3 GB | D | ✅ |
 | `allenai/OLMo-2-1124-7B` | 7B | 32 | 4096 | 32 | 32 (MHA) | 128 | 11008 | — | — | RMSNorm | SwiGLU | post-norm, QK-Norm | 14 GB | D | ❌ |
 | `internlm/internlm2_5-7b` | 7.7B | 32 | 4096 | 32 | 8 | 128 | 14336 | 92544 | 1e6 | RMSNorm | SwiGLU | wqkv fused | 15 GB | C | ❌ |
 | `stabilityai/stablelm-2-1_6b` | 1.6B | 24 | 2048 | 32 | 32 (MHA) | 64 | 5632 | 100352 | 10k | **LayerNorm** (with bias) | SwiGLU | parallel attn/MLP | 3.2 GB | **C** (LayerNorm) | ✅ |
 
-**SmolLM2-1.7B** is the closest architectural twin to Llama-3.2-1B: same emb_dim=2048, head_dim=64, hidden=8192, RMSNorm + SwiGLU, RoPE half-split. Differences: MHA (degenerate GQA), tied embeddings, smaller vocab, rope_θ=10k. **Tier A** strictly.
+**SmolLM2-1.7B** is the closest architectural twin to Llama-3.2-1B: same emb_dim=2048, head_dim=64, hidden=8192, RMSNorm + SwiGLU, RoPE half-split. Differences: MHA (degenerate GQA), tied embeddings, smaller vocab, rope_θ=130k. **Tier A** strictly. **Validated by deployment 2026-04-17** (`programming_examples/smollm2_1_7b/`): per-layer prefill/decode rate at parity with llama3 (79 ms/layer prefill, 5.7 ms/layer decode); ~1.88 s prefill / 136 ms-per-token decode for the deeper 24-layer stack; only one bug fixed (stale path in `_llm_shared/kernel_builder/external_kernels.py:99`).
 
 **TinyLlama-1.1B**: emb=2048, head_dim=64, hidden=5632 (new GEMM N), nKV=4 (new GQA ratio). Tier B (one new GEMM shape and a 32:4 GQA pattern).
 

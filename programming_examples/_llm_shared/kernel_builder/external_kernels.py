@@ -95,8 +95,8 @@ _PROJ_ROOT = Path(__file__).resolve().parent.parent.parent  # programming_exampl
 
 
 def compile_silu_and_mul():
-    """Compile silu_and_mul.o from kernel_builder/ffn_swiglu/silu_and_mul.cc."""
-    src = _PROJ_ROOT / "llama3" / "kernel_builder" / "ffn_swiglu" / "silu_and_mul.cc"
+    """Compile silu_and_mul.o from _llm_shared/kernel_builder/ffn_swiglu/silu_and_mul.cc."""
+    src = Path(__file__).resolve().parent / "ffn_swiglu" / "silu_and_mul.cc"
     include_dir = _get_aie_include_dir()
     utils_header = Path(include_dir) / "aie_kernels" / "aie_kernel_utils.h"
     extra = []
