@@ -39,7 +39,7 @@ from air.dialects.scf import for_, yield_
 from air.backend.xrt_runner import XRTRunner, type_mapper
 from air.backend.xrt import XRTBackend
 
-from llama3.kernel_builder.stitching import (
+from _llm_shared.kernel_builder.stitching import (
     _extract_between_func_and_return,
     _extract_affine_maps,
     _extract_private_funcs,
@@ -135,7 +135,7 @@ def build_flash_o_add_module(
             %arg6: x_residual   (seq_len, emb_dim)       Residual skip connection
             %arg7: output       (n_total,)               1D final output
     """
-    from llama3.kernel_builder.gemm_builder import _build_gemm_module
+    from _llm_shared.kernel_builder.gemm_builder import _build_gemm_module
 
     n_total = seq_len * emb_dim
     add_tile_n = emb_dim

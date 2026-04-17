@@ -26,8 +26,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from llama3_weights import LlamaConfig, load_weights, generate_rope_lut
-from llama3.kernel_builder.cache import KernelCache, prepare_air_project
-from llama3.kernel_builder.gemm_builder import _build_gemm_module
+from _llm_shared.kernel_builder.cache import KernelCache, prepare_air_project
+from _llm_shared.kernel_builder.gemm_builder import _build_gemm_module
 
 # ---------------------------------------------------------------------------
 # Decode kernel compilation
@@ -105,7 +105,7 @@ def _ensure_mv_k8192_o():
 
 def compile_decode_kernels(cache, config):
     """Compile the 3 merged decode kernels."""
-    from llama3.kernel_builder.external_kernels import compile_all_external_kernels
+    from _llm_shared.kernel_builder.external_kernels import compile_all_external_kernels
 
     compile_all_external_kernels(head_dim=config.head_dim)
 

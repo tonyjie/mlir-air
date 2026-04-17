@@ -17,7 +17,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from llama3.kernel_builder.stitching import (
+from _llm_shared.kernel_builder.stitching import (
     _extract_between_func_and_return,
     _extract_affine_maps,
     _rename_all,
@@ -45,7 +45,7 @@ def build_lm_head_module(
             %arg(1+2*p): weight_p (emb_dim, n_part)
             %arg(2+2*p): output_p (seq_len, n_part)
     """
-    from llama3.kernel_builder.gemm_builder import _build_gemm_module
+    from _llm_shared.kernel_builder.gemm_builder import _build_gemm_module
 
     print(f"  Building {n_partitions}-partition LM Head GEMM (N_part={n_part})...")
     gemm_ir = str(

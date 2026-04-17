@@ -23,7 +23,7 @@ sys.path.insert(
     ),
 )
 
-from llama3.kernel_builder.stitching import (
+from _llm_shared.kernel_builder.stitching import (
     _extract_between_func_and_return,
     _extract_affine_maps,
     _extract_private_funcs,
