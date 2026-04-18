@@ -529,6 +529,13 @@ air.channel @channel_0 [1, 1] {broadcast_shape = [1, 4]}
 }
 ```
 
+#### Options
+
+```
+-shim-dma-channels-per-col : Number of physical DMA channels per direction per shim tile column. Used by auto-packet-switching detection to determine when channel count exceeds physical capacity.
+-force-shim-packet-flow    : Unconditionally mark all shim-bound channels (both input and output) as dma_packet, to enable time-multiplexed sharing with control packet flows.
+```
+
 ### `-air-example-pass`
 
 _Skeleton module op pass_
