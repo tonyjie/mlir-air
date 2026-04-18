@@ -16,8 +16,8 @@ head-first kernel + host-transpose wrapper (Option C — see LESSONS Lesson 3).
 | Decode rate (steady-state)   | **214.9 ms/token (4.7 tok/s)** — exactly the K-scaled prediction |
 | Top-1 NPU/CPU match (decode) | 3/3 |
 | Top-1 NPU/CPU match (prefill)| 4/4 decisive prompts + 2/2 competitive top-5 overlap |
-| End-to-end NPU output (NPU FA) | `'The capital of France is Paris. It is the largest city in'` |
-| End-to-end inference wall (8 tokens) | **5.6 s** (vs 15.6 s with CPU-attn — 2.8× faster) |
+| End-to-end NPU output (100 tokens, NPU FA) | `'The capital of France is Paris. It is the largest city in France. It is also the capital of the Île-de-France region. Paris is located in the north of France. It is on the river Seine. It is the most visited city in the world. It has many famous buildings and monuments. The most famous is the Eiffel Tower. It is 324 meters high. It was built for the World's Fair in 1889. It is made of iron and glass. It has three'` |
+| End-to-end inference wall (100 tokens) | **28.7 s** (4.1 s prefill + 99 × 248 ms decode; first 65 tokens at 215 ms steady-state, then steps to ~305 ms — possible thermal throttling) |
 
 ## Quick start
 

@@ -141,12 +141,12 @@ def main():
     parser.add_argument(
         "--n-tokens",
         type=int,
-        default=10,
-        help="Number of decode tokens to generate (default: 10)",
+        default=100,
+        help="Number of decode tokens to generate (default: 100)",
     )
     parser.add_argument("--prompt", type=str, default="The capital of France is")
     parser.add_argument(
-        "--max-seq", type=int, default=128, help="Max KV-cache positions (default: 128)"
+        "--max-seq", type=int, default=256, help="Max KV-cache positions (default: 256)"
     )
     parser.add_argument("--cache-dir", type=str, default="decode_kernel_cache")
     parser.add_argument("--model", type=str, default="meta-llama/Llama-3.2-3B")

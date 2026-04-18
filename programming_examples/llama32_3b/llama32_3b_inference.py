@@ -105,7 +105,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Llama-3.2-3B end-to-end NPU inference (prefill + decode)"
     )
-    parser.add_argument("--n-tokens", type=int, default=10)
+    parser.add_argument("--n-tokens", type=int, default=100)
     parser.add_argument("--prompt", type=str, default="The capital of France is")
     parser.add_argument(
         "--seq-len",

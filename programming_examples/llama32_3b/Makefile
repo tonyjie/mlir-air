@@ -17,10 +17,10 @@
 srcdir := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
 
 # Configurable parameters (override via `make VAR=value`)
-N_TOKENS ?= 8
+N_TOKENS ?= 100
 PROMPT   ?= The capital of France is
 SEQ_LEN  ?= 2048
-MAX_SEQ  ?= 128
+MAX_SEQ  ?= 256
 MODEL    ?= meta-llama/Llama-3.2-3B
 
 # Phase test scripts
@@ -93,7 +93,7 @@ compile-decode:
 
 run:
 	python3 $(srcdir)/$(INFERENCE) --n-tokens $(N_TOKENS) --prompt "$(PROMPT)" \
-		--seq-len $(SEQ_LEN) --model $(MODEL) --profile
+		--seq-len $(SEQ_LEN) --model $(MODEL) --npu-attn --profile
 
 run-decode-only:
 	python3 $(srcdir)/$(PHASE5) --n-tokens $(N_TOKENS) --prompt "$(PROMPT)" \
@@ -102,7 +102,7 @@ run-decode-only:
 run-decode: run
 
 run-prefill:
-	python3 $(srcdir)/$(PHASE4) --seq-len $(SEQ_LEN) --model $(MODEL)
+	python3 $(srcdir)/$(PHASE4) --seq-len $(SEQ_LEN) --model $(MODEL) --npu-attn
 
 run-block:
 	python3 $(srcdir)/$(PHASE2) --no-preload --npu-attn --seq-len $(SEQ_LEN) --model $(MODEL)
