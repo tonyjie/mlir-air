@@ -167,3 +167,42 @@ rope_θ=500000, tied embeddings.
 
 **Deployment complete.**
 
+### Phase 4 follow-up: NPU FlashAttention UNBLOCKED via Option C (2026-04-18)
+
+After upstream sync, the seq-first FA at head_dim=128 STILL hung. Bisect (in
+`/tmp/fa_bisect.py`) localized it to a real upstream bug in
+`attn_npu2_seqfirst.py`'s `dk_chunks > 1` shim-DMA path that's never lit-tested
+upstream. Switched to **Option C**: head-first FA kernel (`attn_npu2.py`) with
+host transposes around the I/O boundary via a `_run_cached("flash_attn", ...)`
+monkey-patch in `llama32_3b_phase2_test.py`.
+
+After fixing the `compile_attn_npu2_split` flag conventions (LESSON 3 — `-Dlqp`
+must be the per-tile `LQP_TILE = LQP/NUM_Q_TILES`, and `-Ddk` is the per-tile
+`LKP` not the full `DK`), NPU FA produces correct results:
+
+| Metric | CPU-attn (original Phase 4) | **NPU FA (Option C)** | Speedup |
+|---|---|---|---|
+| Cold prefill NPU layers | 16.4 s (587 ms/layer) | **6.7 s (238 ms/layer)** | 2.5× |
+| **Warm prefill NPU layers** | 13.6 s (487 ms/layer) | **3.2 s (115 ms/layer)** | **4.2×** |
+| Wall warm | 15.7 s | **5.3 s** | 3.0× |
+| Patterns applied | 4/5 | **5/5** | — |
+
+End-to-end inference (`make run`, 8 tokens):
+- Total wall: **5.6 s** (vs 15.6 s with CPU-attn — 2.8× faster)
+- Generated text: `'The capital of France is Paris. It is the largest city in'` —
+  semantically + factually correct; first LM Head produces `' Paris'` (decisive!)
+  vs `' the'` with CPU-attn (the BF16 reorder issue from Lesson 2 didn't
+  reproduce on the NPU FA path because the noise pattern is different).
+- Per-layer rate **115 ms/layer** matches the predicted 1.46× factor vs llama3
+  (1.5× wider K + minor head_dim=128 attention overhead).
+
+**LESSON 3 captured**: `attn_npu2.cc` flag conventions are per-tile, not per-launch.
+The fixed `compile_attn_npu2_split(lqp, lkp, dk, dv, num_q_tiles=4)` now derives
+`lqp_tile = lqp // num_q_tiles` and emits `-Dlqp={lqp_tile} -Ddk={lkp}
+-Ddk_full={dk} -Ddv={lkp} -Ddv_full={dv}` — matching the Makefile's convention
+exactly. Promotion-ready for any future head_dim ≥ 128 deployment.
+
+**Original "NPU FA hang" follow-up: RESOLVED.** The seq-first kernel bug
+remains open upstream but no longer blocks llama32_3b. Phase 4 is now PASS with
+all 5 patterns applied.
+

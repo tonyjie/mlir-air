@@ -128,7 +128,7 @@ def compile_attn_npu2(head_dim=64):
     compile_attn_npu2_split(lqp=head_dim, lkp=head_dim, dk=head_dim, dv=head_dim)
 
 
-def compile_attn_npu2_split(lqp, lkp, dk, dv, output_name="attn_npu2.o"):
+def compile_attn_npu2_split(lqp, lkp, dk, dv, num_q_tiles=4, output_name="attn_npu2.o"):
     """Compile attn_npu2.o with explicit (lqp, lkp, dk, dv) tile parameters.
 
     Use this when `lkp != dk` is required for L1 budget — e.g., Llama-3.2-3B
@@ -137,30 +137,45 @@ def compile_attn_npu2_split(lqp, lkp, dk, dv, output_name="attn_npu2.o"):
     config is `lqp=256, lkp=64, dk=dv=128` which gives `dk_chunks = dk/lkp = 2`
     and ≈ 50 KB L1 (proven by `flash_attention/.../run_npu2_makefile_peano_llama3_8b.lit`).
 
+    IMPORTANT: the C++ kernel's `dk`/`dv` defines are **per-tile inner
+    dimensions** (must equal `lkp`), and `dk_full`/`dv_full` are the **full
+    head dimensions**. This matches the Makefile's flag convention exactly:
+        -Dlqp=$(LQP_TILE)  -Dlkp=$(LKP)
+        -Ddk=$(LKP)        -Ddk_full=$(DK)
+        -Ddv=$(LKP)        -Ddv_full=$(DV)
+
+    Passing `-Ddk=DK` (not `-Ddk=LKP`) when `dk_chunks > 1` produces a kernel
+    that does the wrong per-tile arithmetic and outputs all-NaN at runtime —
+    discovered the hard way during llama32_3b Phase 4 (2026-04-18).
+
     Args:
         lqp: Q chunk size per launch iteration (must be divisible by 4 for
              num_q_tiles=4; tile_size_q = lqp/4).
         lkp: K/V chunk size per iteration. dk_chunks = dk/lkp; lkp must
-             divide dk.
-        dk:  Key/Q head dimension (per-tile inner accumulation).
-        dv:  Value head dimension.
+             divide dk. The kernel's per-tile dk/dv equal lkp.
+        dk:  Full key/Q head dimension. The .o's `dk_full` macro.
+        dv:  Full value head dimension. The .o's `dv_full` macro.
         output_name: .o file to produce (default 'attn_npu2.o'). Override
              when emitting multiple FA kernel variants in the same build.
     """
     assert dk % lkp == 0, f"dk={dk} must be divisible by lkp={lkp}"
-    assert lqp % 4 == 0, f"lqp={lqp} must be divisible by num_q_tiles=4"
+    assert dv % lkp == 0, f"dv={dv} must be divisible by lkp={lkp}"
+    assert (
+        lqp % num_q_tiles == 0
+    ), f"lqp={lqp} must be divisible by num_q_tiles={num_q_tiles}"
+    lqp_tile = lqp // num_q_tiles  # per-tile Q size — what the .o expects
     src = _PROJ_ROOT / "flash_attention" / "kernel_fusion_based" / "attn_npu2.cc"
     _compile_kernel(
         src,
         output_name,
         extra_flags=[
             "-DBIT_WIDTH=8",
-            f"-Dlqp={lqp}",
+            f"-Dlqp={lqp_tile}",  # per-tile Q rows (= lqp / num_q_tiles)
             f"-Dlkp={lkp}",
-            f"-Ddk={dk}",
-            f"-Ddk_full={dk}",
-            f"-Ddv={dv}",
-            f"-Ddv_full={dv}",
+            f"-Ddk={lkp}",  # per-tile dk == lkp (NOT the full head dim)
+            f"-Ddk_full={dk}",  # full head dim
+            f"-Ddv={lkp}",  # per-tile dv == lkp
+            f"-Ddv_full={dv}",  # full head dim (== dk for square Q/V)
             "-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16",
             "-DROUND_CONV_EVEN",
         ],

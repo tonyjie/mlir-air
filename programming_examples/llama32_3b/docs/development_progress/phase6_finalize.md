@@ -14,26 +14,27 @@ rope_θ=500000
 | 1. Per-kernel shapes | ✅ PASS                   | 3 drop-in + N parametric-recompile + 1 novel item flagged (FA L1 budget at hd=128) |
 | 2. Single block      | ✅ PASS (LESSON 1)        | whole-tensor cos=0.996, per-pos min=0.980 (head_dim-scaled gate), MAE=0.005 (5× lower than smollm2) |
 | 3. Full model        | ✅ PASS (LESSON 2)        | 4/4 decisive top-1 match + 2/2 competitive top-5 overlap; per-layer cos drifts 0.997 → 0.881 across 28 layers (BF16 accumulation, no kernel bug) |
-| 4. Prefill perf      | ✅ PASS (NPU FA flagged)  | 4/5 patterns; warm 13.6 s NPU / 15.7 s wall (CPU-attn); `compile_attn_npu2_split` API added but FA runtime hangs at our shape |
+| 4. Prefill perf      | ✅ PASS (Option C unblocks NPU FA) | **5/5 patterns**; warm **3.2 s NPU / 5.3 s wall** (NPU FA via head-first + host transposes — 4.2× speedup vs CPU-attn baseline). Original seq-first FA hung; resolved via Option C + LESSON 3 (.o flag fix) |
 | 5. Decode perf       | ✅ PASS                   | **5/5 patterns**; **214.9 ms/token (4.7 tok/s)**; 3/3 NPU/CPU top-1 match |
 | 6. Finalize          | ✅ PASS                   | This document; end-to-end runner wired |
 
 ## Performance comparison
 
-### Prefill (seq_len=2048, BF16, CPU-attn path)
+### Prefill (seq_len=2048, BF16, NPU FA path — Option C unblocked 2026-04-18)
 
-| Model | Layers | Attn type | head_dim | emb_dim | NPU prefill | per-layer | wall (incl LM Head) |
+| Model | Layers | Attn type | head_dim | emb_dim | NPU prefill (warm) | per-layer | wall (incl LM Head) |
 |---|---|---|---|---|---|---|---|
-| llama3-3.2-1B   | 16 | GQA (n_kv=8) NPU FA | 64  | 2048 | 1.30 s | 81 ms  | 1.54 s (NPU LM Head) |
-| smollm2-1.7B    | 24 | MHA (n_kv=32) NPU FA| 64  | 2048 | 1.88 s | 79 ms  | 2.41 s (CPU LM Head) |
-| **llama3-3.2-3B** | 28 | GQA (n_kv=8, g=3) **CPU FA** | **128** | **3072** | **13.6 s** | **487 ms** | **15.7 s** (CPU LM Head) |
-| _scaled-llama3 with NPU FA_ | _28_ | _—_ | _—_ | _—_ | _~3.2 s_ | _~115 ms_ | _~3.4 s_ |
-| _CPU-attn dominates the actual_ | | | | | | | |
+| llama3-3.2-1B   | 16 | GQA (n_kv=8) NPU FA          | 64  | 2048 | 1.30 s | 81 ms  | 1.54 s (NPU LM Head) |
+| smollm2-1.7B    | 24 | MHA (n_kv=32) NPU FA         | 64  | 2048 | 1.88 s | 79 ms  | 2.41 s (CPU LM Head) |
+| **llama3-3.2-3B (NPU FA)** | 28 | GQA (n_kv=8, g=3) **NPU FA** (head-first + host transposes) | **128** | **3072** | **3.22 s** | **115 ms** | **5.3 s** (CPU LM Head) |
+| _llama3-3.2-3B (CPU FA, original)_ | _28_ | _CPU GQA_ | _128_ | _3072_ | _13.6 s_ | _487 ms_ | _15.7 s_ |
+| _predicted: 1.5× wider K + 2× hd_ | _—_ | _—_ | _—_ | _—_ | — | _~115 ms_ | _—_ |
 
-The **6× per-layer slowdown vs llama3** is dominated by **CPU attention**
-(numpy GQA at seq=2048, head_dim=128, 24 heads ≈ 300 ms/layer). The Phase 4
-NPU FA hang is the highest-impact follow-up — projected ~2× prefill speedup
-when resolved (estimate: ~7 s warm prefill).
+**Per-layer rate hits the predicted 1.46× scaling** vs llama3 (1.5× wider K).
+**4.2× speedup on warm NPU prefill** vs CPU-attn baseline. The remaining
+~14% wall-clock overhead vs scaled-llama3 (5.3 s vs ~3.4 s NPU-LM-Head
+projection) is the CPU LM Head — moving it to NPU would further shave ~2 s
+(see Phase 5 / future work).
 
 ### Decode (per-token, BF16)
 
@@ -49,33 +50,31 @@ llama3/smollm2, matching the 1.5× wider K dimension (3072 vs 2048). Decode
 kernels at K=3072 squeeze the same per-byte efficiency as the reference
 deployments — no thermal/L1/BD bottleneck.
 
-### End-to-end NPU run
+### End-to-end NPU run (NPU FA path — Option C)
 
 ```
 $ make run N_TOKENS=8
-[1/3] NPU prefill (28 layers): 14.10 s (504 ms/layer)
-      First LM Head GEMV: 29 ms -> ' the'
-[2/3] NPU decode loop (8 tokens):
-      Tok 1: ' most'      215 ms
-      Tok 2: ' visited'   214 ms
-      Tok 3: ' city'      214 ms
-      Tok 4: ' in'        215 ms
-      Tok 5: ' the'       215 ms
-      Tok 6: ' world'     217 ms
-      Tok 7: '.'          214 ms
+[1/3] NPU prefill (28 layers): 4.09 s (146 ms/layer)
+      First LM Head GEMV: 22 ms -> ' Paris'   ← decisive top-1 with NPU FA
+[2/3] NPU decode loop (7 tokens):
+      Tok 1: '.'         215 ms
+      Tok 2: ' It'       214 ms
+      Tok 3: ' is'       215 ms
+      Tok 4: ' the'      219 ms
+      Tok 5: ' largest'  217 ms
+      Tok 6: ' city'     214 ms
+      Tok 7: ' in'       214 ms
 Generated text:
-  '<|begin_of_text|>The capital of France is the most visited city in the world.'
+  '<|begin_of_text|>The capital of France is Paris. It is the largest city in'
 ```
 
-Total inference wall: **15.6 s** for 8 generated tokens (28-layer prefill
-dominates; decode is ~1.5 s for 7 tokens).
+Total inference wall: **5.6 s** for 8 generated tokens (28-layer prefill
+4.1 s + first LM Head 22 ms + 7-token decode 1.5 s). **2.8× faster** than
+the CPU-attn baseline (15.6 s).
 
-The first NPU LM Head produces `' the'` (rather than `' Paris'`) because of
-the same Phase 3 competitive-prompt behavior — accumulated BF16 noise across
-28 layers reorders the top-2 close-prob tokens (CPU top-1 ' Paris' p=0.246 vs
-' the' p=0.136). The decoded continuation `'the most visited city in the
-world'` is semantically valid and factually correct (Paris is indeed the
-most visited city in the world).
+NPU FA produces the **canonical** `' Paris'` first token (CPU top-1 prob 0.246).
+The Phase 3 competitive-prompt BF16 reorder (LESSON 2) didn't reproduce on
+the NPU FA path — the noise pattern is different (and slightly tighter).
 
 ## Memory footprint
 
@@ -131,7 +130,8 @@ the smollm2 finalize precedent — we'll re-evaluate after the next deployment.
 
 | Item | Type | Priority | Status / Estimated effort |
 |---|---|---|---|
-| **NPU FlashAttention runtime hang at head_dim=128 + lq=lk=2048** | Perf | **HIGH** | OPEN — projected ~2× prefill speedup when fixed (13.6 s → ~7 s). Triage hypotheses in TODO.md: GQA group_size=3 (untested), lq scaling 4× lit test, dk_chunks=2 path. ~hours-to-days of bisect + debug. |
+| ~~NPU FlashAttention runtime hang at head_dim=128~~ | ~~Perf~~ | ~~HIGH~~ | **DONE 2026-04-18** via Option C (head-first FA + host transposes) + LESSON 3 (compile flag fix). Warm prefill 13.6 s → 3.2 s (4.2×). |
+| **Upstream**: seq-first FA `dk_chunks > 1` is broken (real bug; never lit-tested upstream) | Perf (upstream) | Medium | OPEN — file an upstream issue. Would let us drop the host-transpose wrapper and gain a few more ms/layer. |
 | F32-output Down GEMM (would tighten per-layer cos to 0.999+) | Acc | Low | OPEN — would move competitive prompts to top-1 match. Refactor of `o_ffn_multi.py` (shared with llama3 — must revalidate). ~2-4 hours. |
 | Skill update: per-position cosine threshold scaling | Skill | Medium | OPEN — 30 min, change one gate condition |
 | Skill update: decisive-vs-competitive Phase 3 gate | Skill | Medium | OPEN — 1 hour, add gate logic + recommend ≥3 decisive prompts |

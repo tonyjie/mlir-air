@@ -110,3 +110,50 @@ weight loading error — those would manifest as a single-layer cosine cliff, Na
 or a top-5 set that DOES NOT overlap (e.g., NPU producing nonsense tokens). For
 those, the Phase 2 per-kernel verify and the layer-bisection diagnostic remain
 the right tools.
+
+## Lesson 3 — `attn_npu2.cc` flag conventions: per-tile sizes, not per-launch
+
+**What happened**: After narrowing the seq-first FA hang to its untested
+`dk_chunks > 1` path, switched to head-first FA via `attn_npu2.py` with host
+transposes (Option C). FA compiled cleanly but produced **all-NaN output** at
+runtime. Bisect: even fresh-compile via XRTRunner with the exact same setup as
+the passing standalone test (uniform(0,4) inputs, same Python build args)
+produced NaN.
+
+**Root cause**: `compile_attn_npu2_split(lqp, lkp, dk, dv)` was passing wrong
+`-D` flags to the `attn_npu2.cc` build. The kernel's `lqp/lkp/dk/dv` defines
+are **per-tile sizes** (the per-core matmul dimensions), NOT per-launch sizes.
+Specifically:
+- `-Dlqp = LQP / NUM_Q_TILES` (the per-tile Q rows = `tile_size_q`), NOT the per-launch `LQP`
+- `-Ddk = LKP` (the per-tile inner dim = `lkp` when `dk_chunks > 1`), NOT the full `DK`
+- `-Ddv = LKP` similarly
+- `-Ddk_full = DK` (the full head dim — used only for the softmax `1/sqrt(dk)` constant)
+- `-Ddv_full = DV` similarly
+
+The Makefile (`flash_attention/kernel_fusion_based/Makefile`) does this
+correctly via `LQP_TILE := $(LQP) / $(NUM_Q_TILES)` and `-Dlqp=$(LQP_TILE)
+-Ddk=$(LKP) -Ddk_full=$(DK)`. My initial `compile_attn_npu2_split` mirrored
+the Python builder's API (`lqp=256, dk=128`) and passed those values directly,
+which produced a kernel doing 256-row matmuls with 128-element inner accumulators
+instead of 64-row × 64-inner. Output was junk → NaN.
+
+**Fix**: `compile_attn_npu2_split(lqp, lkp, dk, dv, num_q_tiles=4)` now derives
+`lqp_tile = lqp // num_q_tiles` and emits `-Dlqp={lqp_tile} -Ddk={lkp}
+-Ddk_full={dk} -Ddv={lkp} -Ddv_full={dv}`. After this fix, NPU FA at our config
+produces correct results: Phase 2 cos=0.9995 / per-pos min=0.9899 / no NaN
+(matches CPU-attn baseline exactly).
+
+**Impact**: Phase 4 prefill at warm steady state went from **13.6 s NPU layers
+(CPU-attn) → 3.2 s NPU layers (NPU FA) — 4.2× speedup**. End-to-end inference
+wall went from 15.6 s → 5.6 s for 8 tokens. Top-1 on 'The capital of France is'
+flipped from `' the'` (competitive top-2 reorder) to `' Paris'` (decisive).
+
+**How to apply**: When adding a new `compile_attn_npu2_split` call site for a
+new model (or when porting the API), DO NOT pass per-launch `lqp` to the .o.
+The fixed API takes per-launch `lqp` and `num_q_tiles` (default 4) and computes
+the per-tile size internally — match what the Makefile does. If you ever need
+to compile a variant with a non-default `num_q_tiles`, pass it explicitly.
+
+**Skill update**: capture this in `.claude/skills/optimize-prefill-perf/SKILL.md`
+as a recipe for "FA kernel produces NaN at head_dim ≥ 128" → check the .o
+flags against the Makefile's `LQP_TILE` and `LKP/DK_full` conventions.

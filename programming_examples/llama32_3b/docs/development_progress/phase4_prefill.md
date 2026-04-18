@@ -1,8 +1,22 @@
 # Phase 4 — Prefill Performance
 
-**Date**: 2026-04-18
+**Date (initial)**: 2026-04-18 (CPU-attn path — NPU FA hung)
+**Date (NPU-FA UNBLOCKED)**: 2026-04-18 (head-first FA + host-transpose wrapper)
 **Test**: `llama32_3b_phase4_test.py`
-**Setup**: 28-layer NPU prefill, **CPU attention fallback** (NPU FA hangs at our shape — see Pattern 5 finding), CPU LM Head
+**Setup**: 28-layer NPU prefill, **NPU FlashAttention via head-first kernel + host-transpose wrapper** (Option C; LESSON 3), CPU LM Head
+
+## Headline numbers (NPU FA path, after Option C unblock)
+
+| Metric | CPU-attn baseline | **NPU FA (Option C)** | Speedup |
+|---|---|---|---|
+| Cold prefill (NPU layers)   | 16.4 s (587 ms/layer) | **6.7 s (238 ms/layer)** | 2.5× |
+| **Warm prefill (NPU layers)** | 13.6 s (487 ms/layer) | **3.2 s (115 ms/layer)** | **4.2×** |
+| Wall (warm, incl CPU LM Head) | 15.7 s | **5.3 s** | 3.0× |
+| Pattern 2 BO-preload gain | 17% | 48% | (FA much faster → BO write is bigger %) |
+| Top-1 token (prompt 'The capital of France is') | `' the'` (competitive) | **`' Paris'`** (decisive!) | — |
+| Patterns applied | 4/5 | **5/5** | — |
+
+Per-layer rate **115 ms/layer** vs llama3-1B's 79 ms = **1.46× slower** — exactly the predicted scaling factor (1.5× wider K=3072 vs 2048; head_dim=128 vs 64 affects only attention). Decode kernels and now FA both squeeze the same per-byte efficiency as the reference deployments.
 
 ## Pattern application
 
@@ -12,9 +26,9 @@
 | 2 | Per-layer BO pre-loading      | **APPLIED HERE**    | `preload_prefill_weights(weights, config, cache, seq_len, rope_lut)` — same config-driven helper smollm2 used; drop-in for Llama-3.2-3B |
 | 3 | Intermediate buffer reuse     | **INHERITED**       | `intermediate_indices` set per kernel in `run_transformer_block` |
 | 4 | Seq-first activation layout   | **INHERITED**       | RoPE + FA accept `(seq, heads*dim)` natively |
-| 5 | CPU → NPU op promotion        | **ATTEMPTED-FAILED**| NPU FA at head_dim=128 hangs with `ERT_CMD_STATE_TIMEOUT`; LM Head deferred to Phase 5 (per llama3 pattern) |
+| 5 | CPU → NPU op promotion        | **APPLIED (Option C)** | NPU FA via **head-first kernel + host transposes** (LESSON 3); LM Head deferred to Phase 5. The original seq-first FA hangs in dk_chunks > 1 path (real upstream bug). Head-first kernel handles dk_chunks=2 fine. Cost of host transposes ~few ms/layer; gain: 4.2× warm prefill speedup. |
 
-**4 of 5 patterns applied or inherited** (gate: ≥3). ✓
+**5 of 5 patterns applied or inherited** (gate: ≥3). ✓
 
 ## Measurements
 
@@ -66,19 +80,56 @@ because no shared buffers when lkp != dk) match the build.
 - Hang on the first invocation (run.wait2() never returns within XRT default timeout)
 - Earlier kernels in the layer (rms_gemms_rope) succeed; only flash_attn hangs
 
-**Hypotheses for the hang** (not investigated to root cause):
-1. **GQA group_size=3** specifically: smollm2 = MHA (group=1), llama3 = group=4,
-   the proven-working llama3-8b lit test = group=4. group=3 (24/8) is
-   untested in the seq-first FA kernel; the affine.apply for `kv_head_index =
-   q_head_index // gqa_group_size` may have a corner case.
-2. **Buffer descriptor / channel exhaustion at lq=lk=2048**: the proven-working
-   llama3-8b lit test uses lq=lk=512. Our lq=lk=2048 is 4× larger → 4× more
-   chunks per cascade stage and 4× more iteration counts.
-3. **L1 budget actually exceeds 64 KB at runtime**: my back-of-envelope gave
-   ~50 KB but I didn't account for ping-pong / channel buffer overhead. With
-   `omit_pingpong="all"` this should be off but worth verifying.
-4. **dk_chunks=2 path may have an integration issue** in seq-first that
-   doesn't surface at dk_chunks=1 (the only config the lit tests exercise).
+**Hypotheses for the hang** (now narrowed via 2026-04-18 bisect):
+1. ~~GQA group_size=3 specifically~~ — RULED OUT (see bisect below)
+2. ~~Buffer descriptor / channel exhaustion at lq=lk=2048~~ — RULED OUT
+3. ~~L1 budget actually exceeds 64 KB at runtime~~ — RULED OUT
+4. **dk_chunks=2 path in `attn_npu2_seqfirst.py` is the offender** — CONFIRMED
+
+**Bisect (2026-04-18, after upstream sync to mlir-air HEAD)**: ran a standalone
+seq-first FA test (`/tmp/fa_bisect.py`) varying one axis at a time toward our
+llama32_3b config:
+
+| Config | (n_heads / n_kv) | (lq=lk) | dk=dv | dk_chunks | result |
+|---|---|---|---|---|---|
+| baseline_hd64    | 32 / 8 (group=4) | 512 | 64  | 1 | runs, wrong outputs (test-harness mismatch) |
+| baseline_hd128   | 32 / 8 (group=4) | 512 | 128 | **2** | **HANG** |
+| vary_heads_24_8  | 24 / 8 (group=3) | 512 | 128 | **2** | **HANG** |
+| vary_seq_2048    | 32 / 8 (group=4) | 2048 | 128 | **2** | **HANG** |
+| llama32_3b_actual| 24 / 8 (group=3) | 2048 | 128 | **2** | **HANG** |
+
+Every config with `dk_chunks=2` hangs in the seq-first variant, regardless of
+GQA group_size or seq length. The hang is **not** GQA-specific, **not** scale-
+related, and **not** llama32_3b-specific — it is intrinsic to the
+`attn_npu2_seqfirst.py` `dk_chunks > 1` code path.
+
+**Cross-check via the head-first lit test**: same shape that fails seq-first
+(DK=128 NUM_HEADS=32 NUM_KV_HEADS=8 LK=LQ=512 LQP=256 LKP=64) **PASSES** in
+the head-first kernel (`attn_npu2.py`):
+
+```
+$ make run DK=128 DV=128 NUM_HEADS=32 NUM_KV_HEADS=8
+... Output 0 correlation: 0.995943 (threshold: 0.99)
+PASS!
+```
+
+So the head_dim=128 + dk_chunks=2 logic works fine in the **head-first** FA
+kernel. Phase 1's "head_dim=128 works in FA" claim was based on the
+`run_npu2_makefile_peano_llama3_8b.lit` test, which exercises the head-first
+variant — not the seq-first variant llama3_prefill (and llama32_3b) uses.
+**There is NO lit test for `attn_npu2_seqfirst.py` at any head_dim**, and
+`dk_chunks > 1` paths in seq-first FA were never validated upstream.
+
+**Triage update**: this is a real kernel bug in `attn_npu2_seqfirst.py`'s
+`dk_chunks > 1` paths (lines around 97, 446, 460, 508, 528–531, 638–725 per
+2026-04-18 source). Fix would either:
+- (a) Port the dk_chunks logic from `attn_npu2.py` (head-first, proven) into
+  `attn_npu2_seqfirst.py`. Substantial — different DMA/channel layout.
+- (b) Add a `dk_chunks=1, lkp=dk=128` shared-buffer path that fits L1 at
+  smaller `tile_size_q` (e.g., `lqp=64, num_q_tiles=4 → tile_size_q=16`).
+  Per Phase 1 math this is also tight (~70 KB) but worth re-verifying with
+  packed buffers.
+- (c) Wait for upstream to lit-test seq-first at hd=128.
 
 **Triage**: deferring to a follow-up. Options for resolution:
 - (a) Bisect by changing one variable at a time: try lq=lk=512 (lit test config), then 1024, then 2048.

@@ -84,27 +84,34 @@ _HEAD_DIM_128_FA_CONFIG = {"lqp": 256, "lkp": 64, "dk": 128, "dv": 128}
 
 
 def _patch_attn_backend_kwargs_for_head_dim_128():
-    """Monkey-patch llama3_prefill._attn_backend_kwargs so the runtime kwargs
-    match our L1-feasible FA build (lkp=64 != head_dim=128 → no shared buffers
-    → omit_while_true_loop=True).
+    """Monkey-patch llama3_prefill._attn_backend_kwargs to return the head-first
+    FA backend kwargs at head_dim=128.
 
-    Llama3 (head_dim=64) uses lkp=64=head_dim, so its default returns
-    enable_shared_buffers=True, omit_while_true_loop=False — correct for it.
-    For Llama-3.2-3B at head_dim=128, that default is wrong; we need
-    omit_while_true_loop=True. Patch is idempotent and only affects this
-    Python process (does not modify llama3_prefill.py on disk).
+    Background: at head_dim=128 the seq-first FA kernel (`attn_npu2_seqfirst.py`)
+    hangs at runtime in the dk_chunks > 1 path — the path was never lit-tested
+    upstream and contains a real shim-DMA bug (see phase4_prefill.md bisect).
+    The head-first kernel (`attn_npu2.py`) at the SAME shape (DK=128,
+    NUM_HEADS=32, NUM_KV_HEADS=8, LQ=LK=512, LQP=256, LKP=64) PASSES with
+    corr=0.996 (verified via lit test). Workaround Option C: use head-first
+    FA + host transposes at I/O boundary (small per-call cost, unblocks
+    NPU FA today).
+
+    For head_dim=128 we therefore return the head-first FA backend kwargs:
+    `omit_while_true_loop=False` (the head-first kernel keeps its NPU-internal
+    loop), `runtime_loop_tiling_sizes=[1, 1, 1]` because dv_chunks=2 produces
+    a 3D output. For head_dim != 128, fall through to llama3's original kwargs.
     """
     _orig = _lp._attn_backend_kwargs
 
     def _patched(head_dim):
         if head_dim == 128:
-            # Match the .o + Python build args from compile_block_kernels below
             return {
-                "omit_while_true_loop": True,
+                "omit_while_true_loop": False,
                 "omit_pingpong": "all",
-                "runtime_loop_tiling_sizes": [1, 1],
+                "runtime_loop_tiling_sizes": [1, 1, 1],
                 "output_format": "elf",
                 "instance_name": "attention_bf16",
+                "target_device": "npu2",
             }
         return _orig(head_dim)
 
@@ -112,6 +119,160 @@ def _patch_attn_backend_kwargs_for_head_dim_128():
 
 
 _patch_attn_backend_kwargs_for_head_dim_128()
+
+
+# Runtime intercept on llama3_prefill._run_cached: when "flash_attn" is invoked
+# at head_dim=128, swap the seq-first arrays into head-first layout, run the
+# head-first ELF, swap the head-first output back to seq-first.
+#
+# Layout reminder (head-first kernel I/O):
+#   Q: [num_heads, lq, dk]                                  bf16
+#   K: [num_kv_heads, lk, dk]                               bf16
+#   V: [num_kv_heads * dv_chunks, lk, dv_tile=lkp]          bf16  (V re-tiled along dv)
+#   Output: [num_heads * dv_chunks, lq, dv_tile=lkp]        bf16  (Output re-tiled along dv)
+#
+# Caller (llama3_prefill.run_transformer_block) does
+#   results = _run_cached(cache, "flash_attn", attn_bk, q_attn, k_attn, v_attn, attn_output)
+#   attn_out = results[-1].reshape(seq_len, n_heads * head_dim)
+# so we need to return a list whose results[-1] is the seq-first (lq, n_heads*dv) bf16 array.
+
+_HEADFIRST_FA_PARAMS = {}  # populated by compile_block_kernels for head_dim=128
+
+
+def _patch_run_cached_for_headfirst_fa():
+    """Intercept _run_cached("flash_attn", ...) at head_dim=128: do host
+    transposes around the head-first ELF call.
+
+    Skips interception when head_dim != 128 OR when no head-first FA params
+    have been registered yet (i.e., we're on the cpu_attn path)."""
+    _orig = _lp._run_cached
+
+    def _patched(cache, name, backend_kwargs, *inputs, **kwargs):
+        if name != "flash_attn" or not _HEADFIRST_FA_PARAMS:
+            return _orig(cache, name, backend_kwargs, *inputs, **kwargs)
+
+        n_heads = _HEADFIRST_FA_PARAMS["n_heads"]
+        n_kv_heads = _HEADFIRST_FA_PARAMS["n_kv_heads"]
+        dk = _HEADFIRST_FA_PARAMS["dk"]
+        dv = _HEADFIRST_FA_PARAMS["dv"]
+        lkp = _HEADFIRST_FA_PARAMS["lkp"]
+        dv_chunks = dv // lkp
+
+        # llama3_prefill always passes (q_seq, k_seq, v_seq, attn_output_seq)
+        q_seq, k_seq, v_seq, _attn_out_seq = inputs
+        lq = q_seq.shape[0]
+        lk = k_seq.shape[0]
+
+        # Seq-first → head-first transposes (host-side; ~few ms each at this size)
+        q_hf = np.ascontiguousarray(q_seq.reshape(lq, n_heads, dk).transpose(1, 0, 2))
+        k_hf = np.ascontiguousarray(
+            k_seq.reshape(lk, n_kv_heads, dk).transpose(1, 0, 2)
+        )
+        # V is re-tiled along dv: split dv into dv_chunks of lkp, then the head-
+        # first kernel expects [n_kv_heads * dv_chunks, lk, lkp] (chunk-then-head
+        # order — see attn_npu2.py:1280 reference impl).
+        v_hf = np.ascontiguousarray(
+            v_seq.reshape(lk, n_kv_heads, dv_chunks, lkp)
+            .transpose(1, 2, 0, 3)
+            .reshape(n_kv_heads * dv_chunks, lk, lkp)
+        )
+        out_hf = np.zeros((n_heads * dv_chunks, lq, lkp), dtype=bfloat16)
+
+        # Call the head-first ELF with the head-first arrays. We don't pass
+        # static_input_indices/intermediate_indices — the caller's hints were
+        # for the seq-first call; the head-first call has different arg semantics.
+        import os as _os
+
+        _dbg = _os.environ.get("HEADFIRST_FA_DEBUG", "")
+        if _dbg:
+            _q = q_hf.astype(np.float32)
+            _k = k_hf.astype(np.float32)
+            _v = v_hf.astype(np.float32)
+            print(
+                f"  [HF-FA pre]  q.shape={q_hf.shape} dtype={q_hf.dtype} "
+                f"min={_q.min():.4f} max={_q.max():.4f} mean={_q.mean():.4f} "
+                f"any_nan={np.any(np.isnan(_q))}",
+                flush=True,
+            )
+            print(
+                f"  [HF-FA pre]  k.shape={k_hf.shape} min={_k.min():.4f} "
+                f"max={_k.max():.4f} any_nan={np.any(np.isnan(_k))}",
+                flush=True,
+            )
+            print(
+                f"  [HF-FA pre]  v.shape={v_hf.shape} min={_v.min():.4f} "
+                f"max={_v.max():.4f} any_nan={np.any(np.isnan(_v))}",
+                flush=True,
+            )
+            print(
+                f"  [HF-FA pre]  out.shape={out_hf.shape} all_zero="
+                f"{not np.any(out_hf.astype(np.float32))}",
+                flush=True,
+            )
+        # MAGNITUDE BISECT: scale Q, K by 0.1 to test the input-magnitude hypothesis.
+        # Mathematically attention output is invariant to the joint scale of Q, K
+        # (since softmax is shift-invariant after the 1/sqrt(dk) scaling), so if
+        # the kernel produces sensible output here that's strong evidence the
+        # NaN was from magnitude.
+        if _os.environ.get("HEADFIRST_FA_SCALE_QK"):
+            scale = float(_os.environ["HEADFIRST_FA_SCALE_QK"])
+            q_hf = (q_hf.astype(np.float32) * scale).astype(bfloat16)
+            k_hf = (k_hf.astype(np.float32) * scale).astype(bfloat16)
+            if _dbg:
+                print(
+                    f"  [HF-FA dbg] scaled Q,K by {scale} (test hypothesis)", flush=True
+                )
+        if _os.environ.get("HEADFIRST_FA_SUBSTITUTE_INPUTS"):
+            rng = np.random.default_rng(42)
+            q_hf = rng.uniform(0, 4.0, q_hf.shape).astype(bfloat16)
+            k_hf = rng.uniform(0, 4.0, k_hf.shape).astype(bfloat16)
+            v_hf = rng.uniform(0, 4.0, v_hf.shape).astype(bfloat16)
+            if _dbg:
+                print(
+                    "  [HF-FA dbg] substituted Q,K,V with uniform(0,4) (matches standalone)",
+                    flush=True,
+                )
+
+        results_hf = cache.load_and_run(
+            "flash_attn", backend_kwargs, q_hf, k_hf, v_hf, out_hf
+        )
+        if _dbg:
+            _r = results_hf[-1].astype(np.float32)
+            print(
+                f"  [HF-FA post] results[-1].shape={results_hf[-1].shape} "
+                f"min={_r.min():.4f} max={_r.max():.4f} mean={_r.mean():.4f} "
+                f"any_nan={np.any(np.isnan(_r))} all_zero="
+                f"{not np.any(_r)}",
+                flush=True,
+            )
+            for i, r in enumerate(results_hf):
+                if r is None:
+                    print(f"  [HF-FA post] results[{i}] = None", flush=True)
+                else:
+                    rf = r.astype(np.float32) if hasattr(r, "astype") else r
+                    has_nan = (
+                        bool(np.any(np.isnan(rf))) if hasattr(rf, "shape") else "N/A"
+                    )
+                    print(
+                        f"  [HF-FA post] results[{i}].shape={getattr(r,'shape',type(r).__name__)} "
+                        f"any_nan={has_nan}",
+                        flush=True,
+                    )
+
+        # Head-first output → seq-first
+        out_packed = results_hf[-1].reshape(n_heads, dv_chunks, lq, lkp)
+        out_seq = np.ascontiguousarray(
+            out_packed.transpose(2, 0, 1, 3).reshape(lq, n_heads * dv)
+        )
+
+        # Caller does `results[-1].reshape(seq_len, n_heads * head_dim)`.
+        # Returning a list with our seq-first output as the last element.
+        return [None] * (len(inputs) - 1) + [out_seq]
+
+    _lp._run_cached = _patched
+
+
+_patch_run_cached_for_headfirst_fa()
 
 
 def compile_block_kernels(cache, config, seq_len, cpu_attn=True):
@@ -172,17 +333,30 @@ def compile_block_kernels(cache, config, seq_len, cpu_attn=True):
     else:
         print("  o_ffn already cached, skipping compile")
 
+    # ALWAYS register head-first FA params at head_dim=128 if NPU FA is used
+    # (even on cache hit) — the _run_cached interceptor needs them to know how
+    # to transpose the seq-first arrays. Was previously inside the cache-miss
+    # branch, which caused NaN on cache hits.
+    if not cpu_attn and head_dim == 128:
+        cfg = _HEAD_DIM_128_FA_CONFIG
+        _HEADFIRST_FA_PARAMS.update(
+            n_heads=n_heads,
+            n_kv_heads=n_kv_heads,
+            dk=cfg["dk"],
+            dv=cfg["dv"],
+            lkp=cfg["lkp"],
+        )
+
     if not cpu_attn and "flash_attn" not in cache.artifacts:
-        # Phase 1 finding: at head_dim=128, default lkp=lqp=head_dim overflows
-        # 64 KB L1 per core. Use the L1-feasible config (proven by
-        # run_npu2_makefile_peano_llama3_8b.lit): lkp=64, lqp=256, dk=dv=128
-        # with dk_chunks = head_dim/lkp = 2. Requires both:
-        #   1. attn_npu2.o compiled with matching -Dlqp -Dlkp -Ddk -Ddv
-        #   2. Python build_attn called with the same lkp/lqp/dk/dv
-        #   3. _attn_backend_kwargs override (omit_while_true_loop=True since
-        #      no shared buffers when lkp != dk) — patched at module import.
-        from flash_attention.kernel_fusion_based.attn_npu2_seqfirst import (
-            build_module as build_attn,
+        # Option C (LESSON 3): use the HEAD-FIRST FA kernel (`attn_npu2.py`),
+        # not the seq-first variant. The seq-first kernel hangs in its
+        # dk_chunks > 1 path at head_dim=128 (real upstream bug — see
+        # phase4_prefill.md bisect). Head-first works fine at the same shape;
+        # we wrap it with host transposes via the _run_cached interceptor
+        # patched above. Cost: a few host transposes per FA call (small);
+        # gain: NPU FA actually runs.
+        from flash_attention.kernel_fusion_based.attn_npu2 import (
+            build_module as build_attn_hf,
         )
 
         cfg = (
@@ -190,9 +364,7 @@ def compile_block_kernels(cache, config, seq_len, cpu_attn=True):
             if head_dim == 128
             else {"lqp": 256, "lkp": head_dim, "dk": head_dim, "dv": head_dim}
         )
-        # Recompile attn_npu2.o to match (the default head_dim=128 build from
-        # compile_all_external_kernels uses the wrong lqp/lkp for L1; force
-        # rebuild here with the right defines).
+        # Recompile attn_npu2.o with the right -Dlqp -Dlkp -Ddk -Ddv defines.
         if head_dim == 128:
             from pathlib import Path as _P
 
@@ -200,10 +372,11 @@ def compile_block_kernels(cache, config, seq_len, cpu_attn=True):
             _P("attn.o").unlink(missing_ok=True)
             compile_attn_npu2_split(**cfg)
 
-        enable_shared_buffers = cfg["lkp"] == cfg["dk"]
+        dv_chunks = cfg["dv"] // cfg["lkp"]
+        runtime_tiling = [1, 1, 1] if dv_chunks > 1 else [1, 1]
         cache.compile_and_cache(
             "flash_attn",
-            build_attn(
+            build_attn_hf(
                 lk=seq_len,
                 lkp=cfg["lkp"],
                 lq=seq_len,
@@ -218,11 +391,12 @@ def compile_block_kernels(cache, config, seq_len, cpu_attn=True):
             ),
             {
                 "verbose": cache.verbose,
-                "omit_while_true_loop": not enable_shared_buffers,
+                "omit_while_true_loop": False,
                 "omit_pingpong": "all",
-                "runtime_loop_tiling_sizes": [1, 1],
+                "runtime_loop_tiling_sizes": runtime_tiling,
                 "output_format": "elf",
                 "instance_name": "attention_bf16",
+                "target_device": "npu2",
             },
         )
 

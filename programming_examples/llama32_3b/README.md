@@ -6,18 +6,18 @@ End-to-end inference of `meta-llama/Llama-3.2-3B` (BF16) on AMD NPU2
 
 ## Status
 
-**Functional and correct.** Decode perf hits the predicted K-scaled parity
-with llama3/smollm2. Prefill currently uses CPU attention (NPU FlashAttention
-at head_dim=128 + lq=lk=2048 hangs at runtime — real follow-up flagged in
-[TODO.md](TODO.md)).
+**Functional, correct, and fast.** Both prefill and decode hit the predicted
+K-scaled parity with llama3/smollm2. NPU FlashAttention works via the
+head-first kernel + host-transpose wrapper (Option C — see LESSONS Lesson 3).
 
 | Stage | Result |
 |---|---|
-| Decode rate (steady-state) | **214.9 ms/token (4.7 tok/s)** — exactly the K-scaled prediction (1.5× wider K vs llama3/smollm2) |
-| Prefill (28 layers, CPU-attn) | 13.6 s warm NPU / 15.7 s wall (seq_len=2048) |
+| Prefill (28 layers, NPU FA) | **3.2 s warm NPU / 5.3 s wall** (115 ms/layer — 1.46× = K-scaled prediction vs llama3) |
+| Decode rate (steady-state)   | **214.9 ms/token (4.7 tok/s)** — exactly the K-scaled prediction |
 | Top-1 NPU/CPU match (decode) | 3/3 |
-| Top-1 NPU/CPU match (full prefill) | 4/4 decisive prompts + 2/2 competitive top-5 overlap |
-| End-to-end NPU output | `'The capital of France is the most visited city in the world.'` |
+| Top-1 NPU/CPU match (prefill)| 4/4 decisive prompts + 2/2 competitive top-5 overlap |
+| End-to-end NPU output (NPU FA) | `'The capital of France is Paris. It is the largest city in'` |
+| End-to-end inference wall (8 tokens) | **5.6 s** (vs 15.6 s with CPU-attn — 2.8× faster) |
 
 ## Quick start
 
@@ -66,16 +66,19 @@ Override defaults: `make run N_TOKENS=20 PROMPT='The largest ocean is the' SEQ_L
 
 ## Performance
 
-### Prefill (seq_len=2048, CPU-attn fallback)
+### Prefill (seq_len=2048, NPU FA via Option C)
 
 | Phase | NPU layers | per-layer | Wall (incl LM Head) |
 |---|---|---|---|
-| Cold (no preload, 1st prompt) | 16.4 s | 587 ms | 18.5 s |
-| Warm (after `preload_prefill_weights`) | 13.6 s | 487 ms | 15.7 s |
+| Cold (no preload, 1st prompt)              | 6.7 s | 238 ms | 8.7 s |
+| **Warm** (after `preload_prefill_weights`) | **3.2 s** | **115 ms** | **5.3 s** |
 
-Pattern 2 (BO pre-load) gain: 17%. Modest because per-layer time is
-dominated by CPU attention (~300 ms numpy GQA at seq=2048, hd=128, 24
-heads). With NPU FA unblocked, projected ~7 s prefill.
+Pattern 2 (BO pre-load) gain: **48%** (compounds well with NPU FA since
+FA itself is fast — BO writes become a bigger fraction). All 5 Phase 4
+optimization patterns applied.
+
+**vs CPU-attn baseline** (the original Phase 4 measurement before NPU FA was
+unblocked): warm NPU prefill went 13.6 s → 3.2 s = **4.2× speedup**.
 
 ### Decode (per-token, NPU LM Head GEMV, CPU per-token attention with KV cache)
 
@@ -148,12 +151,9 @@ the import map and full divergence list.
 
 See [TODO.md](TODO.md) for the live list. Highlights:
 
-1. **NPU FlashAttention** at head_dim=128 + lq=lk=2048 hangs (`ERT_CMD_STATE_TIMEOUT`).
-   `compile_attn_npu2_split(lqp, lkp, dk, dv)` API was added to
-   `_llm_shared/kernel_builder/external_kernels.py` and the kernel compiles
-   cleanly with the L1-feasible config (lkp=64, lqp=256, dk=dv=128); runtime
-   hang is the open investigation. Highest-impact perf win when resolved
-   (~2× prefill speedup projected).
+1. **Upstream `attn_npu2_seqfirst.py` `dk_chunks > 1` bug** — Llama-3.2-3B
+   works around this via Option C (head-first FA + host transposes). A direct
+   fix in seq-first would let us drop the wrapper and gain a few more ms/layer.
 
 2. **F32-output Down GEMM** would push per-layer cosine to 0.999+ uniformly
    and likely move competitive prompts (e.g. `'The capital of France is'`)
