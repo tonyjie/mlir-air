@@ -117,25 +117,55 @@ def compile_rope():
 
 
 def compile_attn_npu2(head_dim=64):
-    """Compile attn_npu2.o (FlashAttention kernel) from source."""
+    """Compile attn_npu2.o (FlashAttention kernel) — back-compat wrapper.
+
+    Defaults `lqp=lkp=dk=dv=head_dim`. This is the right setup for
+    head_dim ≤ 64 (Q+K share via shared-buffers fits 64 KB L1). For
+    head_dim ≥ 128 the per-tile L1 footprint exceeds 64 KB; use
+    `compile_attn_npu2_split` instead with `lkp != dk` (e.g.,
+    lkp=64, dk=128 yields dk_chunks=2 and a feasible L1 budget).
+    """
+    compile_attn_npu2_split(lqp=head_dim, lkp=head_dim, dk=head_dim, dv=head_dim)
+
+
+def compile_attn_npu2_split(lqp, lkp, dk, dv, output_name="attn_npu2.o"):
+    """Compile attn_npu2.o with explicit (lqp, lkp, dk, dv) tile parameters.
+
+    Use this when `lkp != dk` is required for L1 budget — e.g., Llama-3.2-3B
+    and Llama-3-8B at head_dim=128 cannot use the default `lkp=dk=128`
+    (per-core L1 ≈ 74 KB > 64 KB even with shared buffers). The L1-feasible
+    config is `lqp=256, lkp=64, dk=dv=128` which gives `dk_chunks = dk/lkp = 2`
+    and ≈ 50 KB L1 (proven by `flash_attention/.../run_npu2_makefile_peano_llama3_8b.lit`).
+
+    Args:
+        lqp: Q chunk size per launch iteration (must be divisible by 4 for
+             num_q_tiles=4; tile_size_q = lqp/4).
+        lkp: K/V chunk size per iteration. dk_chunks = dk/lkp; lkp must
+             divide dk.
+        dk:  Key/Q head dimension (per-tile inner accumulation).
+        dv:  Value head dimension.
+        output_name: .o file to produce (default 'attn_npu2.o'). Override
+             when emitting multiple FA kernel variants in the same build.
+    """
+    assert dk % lkp == 0, f"dk={dk} must be divisible by lkp={lkp}"
+    assert lqp % 4 == 0, f"lqp={lqp} must be divisible by num_q_tiles=4"
     src = _PROJ_ROOT / "flash_attention" / "kernel_fusion_based" / "attn_npu2.cc"
     _compile_kernel(
         src,
-        "attn_npu2.o",
+        output_name,
         extra_flags=[
             "-DBIT_WIDTH=8",
-            f"-Dlqp={head_dim}",
-            f"-Dlkp={head_dim}",
-            f"-Ddk={head_dim}",
-            f"-Ddk_full={head_dim}",
-            f"-Ddv={head_dim}",
-            f"-Ddv_full={head_dim}",
+            f"-Dlqp={lqp}",
+            f"-Dlkp={lkp}",
+            f"-Ddk={dk}",
+            f"-Ddk_full={dk}",
+            f"-Ddv={dv}",
+            f"-Ddv_full={dv}",
             "-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16",
             "-DROUND_CONV_EVEN",
         ],
     )
-    # Also create attn.o symlink/copy (some link_with attributes use "attn.o")
-    if not Path("attn.o").exists() and Path("attn_npu2.o").exists():
+    if output_name == "attn_npu2.o" and not Path("attn.o").exists():
         import shutil
 
         shutil.copy2("attn_npu2.o", "attn.o")
