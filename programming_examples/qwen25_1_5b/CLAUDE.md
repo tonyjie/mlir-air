@@ -8,7 +8,15 @@ that this model also requires.
 
 ## Status
 
-**Deployment in progress** — see `TODO.md` for phase tracking.
+**Deployed and operational** (2026-04-19). All 7 phases of `deploy-new-llm`
+PASSED. End-to-end NPU inference (prefill + decode) wired up via
+`qwen25_inference.py` (entry point for `make run`).
+
+Performance (validated):
+- **Prefill**: 2.4 s for 28 layers (85 ms/layer, seq_len=2048) via NPU FA
+  Option C head-first wrapper at head_dim=128
+- **Decode**: 216 ms/token (4.6 tok/s); per-layer rate matches llama32_3b
+- See `docs/development_progress/phase6_finalize.md` for the full perf summary.
 
 ## Model config
 

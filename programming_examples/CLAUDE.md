@@ -202,7 +202,7 @@ Type mapping: `xrt_dtype = type_mapper(np_dtype)` (from `air.backend.xrt_runner`
 
 ## LLM deployments on NPU2
 
-Three end-to-end validated LlamaForCausalLM-class deployments using the
+Four end-to-end validated decoder-only LLM deployments using the
 `deploy-new-llm` skill chain (`.claude/skills/deploy-new-llm/`):
 
 | Model | Layers | head_dim | Per-layer rate (decode) | NPU prefill (warm) |
@@ -210,6 +210,7 @@ Three end-to-end validated LlamaForCausalLM-class deployments using the
 | `llama3/`         (Llama-3.2-1B)  | 16 | 64  | 5.75 ms/layer (10.8 tok/s) | 1.30 s |
 | `smollm2_1_7b/`   (SmolLM2-1.7B)  | 24 | 64  | 5.7 ms/layer (7.3 tok/s)   | 1.88 s |
 | `llama32_3b/`     (Llama-3.2-3B)  | 28 | **128** | 7.7 ms/layer (4.7 tok/s)  | **3.2 s** (NPU FA via Option C) |
+| `qwen25_1_5b/`    (Qwen2.5-1.5B)  | 28 | **128** | 7.7 ms/layer (4.6 tok/s)  | **2.4 s** (NPU FA + GQA-reindexed padding + QKV bias) |
 
 Quick start with the original llama3 reference deployment:
 ```bash

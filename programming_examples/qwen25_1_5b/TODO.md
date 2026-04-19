@@ -7,7 +7,7 @@
 - [x] 3: Full model  (2026-04-19 — decisive 3/3 top-1, competitive 3/3 top-5 overlap @ seq_len=2048)
 - [x] 4: Prefill perf  (2026-04-19 — 5/5 patterns; warm 2.4 s NPU layers / 4.1 s wall via NPU FA Option C; 4.2× vs CPU-attn)
 - [x] 5: Decode perf  (2026-04-19 — 216 ms/token, 4.6 tok/s, 5/6 NPU/CPU match; 5/5 patterns; new `k_split` knob in matvec.py)
-- [ ] 6: Finalize
+- [x] 6: Finalize  (2026-04-19 — end-to-end runner wired; 6.1s wall for 14 tokens; coherent multi-fact text)
 
 ## Active blockers
 (none yet)
