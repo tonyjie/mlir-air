@@ -200,13 +200,33 @@ Type mapping: `xrt_dtype = type_mapper(np_dtype)` (from `air.backend.xrt_runner`
 - Configurable tile sizes, herd shapes, sweep infrastructure
 - C++ profiling harness
 
-## LLAMA-3.2-1B on NPU2 (`llama3/`)
+## LLM deployments on NPU2
 
-End-to-end LLAMA-3.2-1B BF16 inference (prefill + decode) on NPU2. Prefill: 1.30s kernel / 1.54s wall (2.1x faster than IRON). Decode: 92ms/token (4.0x faster than IRON).
+Three end-to-end validated LlamaForCausalLM-class deployments using the
+`deploy-new-llm` skill chain (`.claude/skills/deploy-new-llm/`):
 
+| Model | Layers | head_dim | Per-layer rate (decode) | NPU prefill (warm) |
+|---|---|---|---|---|
+| `llama3/`         (Llama-3.2-1B)  | 16 | 64  | 5.75 ms/layer (10.8 tok/s) | 1.30 s |
+| `smollm2_1_7b/`   (SmolLM2-1.7B)  | 24 | 64  | 5.7 ms/layer (7.3 tok/s)   | 1.88 s |
+| `llama32_3b/`     (Llama-3.2-3B)  | 28 | **128** | 7.7 ms/layer (4.7 tok/s)  | **3.2 s** (NPU FA via Option C) |
+
+Quick start with the original llama3 reference deployment:
 ```bash
 cd programming_examples/llama3
 make compile && make run
 ```
 
-See `llama3/CLAUDE.md` for full architecture, file map, design patterns, and GEMM tile configs.
+For deploying a NEW LlamaForCausalLM-class model on NPU2:
+- **Invoke `/deploy-new-llm <hf_model_id>` from Claude Code** — the skill walks
+  the 7-phase deployment workflow (bootstrap → per-kernel shapes → single block
+  → full model → prefill perf → decode perf → finalize) with explicit gates.
+- Shared infrastructure (kernel builders, host helpers, head-first FA wrapper
+  for head_dim ≥ 128) lives in `_llm_shared/`. See
+  [`_llm_shared/README.md`](_llm_shared/README.md) for the helper map.
+- Reference deployments to copy from: `llama32_3b/` exercises the full helper
+  API (head_dim=128 + Option C FA wrapper); `smollm2_1_7b/` is the simpler
+  drop-in case (head_dim=64 + standard seq-first FA).
+
+See `<model>/CLAUDE.md` in each deployment dir for architecture, file map,
+design patterns, and tile configs.

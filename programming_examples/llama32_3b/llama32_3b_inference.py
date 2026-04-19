@@ -1,30 +1,21 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
 
-"""Llama-3.2-3B — end-to-end NPU inference (NPU prefill + NPU decode).
+"""Llama-3.2-3B end-to-end NPU inference (NPU prefill + NPU decode).
 
 Pipeline:
     embed (CPU)
     --- prefill (per prompt) ---
-    -> 28x [rms_gemms_rope (NPU 6-launch ELF) -> CPU attention -> o_ffn (NPU 8-launch ELF)]
-       extracting per-layer K (post-RoPE) and V into KV cache from rms_gemms_rope intermediates
-    -> final RMSNorm at last prompt position (CPU, single vector)
-    -> NPU LM Head GEMV at last prompt position (reuses the decode lm_head_gemv kernel)
+    -> 28x [rms_gemms_rope (NPU 6-launch ELF) -> {NPU FA via Option C | CPU attn}
+            -> o_ffn (NPU 8-launch ELF)]
+       extracting per-layer K (post-RoPE) and V into KV cache
+    -> final RMSNorm at last prompt position (CPU)
+    -> NPU LM Head GEMV at last prompt position
     -> argmax -> first generated token
     --- decode (per token) ---
-    -> 28x [rms_gemv_rope (NPU 6-launch ELF) -> CPU attention (with KV cache) -> o_gemv_ffn (NPU 8-launch ELF)]
-       updating KV cache at current_pos
-    -> final RMSNorm (CPU, single vector)
-    -> NPU LM Head GEMV
-    -> argmax -> next token
-
-Modeled on `smollm2_inference.py`. Differences for Llama-3.2-3B:
-  - 28 layers (vs 24); GQA n_kv_heads=8 group=3; head_dim=128 (vs 64)
-  - vocab=128256 (same as llama3 — LM Head GEMV partition is drop-in 8×16384)
-  - **Defaults to --cpu-attn**: NPU FlashAttention at head_dim=128 currently
-    hangs at runtime (`compile_attn_npu2_split` API was added in Phase 4 and
-    the kernel compiles, but `ERT_CMD_STATE_TIMEOUT` on first invocation —
-    real follow-up flagged in TODO.md).
+    -> 28x [rms_gemv_rope (NPU 6-launch ELF) -> CPU attention (KV cache)
+            -> o_gemv_ffn (NPU 8-launch ELF)]
+    -> final RMSNorm + NPU LM Head GEMV -> argmax
 """
 
 import argparse
@@ -52,53 +43,14 @@ from llama3_prefill import (
     preload_prefill_weights,
 )
 from llama3_decode import compile_decode_kernels, run_decode_block
-import llama3_inference  # _preload_decode_weights, _LM_N_PARTITIONS/_PART, _LM_GEMV_BACKEND
+import llama3_inference
 from _llm_shared.kernel_builder.external_kernels import compile_all_external_kernels
-
-from llama32_3b_phase2_test import compile_block_kernels
-from llama32_3b_phase5_test import _pre_transpose_decode_weights, _npu_lm_head_gemv
-
-
-def npu_prefill_with_kv_extraction(
-    token_ids, weights, config, prefill_cache, rope_lut_bf16, max_seq, cpu_attn=True
-):
-    """Run 28-layer NPU prefill; extract per-layer K (post-RoPE) and V into KV cache."""
-    seq_len = len(token_ids)
-    n_kv_heads = config.n_kv_heads
-    head_dim = config.head_dim
-
-    k_cache = np.zeros((config.n_layers, n_kv_heads, max_seq, head_dim), dtype=bfloat16)
-    v_cache = np.zeros((config.n_layers, n_kv_heads, max_seq, head_dim), dtype=bfloat16)
-
-    embed_f32 = weights.embed_table[token_ids].astype(np.float32)
-    x_bf16 = embed_f32.astype(bfloat16)
-
-    for layer_idx in range(config.n_layers):
-        x_bf16, intermediates = run_transformer_block(
-            x_bf16,
-            weights.layers[layer_idx],
-            rope_lut_bf16,
-            config,
-            prefill_cache,
-            layer_idx=layer_idx,
-            verify=False,
-            cpu_attn=cpu_attn,
-            verbose=False,
-        )
-        k_roped = (
-            np.asarray(intermediates["k_roped"], dtype=bfloat16)
-            .reshape(seq_len, n_kv_heads, head_dim)
-            .transpose(1, 0, 2)
-        )
-        v_raw = (
-            np.asarray(intermediates["v"], dtype=bfloat16)
-            .reshape(seq_len, n_kv_heads, head_dim)
-            .transpose(1, 0, 2)
-        )
-        k_cache[layer_idx, :, :seq_len, :] = k_roped
-        v_cache[layer_idx, :, :seq_len, :] = v_raw
-
-    return x_bf16, k_cache, v_cache
+from _llm_shared.phase_helpers.orchestration import compile_block_kernels
+from _llm_shared.phase_helpers.decode_setup import (
+    pre_transpose_decode_weights,
+    npu_lm_head_gemv,
+)
+from _llm_shared.phase_helpers.prefill_runner import npu_prefill_with_kv_extraction
 
 
 def main():
@@ -107,12 +59,7 @@ def main():
     )
     parser.add_argument("--n-tokens", type=int, default=100)
     parser.add_argument("--prompt", type=str, default="The capital of France is")
-    parser.add_argument(
-        "--seq-len",
-        type=int,
-        default=2048,
-        help="Prefill seq_len AND decode max position (default: 2048)",
-    )
+    parser.add_argument("--seq-len", type=int, default=2048)
     parser.add_argument("--prefill-cache-dir", type=str, default="prefill_kernel_cache")
     parser.add_argument("--decode-cache-dir", type=str, default="decode_kernel_cache")
     parser.add_argument("--model", type=str, default="meta-llama/Llama-3.2-3B")
@@ -121,31 +68,26 @@ def main():
         dest="cpu_attn",
         action="store_true",
         default=True,
-        help="Use CPU attention in prefill (default; NPU FA hangs at head_dim=128)",
+        help="Use CPU attention in prefill (default; --npu-attn for Option C)",
     )
     parser.add_argument(
         "--npu-attn",
         dest="cpu_attn",
         action="store_false",
-        help="Try NPU FlashAttention in prefill (currently hangs)",
+        help="Use NPU FA (Option C head-first wrapper at head_dim=128)",
     )
     parser.add_argument(
         "--profile", action="store_true", help="Print per-token decode timings"
     )
-    parser.add_argument(
-        "--compile-only",
-        action="store_true",
-        help="Compile prefill + decode kernels and exit",
-    )
+    parser.add_argument("--compile-only", action="store_true")
     args = parser.parse_args()
 
     os.chdir(_THIS_DIR)
-
     config = LlamaConfig()
     print(f"Llama-3.2-3B end-to-end NPU inference")
     print(
         f"  layers={config.n_layers}, vocab={config.vocab_size}, "
-        f"head_dim={config.head_dim}, attn={'CPU' if args.cpu_attn else 'NPU FA'}"
+        f"head_dim={config.head_dim}, attn={'CPU' if args.cpu_attn else 'NPU FA (Option C)'}"
     )
     print(f"  seq_len={args.seq_len}, n_tokens={args.n_tokens}")
 
@@ -189,7 +131,7 @@ def main():
 
     print("\n[setup] Pre-loading BOs...")
     t = time.time()
-    _pre_transpose_decode_weights(weights, config)
+    pre_transpose_decode_weights(weights, config)
     preload_prefill_weights(weights, config, prefill_cache, args.seq_len, rope_lut_bf16)
     llama3_inference._preload_decode_weights(decode_cache, weights, config)
     t_preload = time.time() - t
@@ -237,7 +179,7 @@ def main():
         .flatten()
         .astype(bfloat16)
     )
-    first_logits = _npu_lm_head_gemv(decode_cache, weights, config, last_normed_bf16)
+    first_logits = npu_lm_head_gemv(decode_cache, weights, config, last_normed_bf16)
     first_token = int(np.argmax(first_logits))
     t_first_lm_head = time.time() - t
     print(
@@ -258,7 +200,6 @@ def main():
             break
 
         x_in_bf16 = embed_table_f32[current_token].astype(bfloat16)
-
         t = time.time()
         x_bf16 = x_in_bf16
         for layer_idx in range(config.n_layers):
@@ -278,7 +219,7 @@ def main():
             .flatten()
             .astype(bfloat16)
         )
-        next_logits = _npu_lm_head_gemv(decode_cache, weights, config, x_normed_bf16)
+        next_logits = npu_lm_head_gemv(decode_cache, weights, config, x_normed_bf16)
         next_token = int(np.argmax(next_logits))
         decode_times.append(time.time() - t)
 
@@ -315,8 +256,7 @@ def main():
             f"median={med_ms:.0f} ms/token  ({1000/avg_ms:.1f} tok/s)"
         )
     print(
-        f"  Total inference wall : "
-        f"{t_prefill + t_first_lm_head + sum(decode_times):.2f}s"
+        f"  Total inference wall : {t_prefill + t_first_lm_head + sum(decode_times):.2f}s"
     )
     return 0
 

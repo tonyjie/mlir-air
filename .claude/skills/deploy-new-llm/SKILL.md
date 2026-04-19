@@ -12,6 +12,26 @@ Single user-facing entry point that scaffolds a new model deployment and orchest
 
 ## Workflow
 
+### Step 0: User assumptions (preconditions check)
+
+This skill assumes the user already has:
+- **mlir-air built and the environment sourced** (the project's `SessionStart`
+  hook in `.claude/settings.local.json` handles this automatically; for manual
+  shells see `.claude/CLAUDE.md` "Environment Setup"). Verify with a quick
+  smoke test: `cd programming_examples/llama3 && make help` — should print
+  the target list without errors.
+- **NPU2 hardware accessible via XRT** (no other process holding it).
+- **HuggingFace login + model access**. For gated models like
+  `meta-llama/Llama-3.2-3B`, `huggingface-cli login` and accept the model
+  card on huggingface.co before invoking this skill. ~6 GB disk per BF16 3B
+  model in `~/.cache/huggingface/hub/`.
+- **System DRAM ≥ 16 GB** for models in the 1-3 B range; deeper deployments
+  (Llama-3-8B class) approach the limit.
+
+If any of these are missing, halt and ask the user to address them before
+proceeding. Do NOT try to install MLIR-AIR / set up XRT / log in to HF on
+the user's behalf.
+
 ### Step 1: Parse arguments
 - Required: HF model ID (e.g. `TinyLlama/TinyLlama-1.1B-Chat-v1.0`)
 - Optional: `--name <dirname>` (default: derived from model ID, lowercased, slashes → underscores)

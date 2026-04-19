@@ -3,29 +3,12 @@
 
 """Phase 4 — prefill performance for Llama-3.2-3B on NPU2.
 
-Confirms the 5 prefill optimization patterns from `optimize-prefill-perf` and
-measures end-to-end prefill latency.
-
-Pattern status (most inherited from llama3_prefill orchestration):
-  1. Multi-launch merging:    INHERITED (rms_gemms_rope=6 launches, o_ffn=8)
-  2. Per-layer BO pre-loading: APPLIED HERE (preload_prefill_weights — same
-                               config-driven helper smollm2 used)
-  3. Intermediate buffer reuse: INHERITED (intermediate_indices set per kernel)
-  4. Seq-first layout:         INHERITED (RoPE+FA accept seq-first natively)
-  5. CPU->NPU op promotion:    ATTEMPTED-FAILED for NPU FlashAttention at
-                               head_dim=128 (kernel compiles via
-                               compile_attn_npu2_split with the L1-feasible
-                               lkp=64 lqp=256 dk=dv=128 config, but runtime
-                               hangs with ERT_CMD_STATE_TIMEOUT at our specific
-                               (n_heads=24, n_kv_heads=8, lq=lk=2048) shape).
-                               Defer NPU LM Head to Phase 5. Use CPU attention
-                               + CPU LM Head for this measurement.
+5/5 patterns applied with --npu-attn (Option C head-first FA).
+4/5 patterns with --cpu-attn (Pattern 5 partial).
 
 Methodology:
-  - "Cold" run: lazy BO allocation on first per-layer call (Phase 3 default).
-  - "Warm" run (after preload_prefill_weights): all per-layer BOs pre-allocated
-    and weights pre-written; inference loop only does dynamic-input writes +
-    kernel launch + output read.
+  - "Cold" run: lazy BO allocation on first per-layer call
+  - "Warm" run (after preload_prefill_weights): all BOs pre-allocated
 """
 
 import argparse
@@ -53,80 +36,31 @@ from llama3_prefill import (
     preload_prefill_weights,
 )
 from _llm_shared.kernel_builder.external_kernels import compile_all_external_kernels
-
-from llama32_3b_phase2_test import compile_block_kernels
+from _llm_shared.phase_helpers.orchestration import compile_block_kernels
+from _llm_shared.phase_helpers.prefill_runner import (
+    embed_and_pad,
+    npu_full_prefill,
+)
 
 PROMPT = "The capital of France is"
-
-
-def _embed_and_pad(prompt, tokenizer, weights, seq_len):
-    token_ids = tokenizer.encode(prompt)
-    real_len = len(token_ids)
-    if real_len < seq_len:
-        pad = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
-        token_ids = token_ids + [pad] * (seq_len - real_len)
-    token_ids = np.array(token_ids[:seq_len], dtype=np.int64)
-    embed_table_f32 = np.asarray(weights.embed_table, dtype=np.float32)
-    x_f32 = embed_table_f32[token_ids]
-    return x_f32.astype(bfloat16), token_ids, real_len
-
-
-def npu_full_prefill(x_bf16, weights, config, cache, rope_lut_bf16, cpu_attn=True):
-    """Run all N layers + final RMSNorm + LM Head; return logits + timings."""
-    t0 = time.time()
-    for layer_idx in range(config.n_layers):
-        x_bf16, _ = run_transformer_block(
-            x_bf16,
-            weights.layers[layer_idx],
-            rope_lut_bf16,
-            config,
-            cache,
-            layer_idx=layer_idx,
-            verify=False,
-            cpu_attn=cpu_attn,
-            verbose=False,
-        )
-    npu_layer_time = time.time() - t0
-
-    t0 = time.time()
-    x_f32 = np.asarray(x_bf16, dtype=np.float32)
-    x_normed = llama32_3b_reference.rms_norm(x_f32, weights.final_norm)
-    lm_head = np.asarray(weights.lm_head, dtype=np.float32)
-    logits = x_normed @ lm_head.T
-    cpu_lm_head_time = time.time() - t0
-
-    return logits, npu_layer_time, cpu_lm_head_time
 
 
 def main():
     parser = argparse.ArgumentParser(description="Llama-3.2-3B Phase 4 prefill perf")
     parser.add_argument("--seq-len", type=int, default=2048)
     parser.add_argument(
-        "--cpu-attn",
-        dest="cpu_attn",
-        action="store_true",
-        default=True,
-        help="Use CPU attention fallback (default: True; NPU FA at head_dim=128 currently hangs)",
+        "--cpu-attn", dest="cpu_attn", action="store_true", default=True
     )
     parser.add_argument(
         "--npu-attn",
         dest="cpu_attn",
         action="store_false",
-        help="Try NPU FlashAttention (currently hangs ERT_CMD_STATE_TIMEOUT at our shape)",
+        help="Use NPU FA (Option C head-first wrapper at head_dim=128)",
     )
     parser.add_argument("--cache-dir", type=str, default="prefill_kernel_cache")
     parser.add_argument("--model", type=str, default="meta-llama/Llama-3.2-3B")
-    parser.add_argument(
-        "--n-warm-runs",
-        type=int,
-        default=3,
-        help="Number of timed runs after preload (default: 3)",
-    )
-    parser.add_argument(
-        "--compile-only",
-        action="store_true",
-        help="Compile prefill kernels and exit",
-    )
+    parser.add_argument("--n-warm-runs", type=int, default=3)
+    parser.add_argument("--compile-only", action="store_true")
     args = parser.parse_args()
 
     os.chdir(_THIS_DIR)
@@ -163,17 +97,22 @@ def main():
         config=config, seq_len=args.seq_len, dtype=bfloat16
     )
 
-    x_bf16, _, real_len = _embed_and_pad(PROMPT, tokenizer, weights, args.seq_len)
+    x_bf16, _, real_len = embed_and_pad(PROMPT, tokenizer, weights, args.seq_len)
     print(f"Input: {PROMPT!r}  ({real_len} real tokens, padded to {args.seq_len})\n")
 
-    # ----- COLD run (no preload) -----
+    # ----- COLD run -----
     print("=" * 60)
     print("MEASUREMENT 1 — COLD prefill (no preload_prefill_weights call)")
     print("=" * 60)
-    print("First per-layer call allocates BOs and writes weights inline.")
     t_wall = time.time()
     logits_cold, npu_layer_t_cold, lm_head_t = npu_full_prefill(
-        x_bf16, weights, config, cache, rope_lut_bf16, cpu_attn=args.cpu_attn
+        x_bf16,
+        weights,
+        config,
+        cache,
+        rope_lut_bf16,
+        llama32_3b_reference,
+        cpu_attn=args.cpu_attn,
     )
     cold_wall = time.time() - t_wall
     cold_top1 = int(np.argmax(logits_cold[real_len - 1]))
@@ -185,7 +124,7 @@ def main():
     print(f"  Wall total  : {cold_wall:.3f} s")
     print(f"  Top-1 token : '{tokenizer.decode([cold_top1])}' (id={cold_top1})")
 
-    # Reset BO state so PRELOAD measurement is honest
+    # Reset BO state for honest preload measurement
     cache._loaded = {}
     if hasattr(cache, "_bo_cache"):
         cache._bo_cache = {}
@@ -194,7 +133,7 @@ def main():
     if hasattr(run_transformer_block, "_arg_cache"):
         run_transformer_block._arg_cache = {}
 
-    # ----- PRELOAD step (Pattern 2) -----
+    # ----- PRELOAD (Pattern 2) -----
     print()
     print("=" * 60)
     print(f"PATTERN 2 APPLIED — preload_prefill_weights ({config.n_layers} layers)")
@@ -212,14 +151,19 @@ def main():
     print("=" * 60)
     print(f"MEASUREMENT 2 — WARM prefill (×{args.n_warm_runs} runs after preload)")
     print("=" * 60)
-    warm_layer_times = []
-    warm_wall_times = []
+    warm_layer_times, warm_wall_times = [], []
     warm_top1 = None
     for i in range(args.n_warm_runs):
-        x_warm, _, _ = _embed_and_pad(PROMPT, tokenizer, weights, args.seq_len)
+        x_warm, _, _ = embed_and_pad(PROMPT, tokenizer, weights, args.seq_len)
         t_wall = time.time()
         logits_warm, npu_layer_t, lm_head_t_w = npu_full_prefill(
-            x_warm, weights, config, cache, rope_lut_bf16, cpu_attn=args.cpu_attn
+            x_warm,
+            weights,
+            config,
+            cache,
+            rope_lut_bf16,
+            llama32_3b_reference,
+            cpu_attn=args.cpu_attn,
         )
         wall = time.time() - t_wall
         warm_layer_times.append(npu_layer_t)
@@ -235,7 +179,6 @@ def main():
     warm_layer_avg = float(np.mean(warm_layer_times))
     warm_wall_avg = float(np.mean(warm_wall_times))
 
-    # ----- Summary -----
     print()
     print("=" * 60)
     print("Phase 4 — Prefill perf summary")
@@ -255,22 +198,25 @@ def main():
     print()
     print("Pattern application status:")
     print(
-        "  [INHERITED      ] 1. Multi-launch merging      (rms_gemms_rope=6, o_ffn=8 launches)"
+        "  [INHERITED] 1. Multi-launch merging      (rms_gemms_rope=6, o_ffn=8 launches)"
     )
     print(
-        f"  [APPLIED        ] 2. Per-layer BO pre-loading  (preload_prefill_weights, {preload_t:.2f} s setup)"
+        f"  [APPLIED  ] 2. Per-layer BO pre-loading  (preload_prefill_weights, {preload_t:.2f} s setup)"
     )
     print(
-        "  [INHERITED      ] 3. Intermediate buffer reuse (intermediate_indices set per kernel)"
+        "  [INHERITED] 3. Intermediate buffer reuse (intermediate_indices set per kernel)"
     )
-    print("  [INHERITED      ] 4. Seq-first layout          (RoPE/FA native)")
+    print("  [INHERITED] 4. Seq-first layout          (RoPE/FA native)")
     if args.cpu_attn:
         print(
-            "  [PARTIAL        ] 5. CPU->NPU op promotion     "
-            "(NPU FA hangs at head_dim=128 + lq=lk=2048; LM Head deferred to Phase 5)"
+            "  [PARTIAL  ] 5. CPU->NPU op promotion     "
+            "(use --npu-attn for Option C head-first FA at head_dim=128)"
         )
     else:
-        print("  [APPLIED        ] 5. CPU->NPU op promotion     (NPU FA active)")
+        print(
+            "  [APPLIED  ] 5. CPU->NPU op promotion     "
+            "(NPU FA via Option C head-first + host transposes)"
+        )
 
     correctness_ok = cold_top1 == warm_top1 and warm_top1 is not None
     n_patterns = 4 if args.cpu_attn else 5

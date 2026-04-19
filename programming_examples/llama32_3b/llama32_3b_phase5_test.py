@@ -3,30 +3,16 @@
 
 """Phase 5 — decode performance for Llama-3.2-3B on NPU2.
 
-Decode pipeline (per-token):
-    embed (CPU)
-    -> 28x [rms_gemv_rope (NPU 6-launch ELF) -> CPU attention (KV cache)
-            -> o_gemv_ffn (NPU 8-launch ELF)]
-    -> final RMSNorm (CPU)
-    -> LM Head GEMV (NPU, 8-partition × 16384, vocab=128256 → 2816 padding)
-    -> argmax
+Uses CPU prefill to seed KV cache (Phase 5 design, per llama3 pattern), then
+NPU decode loop with KV cache. Validates each NPU next-token against CPU
+reference next-token (gate: ≥ 80% match).
 
-Setup:
-  CPU prefill on the prompt seeds the KV cache (per-layer K/V), then NPU
-  decode generates tokens one at a time, validating each next-token against
-  CPU reference next-token.
-
-Pattern application (per `optimize-decode-perf`):
-  1. Multi-launch merging:   INHERITED (rms_gemv_rope=6, o_gemv_ffn=8 launches)
-  2. Static weight BOs:      INHERITED (decode preload sets static_indices)
-  3. NPU LM Head GEMV:       APPLIED (8-partition × 16384, vocab=128256;
-                             same partition scheme as llama3 — drop-in,
-                             only 2816 padding rows, NOT the heavy
-                             zero-padding smollm2 had at vocab=49152)
-  4. Extern kernel rename:   INHERITED (mv_k8192.o for Down GEMV K=8192)
-  5. CPU->NPU op promotion:  PARTIAL (attention stays on CPU per llama3 design;
-                             final RMSNorm stays on CPU — single-token cost
-                             is negligible)
+Pattern application (5/5):
+  1. Multi-launch merging      INHERITED (rms_gemv_rope=6, o_gemv_ffn=8)
+  2. Static weight BOs         INHERITED
+  3. NPU LM Head GEMV          APPLIED (8×16384 partition, vocab=128256)
+  4. Extern kernel rename      INHERITED (mv_k8192.o for Down GEMV)
+  5. CPU->NPU op promotion     PARTIAL (attention stays CPU per llama3 design)
 """
 
 import argparse
@@ -49,91 +35,13 @@ import llama32_3b_reference
 
 from llama3_prefill import KernelCache, prepare_air_project
 from llama3_decode import compile_decode_kernels, run_decode_block
-import llama3_inference  # for _preload_decode_weights, _LM_N_PARTITIONS, _LM_N_PART, _LM_GEMV_BACKEND
-from _llm_shared.kernel_builder.external_kernels import compile_all_external_kernels
+import llama3_inference
 
-
-def _seed_kv_cache_via_cpu_prefill(
-    weights, config, prompt_token_ids, rope_lut_f32, max_seq
-):
-    """Run CPU reference prefill on the prompt; populate per-layer KV cache."""
-    n_layers = config.n_layers
-    n_kv_heads = config.n_kv_heads
-    head_dim = config.head_dim
-    emb_dim = config.emb_dim
-
-    embed_table_f32 = np.asarray(weights.embed_table, dtype=np.float32)
-    x = embed_table_f32[np.array(prompt_token_ids, dtype=np.int64)]
-    prompt_len = len(prompt_token_ids)
-
-    k_cache = np.zeros((n_layers, n_kv_heads, max_seq, head_dim), dtype=bfloat16)
-    v_cache = np.zeros((n_layers, n_kv_heads, max_seq, head_dim), dtype=bfloat16)
-
-    for i in range(n_layers):
-        x, intermediates = llama32_3b_reference.transformer_block(
-            x, weights.layers[i], rope_lut_f32, config
-        )
-        k_per_pos = intermediates["k_roped"].reshape(prompt_len, n_kv_heads, head_dim)
-        v_per_pos = intermediates["v"].reshape(prompt_len, n_kv_heads, head_dim)
-        k_cache[i, :, :prompt_len, :] = k_per_pos.transpose(1, 0, 2).astype(bfloat16)
-        v_cache[i, :, :prompt_len, :] = v_per_pos.transpose(1, 0, 2).astype(bfloat16)
-
-    x_normed = llama32_3b_reference.rms_norm(x, weights.final_norm)
-    return k_cache, v_cache, x_normed[-1]
-
-
-def _pre_transpose_decode_weights(weights, config):
-    emb_dim = config.emb_dim
-    kv_dim = config.n_kv_heads * config.head_dim
-    hidden_dim = config.hidden_dim
-    if hasattr(weights, "_decode_weights_transposed"):
-        return
-    for i, lw in enumerate(weights.layers):
-        lw._wq_t = np.ascontiguousarray(
-            lw.wq.astype(bfloat16).reshape(emb_dim, emb_dim).T
-        )
-        lw._wk_t = np.ascontiguousarray(
-            lw.wk.astype(bfloat16).reshape(emb_dim, kv_dim).T
-        )
-        lw._wv_t = np.ascontiguousarray(
-            lw.wv.astype(bfloat16).reshape(emb_dim, kv_dim).T
-        )
-        lw._wo_t = np.ascontiguousarray(
-            lw.wo.astype(bfloat16).reshape(emb_dim, emb_dim).T
-        )
-        lw._wgate_t = np.ascontiguousarray(
-            lw.w_gate.astype(bfloat16).reshape(emb_dim, hidden_dim).T
-        )
-        lw._wup_t = np.ascontiguousarray(
-            lw.w_up.astype(bfloat16).reshape(emb_dim, hidden_dim).T
-        )
-        lw._wdown_t = np.ascontiguousarray(
-            lw.w_down.astype(bfloat16).reshape(hidden_dim, emb_dim).T
-        )
-        lw._layer_idx = i
-    weights._decode_weights_transposed = True
-
-
-def _npu_lm_head_gemv(decode_cache, weights, config, x_normed_bf16):
-    """Run NPU LM Head GEMV; return concatenated logits clipped to vocab_size."""
-    lm_inputs = [x_normed_bf16]
-    for p in range(llama3_inference._LM_N_PARTITIONS):
-        lm_inputs.append(weights._lm_weight_parts_gemv[p])
-        lm_inputs.append(np.zeros(llama3_inference._LM_N_PART, dtype=bfloat16))
-    results = decode_cache.load_and_run(
-        "lm_head_gemv",
-        llama3_inference._LM_GEMV_BACKEND,
-        *lm_inputs,
-        output_indices=[2 + 2 * p for p in range(llama3_inference._LM_N_PARTITIONS)],
-        static_input_indices={
-            1 + 2 * p for p in range(llama3_inference._LM_N_PARTITIONS)
-        },
-        intermediate_indices={
-            2 + 2 * p for p in range(llama3_inference._LM_N_PARTITIONS)
-        },
-    )
-    logits = np.concatenate(results, axis=0)[: config.vocab_size]
-    return logits
+from _llm_shared.phase_helpers.decode_setup import (
+    pre_transpose_decode_weights,
+    npu_lm_head_gemv,
+    seed_kv_cache_via_cpu_prefill,
+)
 
 
 def main():
@@ -156,17 +64,12 @@ def main():
         "--n-warmup",
         type=int,
         default=2,
-        help="Discard first N tokens for timing average (NPU warmup)",
+        help="Discard first N tokens for timing average",
     )
-    parser.add_argument(
-        "--compile-only",
-        action="store_true",
-        help="Compile decode kernels and exit",
-    )
+    parser.add_argument("--compile-only", action="store_true")
     args = parser.parse_args()
 
     os.chdir(_THIS_DIR)
-
     config = LlamaConfig()
     print(f"Llama-3.2-3B config: {config}")
 
@@ -203,11 +106,15 @@ def main():
     prompt_len = len(prompt_tokens)
     print(f"\nPrompt: {args.prompt!r} ({prompt_len} tokens)")
 
-    # CPU prefill to seed KV cache + initial generated token
     print("\nRunning CPU reference prefill (one-time, seeds KV cache)...")
     t = time.time()
-    k_cache, v_cache, x_normed_first = _seed_kv_cache_via_cpu_prefill(
-        weights, config, prompt_tokens, rope_lut_f32, args.max_seq
+    k_cache, v_cache, x_normed_first = seed_kv_cache_via_cpu_prefill(
+        weights,
+        config,
+        prompt_tokens,
+        rope_lut_f32,
+        args.max_seq,
+        llama32_3b_reference,
     )
     print(f"  CPU prefill: {time.time()-t:.1f}s")
     lm_head_f32 = np.asarray(weights.lm_head, dtype=np.float32)
@@ -218,7 +125,6 @@ def main():
         f"{tokenizer.decode([first_npu_token])!r} (id={first_npu_token})"
     )
 
-    # Decode kernel cache + compile
     prepare_air_project()
     cache_dir = _THIS_DIR / args.cache_dir
     decode_cache = KernelCache(cache_dir=str(cache_dir))
@@ -237,17 +143,14 @@ def main():
     else:
         print("\nDecode kernels already cached — skipping compile.")
 
-    # Pre-transpose weights for decode
     print("\nPre-transposing decode weights...")
-    _pre_transpose_decode_weights(weights, config)
+    pre_transpose_decode_weights(weights, config)
 
-    # Pre-load decode BOs (config-driven)
     print(f"Pre-loading decode BOs ({config.n_layers} layers + LM Head GEMV)...")
     t = time.time()
     llama3_inference._preload_decode_weights(decode_cache, weights, config)
     print(f"  Preload: {time.time()-t:.1f}s")
 
-    # Decode loop
     print(f"\n{'='*60}")
     print(f"DECODE LOOP — generating {args.n_tokens} tokens")
     print(f"{'='*60}")
@@ -286,7 +189,7 @@ def main():
             .flatten()
             .astype(bfloat16)
         )
-        npu_logits = _npu_lm_head_gemv(decode_cache, weights, config, x_normed_bf16)
+        npu_logits = npu_lm_head_gemv(decode_cache, weights, config, x_normed_bf16)
         next_npu = int(np.argmax(npu_logits))
         npu_t = time.time() - t0
         npu_token_times_full.append(npu_t)
@@ -313,14 +216,12 @@ def main():
         print(
             f"  Tok {token_idx+1:2d} pos={current_pos:3d}  "
             f"NPU={next_npu:5d} {npu_token_str!r:<14s}  "
-            f"NPU_t={npu_t*1000:6.1f}ms  "
-            f"CPU_t={cpu_t:5.1f}s  {match_str}"
+            f"NPU_t={npu_t*1000:6.1f}ms  CPU_t={cpu_t:5.1f}s  {match_str}"
         )
 
         generated.append(next_npu)
         current_token = next_npu
 
-    # Summary
     print(f"\n{'='*60}")
     print(f"Phase 5 — decode perf summary")
     print(f"{'='*60}")
@@ -352,12 +253,8 @@ def main():
     print(
         f"    [INHERITED] 1. Multi-launch merging      (rms_gemv_rope=6, o_gemv_ffn=8)"
     )
-    print(
-        f"    [INHERITED] 2. Static weight BOs         (decode preload sets static_indices)"
-    )
-    print(
-        f"    [APPLIED  ] 3. NPU LM Head GEMV          (8×16384, vocab=128256, 2816 pad)"
-    )
+    print(f"    [INHERITED] 2. Static weight BOs         (decode preload)")
+    print(f"    [APPLIED  ] 3. NPU LM Head GEMV          (8×16384, vocab=128256)")
     print(f"    [INHERITED] 4. Extern kernel rename      (mv_k8192.o for Down GEMV)")
     print(
         f"    [PARTIAL  ] 5. CPU->NPU op promotion     (attention stays CPU per llama3 design)"
