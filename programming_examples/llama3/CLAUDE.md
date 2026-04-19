@@ -71,7 +71,7 @@ generate() decode loop     ← per token: 16 layers × 3 kernel calls + LM Head 
 - **`intermediate_indices`**: Skip BO write for buffers the kernel overwrites.
 - **External kernel rename**: K=8192 Down GEMV uses `mv_k8192.o` (compiled with `-D` renamed symbols) to coexist with K=2048 GEMVs in one ELF.
 - **Seq-first layout**: RoPE + FlashAttention accept `(seq, heads×dim)` natively — zero host transposes.
-- **Half-split RoPE kernel**: Custom `rope_halfsplit.cc` matches HuggingFace Llama's rotation convention `(d[i], d[i+32])`. LUT layout is `[cos..., sin...]` (concatenated). Replaces upstream interleaved `rope.cc`. See `docs/explain.md`.
+- **Half-split RoPE kernel**: Custom `rope_halfsplit.cc` matches HuggingFace Llama's rotation convention `(d[i], d[i+32])`. LUT layout is `[cos..., sin...]` (concatenated). Replaces upstream interleaved `rope.cc`. See `../_llm_shared/docs/explain.md`.
 
 ## Documentation
 
@@ -80,6 +80,6 @@ generate() decode loop     ← per token: 16 layers × 3 kernel calls + LM Head 
 | [README.md](README.md) | Quick overview for newcomers |
 | [docs/usage.md](docs/usage.md) | All make targets, CLI options, file structure |
 | [docs/profile.md](docs/profile.md) | Kernel timing breakdown, BO categories, memory model |
-| [docs/explain.md](docs/explain.md) | Compilation pipeline, stitching details, kernel directory map |
+| [_llm_shared/docs/explain.md](../_llm_shared/docs/explain.md) | Compilation pipeline, stitching details, kernel directory map (moved 2026-04-18) |
 | [docs/issues.md](docs/issues.md) | Known issues: BF16 precision, fixed seq_len, no sampling |
 | [docs/development_progress/](docs/development_progress/) | Optimization history (18.67s → 1.54s), design decisions |

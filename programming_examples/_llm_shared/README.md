@@ -20,23 +20,33 @@ _llm_shared/
 │   ├── cache.py                       # KernelCache (compile-time cache)
 │   ├── gemm_builder.py                # GEMM IR builder helpers
 │   └── stitching.py                   # Multi-launch ELF MLIR stitching
-└── phase_helpers/                     # Per-deployment phase test helpers
-    ├── metrics.py                     # cosine_sim, mae, per_pos_cosine_min,
-    │                                    head_dim_scaled_per_pos_threshold
-    ├── canonical_prompts.py           # DECISIVE_PROMPTS + COMPETITIVE_PROMPTS
-    │                                    (LESSON 2 Phase 3 set)
-    ├── orchestration.py               # compile_block_kernels,
-    │                                    preload_block_weights,
-    │                                    evaluate_prompt
-    ├── prefill_runner.py              # embed_and_pad, npu_full_prefill,
-    │                                    run_npu_full_prefill,
-    │                                    run_cpu_full_prefill,
-    │                                    npu_prefill_with_kv_extraction
-    ├── decode_setup.py                # pre_transpose_decode_weights,
-    │                                    npu_lm_head_gemv,
-    │                                    seed_kv_cache_via_cpu_prefill
-    └── headfirst_fa.py                # Option C head-first FA wrapper for
-                                         head_dim ≥ 128 (LESSON 3)
+├── phase_helpers/                     # Per-deployment phase test helpers
+│   ├── metrics.py                     # cosine_sim, mae, per_pos_cosine_min,
+│   │                                    head_dim_scaled_per_pos_threshold
+│   ├── canonical_prompts.py           # DECISIVE_PROMPTS + COMPETITIVE_PROMPTS
+│   │                                    (LESSON 2 Phase 3 set)
+│   ├── orchestration.py               # compile_block_kernels,
+│   │                                    preload_block_weights,
+│   │                                    evaluate_prompt
+│   ├── prefill_runner.py              # embed_and_pad, npu_full_prefill,
+│   │                                    run_npu_full_prefill,
+│   │                                    run_cpu_full_prefill,
+│   │                                    npu_prefill_with_kv_extraction
+│   ├── decode_setup.py                # pre_transpose_decode_weights,
+│   │                                    npu_lm_head_gemv,
+│   │                                    seed_kv_cache_via_cpu_prefill
+│   └── headfirst_fa.py                # Option C head-first FA wrapper for
+│                                        head_dim ≥ 128 (LESSON 3)
+└── docs/                              # Shared pattern + kernel design docs
+    │                                  # (cited by the skill chain;
+    │                                  # see docs/README.md for the topic map)
+    ├── README.md
+    ├── explain.md                     # compilation pipeline overview
+    ├── perf_optimization.md           # the 18.67s → 1.30s perf journey
+    ├── kernels/                       # per-kernel design (GEMM, GEMV, RoPE,
+    │                                  # RMSNorm, FlashAttn, SwiGLU, …)
+    ├── multi-launch/                  # multi-launch ELF stitching patterns
+    └── compiler_issues/               # MLIR-AIR compiler quirks + workarounds
 ```
 
 ## How a deployment uses this

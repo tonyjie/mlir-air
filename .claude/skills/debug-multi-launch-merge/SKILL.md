@@ -8,11 +8,11 @@ When stitching kernels together via `_llm_shared/kernel_builder/stitching.py` to
 
 ## Knowledge base references
 Read these BEFORE acting if they apply:
-- `programming_examples/llama3/docs/development_progress/compiler_issues/multi_launch_blockers.md` — exhaustive list of merge constraints
-- `programming_examples/llama3/docs/development_progress/compiler_issues/multi_launch_root_cause.md` — root cause analyses
-- `programming_examples/llama3/docs/development_progress/multi-launch/full_block.md` — why attention cannot merge further
-- `programming_examples/llama3/docs/development_progress/multi-launch/compiler_scaling.md` — compile time scaling with ELF size
-- `programming_examples/llama3/docs/development_progress/compiler_issues/weight_broadcast_dma.md` — DMA stride limitation for BF16 broadcast (also: memory `project_bf16_dma_stride`)
+- `programming_examples/_llm_shared/docs/compiler_issues/multi_launch_blockers.md` — exhaustive list of merge constraints
+- `programming_examples/_llm_shared/docs/compiler_issues/multi_launch_root_cause.md` — root cause analyses
+- `programming_examples/_llm_shared/docs/multi-launch/full_block.md` — why attention cannot merge further
+- `programming_examples/_llm_shared/docs/multi-launch/compiler_scaling.md` — compile time scaling with ELF size
+- `programming_examples/_llm_shared/docs/compiler_issues/weight_broadcast_dma.md` — DMA stride limitation for BF16 broadcast (also: memory `project_bf16_dma_stride`)
 
 ## Trigger pattern
 

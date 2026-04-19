@@ -52,7 +52,7 @@ make verify
 |-----|-------------|
 | [Usage Guide](docs/usage.md) | All `make` targets, command-line options, file structure |
 | [Performance Profile](docs/profile.md) | Kernel timing breakdown, BO categories, memory model |
-| [Implementation Guide](docs/explain.md) | How kernels are built, compiled, and stitched together |
+| [Implementation Guide](../_llm_shared/docs/explain.md) | How kernels are built, compiled, and stitched together (in _llm_shared/docs/) |
 | [Known Issues](docs/issues.md) | BF16 precision, fixed seq_len, no sampling |
 
 ## Architecture Overview
@@ -88,5 +88,5 @@ reducing XRT dispatch overhead from 10 calls/layer to 3.
 For the optimization journey and design decisions, see [`docs/development_progress/`](docs/development_progress/):
 - [Plan](docs/development_progress/plan.md) — original design and phased approach
 - [Progress](docs/development_progress/progress.md) — milestone tracker
-- [Performance History](docs/development_progress/perf_optimization.md) — 18.67s → 1.54s optimization journey
-- [Multi-launch Merging](docs/development_progress/multi-launch/) — kernel fusion details
+- [Performance History](../_llm_shared/docs/perf_optimization.md) — 18.67s → 1.54s optimization journey (in _llm_shared/docs/)
+- [Multi-launch Merging](../_llm_shared/docs/multi-launch/) — kernel fusion details (in _llm_shared/docs/)

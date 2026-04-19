@@ -7,7 +7,7 @@ description: Phase 5 of LLM deployment — apply the 5 known decode optimization
 Apply the decode optimization patterns that took LLAMA from ~500ms/token → 92ms/token. Same structure as Phase 4 but tuned for the M=1 (single-token) case.
 
 ## Knowledge base references
-- `programming_examples/llama3/docs/development_progress/multi-launch/decode_merging.md` — decode-specific merge patterns
+- `programming_examples/_llm_shared/docs/multi-launch/decode_merging.md` — decode-specific merge patterns
 - `programming_examples/llama3/docs/development_progress/decode_archive/DECODE_PROGRESS.md` — decode milestones
 - `programming_examples/llama3/docs/development_progress/decode_archive/gemv_investigation.md` — AIR vs IRON GEMV perf
 

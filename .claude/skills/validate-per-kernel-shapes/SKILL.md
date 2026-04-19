@@ -8,13 +8,13 @@ Before integration, prove each individual kernel (RMSNorm, GEMM, GEMV, RoPE, Fla
 
 ## Knowledge base references
 Read these BEFORE acting:
-- `programming_examples/llama3/docs/development_progress/kernels/gemm.md` — GEMM tile config strategy
-- `programming_examples/llama3/docs/development_progress/kernels/gemv.md` — GEMV herd layouts (8×1 K=2048; extern rename for K=8192)
-- `programming_examples/llama3/docs/development_progress/kernels/rmsnorm.md` — 8-tile broadcast strategy
-- `programming_examples/llama3/docs/development_progress/kernels/rope.md` — RoPE LUT layout, half-split convention
-- `programming_examples/llama3/docs/development_progress/kernels/flash_attention.md` — seq-first layout, causal masking
-- `programming_examples/llama3/docs/development_progress/kernels/ffn_swiglu.md`, `silu_and_mul.md`
-- `programming_examples/llama3/docs/development_progress/kernels/eltwise_add.md`
+- `programming_examples/_llm_shared/docs/kernels/gemm.md` — GEMM tile config strategy
+- `programming_examples/_llm_shared/docs/kernels/gemv.md` — GEMV herd layouts (8×1 K=2048; extern rename for K=8192)
+- `programming_examples/_llm_shared/docs/kernels/rmsnorm.md` — 8-tile broadcast strategy
+- `programming_examples/_llm_shared/docs/kernels/rope.md` — RoPE LUT layout, half-split convention
+- `programming_examples/_llm_shared/docs/kernels/flash_attention.md` — seq-first layout, causal masking
+- `programming_examples/_llm_shared/docs/kernels/ffn_swiglu.md`, `silu_and_mul.md`
+- `programming_examples/_llm_shared/docs/kernels/eltwise_add.md`
 
 ## Workflow
 

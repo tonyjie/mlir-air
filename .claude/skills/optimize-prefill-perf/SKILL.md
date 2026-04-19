@@ -7,9 +7,9 @@ description: Phase 4 of LLM deployment — apply the 5 known prefill optimizatio
 Apply the prefill optimization patterns that took LLAMA from 18.67s → 1.30s. Each pattern is mechanically applicable; the skill attempts each and records the gain or skip-reason. Judgment-heavy choices defer to human.
 
 ## Knowledge base references
-- `programming_examples/llama3/docs/development_progress/perf_optimization.md` — full optimization journey
-- `programming_examples/llama3/docs/development_progress/multi-launch/host_optimization.md` — `static_input_indices`, `intermediate_indices`
-- `programming_examples/llama3/docs/development_progress/multi-launch/decode_merging.md` — extern kernel rename pattern (used here for shape-collision avoidance)
+- `programming_examples/_llm_shared/docs/perf_optimization.md` — full optimization journey
+- `programming_examples/_llm_shared/docs/multi-launch/host_optimization.md` — `static_input_indices`, `intermediate_indices`
+- `programming_examples/_llm_shared/docs/multi-launch/decode_merging.md` — extern kernel rename pattern (used here for shape-collision avoidance)
 
 ## Workflow
 
@@ -66,9 +66,12 @@ from llama32_3b deployment, 2026-04-18). Two pitfalls:
    `dk_chunks=2` and the kernel hangs with `ERT_CMD_STATE_TIMEOUT`. **Workaround
    (Option C, proven on llama32_3b)**: switch to head-first `attn_npu2.py` +
    wrap with host transposes via a `_run_cached("flash_attn", ...)` monkey-patch.
-   Reference implementation:
-   `programming_examples/llama32_3b/llama32_3b_phase2_test.py:_patch_run_cached_for_headfirst_fa`.
-   Cost: a few ms/layer host transpose; gain: 4.2× speedup vs CPU-attn.
+   **Reusable implementation:**
+   `programming_examples/_llm_shared/phase_helpers/headfirst_fa.py` exposes
+   `install_headfirst_fa_wrapper()` + `compile_headfirst_fa_kernel(...)`;
+   `_llm_shared/phase_helpers/orchestration.compile_block_kernels` already
+   auto-routes head_dim ≥ 128 through it. Cost: a few ms/layer host transpose;
+   gain: 4.2× speedup vs CPU-attn (llama32_3b warm prefill 13.6 s → 3.2 s).
 
 If FA hangs or produces NaN at head_dim ≥ 128, invoke `debug-fa-runtime-failure`
 recipe BEFORE assuming the kernel is broken — it bisects (n_heads, n_kv, lq=lk,

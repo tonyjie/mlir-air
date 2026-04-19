@@ -9,7 +9,7 @@ Once individual kernels work, integrate them into a single transformer block. Th
 ## Knowledge base references
 - `programming_examples/llama3/llama3_prefill.py:run_transformer_block` — reference single-block pipeline
 - `programming_examples/llama3/docs/development_progress/progress.md` — LLAMA Phase 2 log (CPU fallback strategy)
-- `programming_examples/llama3/docs/explain.md` — kernel directory map
+- `programming_examples/_llm_shared/docs/explain.md` — kernel directory map
 
 ## Workflow
 

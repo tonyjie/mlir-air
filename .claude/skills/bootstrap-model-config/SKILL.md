@@ -10,7 +10,7 @@ Translate a HuggingFace model into the data structures the rest of the pipeline 
 Read these BEFORE acting:
 - `programming_examples/llama3/llama3_weights.py` — reference Config dataclass + HF weight loading
 - `programming_examples/llama3/llama3_reference.py` — reference CPU F32 inference
-- `programming_examples/llama3/docs/explain.md` — RoPE half-split convention details
+- `programming_examples/_llm_shared/docs/explain.md` — RoPE half-split convention details
 
 ## Workflow
 

@@ -8,8 +8,8 @@ Diagnose and auto-fix Buffer Object (BO) corruption issues in multi-launch and p
 
 ## Knowledge base references
 Read these BEFORE acting if they apply:
-- `programming_examples/llama3/docs/development_progress/multi-launch/host_optimization.md` — `static_input_indices`, `intermediate_indices`, BO write/read overhead
-- `programming_examples/llama3/docs/development_progress/compiler_issues/herd_load_bug.md` — herd_load vs segment_load semantics
+- `programming_examples/_llm_shared/docs/multi-launch/host_optimization.md` — `static_input_indices`, `intermediate_indices`, BO write/read overhead
+- `programming_examples/_llm_shared/docs/compiler_issues/herd_load_bug.md` — herd_load vs segment_load semantics
 
 ## Trigger pattern
 

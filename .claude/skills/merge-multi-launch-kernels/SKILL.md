@@ -8,9 +8,9 @@ The procedure for merging N separate kernel launches into one multi-launch ELF u
 
 ## Knowledge base references
 Read these BEFORE acting:
-- `programming_examples/llama3/docs/development_progress/multi-launch/host_optimization.md` — host-side BO write/read overhead, why merging helps
-- `programming_examples/llama3/docs/development_progress/multi-launch/decode_merging.md` — decode-specific merge patterns (extern kernel rename for K=8192)
-- `programming_examples/llama3/docs/development_progress/multi-launch/full_block.md` — what does NOT merge (attention)
+- `programming_examples/_llm_shared/docs/multi-launch/host_optimization.md` — host-side BO write/read overhead, why merging helps
+- `programming_examples/_llm_shared/docs/multi-launch/decode_merging.md` — decode-specific merge patterns (extern kernel rename for K=8192)
+- `programming_examples/_llm_shared/docs/multi-launch/full_block.md` — what does NOT merge (attention)
 - `programming_examples/llama3/multi_launch_builder/rms_gemms_rope_multi.py` — reference implementation of a 6-launch merge
 - `programming_examples/llama3/multi_launch_builder/o_ffn_multi.py` — reference 8-launch merge
 

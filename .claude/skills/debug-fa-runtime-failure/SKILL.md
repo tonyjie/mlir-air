@@ -70,8 +70,11 @@ corr=0.996 PASS).
    `attn_npu2_seqfirst.build_module(...)`. Same args, different I/O layout.
 2. Monkey-patch `llama3_prefill._run_cached` to intercept `"flash_attn"`
    calls: transpose seq-first inputs to head-first layout, call the
-   head-first ELF, transpose output back. Reference:
-   `programming_examples/llama32_3b/llama32_3b_phase2_test.py:_patch_run_cached_for_headfirst_fa`.
+   head-first ELF, transpose output back. **Reusable implementation:**
+   `programming_examples/_llm_shared/phase_helpers/headfirst_fa.py` —
+   call `install_headfirst_fa_wrapper()` once at module load and
+   `compile_headfirst_fa_kernel(cache, seq_len, n_heads, n_kv_heads, head_dim)`
+   from your `compile_block_kernels()`. Used by llama32_3b phase tests.
 3. Override `_attn_backend_kwargs` to return head-first kwargs:
    `omit_while_true_loop=False`, `runtime_loop_tiling_sizes=[1, 1, 1]` if
    `dv_chunks > 1`, `target_device="npu2"`.

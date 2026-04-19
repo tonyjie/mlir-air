@@ -148,7 +148,7 @@ All 9 kernel configs tested on NPU2 hardware with random data:
 | 2026-03-13 | **ROOT CAUSE FOUND**: Per-kernel diagnostic shows **flash attention (step 7) has corr=0.34** — all other 14 kernels have corr>0.999. The flash attention kernel was compiled without causal masking (`causal=False`), performing bidirectional attention. CPU reference correctly applies causal masking. |
 | | **Fix attempt 1**: `causal=True` — fails to compile at seq_len=2048 due to BD exhaustion (hardware limit: 48 BDs per MemTile, causal needs ~144). |
 | | **Fix attempt 2**: Pass causal mask via external mask input — kernel ignores `arg3` (mask not in launch operands in non-causal path). |
-| | **Status**: Blocked on flash attention causal masking compilation. See `kernels/flash_attention.md`. |
+| | **Status**: Blocked on flash attention causal masking compilation. See `../../../_llm_shared/docs/kernels/flash_attention.md`. |
 | 2026-03-13 | **F32 residual path improvement** (secondary): Added dual-precision BF16/F32 residual state to `run_transformer_block()`. Later removed (2026-04-10) — F32 path was dead code, never actually used. |
 | 2026-03-13 | **Configuration sweep**: Created `test_flash_attn_configs.py`. Tested 10 configs at LLAMA shapes. Only 3/10 compile and pass. Best: LQP=256/LKP=64 at 2427 GFLOPS. All causal configs failed (BD exhaustion, pre-upstream-fix). |
 | 2026-03-16 | **Causal BD exhaustion fixed upstream**. `causal=True` now compiles: `make run LQ=2048 LK=2048 LQP=256 LKP=64 ... EXTRA_PY_FLAGS="--causal"` → PASS! |
@@ -193,7 +193,7 @@ All 9 kernel configs tested on NPU2 hardware with random data:
 
 ## Phase 4: Performance Optimization
 
-See `perf_optimization.md` for full IRON comparison and optimization history.
+See `../../../_llm_shared/docs/perf_optimization.md` for full IRON comparison and optimization history.
 
 **Prefill journey**: 18.67s → 3.57s → 1.77s → 1.49s → 1.25s → **1.30s kernel / 1.54s wall** (14× total improvement)
 **Decode journey**: 500ms → 351ms → 365ms (merged) → **92ms** (NPU LM Head, 5.4× improvement)
