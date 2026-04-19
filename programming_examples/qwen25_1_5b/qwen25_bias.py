@@ -117,31 +117,75 @@ def clear_layer_bias():
     _LAYER_BIAS.clear()
 
 
-def install_qkv_bias_wrapper():
-    """Monkey-patch `llama3_prefill._run_cached` to apply Qwen2 QKV bias.
+# Decode position: set by the per-token loop before invoking run_decode_block.
+# Used by the load_and_run patch when it sees a `rms_gemv_rope` call to slice
+# the precomputed bq_roped / bk_roped to the right position.
+_DECODE_POS = None
 
-    Idempotent. Call once before any `run_transformer_block` invocation.
-    No-op for `rms_gemms_rope` calls whose `bo_key` doesn't have a registered
-    bias — safe to leave installed across deployments (llama3/smollm2 won't
-    register layers and thus pay zero overhead).
+
+def set_decode_position(pos):
+    """Tell the decode bias wrapper which position the next rms_gemv_rope is at."""
+    global _DECODE_POS
+    _DECODE_POS = int(pos) if pos is not None else None
+
+
+def _apply_bias_to_results(results, bias, pos=None):
+    """Add registered bias to (v, q_roped, k_roped) at results[8],[11],[12].
+
+    For decode (pos given): slice bq_roped/bk_roped to [pos:pos+1].
+    For prefill (pos=None): use the full bq_roped/bk_roped tensors.
+    """
+    bq_roped = bias["bq_roped"]
+    bk_roped = bias["bk_roped"]
+    bv = bias["bv"]
+    if pos is not None:
+        bq_roped = bq_roped[pos : pos + 1]
+        bk_roped = bk_roped[pos : pos + 1]
+
+    v = np.asarray(results[8])
+    q_roped = np.asarray(results[11])
+    k_roped = np.asarray(results[12])
+    seq_dim = bq_roped.shape[0]
+    q2 = q_roped.reshape(seq_dim, -1)
+    k2 = k_roped.reshape(seq_dim, -1)
+    v2 = v.reshape(seq_dim, -1)
+    q2_new = (q2.astype(np.float32) + bq_roped.astype(np.float32)).astype(bfloat16)
+    k2_new = (k2.astype(np.float32) + bk_roped.astype(np.float32)).astype(bfloat16)
+    v2_new = (v2.astype(np.float32) + bv.astype(np.float32)).astype(bfloat16)
+    results = list(results)
+    results[8] = v2_new.reshape(v.shape)
+    results[11] = q2_new.reshape(q_roped.shape)
+    results[12] = k2_new.reshape(k_roped.shape)
+    return results
+
+
+def install_qkv_bias_wrapper():
+    """Monkey-patch KernelCache.load_and_run to apply Qwen2 QKV bias.
+
+    Catches both prefill (`rms_gemms_rope`, full bq_roped) and decode
+    (`rms_gemv_rope`, sliced to current position via `set_decode_position`).
+
+    Idempotent. Safe to leave installed across deployments — only fires for
+    layers that have explicitly registered bias via `register_layer_bias`.
     """
     global _INSTALLED
     if _INSTALLED:
         return
 
-    import llama3_prefill as _lp
+    from llama3_prefill import KernelCache as _KC
 
-    _orig_run_cached = _lp._run_cached
+    _orig_load_and_run = _KC.load_and_run
 
-    def _patched_run_cached(cache, name, backend_kwargs, *inputs, **kwargs):
-        results = _orig_run_cached(cache, name, backend_kwargs, *inputs, **kwargs)
-        if name != "rms_gemms_rope":
+    def _patched_load_and_run(self, name, backend_kwargs, *inputs, **kwargs):
+        results = _orig_load_and_run(self, name, backend_kwargs, *inputs, **kwargs)
+        if name not in ("rms_gemms_rope", "rms_gemv_rope"):
             return results
 
         bo_key = kwargs.get("bo_key")
-        if not bo_key or not bo_key.startswith("rms_gemms_rope_L"):
-            if os.environ.get("QWEN25_BIAS_DEBUG"):
-                print(f"  [qwen25_bias] skipped: bo_key={bo_key!r}", flush=True)
+        if not bo_key:
+            return results
+        suffix = f"{name}_L"
+        if not bo_key.startswith(suffix):
             return results
         try:
             layer_idx = int(bo_key.split("_L", 1)[1])
@@ -156,45 +200,21 @@ def install_qkv_bias_wrapper():
                     flush=True,
                 )
             return results
+
+        # Decode path: slice to current position.
+        pos = _DECODE_POS if name == "rms_gemv_rope" else None
+        if name == "rms_gemv_rope" and pos is None:
+            raise RuntimeError(
+                "qwen25_bias: rms_gemv_rope intercepted but no decode position "
+                "set. Call qwen25_bias.set_decode_position(pos) before each "
+                "run_decode_block invocation."
+            )
         if os.environ.get("QWEN25_BIAS_DEBUG"):
             print(
-                f"  [qwen25_bias] applying bias for layer {layer_idx}",
+                f"  [qwen25_bias] applying bias for {name} layer {layer_idx} pos={pos}",
                 flush=True,
             )
+        return _apply_bias_to_results(results, bias, pos=pos)
 
-        # Per llama3_prefill.run_transformer_block, the caller does:
-        #   v       = results[8].reshape(seq_len, kv_dim)
-        #   q_roped = results[11].reshape(seq_len, n_heads * head_dim)
-        #   k_roped = results[12].reshape(seq_len, n_kv_heads * head_dim)
-        # Add bias to each in F32 then cast back to bf16 (avoids a second
-        # rounding error from intermediate bf16 sums).
-        bq_roped = bias["bq_roped"]
-        bk_roped = bias["bk_roped"]
-        bv = bias["bv"]
-
-        # Defensive: convert results to ndarray if they're lazy.
-        v = np.asarray(results[8])
-        q_roped = np.asarray(results[11])
-        k_roped = np.asarray(results[12])
-
-        seq_len = q_roped.shape[0] if q_roped.ndim == 2 else bq_roped.shape[0]
-        # Reshape to 2-D so the broadcast-add works whether the ELF returned
-        # 1-D flat outputs or 2-D outputs.
-        q2 = q_roped.reshape(seq_len, -1)
-        k2 = k_roped.reshape(seq_len, -1)
-        v2 = v.reshape(seq_len, -1)
-
-        q2_new = (q2.astype(np.float32) + bq_roped.astype(np.float32)).astype(bfloat16)
-        k2_new = (k2.astype(np.float32) + bk_roped.astype(np.float32)).astype(bfloat16)
-        v2_new = (v2.astype(np.float32) + bv.astype(np.float32)).astype(bfloat16)
-
-        # Preserve the original shape of each result element (some callsites
-        # downstream call `.reshape` on the same object).
-        results = list(results)
-        results[8] = v2_new.reshape(v.shape)
-        results[11] = q2_new.reshape(q_roped.shape)
-        results[12] = k2_new.reshape(k_roped.shape)
-        return results
-
-    _lp._run_cached = _patched_run_cached
+    _KC.load_and_run = _patched_load_and_run
     _INSTALLED = True

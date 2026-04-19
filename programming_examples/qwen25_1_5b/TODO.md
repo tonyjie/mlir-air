@@ -4,9 +4,9 @@
 - [x] 0: Bootstrap  (2026-04-18 — top-1 " Paris", corr 0.99999992 vs HF F32)
 - [x] 1: Per-kernel shapes  (2026-04-18 — classification + variant audit; 3 NEW items + 1 risk for Phase 2)
 - [x] 2: Single block  (2026-04-19 — cosine 0.9988 / per-pos 0.9981 @ seq_len=2048 via GQA-reindexed padding; bias via host post-add)
-- [ ] 3: Full model
-- [ ] 4: Prefill perf
-- [ ] 5: Decode perf
+- [x] 3: Full model  (2026-04-19 — decisive 3/3 top-1, competitive 3/3 top-5 overlap @ seq_len=2048)
+- [x] 4: Prefill perf  (2026-04-19 — 5/5 patterns; warm 2.4 s NPU layers / 4.1 s wall via NPU FA Option C; 4.2× vs CPU-attn)
+- [x] 5: Decode perf  (2026-04-19 — 216 ms/token, 4.6 tok/s, 5/6 NPU/CPU match; 5/5 patterns; new `k_split` knob in matvec.py)
 - [ ] 6: Finalize
 
 ## Active blockers

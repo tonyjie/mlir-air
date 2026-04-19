@@ -27,7 +27,10 @@ from qwen25_weights import (
 )
 
 
-def rms_norm(x, weight, eps):
+def rms_norm(x, weight, eps=1e-6):
+    """Qwen2 RMSNorm. Default eps=1e-6 matches Qwen2 config; callers from
+    shared infra (prefill_runner) pass weight only and rely on this default.
+    """
     x = np.asarray(x, dtype=np.float32)
     weight = np.asarray(weight, dtype=np.float32)
     rms = np.sqrt(np.mean(x * x, axis=-1, keepdims=True) + eps)
@@ -144,16 +147,22 @@ def transformer_block(x, layer_weights, rope_lut, config):
             k_heads[:, h, :].reshape(seq_len, head_dim), rope_lut[:seq_len]
         )
     k_roped = k_roped_heads.reshape(seq_len, n_kv_heads * head_dim)
+    intermediates["q_roped"] = q_roped
+    intermediates["k_roped"] = k_roped
 
     attn_out = attention_reference(q_roped, k_roped, v, n_heads, n_kv_heads)
+    intermediates["attn_out"] = attn_out
 
     wo = np.asarray(layer_weights.wo, dtype=np.float32)
     proj = attn_out @ wo  # (no o_proj bias in Qwen2)
+    intermediates["proj"] = proj
 
     res1 = x + proj
+    intermediates["res1"] = res1
 
     # --- Feed-forward (SwiGLU) ---
     normed2 = rms_norm(res1, layer_weights.ffn_norm, eps=eps)
+    intermediates["ffn_norm"] = normed2
     w_gate = np.asarray(layer_weights.w_gate, dtype=np.float32)
     w_up = np.asarray(layer_weights.w_up, dtype=np.float32)
     gate = normed2 @ w_gate

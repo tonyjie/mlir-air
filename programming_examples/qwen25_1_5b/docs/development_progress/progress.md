@@ -73,6 +73,76 @@ See `phase2_block.md` for the full discussion + tile-config audit.
 - L3: At emb_dim=1536, the 6-launch `rms_gemms_rope` ELF exhausts shim BD
   pool at seq_len=2048 — Phase 3 needs the 2-ELF split.
 
+## Phase 3: Full-model correctness (PASS, 2026-04-19)
+
+See `phase3_full.md` for the per-prompt table.
+
+- **Gate**: decisive 3/3 top-1, competitive 3/3 top-5 overlap, no NaN ✓
+- **Strict top-1**: 5/6 (the one miss is `'The sky is'` competitive: NPU=' ',
+  CPU=' blue', cpu_p=0.265 — expected BF16 reorder per LESSON 2)
+- **Decisive matches**: ' ', ' ', ' ' for `1+1`, `2+2`, `Water freezes at`
+- **Competitive top-1 successes**: ' Pacific', ' Paris' for `largest ocean`
+  and `France` (despite cpu_p=0.34/0.27 — competitive but stable enough)
+- **NPU prefill (CPU-attn)**: ~10 s / 28 layers (~360 ms/layer); CPU
+  reference: ~18 s/prompt
+- **Padding stability**: GQA-reindexed padding propagates correctly
+  through all 28 layers — no structural drift from the padding scheme
+  (the small per-prompt corr range 0.91–0.99 is normal BF16 accumulation
+  across deep stack at head_dim=128, matching llama32_3b's behavior).
+
+## Phase 4: Prefill perf (PASS, 2026-04-19)
+
+See `phase4_prefill.md` for the full pattern table + per-pattern measurements.
+
+- **5/5 patterns applied with NPU FA**:
+  1. Multi-launch merging (INHERITED — rms_gemms_rope=6 + o_ffn=8 launches)
+  2. BO pre-loading (APPLIED — `preload_prefill_weights` works unchanged with
+     padded weights; 1.78 s setup)
+  3. Intermediate buffer reuse (INHERITED)
+  4. Seq-first layout (INHERITED)
+  5. **NPU FA via Option C head-first wrapper** (APPLIED — works clean at
+     padded GQA group=8)
+- **Headline numbers** (warm avg of 3, NPU FA path):
+  - NPU layers: **2.4 s** (85 ms/layer) — 4.2× faster than CPU-attn (10.1 s)
+  - Wall (incl. CPU LM head): **4.1 s** — 2.9× faster than CPU-attn (11.8 s)
+- **Top-1 token preserved** (' Paris') on cold + warm + CPU reference — no
+  regression introduced by NPU FA path through padded shapes.
+- **Vs prior deployments** (warm ms/layer): llama3 81, smollm2 79,
+  llama32_3b 115, **qwen25_1_5b 85** — sits cleanly between smaller-emb
+  and same-depth models, confirming the padding overhead is small.
+
+## Phase 5: Decode perf (PASS, 2026-04-19)
+
+See `phase5_decode.md` for the full per-pattern table + timing.
+
+- **Headline**: **216 ms/token (4.6 tok/s)** steady-state, 7.7 ms/layer at
+  Qwen2.5-1.5B (28 layers, head_dim=128). Per-layer rate matches
+  llama32_3b exactly (also 7.7 ms/layer at same depth + head_dim).
+- **Top-1 NPU/CPU match**: 5/6 (83%) > 80% gate ✓
+- **Generated**: "The capital of France is Paris, and the capital of France"
+- **5/5 patterns** (with `[PARTIAL]` on attention same as llama3 design):
+  1. Multi-launch merging (INHERITED — rms_gemv_rope=6, o_gemv_ffn=8)
+  2. Static weight BOs (INHERITED)
+  3. **NPU LM Head GEMV** (APPLIED — 10×16384 partition, vocab=151936;
+     `tile_m=16, m_input=16` to fit B-DMA repeat-count limit)
+  4. **Extern kernel rename** (APPLIED — `mv_k8960.o` for Down GEMV K=8960
+     plus new `down_k_split=70` matvec knob to fit K-DMA repeat-count)
+  5. CPU→NPU op promotion (PARTIAL — attention stays on CPU, llama3 design)
+
+### NEW reusable infra (back-compat verified, default-off)
+- `matrix_vector_multiplication/bf16/matvec.py`: added optional `k_split`
+  parameter. Default None preserves existing behavior byte-for-byte.
+- `llama3/multi_launch_builder/o_gemv_ffn_multi.py`: added optional
+  `down_k_split` parameter forwarded to matvec.
+- `qwen25_bias.py`: refactored to monkey-patch `KernelCache.load_and_run`
+  (covers BOTH prefill `rms_gemms_rope` and decode `rms_gemv_rope`); added
+  `set_decode_position(pos)` API.
+
+### Lesson 5 captured (LESSONS.md)
+- Two distinct K-DMA `repeat_count > 255` walls at hidden_dim ≥ ~8200.
+- `k_split` knob in matvec.py is reusable for any future model with
+  hidden_dim > 8160 (incl. Llama-3-8B at 14336).
+
 ### Phase 3 BLOCKERS — RESOLVED 2026-04-19
 1. **seq_len=2048 BD allocator exhaustion** — RESOLVED via `qwen25_pad.py`
    GQA-aware reindexed padding (emb_dim 1536→2048, hidden_dim 8960→9216,

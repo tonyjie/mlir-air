@@ -109,6 +109,56 @@ Implemented in `qwen25_pad.py` (`_gqa_reindex_qhead_axis*`).
 RMSNorm-scale noise). NPU Phase 2 cosine at seq_len=2048 = 0.9988
 (matches the seq_len=512 unpadded path). Phase 3 unblocked.
 
+## Lesson 5 — Two distinct K-DMA repeat-count walls at hidden_dim ≥ ~8200 (Phase 5, 2026-04-19)
+
+**Situation**: Qwen2.5 hidden_dim=8960 hit two SHIM `push_queue.repeat_count`
+> 255 walls in decode:
+
+(a) **Down GEMV K-DMA wall**: K=8960 auto-splits as `(outer=K/32=280,
+    inner=32)` because the AIE2P vector width is 32 BF16. Outer 280 > 255 ❌.
+    K_max under this auto-split is 32 × 255 = **8160** — anything larger
+    fails compile.
+
+(b) **B-input shim DMA wall** (separate, even at smaller K!): the input
+    vector `_l3_b` is read `launch_count × (tile_m / m_input)` times per
+    GEMV. For Gate/Up at M=hidden_dim=8960 with default
+    `(tile_m=8, m_input=4)`: `8960/64 × 2 = 280` reads — exceeds 255. Same
+    for LM-head per-partition with M=16384: `16384/64 × 2 = 512` ❌.
+
+**Fix (a)**: Added `k_split` parameter to `matvec.build_module`
+(default None, back-compat). When set, `src_sizes=[k_split, k_inner]`
+explicitly pre-splits the K-DMA so the lowering doesn't auto-split. Use
+`k_split=70` for K=8960 → splits as `(70, 128)` — outer 70 ≤ 255 ✓.
+Forwarded to Down via `down_k_split` in `o_gemv_ffn_multi`.
+
+**Fix (b)**: Set `tile_m = m_input = 16` for the K=2048 GEMVs. Inner
+`tile_m / m_input = 1` cuts reads by 2×. Combined with the larger tile_m
+the launch count also drops, so `launch_count × inner` stays under 255
+even for M=16384 LM-head partitions.
+
+**Why these are GENERIC fixes** (not just Qwen2.5):
+- `k_split` is needed by ANY model with hidden_dim > 8160 (e.g., Llama-3-8B
+  has 14336 — would also need `k_split` like 56 → inner 256).
+- `tile_m = m_input` is just a tuning; helps any GEMV where M and K are
+  large enough to push the B-DMA fires count near the limit.
+
+**Back-compat for shared infra changes**:
+- `matvec.build_module(k_split=None)` produces byte-identical IR to before
+  (else-branch preserves old `src_sizes=[k]` path). Verified.
+- `o_gemv_ffn_multi.build_o_gemv_ffn_module(down_k_split=None)` same —
+  forwards None to matvec, no behavior change.
+- llama3, smollm2, llama32_3b decode paths exercise the default
+  `k_split=None` path → no regression.
+
+**How to apply**: when bringing up decode for a new model:
+1. Compute `launch_count × (tile_m / m_input)` for every GEMV. Must be ≤ 255.
+2. If `hidden_dim > 8160`, set `down_k_split` to a value where
+   `hidden_dim % k_split == 0` and `k_split ≤ 255` and
+   `hidden_dim/k_split ≤ ~1023` (BD inner dim limit).
+3. CPU sanity test the matvec.build_module with both default and your
+   `k_split` to confirm the IR change is what you expected before going
+   to hardware compile (saves ~30 s per iteration).
+
 **How to apply**: when padding emb_dim of a GQA model, NEVER assume
 `n_heads = padded_emb_dim / head_dim` directly. Either (a) pad with
 GQA-aware reindexing, (b) split the ELF instead, or (c) keep emb_dim

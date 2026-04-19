@@ -342,6 +342,7 @@ def build_o_gemv_ffn_module(
     down_tile_m=2,
     down_m_input=1,
     herd_m=8,
+    down_k_split=None,
 ):
     """Build 8-launch O GEMV + FFN decode pipeline in one ELF.
 
@@ -352,6 +353,11 @@ def build_o_gemv_ffn_module(
     K=8192 Down GEMV uses tile_m=2, m_input=1 (smaller tiles for large K).
     The external func type mismatch is resolved by renaming the Down GEMV's
     @matvec to @dg_matvec_vectorized_bf16_bf16 with separate link_with.
+
+    `down_k_split` (optional): forwarded to matvec.build_module for the Down
+    GEMV only. Default None preserves the existing behavior. Set this when
+    Down's K exceeds the auto-split repeat-count limit (32 × 255 = 8160) —
+    e.g., Qwen2.5 hidden_dim=8960 needs `down_k_split=14` (inner=640).
     """
     from matvec import build_module as build_gemv
     from eltwise_add.eltwise_add import build_module as build_add
@@ -401,7 +407,14 @@ def build_o_gemv_ffn_module(
     print("  [7/8] Down GEMV...")
     down_ir = str(
         build_gemv(
-            emb_dim, hidden_dim, down_tile_m, down_m_input, herd_m, bfloat16, bfloat16
+            emb_dim,
+            hidden_dim,
+            down_tile_m,
+            down_m_input,
+            herd_m,
+            bfloat16,
+            bfloat16,
+            k_split=down_k_split,
         )
     )
 

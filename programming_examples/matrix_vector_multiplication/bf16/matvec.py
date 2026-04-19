@@ -29,7 +29,31 @@ range_ = for_
 
 
 @module_builder
-def build_module(m, k, tile_m, m_input, herd_m, np_dtype_in, np_dtype_out):
+def build_module(
+    m,
+    k,
+    tile_m,
+    m_input,
+    herd_m,
+    np_dtype_in,
+    np_dtype_out,
+    k_split=None,
+):
+    """Build a BF16 GEMV module.
+
+    Args:
+        m, k: matrix dims (output rows, input cols).
+        tile_m, m_input, herd_m: tile config (see file header).
+        np_dtype_in, np_dtype_out: numpy dtypes.
+        k_split (optional): pre-split the K-dim DMA into (k_split, k//k_split)
+            instead of letting the lowering pass auto-split. Use this when
+            K is large enough that the lowering would emit a BD chain with
+            outer-dim repeat_count > 255 (the AIE2P shim hardware limit).
+            Default None preserves the existing behavior unchanged
+            (back-compat for llama3, smollm2, llama32_3b at K ≤ 8192).
+            For K=8960 (Qwen2.5 hidden_dim), use k_split=14 → inner=640
+            (auto-split would give outer=280 > 255).
+    """
     assert (
         m % (tile_m * herd_m) == 0
     ), f"M ({m}) must be divisible by tile_m * herd_m ({tile_m * herd_m})"
@@ -37,6 +61,11 @@ def build_module(m, k, tile_m, m_input, herd_m, np_dtype_in, np_dtype_out):
         tile_m % m_input == 0
     ), f"tile_m ({tile_m}) must be divisible by m_input ({m_input})"
     assert k % 64 == 0, f"K ({k}) must be divisible by 64 (vector width)"
+    if k_split is not None:
+        assert k % k_split == 0, f"K ({k}) must be divisible by k_split ({k_split})"
+        k_inner = k // k_split
+    else:
+        k_inner = None
 
     # Guard MemTile/L2 capacity for staged A and C tiles.
     bytes_per_elem_in = np.dtype(np_dtype_in).itemsize
@@ -148,13 +177,25 @@ def build_module(m, k, tile_m, m_input, herd_m, np_dtype_in, np_dtype_out):
                 l1_c_data = AllocOp(l1MemrefTyC, [], [])
 
                 # L3→L2: A (all herd_m * tile_m rows)
-                dma_memcpy_nd(
-                    l2_a_data,
-                    l3_a_data_s,
-                    src_offsets=[0, launch_offset_m, 0],
-                    src_sizes=[herd_m, tile_m, k],
-                    src_strides=[tile_m * k, k, 1],
-                )
+                if k_inner is not None:
+                    # Pre-split K dim so the lowering doesn't auto-split into a
+                    # BD chain whose outer-dim repeat count exceeds 255 (HW
+                    # limit). Total elements unchanged.
+                    dma_memcpy_nd(
+                        l2_a_data,
+                        l3_a_data_s,
+                        src_offsets=[0, launch_offset_m, 0, 0],
+                        src_sizes=[herd_m, tile_m, k_split, k_inner],
+                        src_strides=[tile_m * k, k, k_inner, 1],
+                    )
+                else:
+                    dma_memcpy_nd(
+                        l2_a_data,
+                        l3_a_data_s,
+                        src_offsets=[0, launch_offset_m, 0],
+                        src_sizes=[herd_m, tile_m, k],
+                        src_strides=[tile_m * k, k, 1],
+                    )
 
                 # Single compute herd: zero-fill + loop(A L2→L1 + B L3→L1, kernel) + C L1→L2
                 # B skips L2 — loaded directly L3→L1 inside loop for channel hoisting
@@ -202,22 +243,40 @@ def build_module(m, k, tile_m, m_input, herd_m, np_dtype_in, np_dtype_out):
                         # L3→L1: B directly (inside loop so the compiler's
                         # air-dma-to-channel pass can hoist it into a channel
                         # with repeat_count, avoiding extra L2 staging for B).
-                        dma_memcpy_nd(
-                            _l1_b,
-                            _l3_b,
-                            src_offsets=[],
-                            src_sizes=[k],
-                            src_strides=[1],
-                        )
+                        if k_inner is not None:
+                            dma_memcpy_nd(
+                                _l1_b,
+                                _l3_b,
+                                src_offsets=[],
+                                src_sizes=[k_split, k_inner],
+                                src_strides=[k_inner, 1],
+                            )
+                        else:
+                            dma_memcpy_nd(
+                                _l1_b,
+                                _l3_b,
+                                src_offsets=[],
+                                src_sizes=[k],
+                                src_strides=[1],
+                            )
 
                         # L2→L1: A[_tx, j_m*m_input:, :]
-                        dma_memcpy_nd(
-                            _l1_a,
-                            _l2_a,
-                            src_offsets=[_tx, j_m_offset, 0],
-                            src_sizes=[1, m_input, k],
-                            src_strides=[tile_m * k, k, 1],
-                        )
+                        if k_inner is not None:
+                            dma_memcpy_nd(
+                                _l1_a,
+                                _l2_a,
+                                src_offsets=[_tx, j_m_offset, 0, 0],
+                                src_sizes=[1, m_input, k_split, k_inner],
+                                src_strides=[tile_m * k, k, k_inner, 1],
+                            )
+                        else:
+                            dma_memcpy_nd(
+                                _l1_a,
+                                _l2_a,
+                                src_offsets=[_tx, j_m_offset, 0],
+                                src_sizes=[1, m_input, k],
+                                src_strides=[tile_m * k, k, 1],
+                            )
 
                         # Kernel
                         row_offset_i32 = arith.index_cast(T.i32(), j_m_offset)
