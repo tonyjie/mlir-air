@@ -18,6 +18,46 @@ Read these BEFORE acting:
 
 ## Workflow
 
+### Step 0: Variant audit — REQUIRED for FlashAttention (LESSON 3 from llama32_3b deployment, 2026-04-18)
+
+When citing an existing lit test as proof that a kernel "supports head_dim=N",
+you MUST identify which Python builder the lit test exercises AND verify
+production code uses the same builder. **The two FA Python builders
+(`attn_npu2.py` head-first vs `attn_npu2_seqfirst.py` seq-first) compile from
+the same C++ kernel but have different Python IR / DMA patterns**, and lit
+tests for one DO NOT validate the other.
+
+For each kernel where lit-test coverage is being claimed:
+
+1. Find the lit test command. Example:
+   ```
+   $ grep -E "RUN.*make.*run.*DK=|--dk\\s+\\d+" \
+       programming_examples/<kernel_dir>/*.lit
+   ```
+2. Trace the Makefile target back to the Python script it invokes:
+   ```
+   $ grep -E "python3.*\\.py" programming_examples/<kernel_dir>/Makefile
+   ```
+3. Diff against the Python file production code imports. If they differ:
+   the lit test does NOT validate the production code path; flag this in
+   the classification table as **"NEEDS Phase 2 standalone validation"**
+   instead of trusting the classification.
+
+**Concrete example from llama32_3b**: I claimed `run_npu2_makefile_peano_llama3_8b.lit`
+proved head_dim=128 worked. The lit test exercises `attn_npu2.py` (head-first).
+But llama3_prefill imports `attn_npu2_seqfirst.py` (seq-first). The seq-first
+`dk_chunks > 1` path is broken — never lit-tested upstream — and hangs at
+runtime. Cost of this audit miss: ~half a deployment session debugging FA hangs.
+
+If you find a coverage gap, add a TODO.md entry like:
+> Phase 2 prerequisite: standalone validation of `<production_python_file>` at
+> `(n_heads=N, n_kv_heads=K, lq=lk=L, dk=D)` — lit test only covers the
+> `<other_python_file>` variant.
+
+A reusable bisect harness (vary one axis at a time across n_heads, n_kv_heads,
+lq, dk; report HANG/NaN/PASS per cell) is the right tool for this validation —
+see `debug-fa-runtime-failure` for the template.
+
 ### Step 1: Enumerate the unique shapes from `<model>_weights.py` Config
 Compute the set of (kernel_type, shape_tuple) pairs the model needs:
 
