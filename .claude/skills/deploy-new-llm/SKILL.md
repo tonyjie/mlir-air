@@ -41,10 +41,18 @@ the user's behalf.
 ### Step 2: Architecture compatibility check
 Fetch HF `config.json`. Reject if any of:
 - Architecture is MoE (e.g., `MixtralForCausalLM`, gpt-oss class)
-- Has sliding-window attention (`sliding_window` set in config)
+- Has sliding-window attention (`sliding_window` set in config AND
+  `use_sliding_window=true`)
 - Uses MLA (Multi-head Latent Attention)
 - Uses encoder-decoder structure
-- Has QKV bias without bias-supporting kernels available
+
+**QKV bias is NOW SUPPORTED** (LESSON 1 from qwen25_1_5b deployment,
+2026-04-19). Qwen2-family models with `qkv_bias=true` are accepted —
+the bias gets added on the HOST after the bias-free kernels return,
+exploiting RoPE's linearity (`RoPE(q + bq) = RoPE(q) + RoPE(bq)`).
+Reference implementation: `programming_examples/qwen25_1_5b/qwen25_bias.py`.
+Per-deployment effort: ~1-2 hours to wire up the bias precompute +
+register_layer_bias loop. Surface in TODO.md as a Phase 2 prerequisite.
 
 Print clear rejection message. Do NOT proceed.
 

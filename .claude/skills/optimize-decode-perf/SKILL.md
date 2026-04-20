@@ -33,6 +33,30 @@ If two GEMV shapes coexist in one ELF (e.g., K=2048 and K=8192) and need differe
 
 See `_llm_shared/kernel_builder/external_kernels.py` and `programming_examples/llama3/multi_launch_builder/o_gemv_ffn_multi.py` for the existing K=8192 rename pattern.
 
+**At hidden_dim > 8160, you also need `k_split`** (LESSON 5 from
+qwen25_1_5b deployment, 2026-04-19). The Down GEMV's K-DMA auto-splits
+as `(outer = K/32, inner = 32)` because the AIE2P BF16 vector width is
+32. K_max under auto-split = 32 × 255 = **8160** — the AIE2P shim's
+`repeat_count` hardware limit. For K > 8160, pass `down_k_split=N` to
+`build_o_gemv_ffn_module` where `K % N == 0` AND `N ≤ 255` AND
+`K/N ≤ 1023` (BD inner dim limit). Examples:
+- Qwen2.5 K=8960: `down_k_split=70` → splits as (70, 128) ✓
+- Llama-3-8B K=14336: `down_k_split=56` → splits as (56, 256) ✓ (proposed)
+
+The `k_split` parameter was added to `matvec.build_module` (default None,
+back-compat preserved — verified llama3 K=8192 IR unchanged). Same
+mechanism is exposed via `down_k_split` in `o_gemv_ffn_multi`.
+
+**Also at large M (e.g., LM-head partitions M=16384, Gate/Up at M ≥ 8K)**:
+the B-input shim DMA fires `launch_count × (tile_m / m_input)` times per
+GEMV, and combined GEMVs sharing the channel ADD UP. To stay under 255:
+set `tile_m = m_input` (inner_loop=1) and pick `tile_m * herd_m ≥ M / 127`.
+Example: Qwen2.5 LM-head per-partition M=16384 → `tile_m=16, m_input=16,
+herd_m=8` → `16384/(16*8) × 1 = 128` ✓.
+
+See `programming_examples/_llm_shared/docs/aie2p_hardware_limits.md`
+Rules B + C for the full derivation.
+
 ### Pattern 5: CPU→NPU op promotion
 Same as Phase 4 Pattern 5 but for decode-specific ops (typically the small attention step on a single query, if currently on CPU).
 

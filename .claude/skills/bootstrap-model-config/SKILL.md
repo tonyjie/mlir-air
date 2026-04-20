@@ -27,9 +27,25 @@ Fetch `config.json` for the target model from HuggingFace. Extract:
 
 ### Step 2: Architecture compatibility check
 Before writing any file, confirm the model is in-scope (per spec §2):
-- Architecture must be in `["LlamaForCausalLM", "MistralForCausalLM" (only if no sliding window), "Qwen2ForCausalLM" (only if no QKV bias), ...]` — i.e., a decoder-only with RMSNorm + SwiGLU + RoPE + GQA/MHA
-- Reject if: MoE layers present, sliding-window attention, MLA, QKV bias (without bias support)
-- Reject explicitly with a clear message; do NOT scaffold a model the rest of the pipeline can't handle
+- Architecture must be in `["LlamaForCausalLM", "MistralForCausalLM"
+  (only if no sliding window), "Qwen2ForCausalLM", ...]` — i.e., a
+  decoder-only with RMSNorm + SwiGLU + RoPE + GQA/MHA
+- Reject if: MoE layers present, sliding-window attention, MLA,
+  encoder-decoder structure
+- Reject explicitly with a clear message; do NOT scaffold a model the
+  rest of the pipeline can't handle
+
+**QKV bias is SUPPORTED** as of qwen25_1_5b deployment (LESSON 1, 2026-04-19):
+the bias gets added on the HOST after the bias-free `rms_gemms_rope` /
+`rms_gemv_rope` ELFs return, exploiting RoPE's linearity:
+`RoPE(q + bq) = RoPE(q) + RoPE(bq)`. Reference implementation:
+`programming_examples/qwen25_1_5b/qwen25_bias.py`. When `qkv_bias=true`:
+- Load q_proj.bias / k_proj.bias / v_proj.bias in `<model>_weights.py`
+  (add `bq, bk, bv` fields to LayerWeights, parallel to wq/wk/wv)
+- Add the bias term to Q/K/V projections in `<model>_reference.py`
+  (BEFORE RoPE, matches HF reference impl)
+- Surface in TODO.md: "Phase 2 prerequisite — wire QKV bias via
+  qwen25_bias-style wrapper (~1-2h)"
 
 ### Step 3: Generate `<model>_weights.py`
 Copy `programming_examples/llama3/llama3_weights.py` to `<model>/<model>_weights.py`. Modify:

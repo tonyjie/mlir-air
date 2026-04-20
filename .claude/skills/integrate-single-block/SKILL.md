@@ -10,8 +10,35 @@ Once individual kernels work, integrate them into a single transformer block. Th
 - `programming_examples/llama3/llama3_prefill.py:run_transformer_block` — reference single-block pipeline
 - `programming_examples/llama3/docs/development_progress/progress.md` — LLAMA Phase 2 log (CPU fallback strategy)
 - `programming_examples/_llm_shared/docs/explain.md` — kernel directory map
+- `programming_examples/_llm_shared/docs/aie2p_hardware_limits.md` — Rule A
+  (BD-friendliness) + the GQA-aware padding workaround
+- `programming_examples/qwen25_1_5b/qwen25_pad.py` — GQA-aware reindexed
+  padding (LESSON 4 from qwen25_1_5b, 2026-04-19)
+- `programming_examples/qwen25_1_5b/qwen25_bias.py` — RoPE-linearity host
+  bias add (LESSON 1 from qwen25_1_5b, 2026-04-19)
 
 ## Workflow
+
+### Step 0: Apply Phase 1 prerequisites (if any were surfaced)
+
+Phase 1's BD-friendliness audit (Rule A in
+`_llm_shared/docs/aie2p_hardware_limits.md`) may have flagged emb_dim or
+hidden_dim as not-1024-aligned. If so, the multi-launch ELF will exhaust
+the BD pool at seq_len=2048 unless you pad. Two paths:
+
+**Padded path (LESSON 4 from qwen25_1_5b, 2026-04-19)** — recommended for
+GQA models. Pad emb_dim and hidden_dim UP to BD-friendly multiples of
+1024 host-side. The naive padding (just zero-extend) BREAKS GQA
+semantics by changing `n_heads / n_kv_heads = group_size`. The fix is
+**GQA-aware reindexing**: insert phantom Q heads INSIDE each KV group,
+not at the end. wq/bq/wo all reindexed. Reference:
+`programming_examples/qwen25_1_5b/qwen25_pad.py`. CPU-only sanity test
+the padded vs orig forward FIRST (cosine should be 0.999998+) before
+going to NPU compile — catches reindex bugs in seconds.
+
+**Bias-with-padding caveat**: if Step 0 ALSO needs Qwen2 QKV bias, use
+the host-side post-RoPE add (LESSON 1) on top of the padded ELF. The
+bias precompute uses padded n_heads. See `qwen25_bias.py`.
 
 ### Step 1: Wire one block with all-NPU kernels (no CPU fallback initially)
 In `<model>/<model>_prefill.py`, implement `run_single_block(layer_idx, hidden, weights, ...)` that:

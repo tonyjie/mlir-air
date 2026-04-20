@@ -8,6 +8,11 @@ Before integration, prove each individual kernel (RMSNorm, GEMM, GEMV, RoPE, Fla
 
 ## Knowledge base references
 Read these BEFORE acting:
+- `programming_examples/_llm_shared/docs/aie2p_hardware_limits.md` —
+  **REQUIRED** for the BD-friendliness audit in Step 0.5 below. Documents
+  the 4 AIE2P shim DMA / lowering limits we've discovered + the
+  "BD-friendliness checklist" that prevents most Phase 2 / Phase 5 compile
+  blowups.
 - `programming_examples/_llm_shared/docs/kernels/gemm.md` — GEMM tile config strategy
 - `programming_examples/_llm_shared/docs/kernels/gemv.md` — GEMV herd layouts (8×1 K=2048; extern rename for K=8192)
 - `programming_examples/_llm_shared/docs/kernels/rmsnorm.md` — 8-tile broadcast strategy
@@ -57,6 +62,57 @@ If you find a coverage gap, add a TODO.md entry like:
 A reusable bisect harness (vary one axis at a time across n_heads, n_kv_heads,
 lq, dk; report HANG/NaN/PASS per cell) is the right tool for this validation —
 see `debug-fa-runtime-failure` for the template.
+
+### Step 0.5: BD-friendliness audit (LESSONS 3-5 from qwen25_1_5b deployment, 2026-04-19)
+
+Run the audit checklist from
+`programming_examples/_llm_shared/docs/aie2p_hardware_limits.md`
+"BD-friendliness audit checklist" section. It surfaces the 4 known
+AIE2P shim/lowering walls BEFORE compile time:
+
+```python
+# Rule A — flag dims that aren't 1024-aligned (Phase 2 risk)
+for name, dim in [("emb_dim", config.emb_dim),
+                  ("hidden_dim", config.hidden_dim),
+                  ("kv_dim", config.n_kv_heads * config.head_dim)]:
+    if dim % 1024 != 0:
+        # → likely needs padding (qwen25_pad.py reference) at seq_len ≥ 2048
+
+# Rule B — flag if Down GEMV K > 8160 (Phase 5 risk)
+if config.hidden_dim > 8160:
+    # → use `down_k_split=N` in build_o_gemv_ffn_module
+    #   where hidden_dim % N == 0 and N ≤ 255
+
+# Rule C — flag if any GEMV's M needs care (Phase 5 risk)
+for name, M in [("Q", n_heads*head_dim), ("K/V", n_kv_heads*head_dim),
+                ("Gate/Up", hidden_dim), ("LM-head-partition", 16384)]:
+    default_fires = (M // 64) * 2  # default tile_m=8, m_input=4, herd_m=8
+    if default_fires > 127:
+        # → tile_m=m_input bump to cut inner loop to 1
+
+# Rule D — flag if Down GEMV L2 doesn't fit (Phase 5 risk)
+if config.hidden_dim * 8 * 2 * 2 > 512 * 1024:
+    # → smaller tile_m or herd_m
+```
+
+Append surfaced risks as TODO.md "Phase 2 prerequisites" or
+"Phase 5 prerequisites" entries. **Each unsurfaced risk costs ~30 min
+of debug detour at compile time.**
+
+### Step 0.6: Tile-config safety check (LESSON 2 from qwen25_1_5b, 2026-04-19)
+
+The shared GEMM/GEMV builders DO NOT assert these constraints — failures
+produce SILENTLY CORRUPT outputs (e.g., qwen25 Phase 2 hit cosine 0.02
+because seq_len=128 < tile_m*herd_m=512). Verify upfront:
+
+For every GEMM/GEMV in your shape table, confirm:
+- `N % (tile_n * herd_n) == 0` for each (Q, K, V, O, Gate, Up, Down)
+- `M >= tile_m * herd_m` AND `M % (tile_m * herd_m) == 0`
+
+If these don't hold for the default tile config, pick a different config
+or pad. Specifically:
+- Qwen2.5 K/V at N=256 needed `tile_n=64, herd_n=4` (256/256=1 ✓) instead
+  of default `tile_n=128, herd_n=4` (256/512=0.5 ✗ silent corruption).
 
 ### Step 1: Enumerate the unique shapes from `<model>_weights.py` Config
 Compute the set of (kernel_type, shape_tuple) pairs the model needs:
