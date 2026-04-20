@@ -425,3 +425,143 @@ For any new model deployed via this chain, you can:
 5. **Cross-check perf** — the per-layer ms/layer rate should fall on the
    family curve (head_dim=64 → ~80 ms/layer prefill, head_dim=128 →
    ~85–115 ms/layer)
+
+---
+
+## Honest assessment: what the chain actually does vs what the SKILL.md says
+
+The skill `SKILL.md` files describe an idealized workflow. What the
+autonomous chain actually does is leaner. Three honest gaps worth knowing
+before reading the skill docs:
+
+### Gap 1: Phase 1 does NOT run per-kernel standalone NPU tests
+
+`validate-per-kernel-shapes/SKILL.md` Step 2 says:
+
+> For each `(kernel_type, shape)`: Build the kernel module … Use
+> `XRTRunner.run_test(...)` with random inputs and CPU reference outputs
+
+But every actual `phase1_kernel_shapes.md` (e.g., `qwen25_1_5b/docs/development_progress/phase1_kernel_shapes.md`)
+says:
+
+> **Approach**: Source-side parametricity audit + variant audit. Standalone
+> XRTRunner per-shape kernels are **deferred to Phase 2** single-block
+> correctness; the per-kernel verify table in Phase 2 functions as the
+> PASS evidence for parametric items.
+
+Phase 1 in practice is a **paper audit** — classification table +
+BD-friendliness check + tile-config safety check. We don't run individual
+kernels on NPU. We trust that if a builder is parametric
+(`build_rms_gemms_rope_module(emb_dim, kv_dim, n_heads, ...)`) and llama3
+validated it once at one shape, it'll work at our shape too — and Phase 2
+single-block catches it if not.
+
+**Cost of this shortcut**: when Phase 2 fails (qwen25's "cosine 0.02
+garbage" episode), we have to bisect to find which kernel is broken. With
+per-kernel standalone tests we'd know immediately.
+
+**When it bites**: a NEW shape combination that the parametric builder
+doesn't actually handle (qwen25's `tile_n=128 herd_n=4` silently
+overshooting K/V's `N=256`). The lesson L2 in the new Phase 1 Step 0.6
+(tile-config safety check) was added specifically to surface this without
+running the kernel.
+
+### Gap 2: We do NOT actually invoke `merge-multi-launch-kernels`
+
+`optimize-prefill-perf/SKILL.md` Pattern 1 says:
+
+> Invoke `merge-multi-launch-kernels` skill for the prefill kernel groups
+> (Group A: rms+gemms+rope, Group B: o+ffn).
+
+But every deployment's `phase4_prefill.md` marks Pattern 1 as
+**INHERITED**:
+
+> rms_gemms_rope (6 launches), o_ffn (8 launches) — default builders
+
+The merge was done once, during the llama3 development arc. Those
+builders live at `programming_examples/llama3/multi_launch_builder/{rms_gemms_rope_multi.py,
+o_ffn_multi.py, ...}`. For each new model we just call
+`build_rms_gemms_rope_module(...)` with our shapes — the function emits a
+pre-stitched 6-launch MLIR module. **No new merge happens.**
+
+The `merge-multi-launch-kernels` skill is **dormant** for the autonomous
+deployment chain. It would only fire if we needed to design a NEW
+multi-launch group from scratch.
+
+### Gap 3: Most "deployment" work is "parameterize llama3 at a new shape"
+
+Honest LOC breakdown of what each phase actually writes:
+
+| Phase | New code per model | What it does |
+|---|---|---|
+| 0 | ~300 LOC: `weights.py` + `reference.py` | numpy F32 reference forward — model-specific math, but mostly mechanical |
+| 1 | 0 LOC | classification doc |
+| 2 | ~150 LOC: `phase2_test.py` | calls llama3's `run_transformer_block` with model weights + Phase 2 metrics |
+| 3 | ~250 LOC: `phase3_test.py` | loops Phase 2 + adds canonical-prompt eval |
+| 4 | ~200 LOC: `phase4_test.py` | wraps llama3's `npu_full_prefill` + `preload_prefill_weights` + cold/warm timings |
+| 5 | ~250 LOC: `phase5_test.py` | wraps llama3's `run_decode_block` + decode loop |
+| 6 | ~250 LOC: `inference.py` | wraps Phase 4 + 5 into end-to-end runner |
+
+**Total per deployment**: ~1500 LOC of model-specific test/orchestration
+code. The 5000+ LOC of actual NPU kernel infrastructure (`KernelCache`,
+`run_transformer_block`, multi-launch ELF builders, BO preload, head-first
+FA wrapper, GEMM/GEMV builders, etc.) all lives in `llama3/` and
+`_llm_shared/`. New deployments **import** it via `sys.path`.
+
+**Model-specific divergences only when truly needed**:
+- **smollm2_1_7b**: zero new files (used llama3 infra unchanged)
+- **llama32_3b**: zero new files (head_dim=128 needed Option C wrapper,
+  but that was added to `_llm_shared/phase_helpers/headfirst_fa.py` and
+  reused)
+- **qwen25_1_5b**: 3 new files (`qwen25_bias.py`, `qwen25_pad.py`,
+  `qwen25_decode_setup.py`) because of Qwen2-specific architecture (bias)
+  + non-1024-aligned dims
+
+### What this means in practice
+
+The skill chain is more accurately described as **a playbook for adapting
+llama3 to new shapes** than as a from-scratch deployment. It's:
+
+- **Cheap**: ~1500 LOC + ~1 hour of NPU time per new model when nothing
+  novel
+- **Robust** for the "small diff vs llama3" case
+- **Brittle** when a model hits something genuinely new (qwen25's BD
+  blowup, k_split need, GQA-padding, QKV bias) — that's where the
+  ~1500 LOC explodes to ~3000 and Phase 1's paper audit isn't strong
+  enough
+
+The skills work because llama3 is solid. **If llama3 broke, every
+deployment breaks** — exactly what the v2 evaluator caught when the
+`compile_attn_npu2` regression silently shipped (commit `6499cae0` Apr 18,
+caught Apr 20).
+
+### Tradeoffs if you wanted to do it differently
+
+| Option | Pros | Cons |
+|---|---|---|
+| Status quo (paper Phase 1 + parametric inherit) | Fast (~1 day per model when smooth) | Phase 2 failures need bisect |
+| Add real per-kernel `XRTRunner` tests in Phase 1 | Catches kernel-shape bugs upfront | +30–60 min per model just for kernel compile |
+| Always run `merge-multi-launch` from scratch | Catches BD/channel issues at merge time | +1–2 hours per model; 95% would be redundant rebuilds |
+
+For now, the paper-audit + parametric-inherit path is right. The v2
+BD-friendliness checks added to Phase 1 close most of the "kernel silently
+breaks at new shape" gap without requiring per-kernel hardware runs.
+The cross-deployment regression check in Phase 7 catches the "shared infra
+change broke another deployment" class — which the in-deployment skills
+can't detect by design.
+
+### Where the skill docs and reality diverge — quick reference
+
+| Skill says | Practice does |
+|---|---|
+| Phase 1: per-kernel `XRTRunner.run_test` for each shape | Phase 1: paper classification (Drop-in / Recompile / NEW) + BD-friendliness audit |
+| Phase 4 Pattern 1: invoke `merge-multi-launch-kernels` | INHERITED — uses pre-stitched llama3 multi-launch ELF builders |
+| Phase 5 Pattern 1: same | INHERITED — same |
+| Phase 4 Pattern 2: hand-roll BO preload | APPLIED — calls llama3's `preload_prefill_weights` |
+| Phase 4 Pattern 4: convert kernels to seq-first layout | INHERITED — RoPE/FA already seq-first in llama3 |
+| New deployment writes full `prefill.py` / `decode.py` | New deployment imports from `../llama3/` via sys.path; only writes weights/reference/inference/phase tests |
+
+This is **by design** — the inheritance is what makes deployments cheap.
+But knowing this means a future contributor (or auditor) reading the
+SKILL.md docs in isolation would over-estimate the work happening per
+deployment.
