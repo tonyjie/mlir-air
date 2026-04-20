@@ -15,7 +15,7 @@
 srcdir := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
 
 # Configurable parameters (override via `make VAR=value`)
-N_TOKENS ?= 8
+N_TOKENS ?= 100
 PROMPT   ?= The capital of France is
 SEQ_LEN  ?= 2048
 MAX_SEQ  ?= 128
@@ -103,7 +103,7 @@ run-prefill:
 	python3 $(srcdir)/$(PHASE4) --seq-len $(SEQ_LEN) --model $(MODEL)
 
 run-block:
-	python3 $(srcdir)/$(PHASE2) --no-preload --npu-attn --seq-len $(SEQ_LEN) --model $(MODEL)
+	python3 $(srcdir)/$(PHASE2) --no-preload --seq-len $(SEQ_LEN) --model $(MODEL)
 
 run-full:
 	python3 $(srcdir)/$(PHASE3) --seq-len $(SEQ_LEN) --model $(MODEL)
