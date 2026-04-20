@@ -136,6 +136,89 @@ compute the gates from their output:
      either kernels weren't cached, or kernels weren't really running.
 4. Output: PASS / WARN / FAIL.
 
+#### Category 5 — Perf integrity (multi-trial, ~5 min) — v2
+
+Single-shot perf claims are fragile (system load, thermal, BO state).
+Re-measure with multiple trials and explicit cold/warm protocol; flag if
+the claim is outside the measured ± std window.
+
+1. **Cold prefill**: clear `prefill_kernel_cache/` only momentarily —
+   actually, DO NOT clear (recompiling burns ~2 min and isn't part of
+   "cold prefill"). Instead, define cold = first run after a fresh
+   `python` process; warm = subsequent runs in the same process. Use
+   `make profile` (the deployment's own perf script) which already does
+   this internally — it's the ground truth for the deployment's perf
+   measurement window.
+
+2. **Warm prefill, N=5 trials**: re-run the warm-loop 5 times. Compute
+   mean, std, median. Compare claim:
+   - PASS if claim ∈ [mean - std, mean + std]
+   - WARN if claim within ±20% of mean
+   - FAIL if claim differs by > 20%
+   - ALSO note: if std/mean > 10%, flag the deployment's measurement as
+     "high variance — single-shot claim was lucky/unlucky".
+
+3. **Decode tok/s, N=20 tokens steady-state**: re-run; compute median
+   ms/token over the last 15 (skip first 5 as warm-up). Same gate as
+   prefill.
+
+4. **Anti-fallback heuristics** (measure-then-compare):
+   - NPU prefill ms/layer should be > 5 ms (a CPU forward pass at the
+     same shape would be much slower, but a "kernel didn't actually run"
+     measurement looks suspiciously like 0.01 ms or the kernel cache
+     load time).
+   - For NPU FA path: `flash_attn.elf` must exist in cache AND the
+     measurement should distinguish from CPU-attn — re-run with
+     `--cpu-attn` and verify NPU FA path is at least 1.5× faster (real
+     speedup) or comparable (if kernel didn't really fire).
+   - LM-head GEMV timing should be > 50 ms — if < 10 ms, kernel may not
+     have actually run; if > 1 s, the BO preload didn't fire.
+
+5. Output: per-metric PASS/WARN/FAIL with measured mean ± std.
+
+**Skip Category 5 entirely** if the deployment is small (n_layers ≤ 16)
+where single-shot variance is naturally low. Phase 5 doesn't apply for
+quick smoke audits.
+
+#### Category 6 — Cross-deployment regression (~10–30 min) — v2
+
+If the audit is being run because of a shared-infra change (e.g., a
+modification to `_llm_shared/`, `matvec.py`, `llama3/llama3_*.py`, or
+`llama3/multi_launch_builder/`), back-compat for OTHER deployments must
+be verified. Otherwise this category is N/A.
+
+**Trigger heuristic** (compute first, skip if not triggered):
+
+```bash
+# In the repo root, identify shared-infra paths in the recent diff
+shared_paths=(
+  "programming_examples/_llm_shared/"
+  "programming_examples/matrix_vector_multiplication/"
+  "programming_examples/llama3/llama3_prefill.py"
+  "programming_examples/llama3/llama3_decode.py"
+  "programming_examples/llama3/llama3_inference.py"
+  "programming_examples/llama3/multi_launch_builder/"
+)
+git diff main..HEAD --name-only | grep -E "^($(IFS=\|; echo "${shared_paths[*]}"))"
+```
+
+If the grep returns any matches, run Category 6. Otherwise mark N/A.
+
+**For each OTHER deployment** (i.e., not the one being primarily
+audited): re-run their Phase 2 + Phase 3 test scripts (correctness only;
+perf is out of scope here). Verify:
+- Phase 2 cosine and per-pos still pass their head_dim-scaled gate
+- Phase 3 decisive top-1 + competitive top-5 still pass
+- No NaN
+
+If ANY other deployment regresses, FAIL Category 6 with the specific
+deployment + measurement. The shared-infra change must be reverted or
+fixed before the original deployment can be tagged.
+
+NPU exclusivity: run sequentially — only ONE process can hold the NPU
+at a time (XRT enforces /tmp/npu.lock). With 3 OTHER deployments,
+budget ~10 min each = 30 min for full cross-deployment regression.
+
 ### Report format
 
 Write to `<model_dir>/docs/evaluation_report.md`. Template:

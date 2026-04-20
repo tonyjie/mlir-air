@@ -124,8 +124,25 @@ def compile_attn_npu2(head_dim=64):
     head_dim ≥ 128 the per-tile L1 footprint exceeds 64 KB; use
     `compile_attn_npu2_split` instead with `lkp != dk` (e.g.,
     lkp=64, dk=128 yields dk_chunks=2 and a feasible L1 budget).
+
+    IMPORTANT: passes `num_q_tiles=1` so the emitted `-Dlqp` define
+    equals `head_dim` (the kernel's per-tile Q size that the IR builder
+    in `attn_npu2_seqfirst` calls with at lqp=256, num_q_tiles=4 → 64
+    per tile for head_dim=64). After the LESSON 3 refactor (commit
+    6499cae0, 2026-04-18) `compile_attn_npu2_split` started dividing
+    `lqp` by `num_q_tiles` (default 4), which silently broke llama3's
+    flash_attn — kernel compiled with -Dlqp=16 vs IR providing 64-row
+    tiles → all-NaN at Layer 1+. Caught by evaluate-deployment v2
+    cross-deployment regression on 2026-04-19. Setting num_q_tiles=1
+    here keeps the back-compat wrapper's `-Dlqp` equal to `head_dim`.
     """
-    compile_attn_npu2_split(lqp=head_dim, lkp=head_dim, dk=head_dim, dv=head_dim)
+    compile_attn_npu2_split(
+        lqp=head_dim,
+        lkp=head_dim,
+        dk=head_dim,
+        dv=head_dim,
+        num_q_tiles=1,
+    )
 
 
 def compile_attn_npu2_split(lqp, lkp, dk, dv, num_q_tiles=4, output_name="attn_npu2.o"):

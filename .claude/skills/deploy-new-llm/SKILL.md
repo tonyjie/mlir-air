@@ -179,13 +179,51 @@ For each phase:
 5. On BLOCKED: surface the blocker, human resolves
 6. Advance to next phase
 
-### Step 8: On final PASS, hand off
-Once Phase 6 (`finalize-deployment`) is PASS, report:
-> "Deployment complete. See `programming_examples/<dirname>/docs/development_progress/progress.md` for the summary."
+### Step 8: Phase 7 — Independent evaluation (added 2026-04-19)
+
+After Phase 6 (`finalize-deployment`) PASSES but BEFORE the final tag,
+spawn the `evaluate-deployment` skill as Phase 7. The skill independently
+re-derives every correctness/perf claim and produces
+`<model>/docs/evaluation_report.md`.
+
+Why: deploy-new-llm Phases 0–6 are autonomous and self-reporting. The
+deployment agent has no incentive to cheat, but also no incentive to
+catch its own silent regressions (e.g., the qwen25_1_5b preload
+AttributeError that landed in production "PASS-with-warnings" via lazy
+fallback was caught only by the v1 evaluator). Phase 7 is the
+independence check.
+
+Invoke as:
+> "Spawning Phase 7 — independent evaluation. The evaluator subagent
+> will re-derive correctness + perf without reading the deployment's
+> own progress/LESSONS docs. Expected runtime: 15–30 min."
+
+Then call the `evaluate-deployment` skill with `<model_dir>` as input.
+
+If the evaluator reports:
+- **PASS** → proceed to Step 9 tag the deployment
+- **PASS-with-warnings** → proceed to Step 9 tag, surface warnings in
+  TODO.md as "follow-up after tag"
+- **FAIL** → mark deployment as `needs-human-review` in TODO.md and STOP.
+  Do NOT tag. Surface the specific failures and let the human triage.
+
+If the deployment touched shared infra (any of `_llm_shared/`, `matvec.py`,
+`llama3/multi_launch_builder/`, `llama3/llama3_*.py`), the evaluator
+should ALSO run Category 6 (cross-deployment regression) — re-runs Phase
+2 + 3 on every OTHER deployment to verify no back-compat break. Budget
+~30 min extra.
+
+### Step 9: On all-PASS, hand off
+Once Phase 6 PASS AND Phase 7 PASS (or PASS-with-warnings), report:
+> "Deployment complete. See `programming_examples/<dirname>/docs/development_progress/progress.md`
+> for the summary and `programming_examples/<dirname>/docs/evaluation_report.md`
+> for the independent audit."
+
+Then tag: `git tag -a deployment-<dirname>-v1 ...`.
 
 ## Verification
 
-The entry skill itself doesn't have a "gate" — its success is measured by the per-phase gates. The entry skill is "successful" when all 7 phases reach PASS.
+The entry skill itself doesn't have a "gate" — its success is measured by the per-phase gates. The entry skill is "successful" when all 7 phases reach PASS (or 6 PASS + 7 PASS-with-warnings, with the warnings explicitly surfaced).
 
 ## Failure modes
 - Architecture rejected at Step 2 → no scaffolding done; deployment cannot proceed
