@@ -133,10 +133,21 @@ def compile_block_kernels(cache, config, seq_len, cpu_attn=True):
 def preload_block_weights(cache, weights, config, seq_len, rope_lut_bf16, layer_idx=0):
     """Pre-load layer-`layer_idx` weights into per-layer BOs (Phase 2 single-block).
 
-    Mirrors llama3's `preload_prefill_weights` but scoped to one layer for
-    Phase 2 testing. Lazy preload via `run_transformer_block`'s arg cache
-    works as a fallback if this fails.
+    Mirrors llama3's `preload_prefill_weights` but scoped to ONE layer.
+    Issues a real warm-up `_run_cached` call per kernel so the per-layer BOs
+    get allocated AND the weights get written via the same code path that
+    `run_transformer_block` will use later (with `bo_key=f"<kernel>_L<idx>"`
+    + `static_input_indices`). On the second call, weights skip BO write.
+
+    Earlier versions called `cache.preload_static_inputs(name, kwargs,
+    list_of_tuples)` which silently fell back to lazy preload because that
+    API actually expects a flat dict — the runner survived but Pattern 2
+    (BO pre-loading) was degraded for Phase 2 tests. Caught by
+    evaluate-deployment audit on qwen25_1_5b 2026-04-19. Fixed to use the
+    same warm-up pattern as `llama3_prefill.preload_prefill_weights`.
     """
+    from llama3_prefill import _run_cached, run_transformer_block
+
     emb_dim = config.emb_dim
     n_heads = config.n_heads
     n_kv_heads = config.n_kv_heads
@@ -146,74 +157,68 @@ def preload_block_weights(cache, weights, config, seq_len, rope_lut_bf16, layer_
     n_total = seq_len * emb_dim
 
     lw = weights.layers[layer_idx]
+    rope_lut_q = np.repeat(rope_lut_bf16[:seq_len], n_heads, axis=0).flatten()
+    rope_lut_k = np.repeat(rope_lut_bf16[:seq_len], n_kv_heads, axis=0).flatten()
 
-    rms_static_inputs = {
-        1: np.asarray(lw.attn_norm, dtype=bfloat16).reshape(emb_dim),
-        3: np.asarray(lw.wq, dtype=bfloat16).reshape(emb_dim, emb_dim),
-        5: np.asarray(lw.wk, dtype=bfloat16).reshape(emb_dim, kv_dim),
-        7: np.asarray(lw.wv, dtype=bfloat16).reshape(emb_dim, kv_dim),
-        9: np.repeat(rope_lut_bf16[:seq_len], n_heads, axis=0).flatten(),
-        10: np.repeat(rope_lut_bf16[:seq_len], n_kv_heads, axis=0).flatten(),
-    }
-    cache.preload_static_inputs(
+    # Also populate run_transformer_block's per-layer arg cache so the
+    # subsequent run_transformer_block call reuses the same arrays.
+    _arg_cache = getattr(run_transformer_block, "_arg_cache", {})
+    run_transformer_block._arg_cache = _arg_cache
+
+    rms_args = [
+        np.zeros((seq_len, emb_dim), dtype=bfloat16),  # arg0 x_in (dynamic)
+        np.asarray(lw.attn_norm, dtype=bfloat16).reshape(emb_dim),
+        np.zeros((seq_len, emb_dim), dtype=bfloat16),  # 2 intermediate
+        np.asarray(lw.wq, dtype=bfloat16).reshape(emb_dim, emb_dim),
+        np.zeros((seq_len, emb_dim), dtype=bfloat16),  # 4 intermediate
+        np.asarray(lw.wk, dtype=bfloat16).reshape(emb_dim, kv_dim),
+        np.zeros((seq_len, kv_dim), dtype=bfloat16),  # 6 intermediate
+        np.asarray(lw.wv, dtype=bfloat16).reshape(emb_dim, kv_dim),
+        np.zeros((seq_len, kv_dim), dtype=bfloat16),  # 8 intermediate/output
+        rope_lut_q,
+        rope_lut_k,
+        np.zeros((seq_len, emb_dim), dtype=bfloat16),  # 11 q_roped
+        np.zeros((seq_len, kv_dim), dtype=bfloat16),  # 12 k_roped
+    ]
+    _arg_cache[f"rms_gemms_rope_L{layer_idx}"] = rms_args
+    _run_cached(
+        cache,
         "rms_gemms_rope",
-        {"verbose": cache.verbose, **_RMS_GEMMS_ROPE_BACKEND},
-        [
-            (
-                f"rms_gemms_rope_L{layer_idx}",
-                rms_static_inputs,
-                [
-                    np.zeros((seq_len, emb_dim), dtype=bfloat16),  # arg0 dynamic
-                    rms_static_inputs[1],
-                    np.zeros((seq_len, emb_dim), dtype=bfloat16),  # 2 intermediate
-                    rms_static_inputs[3],
-                    np.zeros((seq_len, emb_dim), dtype=bfloat16),  # 4 intermediate
-                    rms_static_inputs[5],
-                    np.zeros((seq_len, kv_dim), dtype=bfloat16),  # 6 intermediate
-                    rms_static_inputs[7],
-                    np.zeros((seq_len, kv_dim), dtype=bfloat16),  # 8 intermediate
-                    rms_static_inputs[9],
-                    rms_static_inputs[10],
-                    np.zeros((seq_len, emb_dim), dtype=bfloat16),  # 11 q_roped
-                    np.zeros((seq_len, kv_dim), dtype=bfloat16),  # 12 k_roped
-                ],
-            )
-        ],
+        _RMS_GEMMS_ROPE_BACKEND,
+        *rms_args,
+        output_indices=[8, 11, 12],
+        static_input_indices={1, 3, 5, 7, 9, 10},
+        intermediate_indices={2, 4, 6, 8, 11, 12},
+        bo_key=f"rms_gemms_rope_L{layer_idx}",
     )
 
-    offn_static_inputs = {
-        1: np.asarray(lw.wo, dtype=bfloat16).reshape(emb_dim, emb_dim),
-        5: np.asarray(lw.ffn_norm, dtype=bfloat16).reshape(emb_dim),
-        7: np.asarray(lw.w_gate, dtype=bfloat16).reshape(emb_dim, hidden_dim),
-        9: np.asarray(lw.w_up, dtype=bfloat16).reshape(emb_dim, hidden_dim),
-        12: np.asarray(lw.w_down, dtype=bfloat16).reshape(hidden_dim, emb_dim),
-    }
-    cache.preload_static_inputs(
+    offn_args = [
+        np.zeros((seq_len, emb_dim), dtype=bfloat16),  # arg0 attn_out (dynamic)
+        np.asarray(lw.wo, dtype=bfloat16).reshape(emb_dim, emb_dim),
+        np.zeros((seq_len, emb_dim), dtype=bfloat16),  # 2
+        np.zeros((seq_len, emb_dim), dtype=bfloat16),  # 3 residual (dynamic)
+        np.zeros((seq_len, emb_dim), dtype=bfloat16),  # 4
+        np.asarray(lw.ffn_norm, dtype=bfloat16).reshape(emb_dim),
+        np.zeros((seq_len, emb_dim), dtype=bfloat16),  # 6
+        np.asarray(lw.w_gate, dtype=bfloat16).reshape(emb_dim, hidden_dim),
+        np.zeros((seq_len, hidden_dim), dtype=bfloat16),  # 8
+        np.asarray(lw.w_up, dtype=bfloat16).reshape(emb_dim, hidden_dim),
+        np.zeros((seq_len, hidden_dim), dtype=bfloat16),  # 10
+        np.zeros((seq_len, hidden_dim), dtype=bfloat16),  # 11
+        np.asarray(lw.w_down, dtype=bfloat16).reshape(hidden_dim, emb_dim),
+        np.zeros((seq_len, emb_dim), dtype=bfloat16),  # 13
+        np.zeros(n_total, dtype=bfloat16),  # 14 output
+    ]
+    _arg_cache[f"o_ffn_L{layer_idx}"] = offn_args
+    _run_cached(
+        cache,
         "o_ffn",
         _O_FFN_BACKEND,
-        [
-            (
-                f"o_ffn_L{layer_idx}",
-                offn_static_inputs,
-                [
-                    np.zeros((seq_len, emb_dim), dtype=bfloat16),  # arg0 dynamic
-                    offn_static_inputs[1],
-                    np.zeros((seq_len, emb_dim), dtype=bfloat16),  # 2
-                    np.zeros((seq_len, emb_dim), dtype=bfloat16),  # 3 residual
-                    np.zeros((seq_len, emb_dim), dtype=bfloat16),  # 4
-                    offn_static_inputs[5],
-                    np.zeros((seq_len, emb_dim), dtype=bfloat16),  # 6
-                    offn_static_inputs[7],
-                    np.zeros((seq_len, hidden_dim), dtype=bfloat16),  # 8
-                    offn_static_inputs[9],
-                    np.zeros((seq_len, hidden_dim), dtype=bfloat16),  # 10
-                    np.zeros((seq_len, hidden_dim), dtype=bfloat16),  # 11
-                    offn_static_inputs[12],
-                    np.zeros((seq_len, emb_dim), dtype=bfloat16),  # 13
-                    np.zeros(n_total, dtype=bfloat16),  # 14 output
-                ],
-            )
-        ],
+        *offn_args,
+        output_indices=[14],
+        static_input_indices={1, 5, 7, 9, 12},
+        intermediate_indices={2, 4, 6, 8, 10, 11, 13, 14},
+        bo_key=f"o_ffn_L{layer_idx}",
     )
 
 

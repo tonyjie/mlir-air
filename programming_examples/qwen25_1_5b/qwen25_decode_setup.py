@@ -231,7 +231,20 @@ def compile_qwen25_decode_kernels(cache, config):
 
 
 def preload_qwen25_lm_head(cache, weights, config):
-    """Pre-load the 10 LM-head partition weights into BOs."""
+    """Pre-load the 10 LM-head partition weights into BOs.
+
+    Issues a real warm-up `cache.load_and_run` call so the per-bo_key BOs
+    get allocated AND the partition weights get written via the same code
+    path that `qwen25_npu_lm_head_gemv` uses later (with
+    `bo_key="lm_head_gemv_qwen25"` + `static_input_indices`). On the
+    second call, the partition weights skip BO write.
+
+    The earlier version called `cache.preload_static_inputs(name, kwargs,
+    list_of_tuples)` — but that API actually expects a flat dict, so it
+    raised `'list' object has no attribute 'items'` and silently fell back
+    to lazy preload, degrading Pattern 3 (NPU LM Head GEMV BO reuse).
+    Caught by evaluate-deployment audit on qwen25_1_5b 2026-04-19.
+    """
     emb_dim = config.emb_dim
     vocab = config.vocab_size
 
@@ -245,8 +258,6 @@ def preload_qwen25_lm_head(cache, weights, config):
             w[: n_end - n_start, :] = lm_head[n_start:n_end, :]
         lm_partitions.append(w)
 
-    # Build static input dict (arg index -> tensor) for cache.preload_static_inputs.
-    static = {1 + 2 * p: lm_partitions[p] for p in range(QWEN25_LM_N_PARTITIONS)}
     full_args = [np.zeros(emb_dim, dtype=bfloat16)]
     for p in range(QWEN25_LM_N_PARTITIONS):
         full_args.append(lm_partitions[p])
@@ -258,17 +269,15 @@ def preload_qwen25_lm_head(cache, weights, config):
         "instance_name": "lm_head_gemv",
         "omit_while_true_loop": False,
     }
-    try:
-        cache.preload_static_inputs(
-            "lm_head_gemv",
-            backend_kwargs,
-            [("lm_head_gemv_qwen25", static, full_args)],
-        )
-    except Exception as e:
-        # Fall back to lazy preload via the first invocation
-        print(
-            f"  LM head preload via preload_static_inputs failed ({e}); will lazy-load"
-        )
+    cache.load_and_run(
+        "lm_head_gemv",
+        backend_kwargs,
+        *full_args,
+        output_indices=[2 + 2 * p for p in range(QWEN25_LM_N_PARTITIONS)],
+        static_input_indices={1 + 2 * p for p in range(QWEN25_LM_N_PARTITIONS)},
+        intermediate_indices={2 + 2 * p for p in range(QWEN25_LM_N_PARTITIONS)},
+        bo_key="lm_head_gemv_qwen25",
+    )
 
 
 def qwen25_npu_lm_head_gemv(cache, weights, config, x_normed_bf16):
