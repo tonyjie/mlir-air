@@ -50,7 +50,7 @@ def main():
         "--cpu-attn",
         dest="cpu_attn",
         action="store_true",
-        default=True,
+        default=False,
     )
     parser.add_argument(
         "--npu-attn",

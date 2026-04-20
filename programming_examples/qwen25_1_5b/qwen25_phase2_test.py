@@ -69,7 +69,7 @@ from qwen25_pad import make_padded_config, pad_weights, slice_output
 # ---------------------------------------------------------------------------
 
 
-def _compile_qwen25_block_kernels(cache, config, seq_len, cpu_attn=True):
+def _compile_qwen25_block_kernels(cache, config, seq_len, cpu_attn=False):
     """Compile rms_gemms_rope + o_ffn (+ optional FA) at Qwen2.5 tile config.
 
     Uses the SHARED multi-launch builders unchanged but overrides the tile
@@ -237,7 +237,7 @@ def main():
         "--cpu-attn",
         dest="cpu_attn",
         action="store_true",
-        default=True,
+        default=False,
         help="Use CPU attention fallback (default)",
     )
     parser.add_argument(

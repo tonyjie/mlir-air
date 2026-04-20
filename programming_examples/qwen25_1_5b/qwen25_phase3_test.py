@@ -224,7 +224,7 @@ def main():
         "--cpu-attn",
         dest="cpu_attn",
         action="store_true",
-        default=True,
+        default=False,
         help="Use CPU attention fallback (default)",
     )
     parser.add_argument(

@@ -42,7 +42,7 @@ def embed_and_pad(prompt, tokenizer, weights, seq_len):
 
 
 def npu_full_prefill(
-    x_bf16, weights, config, cache, rope_lut_bf16, ref_module, cpu_attn=True
+    x_bf16, weights, config, cache, rope_lut_bf16, ref_module, cpu_attn=False
 ):
     """Run all N layers + final RMSNorm + CPU LM Head; return logits + timings.
 
@@ -81,7 +81,7 @@ def run_npu_full_prefill(
     cache,
     rope_lut_bf16,
     ref_module,
-    cpu_attn=True,
+    cpu_attn=False,
     capture_intermediates=False,
     verbose=False,
 ):
@@ -148,7 +148,7 @@ def npu_prefill_with_kv_extraction(
     prefill_cache,
     rope_lut_bf16,
     max_seq,
-    cpu_attn=True,
+    cpu_attn=False,
 ):
     """Run NPU prefill; extract per-layer K (post-RoPE) and V into KV cache.
 

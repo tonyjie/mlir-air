@@ -49,7 +49,7 @@ def main():
     parser = argparse.ArgumentParser(description="Llama-3.2-3B Phase 4 prefill perf")
     parser.add_argument("--seq-len", type=int, default=2048)
     parser.add_argument(
-        "--cpu-attn", dest="cpu_attn", action="store_true", default=True
+        "--cpu-attn", dest="cpu_attn", action="store_true", default=False
     )
     parser.add_argument(
         "--npu-attn",

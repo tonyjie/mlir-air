@@ -718,7 +718,7 @@ def _build_gemm_module(
     return mlir_module
 
 
-def compile_all_kernels(cache, config, seq_len, cpu_attn=True):
+def compile_all_kernels(cache, config, seq_len, cpu_attn=False):
     """Pre-compile all unique kernel configs to cache.
 
     Args:
@@ -932,7 +932,7 @@ def run_transformer_block(
     cache,
     layer_idx=0,
     verify=False,
-    cpu_attn=True,
+    cpu_attn=False,
     verbose=False,
 ):
     """Execute a single transformer block on NPU using cached kernels.
@@ -1325,7 +1325,7 @@ def run_full_model(
     cache,
     rope_lut_bf16,
     verify=False,
-    cpu_attn=True,
+    cpu_attn=False,
     verbose=True,
 ):
     """Run the full LLAMA-3.2-1B forward pass using cached kernels.
@@ -1439,7 +1439,7 @@ def run_full_model(
 
 
 def run_full_model_diagnostic(
-    token_ids, weights, config, cache, rope_lut_bf16, rope_lut_f32, cpu_attn=True
+    token_ids, weights, config, cache, rope_lut_bf16, rope_lut_f32, cpu_attn=False
 ):
     """Run NPU and CPU in parallel per layer, comparing outputs at each boundary.
 

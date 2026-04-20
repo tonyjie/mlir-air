@@ -93,7 +93,7 @@ compile-decode:
 
 run:
 	python3 $(srcdir)/$(INFERENCE) --n-tokens $(N_TOKENS) --prompt "$(PROMPT)" \
-		--seq-len $(SEQ_LEN) --model $(MODEL) --npu-attn --profile
+		--seq-len $(SEQ_LEN) --model $(MODEL) --profile
 
 run-decode-only:
 	python3 $(srcdir)/$(PHASE5) --n-tokens $(N_TOKENS) --prompt "$(PROMPT)" \
@@ -102,10 +102,10 @@ run-decode-only:
 run-decode: run
 
 run-prefill:
-	python3 $(srcdir)/$(PHASE4) --seq-len $(SEQ_LEN) --model $(MODEL) --npu-attn
+	python3 $(srcdir)/$(PHASE4) --seq-len $(SEQ_LEN) --model $(MODEL)
 
 run-block:
-	python3 $(srcdir)/$(PHASE2) --no-preload --npu-attn --seq-len $(SEQ_LEN) --model $(MODEL)
+	python3 $(srcdir)/$(PHASE2) --no-preload --seq-len $(SEQ_LEN) --model $(MODEL)
 
 run-full:
 	python3 $(srcdir)/$(PHASE3) --seq-len $(SEQ_LEN) --model $(MODEL)

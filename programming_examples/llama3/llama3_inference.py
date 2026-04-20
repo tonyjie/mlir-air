@@ -352,7 +352,7 @@ def run_npu_prefill(
     rope_lut_bf16,
     max_seq,
     tokenizer,
-    cpu_attn=True,
+    cpu_attn=False,
     profile=False,
     verify=False,
 ):
@@ -554,7 +554,7 @@ def generate(
     n_tokens=10,
     profile=False,
     verify=False,
-    cpu_attn=True,
+    cpu_attn=False,
 ):
     """Run NPU prefill + NPU decode generation.
 

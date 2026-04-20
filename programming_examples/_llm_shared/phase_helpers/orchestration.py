@@ -30,7 +30,7 @@ from .headfirst_fa import (
 )
 
 
-def compile_block_kernels(cache, config, seq_len, cpu_attn=True):
+def compile_block_kernels(cache, config, seq_len, cpu_attn=False):
     """Compile the rms_gemms_rope + o_ffn (+ optional flash_attn) ELFs.
 
     Routes head_dim=128 NPU FA through Option C (head-first kernel + host

@@ -67,14 +67,14 @@ def main():
         "--cpu-attn",
         dest="cpu_attn",
         action="store_true",
-        default=True,
-        help="Use CPU attention in prefill (default; --npu-attn for Option C)",
+        default=False,
+        help="Use CPU attention in prefill (default: NPU FA via Option C)",
     )
     parser.add_argument(
         "--npu-attn",
         dest="cpu_attn",
         action="store_false",
-        help="Use NPU FA (Option C head-first wrapper at head_dim=128)",
+        help="(back-compat alias; NPU FA is the default now — this flag is a no-op)",
     )
     parser.add_argument(
         "--profile", action="store_true", help="Print per-token decode timings"
