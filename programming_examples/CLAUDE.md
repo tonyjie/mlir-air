@@ -202,8 +202,12 @@ Type mapping: `xrt_dtype = type_mapper(np_dtype)` (from `air.backend.xrt_runner`
 
 ## LLM deployments on NPU2
 
-Four end-to-end validated decoder-only LLM deployments using the
-`deploy-new-llm` skill chain (`.claude/skills/deploy-new-llm/`):
+Six end-to-end validated decoder-only LLM deployments using the
+`deploy-new-llm` skill chain (`.claude/skills/deploy-new-llm/`). The two
+qwen3 deployments shipped on the **kernel-first path** (Phase A per-leaf
+registry → Phase B fused multi-launch ELFs + host-side opts) instead of
+the inheritance-based default — Q/K Norm doesn't slot into the existing
+fused ELFs cleanly. See `qwen3_0_6b/CLAUDE.md` for the methodology.
 
 | Model | Layers | head_dim | Per-layer rate (decode) | NPU prefill (warm) |
 |---|---|---|---|---|
@@ -211,6 +215,8 @@ Four end-to-end validated decoder-only LLM deployments using the
 | `smollm2_1_7b/`   (SmolLM2-1.7B)  | 24 | 64  | 5.7 ms/layer (7.3 tok/s)   | 1.88 s |
 | `llama32_3b/`     (Llama-3.2-3B)  | 28 | **128** | 7.7 ms/layer (4.7 tok/s)  | **3.2 s** (NPU FA via Option C) |
 | `qwen25_1_5b/`    (Qwen2.5-1.5B)  | 28 | **128** | 7.7 ms/layer (4.6 tok/s)  | **2.4 s** (NPU FA + GQA-reindexed padding + QKV bias) |
+| `qwen3_0_6b/`     (Qwen3-0.6B)    | 28 | **128** | 3.4 ms/layer (10.5 tok/s) | **2.20 s** (kernel-first; Q/K Norm on tile, 3-K matvec rename) |
+| `qwen3_1_7b/`     (Qwen3-1.7B)    | 28 | **128** | 5.3 ms/layer (6.7 tok/s)  | **2.81 s** (kernel-first; q_dim==emb_dim → 2-K rename, 19×8192 LM head) |
 
 Quick start with the original llama3 reference deployment:
 ```bash
@@ -227,7 +233,9 @@ For deploying a NEW LlamaForCausalLM-class model on NPU2:
   [`_llm_shared/README.md`](_llm_shared/README.md) for the helper map.
 - Reference deployments to copy from: `llama32_3b/` exercises the full helper
   API (head_dim=128 + Option C FA wrapper); `smollm2_1_7b/` is the simpler
-  drop-in case (head_dim=64 + standard seq-first FA).
+  drop-in case (head_dim=64 + standard seq-first FA); `qwen3_0_6b/` is the
+  kernel-first reference (use it when the model has a new op like Q/K Norm
+  that doesn't slot into existing fused ELFs).
 
 See `<model>/CLAUDE.md` in each deployment dir for architecture, file map,
 design patterns, and tile configs.

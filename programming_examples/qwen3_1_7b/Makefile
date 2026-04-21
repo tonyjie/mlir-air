@@ -28,9 +28,9 @@ MODEL    ?= Qwen/Qwen3-1.7B
 # Phase test scripts
 PHASE0     := qwen3_reference.py
 PHASE2     := qwen3_phase2_test.py
-PHASE3     := qwen3_phase3_test.py
 PHASE4     := qwen3_phase4_test.py
 PHASE5     := qwen3_phase5_test.py
+SWEEP      := qwen3_canonical_sweep.py
 INFERENCE  := qwen3_inference.py
 
 .PHONY: help compile run profile verify clean \
@@ -62,7 +62,7 @@ help:
 	@echo "  make run-prefill     Phase 4  — NPU prefill perf (cold vs warm) — no decode"
 	@echo "  make run-decode-only Phase 5  — CPU prefill SEED + NPU decode (older path)"
 	@echo "  make run-block       Phase 2  — single-block correctness (NPU FA)"
-	@echo "  make run-full        Phase 3  — full 28-layer prefill + top-1 match"
+	@echo "  make run-full        Phase 3  — 6-prompt canonical sweep (full 28-layer)"
 	@echo "  make run-reference   Phase 0  — CPU reference vs HuggingFace F32"
 	@echo ""
 	@echo "Maintenance:"
@@ -109,8 +109,7 @@ run-prefill:
 run-block:
 	python3 $(srcdir)/$(PHASE2) --no-preload --seq-len $(SEQ_LEN) --model $(MODEL)
 
-run-full:
-	python3 $(srcdir)/$(PHASE3) --seq-len $(SEQ_LEN) --model $(MODEL)
+run-full: sweep
 
 run-reference:
 	python3 $(srcdir)/$(PHASE0) --prompt "$(PROMPT)" --model $(MODEL) --verify
