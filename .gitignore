@@ -50,3 +50,6 @@ libadf.a
 
 # intermediate files
 air.mlir
+
+# paper writing related
+paper-auto-llm-on-npu/

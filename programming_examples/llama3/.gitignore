@@ -7,5 +7,9 @@ test_swiglu/
 test_swiglu_llama/
 test_swiglu_2048/
 *.pyc
+*.o
 air_project/
 flash_attn_issue/
+prefill_kernel_cache/
+prefill_kernel_cache_*/
+decode_kernel_cache/
