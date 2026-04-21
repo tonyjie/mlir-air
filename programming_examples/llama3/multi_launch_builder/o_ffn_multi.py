@@ -180,6 +180,7 @@ def build_o_ffn_module(
     seq_len=2048,
     emb_dim=2048,
     hidden_dim=8192,
+    o_in_dim=None,
     # O GEMM tile config
     o_tile_m=64,
     o_tile_k_l2=256,
@@ -230,16 +231,21 @@ def build_o_ffn_module(
     from _llm_shared.kernel_builder.gemm_builder import _build_gemm_module
     from weighted_rms_norm.weighted_rms_norm import build_module as build_rms
 
+    if o_in_dim is None:
+        o_in_dim = emb_dim
+
     n_total = seq_len * emb_dim
 
     # ---- Build sub-kernels ----
 
-    # L1: O GEMM
+    # L1: O GEMM. K = o_in_dim (n_heads * head_dim), N = emb_dim.
+    # For Llama-class models, o_in_dim == emb_dim (default). For Qwen3-0.6B,
+    # n_heads*head_dim (2048) != emb_dim (1024) so o_in_dim must be passed.
     print("  [1/8] O GEMM...")
     o_ir = str(
         _build_gemm_module(
             seq_len,
-            emb_dim,
+            o_in_dim,
             emb_dim,
             o_tile_m,
             o_tile_k_l2,
@@ -485,8 +491,8 @@ def build_o_ffn_module(
 module {{
   {privates_str}
   func.func @o_ffn(
-    %arg0: memref<{seq_len}x{emb_dim}xbf16>,
-    %arg1: memref<{emb_dim}x{emb_dim}xbf16>,
+    %arg0: memref<{seq_len}x{o_in_dim}xbf16>,
+    %arg1: memref<{o_in_dim}x{emb_dim}xbf16>,
     %arg2: memref<{seq_len}x{emb_dim}xbf16>,
     %arg3: memref<{seq_len}x{emb_dim}xbf16>,
     %arg4: memref<{seq_len}x{emb_dim}xbf16>,

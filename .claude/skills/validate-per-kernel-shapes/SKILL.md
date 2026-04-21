@@ -23,6 +23,79 @@ Read these BEFORE acting:
 
 ## Workflow
 
+### Step 0a: Inheritance vs kernel-first decision (ADDED from qwen3 deployment, 2026-04-21)
+
+Before launching the per-kernel shape sweep, decide which integration path
+this deployment will take. The 4 prior deployments (llama3, smollm2,
+llama32_3b, qwen25) all used **inheritance**: the existing fused
+multi-launch ELFs (`rms_gemms_rope`, `o_ffn`, `rms_gemv_rope`, `o_gemv_ffn`)
+just take new shape parameters and the per-layer kernel sequence is
+unchanged. Inheritance is the default — it's faster, well-tested, and
+reuses all the host-side optimizations that ship with llama3.
+
+**Switch to the kernel-first path** if ANY of these is true:
+
+  (a) The model introduces an OP TYPE that no prior model has (e.g.,
+      Qwen3's per-layer per-head Q/K Norm — a per-head RMSNorm with a
+      `(head_dim,)` weight that no llama-class model uses).
+
+  (b) The model needs a NEW op to land BETWEEN two ops that the existing
+      fused ELF combines into one launch (e.g., Q/K Norm has to happen
+      between Q/K projection and RoPE, but `rms_gemv_rope` fuses both —
+      no host hook to insert anything in the middle).
+
+  (c) The model REORDERS existing ops (e.g., post-norm vs pre-norm
+      attention; norm AFTER residual instead of before).
+
+  (d) Some shape combination has `n_heads * head_dim != emb_dim` AND the
+      existing builder hardcodes that they're equal (already addressed
+      via the backward-compat `q_dim` / `o_in_dim` kwargs we added during
+      the qwen3 deployment, but verify).
+
+**Kernel-first path**: instead of subclassing/extending the inherited
+fused builders, you build NEW model-specific multi-launch ELFs from leaf
+kernels in the registry. The bottom-up steps are:
+
+  1. **Kernel registry sweep** — verify every leaf kernel needed
+     (rmsnorm, gemv/gemm, rope_halfsplit, qknorm-via-weighted_rms_norm,
+     silu_and_mul, etc.) compiles + runs + matches numpy reference at
+     this model's shapes. Same gate as inheritance Phase 1; you do this
+     either way.
+  2. **Stitch leaves into model-specific multi-launch ELFs** (see
+     `integrate-single-block` for the per-block stitch and
+     `merge-multi-launch-kernels` for the stitching machinery —
+     model-specific ELFs go in `<model>/multi_launch/`, NOT in
+     `llama3/multi_launch_builder/`).
+  3. **Apply known optimizations on top** — pre-transpose weights,
+     per-layer arg cache, `static_input_indices`, `intermediate_indices`,
+     `bo_key=f"...L{i}"`, `preload_decode_weights`-style warmup. These
+     are kernel-agnostic and transfer directly.
+
+**Reference**: the qwen3-0.6B deployment is the prototype for this path.
+See:
+  - `programming_examples/qwen3_0_6b/docs/development_progress/phase_b_fusion.md`
+    for the design (8-launch `rms_attn_gemvs_qknorm_rope` + 8-launch
+    `o_gemv_ffn_silu` + LM head)
+  - `programming_examples/qwen3_0_6b/multi_launch/` for the stitching
+    code and the **3-K matvec rename pattern** (when one fused ELF needs
+    GEMVs at 3 distinct K values, e.g., O at K=q_dim, Gate/Up at K=emb_dim,
+    Down at K=hidden_dim)
+  - `programming_examples/qwen3_0_6b/qwen3_decode.py` for the host-side
+    optimizations (pre-transpose, arg cache, preload) and how they wire
+    to fused ELFs
+
+**Cost estimate**: kernel-first added ~1 day on top of the inheritance
+attempt for qwen3-0.6B. The bulk was building two new fused ELFs
+(`rms_attn_gemvs_qknorm_rope` and `o_gemv_ffn_silu`) and the 3-K matvec
+rename. Each of the leaves was already in the registry — no new C kernel
+was written.
+
+**Don't write new C kernels speculatively**. Almost always the leaf
+kernel exists; the trick is the right way to STITCH them. For Q/K Norm
+specifically, `weighted_rms_norm` with the heads-as-M trick (M=n_heads,
+N=head_dim, sharing the (head_dim,) weight across rows) is exactly the
+op — no new kernel needed.
+
 ### Step 0: Variant audit — REQUIRED for FlashAttention (LESSON 3 from llama32_3b deployment, 2026-04-18)
 
 When citing an existing lit test as proof that a kernel "supports head_dim=N",

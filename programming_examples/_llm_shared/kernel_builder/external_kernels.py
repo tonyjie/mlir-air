@@ -223,6 +223,48 @@ def compile_mv(tile_m=8):
     _compile_kernel(src, "mv.o", extra_flags=[f"-DDIM_M_OUTPUT={tile_m}"])
 
 
+def compile_mv_og(tile_m=8):
+    """Compile mv_og.o with `og_matvec_*` renamed symbols.
+
+    For Qwen3 decode o_gemv_ffn: O GEMV at K=2048 collides with Gate/Up at
+    K=1024 in the same ELF (different memref<m_input × K> signatures hashing
+    to the same `@matvec_vectorized_bf16_bf16` symbol). Rename via -D so O
+    can link against its own .o copy and coexist with default mv.o + mv_dg.o.
+    Functionally identical to mv.o (DIM_M_OUTPUT=tile_m); only symbol differs.
+    """
+    src = _PROJ_ROOT / "matrix_vector_multiplication" / "bf16" / "mv.cc"
+    _compile_kernel(
+        src,
+        "mv_og.o",
+        extra_flags=[
+            f"-DDIM_M_OUTPUT={tile_m}",
+            "-Dmatvec_vectorized_bf16_bf16=og_matvec_vectorized_bf16_bf16",
+            "-Dlinalg_fill_bf16=og_linalg_fill_bf16",
+        ],
+    )
+
+
+def compile_mv_dg_qwen3(tile_m=8):
+    """Compile mv_dg_qwen3.o with `dg_matvec_*` renamed symbols at tile_m=8.
+
+    The existing `compile_mv_k8192()` produces mv_k8192.o with DIM_M_OUTPUT=2
+    (for llama3's down_tile_m=2 at K=8192). Qwen3 decode uses down_tile_m=8
+    (K=3072 fits the standard tile config). We need a separate copy with
+    DIM_M_OUTPUT=8 + the same `dg_*` rename so it can link alongside the
+    Qwen3 o+ffn ELF without overwriting llama3's mv_k8192.o on disk.
+    """
+    src = _PROJ_ROOT / "matrix_vector_multiplication" / "bf16" / "mv.cc"
+    _compile_kernel(
+        src,
+        "mv_dg_qwen3.o",
+        extra_flags=[
+            f"-DDIM_M_OUTPUT={tile_m}",
+            "-Dmatvec_vectorized_bf16_bf16=dg_matvec_vectorized_bf16_bf16",
+            "-Dlinalg_fill_bf16=dg_linalg_fill_bf16",
+        ],
+    )
+
+
 def compile_all_external_kernels(head_dim=64):
     """Compile all external C++ kernels from source.
 

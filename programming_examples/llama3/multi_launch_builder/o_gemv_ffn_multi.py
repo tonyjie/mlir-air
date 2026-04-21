@@ -337,6 +337,7 @@ def _build_rms_1d_ir(emb_dim, vector_size=16):
 def build_o_gemv_ffn_module(
     emb_dim=2048,
     hidden_dim=8192,
+    o_in_dim=None,
     tile_m=8,
     m_input=4,
     down_tile_m=2,
@@ -358,6 +359,11 @@ def build_o_gemv_ffn_module(
     GEMV only. Default None preserves the existing behavior. Set this when
     Down's K exceeds the auto-split repeat-count limit (32 × 255 = 8160) —
     e.g., Qwen2.5 hidden_dim=8960 needs `down_k_split=14` (inner=640).
+
+    `o_in_dim` (optional): O GEMV input dim (= n_heads * head_dim). Defaults
+    to `emb_dim` for the llama-class case where n_heads*head_dim == emb_dim.
+    For Qwen3-0.6B (n_heads=16, head_dim=128 → 2048; emb_dim=1024) pass
+    `o_in_dim=2048` so wo is `(emb_dim, o_in_dim)` and attn_out is `(o_in_dim,)`.
     """
     from matvec import build_module as build_gemv
     from eltwise_add.eltwise_add import build_module as build_add
@@ -365,10 +371,13 @@ def build_o_gemv_ffn_module(
         build_module as build_silu,
     )
 
-    # ------- L1: O GEMV (M=2048, K=2048) -------
+    if o_in_dim is None:
+        o_in_dim = emb_dim
+
+    # ------- L1: O GEMV (M=emb_dim, K=o_in_dim) -------
     print("  [1/8] O GEMV...")
     o_gemv_ir = str(
-        build_gemv(emb_dim, emb_dim, tile_m, m_input, herd_m, bfloat16, bfloat16)
+        build_gemv(emb_dim, o_in_dim, tile_m, m_input, herd_m, bfloat16, bfloat16)
     )
 
     # ------- L2: Eltwise Add (N=2048, herd=[8,1]) -------
@@ -494,8 +503,8 @@ def build_o_gemv_ffn_module(
 module {{
   {chr(10).join('  ' + p for p in all_privates)}
   func.func @o_gemv_ffn(
-    %arg0: memref<{emb_dim}x{emb_dim}xbf16>,
-    %arg1: memref<{emb_dim}xbf16>,
+    %arg0: memref<{emb_dim}x{o_in_dim}xbf16>,
+    %arg1: memref<{o_in_dim}xbf16>,
     %arg2: memref<{emb_dim}xbf16>,
     %arg3: memref<{emb_dim}xbf16>,
     %arg4: memref<{emb_dim}xbf16>,

@@ -32,7 +32,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from air.backend.xrt_runner import XRTRunner
 from air.backend.xrt import XRTBackend
 
-from llama3.multi_launch_builder.ffn_full_multi import (
+from llama3.multi_launch_builder.superseded.ffn_full_multi import (
     _extract_between_func_and_return,
     _extract_affine_maps,
     _rename_all,
@@ -45,6 +45,7 @@ def build_rms_attn_gemms_module(
     seq_len=2048,
     emb_dim=2048,
     kv_dim=512,
+    q_dim=None,
     # GEMM tile config (uniform for Q/K/V to avoid hardware state conflicts)
     tile_m=64,
     tile_k_l2=64,
@@ -58,8 +59,12 @@ def build_rms_attn_gemms_module(
 
     Args:
         seq_len: Sequence length.
-        emb_dim: Embedding dimension.
+        emb_dim: Embedding dimension (RMSNorm input/output dim, GEMM K dim).
         kv_dim: Key/Value dimension (n_kv_heads * head_dim).
+        q_dim: Query output dimension (n_heads * head_dim). Defaults to
+            emb_dim for the llama3-class case where n_heads*head_dim == emb_dim.
+            For Qwen3-0.6B etc. where n_heads*head_dim != emb_dim, pass
+            q_dim explicitly (e.g., 2048 for 16 heads × 128 head_dim).
         print_kernels: If True, print each sub-kernel's MLIR before stitching.
 
     Returns:
@@ -67,8 +72,8 @@ def build_rms_attn_gemms_module(
             %arg0: x_in        (seq_len, emb_dim)    - input
             %arg1: norm_weight  (emb_dim,)            - RMSNorm weight
             %arg2: normed       (seq_len, emb_dim)    - RMSNorm output / GEMM input
-            %arg3: wq           (emb_dim, emb_dim)    - Q weight
-            %arg4: q_out        (seq_len, emb_dim)    - Q output
+            %arg3: wq           (emb_dim, q_dim)      - Q weight
+            %arg4: q_out        (seq_len, q_dim)      - Q output
             %arg5: wk           (emb_dim, kv_dim)     - K weight
             %arg6: k_out        (seq_len, kv_dim)     - K output
             %arg7: wv           (emb_dim, kv_dim)     - V weight
@@ -76,6 +81,9 @@ def build_rms_attn_gemms_module(
     """
     from llama3.llama3_prefill import _build_gemm_module
     from weighted_rms_norm.weighted_rms_norm import build_module as build_rms
+
+    if q_dim is None:
+        q_dim = emb_dim
 
     # Build RMSNorm (needs launch+segment wrapper for multi-launch ELF)
     print("  [1/4] RMSNorm...")
@@ -89,7 +97,7 @@ def build_rms_attn_gemms_module(
         _build_gemm_module(
             seq_len,
             emb_dim,
-            emb_dim,
+            q_dim,
             tile_m,
             tile_k_l2,
             tile_k_l1,
@@ -171,8 +179,8 @@ module {{
     %arg0: memref<{seq_len}x{emb_dim}xbf16>,
     %arg1: memref<{emb_dim}xbf16>,
     %arg2: memref<{seq_len}x{emb_dim}xbf16>,
-    %arg3: memref<{emb_dim}x{emb_dim}xbf16>,
-    %arg4: memref<{seq_len}x{emb_dim}xbf16>,
+    %arg3: memref<{emb_dim}x{q_dim}xbf16>,
+    %arg4: memref<{seq_len}x{q_dim}xbf16>,
     %arg5: memref<{emb_dim}x{kv_dim}xbf16>,
     %arg6: memref<{seq_len}x{kv_dim}xbf16>,
     %arg7: memref<{emb_dim}x{kv_dim}xbf16>,

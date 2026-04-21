@@ -1,0 +1,13 @@
+build_peano/
+build_chess/
+__pycache__/
+*.pyc
+*.o
+*.elf
+*.xclbin
+*.insts.bin
+*.mlir
+air_project/
+prefill_kernel_cache/
+prefill_kernel_cache_*/
+decode_kernel_cache/

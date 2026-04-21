@@ -19,6 +19,40 @@ Once individual kernels work, integrate them into a single transformer block. Th
 
 ## Workflow
 
+### Step 0a: Inheritance vs kernel-first integration (ADDED 2026-04-21, qwen3-0.6B)
+
+If Phase 1 selected the **inheritance path** (the model's per-layer kernel
+sequence is bit-for-bit the llama-class one — RMSNorm → Q/K/V →
+RoPE → FA → O → add → RMSNorm → Gate/Up → SwiGLU → Down → add), use
+`llama3_prefill.run_transformer_block` directly with the new shape
+parameters. This is what smollm2, llama32_3b, and qwen25 do.
+
+If Phase 1 selected the **kernel-first path** (a NEW op exists, an op
+sits BETWEEN currently-fused launches, or ops are reordered), do NOT
+call `run_transformer_block`. Instead:
+
+  1. Build new model-specific multi-launch ELFs in
+     `<model>/multi_launch/`. The qwen3-0.6B prototype is:
+       - `multi_launch/rms_attn_gemvs_qknorm_rope_qwen3.py` —
+         RMSNorm + Q/K/V GEMV + Q-Norm + K-Norm + RoPE Q + RoPE K
+         (8 launches, with the new `_build_qknorm_per_head_1d` helper)
+       - `multi_launch/o_gemv_ffn_silu_qwen3.py` —
+         O + add + RMSNorm + Gate + Up + SiLU+Mul + Down + add
+         (8 launches, with the **3-K matvec rename** — see qwen3 deployment)
+  2. Standalone-verify each new fused ELF against numpy reference
+     (cosine > 0.99 per output) BEFORE plugging into the per-block runtime.
+  3. Write a per-model `run_transformer_block_<model>` (or its decode
+     equivalent `run_decode_block`) that calls these new ELFs in order
+     via `_run_cached`. The qwen3 example is `qwen3_decode.run_decode_block`.
+
+The cosine gate in Step 3 below is the SAME for both paths (head_dim-scaled
+per-position min, real-token positions only).
+
+**Reference**: see `programming_examples/qwen3_0_6b/docs/development_progress/phase_b_fusion.md`
+for the kernel-first integration walkthrough on a model that introduced
+Q/K Norm — including how to use `weighted_rms_norm` with the
+heads-as-M trick to land per-head RMSNorm without writing a new C kernel.
+
 ### Step 0: Apply Phase 1 prerequisites (if any were surfaced)
 
 Phase 1's BD-friendliness audit (Rule A in
