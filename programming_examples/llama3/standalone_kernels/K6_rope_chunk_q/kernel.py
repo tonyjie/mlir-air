@@ -26,7 +26,7 @@ sys.path.insert(0, os.path.join(_REPO_ROOT, "programming_examples"))
 
 # Production rope builder + external-kernel compile.
 from llama3.multi_launch_builder.rms_gemms_rope_multi import _build_rope_2d
-from _llm_shared.kernel_builder.external_kernels import compile_rope
+from llama3.kernel_builder.external_kernels import compile_rope
 
 from air.backend.xrt_runner import XRTRunner
 

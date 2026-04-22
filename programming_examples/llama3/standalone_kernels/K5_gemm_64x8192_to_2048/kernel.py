@@ -18,7 +18,7 @@ _REPO_ROOT = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "..", "..", "..")
 )
 sys.path.insert(0, os.path.join(_REPO_ROOT, "programming_examples"))
-from _llm_shared.kernel_builder.gemm_builder import _build_gemm_module
+from llama3.kernel_builder.gemm_builder import _build_gemm_module
 
 from air.backend.xrt_runner import XRTRunner
 
@@ -26,7 +26,7 @@ M = 64  # chunk size
 K = 8192  # hidden_dim (in_features)
 N = 2048  # emb_dim (out_features)
 
-# Production Down GEMM tile config (from _llm_shared/kernel_builder/ffn_swiglu/run.py):
+# Production Down GEMM tile config (from llama3/kernel_builder/ffn_swiglu/run.py):
 # tile_m=64, tile_k_l2=256, tile_k_l1=32, tile_n=64, herd=8x4
 # Adapt herd_m=1 for our M=64.
 TILE_M = 64

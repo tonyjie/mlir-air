@@ -35,7 +35,7 @@ sys.path.insert(0, os.path.join(_REPO_ROOT, "programming_examples"))
 from flash_attention.kernel_fusion_based.attn_npu2_seqfirst import (
     build_module as build_attn,
 )
-from _llm_shared.kernel_builder.external_kernels import compile_attn_npu2
+from llama3.kernel_builder.external_kernels import compile_attn_npu2
 
 from air.backend.xrt_runner import XRTRunner
 

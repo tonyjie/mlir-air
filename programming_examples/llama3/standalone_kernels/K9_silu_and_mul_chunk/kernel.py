@@ -20,8 +20,8 @@ _REPO_ROOT = os.path.abspath(
 )
 sys.path.insert(0, os.path.join(_REPO_ROOT, "programming_examples"))
 
-from _llm_shared.kernel_builder.ffn_swiglu.silu_and_mul import build_module
-from _llm_shared.kernel_builder.external_kernels import compile_silu_and_mul
+from llama3.kernel_builder.ffn_swiglu.silu_and_mul import build_module
+from llama3.kernel_builder.external_kernels import compile_silu_and_mul
 
 from air.backend.xrt_runner import XRTRunner
 

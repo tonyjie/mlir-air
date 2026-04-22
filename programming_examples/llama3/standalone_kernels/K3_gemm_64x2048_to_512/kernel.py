@@ -19,7 +19,7 @@ _REPO_ROOT = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "..", "..", "..")
 )
 sys.path.insert(0, os.path.join(_REPO_ROOT, "programming_examples"))
-from _llm_shared.kernel_builder.gemm_builder import _build_gemm_module
+from llama3.kernel_builder.gemm_builder import _build_gemm_module
 
 from air.backend.xrt_runner import XRTRunner
 
