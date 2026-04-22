@@ -10,6 +10,56 @@
 
 ---
 
+## ⚠ Open Issues — Blockers for Phase B / Milestone 1 perf
+
+### ISSUE-1 (P0): GEMMs K2–K5 use only 4 of 32 cores (12.5% utilization)
+
+The four GEMM kernels (Q proj, K/V proj, Gate/Up, Down) currently compile with `tile_m=64, herd_m=1, herd_n=4` because `GEMM_TRANSFORM_IR` is hand-tuned for `tile_m=64` and breaks at smaller tile_m (see "GEMM tile-config constraint at M=64" below for evidence). With `herd_m=1` we use **only 4 of the 32 AIE cores in the 8×4 herd** — an 8× under-utilization in the M dimension.
+
+**Measured baseline (`make profile`, NPU2, default xrt power mode):**
+
+| Kernel | Shape (M,K,N) | Theory FLOP | Latency (min) | GFLOPS | Correlation |
+|---|---|---|---|---|---|
+| K2 Q/O proj | 64, 2048, 2048 | 0.537 | 0.71 ms | **753** | 0.9999 |
+| K3 K/V proj | 64, 2048, 512  | 0.134 | 0.22 ms | **602** | 0.9999 |
+| K4 Gate/Up  | 64, 2048, 8192 | 2.147 | *(profile loop hangs — see ISSUE-3)* | — | 0.56 |
+| K5 Down     | 64, 8192, 2048 | 2.147 | *(profile loop hangs — see ISSUE-3)* | — | 0.79 |
+
+K2 single-invocation cost is ~0.71 ms. Per-layer GEMM count: 2×K2 (Q+O) + 2×K3 (K+V) + 2×K4 (Gate+Up) + 1×K5 (Down) = 7 GEMM calls. Naively at K2's measured rate per call, **just the GEMMs would cost ~5 ms × 16 layers = 80 ms per chunk** — and that's before counting K4/K5 (which can't be measured yet but theory says they're 4× heavier than K2). Realistic per-chunk GEMM total likely 200+ ms, vs the ~150 ms total budget needed to make chunked prefill faster than today's 1.30s padded prefill at typical chat message lengths.
+
+**Impact:** Each chunk's 7 GEMM launches per layer (× 16 layers = 112 calls per chunk) currently run at ≤ 1/8 of achievable throughput. **Milestone 1's perf goal (per-chunk prefill ≪ today's 1.30 s) likely cannot be met until this is fixed.**
+
+**Fix paths (in increasing order of effort):**
+
+1. **Larger chunk_size that aligns to herd_m=8.** With C=512 (= tile_m=64 × herd_m=8) we get full 8×4 = 32 cores active. But: a 512-token chunk wastes most of its compute on short user messages (typical chat turn ~30 tokens). Chunk size becomes a perf-vs-latency tradeoff.
+2. **Restructure `GEMM_TRANSFORM_IR`** so it works correctly at small tile_m (e.g., tile_m=8 for full 8 herd_m utilization at M=64). Real MLIR-transform work — has to handle the inner tile_using_for + unroll factor 2 cleanly when the inner linalg.generic is small.
+3. **Alternative GEMM kernel** tailored for small-M LLM cases (e.g., decode-style GEMV adapted for M=2..C). Most invasive.
+
+**Action:** before Phase B, prioritize one fix path. Re-measure with `make profile` once a config change lands.
+
+### ISSUE-2 (P0): K8 flash_attn_chunk blocked at AIE backend lowering
+
+See "K8 (flash_attn_chunk) — Detailed Blocker Analysis" section below. Fundamentally a kernel-design issue (rectangular Q×K changes the BD allocation pattern beyond the AIE backend's budget). Hours-to-days of FA kernel work to resolve.
+
+### ISSUE-3 (P1): K4 / K5 profile-loop hang (correctness OK in single-invocation)
+
+Single-invocation `make run` PASSes for K4 (Gate/Up, output 1 MB) and K5 (Down, K=8192). But the multi-invocation `make profile` loop (warmup=5, iters=20 via XRTBackend kernel handle reuse) produces:
+
+- K4: per-invocation latency ~61 s (likely XRT timeout) AND output correlation 0.56 (wrong math)
+- K5: huge variance (min 0.12 ms / avg 58 s / max 61 s) AND correlation 0.79
+
+K2 (output 256 KB) and K3 (output 64 KB) profile cleanly under the same harness, suggesting the issue scales with output buffer size or with K depth. Hypothesis: BO state isn't being reset between invocations correctly, or large-output kernels need explicit FROM_DEVICE sync between iterations. Profile harness reuses the same loaded ELF + same BOs across iterations following the `weighted_rms_norm.py` reference pattern — that pattern should work. Needs targeted debug.
+
+This blocks getting baseline numbers for K4/K5 but doesn't affect correctness. Theoretical estimate (assuming K4/K5 sustain ~750 GFLOPS like K2): each ~2.86 ms per call.
+
+---
+
+### ISSUE-2 (P0): K8 flash_attn_chunk blocked at AIE backend lowering
+
+See "K8 (flash_attn_chunk) — Detailed Blocker Analysis" section below. Fundamentally a kernel-design issue (rectangular Q×K changes the BD allocation pattern beyond the AIE backend's budget). Hours-to-days of FA kernel work to resolve.
+
+---
+
 ## What's Been Done — Per-Kernel Results
 
 Each kernel lives in its own directory under

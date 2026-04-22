@@ -17,6 +17,7 @@ This gives:
   K-iters per L2 block = 64 / 32 = 2
 """
 
+import argparse
 import os
 import sys
 
@@ -29,9 +30,12 @@ _REPO_ROOT = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "..", "..", "..")
 )
 sys.path.insert(0, os.path.join(_REPO_ROOT, "programming_examples"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))  # for _profile
 from llama3.kernel_builder.gemm_builder import _build_gemm_module
 
 from air.backend.xrt_runner import XRTRunner
+
+from _profile import profile_kernel
 
 # Chunked-prefill GEMM shape
 M = 64  # chunk size
@@ -51,19 +55,8 @@ HERD_M = 1
 HERD_N = 4
 
 
-def main():
-    print(
-        f"K2 gemm: ({M},{K}) x ({K},{N}) -> ({M},{N}) bf16, "
-        f"tile_m={TILE_M} tile_n={TILE_N} herd={HERD_M}x{HERD_N}"
-    )
-
-    np.random.seed(0)
-    # Use small-magnitude random data to limit accumulation magnitude in bf16.
-    a = (np.random.randn(M, K) * 0.1).astype(bfloat16)
-    b = (np.random.randn(K, N) * 0.1).astype(bfloat16)
-    c_expected = (a.astype(np.float32) @ b.astype(np.float32)).astype(bfloat16)
-
-    mlir_module = _build_gemm_module(
+def _build():
+    return _build_gemm_module(
         m=M,
         k=K,
         n=N,
@@ -75,20 +68,71 @@ def main():
         herd_n=HERD_N,
     )
 
+
+def _gflops_one_invocation():
+    """Theoretical compute for one GEMM invocation: 2*M*K*N flops."""
+    return 2.0 * M * K * N / 1e9
+
+
+def run_correctness():
+    print(
+        f"K2 gemm: ({M},{K}) x ({K},{N}) -> ({M},{N}) bf16, "
+        f"tile_m={TILE_M} tile_n={TILE_N} herd={HERD_M}x{HERD_N}"
+    )
+    np.random.seed(0)
+    a = (np.random.randn(M, K) * 0.1).astype(bfloat16)
+    b = (np.random.randn(K, N) * 0.1).astype(bfloat16)
+    c_expected = (a.astype(np.float32) @ b.astype(np.float32)).astype(bfloat16)
+
     runner = XRTRunner(
         verbose=False,
         omit_while_true_loop=False,
         output_format="xclbin",
         instance_name="K2_gemm_64x2048_to_2048",
     )
-    rc = runner.run_test(
-        mlir_module,
+    return runner.run_test(
+        _build(),
         inputs=[a, b],
         expected_outputs=[c_expected],
         rtol=5e-2,
         atol=2.0,
     )
-    sys.exit(rc)
+
+
+def run_profile(iterations=20, warmup=5):
+    np.random.seed(0)
+    a = (np.random.randn(M, K) * 0.1).astype(bfloat16)
+    b = (np.random.randn(K, N) * 0.1).astype(bfloat16)
+    out_buf = np.zeros((M, N), dtype=bfloat16)
+    expected = (a.astype(np.float32) @ b.astype(np.float32)).astype(bfloat16)
+    return profile_kernel(
+        _build,
+        inputs=[a, b, out_buf],
+        gflops_per_invocation=_gflops_one_invocation(),
+        herd_active=HERD_M * HERD_N,
+        instance_name="K2_gemm_64x2048_to_2048_profile",
+        label=f"K2 gemm ({M},{K})x({K},{N}) tile_m={TILE_M} herd={HERD_M}x{HERD_N}",
+        iterations=iterations,
+        warmup=warmup,
+        expected_output=expected,
+    )
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument(
+        "--profile",
+        action="store_true",
+        help="Profile kernel latency + GFLOPS (no correctness check)",
+    )
+    p.add_argument("--iterations", type=int, default=20)
+    p.add_argument("--warmup", type=int, default=5)
+    args = p.parse_args()
+
+    if args.profile:
+        sys.exit(run_profile(args.iterations, args.warmup))
+    else:
+        sys.exit(run_correctness())
 
 
 if __name__ == "__main__":

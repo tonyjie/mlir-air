@@ -18,5 +18,10 @@ run:
 	PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) cd $(BUILD_DIR) && \
 		python3 $(srcdir)/kernel.py
 
+profile:
+	mkdir -p $(BUILD_DIR)
+	PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) cd $(BUILD_DIR) && \
+		python3 $(srcdir)/kernel.py --profile
+
 clean:
 	rm -rf $(BUILD_DIR) __pycache__
