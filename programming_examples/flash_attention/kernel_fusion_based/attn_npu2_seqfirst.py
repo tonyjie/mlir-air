@@ -99,7 +99,15 @@ def build_module(
     assert dv % dv_tile == 0, f"dv ({dv}) must be divisible by dv_tile/lkp ({dv_tile})"
     dv_chunks = dv // dv_tile
     if causal:
-        assert lq == lk, f"Causal masking requires lq == lk, got lq={lq}, lk={lk}"
+        # Allow lq <= lk to support chunked-prefill (Q is one chunk of length
+        # lq attending against the full KV cache of length lk). The built-in
+        # apply_causal_mask iterates over all K blocks and masks
+        # `kv_block_idx > q_block_idx` to all -inf, which correctly suppresses
+        # K positions [lq..lk) for the FIRST-CHUNK case (current_pos = 0).
+        # Mid-stream chunks (current_pos > 0) need an explicit mask input —
+        # NOT handled by this code path; use causal=False and provide a mask
+        # buffer for that case.
+        assert lq <= lk, f"Causal masking requires lq <= lk, got lq={lq}, lk={lk}"
         assert lqp // num_q_tiles == lkp, (
             f"Causal masking requires tile_size_q == lkp, got "
             f"tile_size_q={lqp // num_q_tiles}, lkp={lkp}"
