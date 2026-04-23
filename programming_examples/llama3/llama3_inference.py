@@ -51,6 +51,31 @@ from llama3_decode import (
 )
 
 # ---------------------------------------------------------------------------
+# Streaming-decode helpers (BPE-safe incremental output)
+# ---------------------------------------------------------------------------
+
+
+class _StreamState:
+    """Tracks how many characters of the running decoded text have been emitted.
+
+    BPE tokens may decode to '' in isolation but combine into characters when
+    paired with later tokens. The safest streaming pattern is to decode the
+    full id list each call and emit only the suffix we have not printed yet.
+    """
+
+    def __init__(self):
+        self.printed_len = 0
+
+
+def _delta_text(tokenizer, ids, state):
+    """Return the new text fragment since the last call, advancing state."""
+    decoded = tokenizer.decode(ids, skip_special_tokens=True)
+    delta = decoded[state.printed_len :]
+    state.printed_len = len(decoded)
+    return delta
+
+
+# ---------------------------------------------------------------------------
 # Backend kwarg presets for decode LM Head
 # ---------------------------------------------------------------------------
 
