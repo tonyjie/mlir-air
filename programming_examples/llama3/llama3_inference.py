@@ -580,6 +580,7 @@ def generate(
     profile=False,
     verify=False,
     cpu_attn=True,
+    on_token=None,
 ):
     """Run NPU prefill + NPU decode generation.
 
@@ -615,6 +616,11 @@ def generate(
     generated_tokens = [prefill_token]  # Token 0 = from prefill
     current_pos = prompt_len
     x_decode = weights.embed_table[prefill_token].astype(bfloat16)
+
+    # Streaming state — only used when on_token is provided.
+    stream_state = _StreamState() if on_token is not None else None
+    if on_token is not None:
+        on_token(prefill_token, _delta_text(tokenizer, generated_tokens, stream_state))
 
     print(f"\nDecoding {n_tokens} tokens (token 1 to {n_tokens})...")
     t_decode_start = time.time()
@@ -674,6 +680,9 @@ def generate(
         generated_tokens.append(next_token)
         current_pos += 1
         x_decode = weights.embed_table[next_token].astype(bfloat16)
+
+        if on_token is not None:
+            on_token(next_token, _delta_text(tokenizer, generated_tokens, stream_state))
 
         if profile:
             print(
