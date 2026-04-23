@@ -401,7 +401,7 @@ def run_npu_prefill(
     cpu_attn=True,
     profile=False,
     verify=False,
-    quiet: bool = False,
+    quiet=False,
 ):
     """Run NPU prefill and extract KV cache for decode.
 
@@ -617,8 +617,9 @@ def generate(
     emb_dim = config.emb_dim
     max_seq = seq_len + n_tokens
     vocab_size = weights.lm_head.shape[0]
+    streaming = on_token is not None
 
-    if on_token is None:
+    if not streaming:
         print(f"\n{'='*60}")
         print(f"LLAMA Inference: prompt_len={seq_len}, n_tokens={n_tokens}")
         print(f"{'='*60}\n")
@@ -635,7 +636,7 @@ def generate(
         cpu_attn=cpu_attn,
         profile=profile,
         verify=verify,
-        quiet=on_token is not None,
+        quiet=streaming,
     )
 
     # --- Phase 2: NPU Decode ---
@@ -644,11 +645,11 @@ def generate(
     x_decode = weights.embed_table[prefill_token].astype(bfloat16)
 
     # Streaming state — only used when on_token is provided.
-    stream_state = _StreamState() if on_token is not None else None
-    if on_token is not None:
+    stream_state = _StreamState() if streaming else None
+    if streaming:
         on_token(prefill_token, _delta_text(tokenizer, generated_tokens, stream_state))
 
-    if on_token is None:
+    if not streaming:
         print(f"\nDecoding {n_tokens} tokens (token 1 to {n_tokens})...")
     t_decode_start = time.time()
 
@@ -708,7 +709,7 @@ def generate(
         current_pos += 1
         x_decode = weights.embed_table[next_token].astype(bfloat16)
 
-        if on_token is not None:
+        if streaming:
             on_token(next_token, _delta_text(tokenizer, generated_tokens, stream_state))
 
         if profile:
@@ -723,7 +724,7 @@ def generate(
     t_decode = time.time() - t_decode_start
     n_generated = len(generated_tokens) - 1  # exclude prefill token
 
-    if on_token is None:
+    if not streaming:
         print(f"\nGenerated {n_generated} tokens in {t_decode:.2f}s")
         print(f"Tokens/second: {n_generated / t_decode:.2f}")
         print(f"Time/token: {t_decode / n_generated * 1000:.0f}ms")
@@ -907,7 +908,9 @@ def repl_loop(session: Session, args) -> None:
             print("\n[interrupted]")
             continue
 
-        print("\n")
+        # Blank line before next "Prompt>".
+        print()
+        print()
 
 
 # ---------------------------------------------------------------------------
