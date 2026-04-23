@@ -401,6 +401,7 @@ def run_npu_prefill(
     cpu_attn=True,
     profile=False,
     verify=False,
+    quiet: bool = False,
 ):
     """Run NPU prefill and extract KV cache for decode.
 
@@ -424,7 +425,8 @@ def run_npu_prefill(
     x_bf16 = embed_f32.astype(bfloat16)
 
     # ---- TIMED SECTION START ----
-    print(f"Running NPU prefill ({config.n_layers} layers, seq_len={seq_len})...")
+    if not quiet:
+        print(f"Running NPU prefill ({config.n_layers} layers, seq_len={seq_len})...")
     t_prefill_start = time.time()
 
     # Run 16 transformer layers on NPU, collecting KV cache
@@ -517,7 +519,8 @@ def run_npu_prefill(
 
     t_prefill = time.time() - t_prefill_start
     # ---- TIMED SECTION END ----
-    print(f"NPU prefill done in {t_prefill:.2f}s. First token: {prefill_token}")
+    if not quiet:
+        print(f"NPU prefill done in {t_prefill:.2f}s. First token: {prefill_token}")
 
     # --- Verification: compare against CPU F32 reference ---
     if verify:
@@ -615,9 +618,10 @@ def generate(
     max_seq = seq_len + n_tokens
     vocab_size = weights.lm_head.shape[0]
 
-    print(f"\n{'='*60}")
-    print(f"LLAMA Inference: prompt_len={seq_len}, n_tokens={n_tokens}")
-    print(f"{'='*60}\n")
+    if on_token is None:
+        print(f"\n{'='*60}")
+        print(f"LLAMA Inference: prompt_len={seq_len}, n_tokens={n_tokens}")
+        print(f"{'='*60}\n")
 
     # --- Phase 1: NPU Prefill ---
     prefill_token, k_cache, v_cache, prompt_len = run_npu_prefill(
@@ -631,6 +635,7 @@ def generate(
         cpu_attn=cpu_attn,
         profile=profile,
         verify=verify,
+        quiet=on_token is not None,
     )
 
     # --- Phase 2: NPU Decode ---
@@ -643,7 +648,8 @@ def generate(
     if on_token is not None:
         on_token(prefill_token, _delta_text(tokenizer, generated_tokens, stream_state))
 
-    print(f"\nDecoding {n_tokens} tokens (token 1 to {n_tokens})...")
+    if on_token is None:
+        print(f"\nDecoding {n_tokens} tokens (token 1 to {n_tokens})...")
     t_decode_start = time.time()
 
     for token_idx in range(n_tokens):
@@ -717,9 +723,10 @@ def generate(
     t_decode = time.time() - t_decode_start
     n_generated = len(generated_tokens) - 1  # exclude prefill token
 
-    print(f"\nGenerated {n_generated} tokens in {t_decode:.2f}s")
-    print(f"Tokens/second: {n_generated / t_decode:.2f}")
-    print(f"Time/token: {t_decode / n_generated * 1000:.0f}ms")
+    if on_token is None:
+        print(f"\nGenerated {n_generated} tokens in {t_decode:.2f}s")
+        print(f"Tokens/second: {n_generated / t_decode:.2f}")
+        print(f"Time/token: {t_decode / n_generated * 1000:.0f}ms")
 
     return generated_tokens
 
@@ -854,6 +861,55 @@ def _print_one_shot_output(
         print(session.tokenizer.decode(all_tokens))
 
 
+def repl_loop(session: Session, args) -> None:
+    """Interactive REPL: prompt-> stream-> repeat. Each turn is independent."""
+    print("\nInteractive mode — Ctrl-D or /quit to exit.")
+    print("Each prompt is independent (no chat memory).\n")
+
+    def _stream_cb(_token_id: int, delta: str) -> None:
+        sys.stdout.write(delta)
+        sys.stdout.flush()
+
+    while True:
+        try:
+            prompt = input("Prompt> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+
+        if not prompt:
+            continue
+        if prompt in ("/quit", "/exit"):
+            return
+
+        # Length guard.
+        check_ids = _tokenize_prompt(session, prompt)
+        if len(check_ids) > session.seq_len:
+            print(
+                f"Prompt too long ({len(check_ids)} > {session.seq_len} tokens). "
+                "Skipped."
+            )
+            continue
+
+        sys.stdout.write("\nResponse: ")
+        sys.stdout.flush()
+        try:
+            run_once(
+                session,
+                prompt,
+                n_tokens=args.n_tokens,
+                profile=False,
+                verify=False,
+                cpu_attn=args.cpu_attn,
+                on_token=_stream_cb,
+            )
+        except KeyboardInterrupt:
+            print("\n[interrupted]")
+            continue
+
+        print("\n")
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -904,17 +960,40 @@ if __name__ == "__main__":
         default="base",
         help="Model variant: base (completion) or instruct (Q&A)",
     )
+    parser.add_argument(
+        "--interactive",
+        action="store_true",
+        help="Drop into a REPL after runtime prep. Loops on prompts; each is independent.",
+    )
     args = parser.parse_args()
+
+    if args.interactive:
+        if args.compile_only:
+            parser.error("--interactive cannot be combined with --compile-only")
+        if args.profile:
+            print(
+                "WARNING: --profile is ignored in --interactive mode.",
+                file=sys.stderr,
+            )
+            args.profile = False
+        if args.verify:
+            print(
+                "WARNING: --verify is ignored in --interactive mode.",
+                file=sys.stderr,
+            )
+            args.verify = False
 
     session = build_session(args)
 
-    generated, prompt_len_actual = run_once(
-        session,
-        args.prompt,
-        n_tokens=args.n_tokens,
-        profile=args.profile,
-        verify=args.verify,
-        cpu_attn=args.cpu_attn,
-    )
-
-    _print_one_shot_output(session, args.prompt, generated, prompt_len_actual)
+    if args.interactive:
+        repl_loop(session, args)
+    else:
+        generated, prompt_len_actual = run_once(
+            session,
+            args.prompt,
+            n_tokens=args.n_tokens,
+            profile=args.profile,
+            verify=args.verify,
+            cpu_attn=args.cpu_attn,
+        )
+        _print_one_shot_output(session, args.prompt, generated, prompt_len_actual)
