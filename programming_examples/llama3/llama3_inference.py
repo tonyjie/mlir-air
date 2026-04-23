@@ -806,7 +806,7 @@ def run_once(
     verify: bool = False,
     cpu_attn: bool = True,
     on_token: Optional[Callable[[int, str], None]] = None,
-) -> tuple:
+) -> tuple[list, int]:
     """Tokenize, pad to seq_len, and call generate(). Returns
     (generated_token_ids, prompt_len_actual)."""
     tokens = _tokenize_prompt(session, prompt_text)
@@ -833,16 +833,21 @@ def run_once(
     return generated, prompt_len_actual
 
 
-def _print_one_shot_output(session, args, generated, prompt_len_actual):
+def _print_one_shot_output(
+    session: Session,
+    prompt_text: str,
+    generated: list,
+    prompt_len_actual: int,
+) -> None:
     """Format and print the final output for non-interactive mode."""
     print(f"\n{'='*60}")
     if session.model_variant == "instruct":
         response = session.tokenizer.decode(generated, skip_special_tokens=True).strip()
-        print(f"Q: {args.prompt}")
+        print(f"Q: {prompt_text}")
         print(f"A: {response}")
     else:
         # Reconstruct the unpadded prompt + generated tokens.
-        prompt_tokens = _tokenize_prompt(session, args.prompt)
+        prompt_tokens = _tokenize_prompt(session, prompt_text)
         print(f"Generated text:")
         print(f"{'='*60}")
         all_tokens = prompt_tokens[:prompt_len_actual] + generated
@@ -912,4 +917,4 @@ if __name__ == "__main__":
         cpu_attn=args.cpu_attn,
     )
 
-    _print_one_shot_output(session, args, generated, prompt_len_actual)
+    _print_one_shot_output(session, args.prompt, generated, prompt_len_actual)
