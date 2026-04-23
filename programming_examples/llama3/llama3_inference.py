@@ -899,8 +899,11 @@ def repl_loop(session: Session, args) -> None:
                 session,
                 prompt,
                 n_tokens=args.n_tokens,
-                profile=False,
-                verify=False,
+                # profile/verify are forced to False by the --interactive
+                # mutex block in __main__; pass through as the single source
+                # of truth.
+                profile=args.profile,
+                verify=args.verify,
                 cpu_attn=args.cpu_attn,
                 on_token=_stream_cb,
             )
@@ -973,6 +976,13 @@ if __name__ == "__main__":
     if args.interactive:
         if args.compile_only:
             parser.error("--interactive cannot be combined with --compile-only")
+        if not args.run_only:
+            parser.error("--interactive requires --run-only")
+        if args.prompt != parser.get_default("prompt"):
+            print(
+                "WARNING: --prompt is ignored in --interactive mode.",
+                file=sys.stderr,
+            )
         if args.profile:
             print(
                 "WARNING: --profile is ignored in --interactive mode.",
