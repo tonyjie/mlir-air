@@ -63,11 +63,11 @@ class _StreamState:
     full id list each call and emit only the suffix we have not printed yet.
     """
 
-    def __init__(self):
-        self.printed_len = 0
+    def __init__(self) -> None:
+        self.printed_len: int = 0
 
 
-def _delta_text(tokenizer, ids, state):
+def _delta_text(tokenizer, ids: list[int], state: _StreamState) -> str:
     """Return the new text fragment since the last call, advancing state."""
     decoded = tokenizer.decode(ids, skip_special_tokens=True)
     delta = decoded[state.printed_len :]

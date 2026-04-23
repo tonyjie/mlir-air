@@ -57,6 +57,10 @@ def test_delta_text_handles_growing_decode():
     assert _delta_text(_MergingTokenizer(), [1, 2], state) == "b"
 
 
-def test_stream_state_starts_at_zero():
-    s = _StreamState()
-    assert s.printed_len == 0
+def test_delta_text_with_empty_ids():
+    """Calling with an empty id list returns '' and leaves state unchanged.
+    This path triggers when generate() is invoked with n_tokens=0."""
+    tok = _FakeTokenizer({1: "Hello"})
+    state = _StreamState()
+    assert _delta_text(tok, [], state) == ""
+    assert state.printed_len == 0
