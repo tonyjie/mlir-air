@@ -29,7 +29,7 @@ N_TOKENS ?= 100
 PROMPT   ?= The capital of France is
 MODEL    ?= base
 
-.PHONY: help compile run profile verify clean \
+.PHONY: help compile run profile verify chat clean \
         compile-prefill compile-decode run-prefill run-decode
 
 # ============================================================
@@ -44,6 +44,7 @@ help:
 	@echo "Quick start:"
 	@echo "  make compile          Compile all kernels (~4 min, one-time)"
 	@echo "  make run              Run inference ($(N_TOKENS) tokens)"
+	@echo "  make chat             Interactive chat REPL (streaming output)"
 	@echo "  make profile          Run with profiling breakdown"
 	@echo ""
 	@echo "Unified pipeline (recommended):"
@@ -95,6 +96,11 @@ profile:
 verify:
 	cd $(BUILD_DIR) && python3 $(srcdir)/llama3_inference.py \
 		--run-only --n-tokens $(N_TOKENS) --verify --profile --prompt "$(PROMPT)" --model $(MODEL)
+
+## Interactive chat: prepare runtime once, then loop on prompts
+chat:
+	cd $(BUILD_DIR) && python3 $(srcdir)/llama3_inference.py \
+		--run-only --interactive --n-tokens $(N_TOKENS) --model $(MODEL)
 
 ## Compile and run in one step
 all: compile profile
