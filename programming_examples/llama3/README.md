@@ -30,7 +30,7 @@ End-to-end LLAMA-3.2-1B (1B parameter, BF16) inference running on AMD NPU2 (AIE2
 # One-time: compile all kernels (~4 min, cached to disk)
 make compile
 
-# Run inference (prefill + 100 tokens decode)
+# Run inference (prefill + 1000 tokens decode)
 make run
 
 # Run with custom prompt

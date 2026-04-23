@@ -25,7 +25,7 @@ else
 endif
 
 # Configurable parameters
-N_TOKENS ?= 100
+N_TOKENS ?= 1000
 PROMPT   ?= The capital of France is
 MODEL    ?= base
 
@@ -63,7 +63,7 @@ help:
 	@echo "  make clean            Remove all build artifacts"
 	@echo ""
 	@echo "Options (override with make VAR=value):"
-	@echo "  N_TOKENS=100          Number of decode tokens"
+	@echo "  N_TOKENS=1000         Number of decode tokens"
 	@echo "  PROMPT=\"...\"          Input prompt text"
 	@echo "  MODEL=base|instruct   Model variant (default: base)"
 	@echo ""

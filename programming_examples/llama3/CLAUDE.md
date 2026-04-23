@@ -18,7 +18,7 @@ End-to-end LLAMA-3.2-1B BF16 inference (prefill + decode) on AMD NPU2 (AIE2P).
 ```bash
 cd programming_examples/llama3
 make compile   # One-time kernel compilation (~4 min, cached to disk)
-make run       # Run inference (prefill + 100 tokens decode)
+make run       # Run inference (prefill + 1000 tokens decode)
 make chat      # Interactive REPL: prep runtime once, loop on prompts (streaming)
 make profile   # Run with per-kernel timing breakdown
 make verify    # Run with CPU reference verification

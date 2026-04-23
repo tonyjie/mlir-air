@@ -58,10 +58,10 @@ Compiles all NPU kernels from source and caches them to disk.
 
 ### `make run`
 
-Runs the unified inference pipeline with default settings (100 tokens).
+Runs the unified inference pipeline with default settings (1000 tokens).
 
 ```bash
-make run                              # 100 tokens, default prompt (base model)
+make run                              # 1000 tokens, default prompt (base model)
 make run N_TOKENS=50                  # Generate 50 tokens
 make run PROMPT="Once upon a time"    # Custom prompt
 make run MODEL=instruct PROMPT="What is the capital of France?"  # Instruct model (Q&A)
