@@ -26,6 +26,8 @@ import argparse
 import os
 import sys
 import time
+from dataclasses import dataclass
+from typing import Any, Callable, Optional
 
 import numpy as np
 from ml_dtypes import bfloat16
@@ -67,12 +69,31 @@ class _StreamState:
         self.printed_len: int = 0
 
 
-def _delta_text(tokenizer, ids: list[int], state: _StreamState) -> str:
+def _delta_text(tokenizer: Any, ids: list[int], state: _StreamState) -> str:
     """Return the new text fragment since the last call, advancing state."""
     decoded = tokenizer.decode(ids, skip_special_tokens=True)
     delta = decoded[state.printed_len :]
     state.printed_len = len(decoded)
     return delta
+
+
+# ---------------------------------------------------------------------------
+# Session: long-lived state created once per process
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Session:
+    """Everything `run_once` needs that should not be rebuilt per turn."""
+
+    config: Any  # LlamaConfig
+    seq_len: int  # padded prompt length (today: 2048)
+    weights: Any  # LlamaWeights, mutated by prepare_runtime()
+    tokenizer: Any  # transformers AutoTokenizer
+    prefill_cache: Any  # KernelCache
+    decode_cache: Any  # KernelCache
+    rope_lut_bf16: np.ndarray  # (max_seq, head_dim) bfloat16
+    model_variant: str  # "base" | "instruct"
 
 
 # ---------------------------------------------------------------------------
@@ -704,12 +725,135 @@ def generate(
 
 
 # ---------------------------------------------------------------------------
+# Session lifecycle and per-turn execution
+# ---------------------------------------------------------------------------
+
+
+def build_session(args) -> Session:
+    """One-time setup: load kernel caches, weights, tokenizer, RoPE LUT,
+    and run prepare_runtime(). Safe to call once per process; do not call
+    twice (prepare_runtime mutates `weights` with idempotency guards but the
+    intent is one-shot)."""
+    config = LlamaConfig()
+    seq_len = 2048
+
+    prefill_cache = KernelCache("prefill_kernel_cache", verbose=args.verbose)
+    decode_cache = KernelCache("decode_kernel_cache", verbose=args.verbose)
+
+    if not args.run_only:
+        print("Compiling prefill kernels...")
+        compile_all_kernels(prefill_cache, config, seq_len, cpu_attn=args.cpu_attn)
+        print("\nCompiling decode kernels...")
+        compile_decode_kernels(decode_cache, config)
+
+    if args.compile_only:
+        sys.exit(0)
+
+    if args.run_only:
+        prefill_cache.load_manifest()
+        decode_cache.load_manifest()
+
+    model_id = (
+        "meta-llama/Llama-3.2-1B-Instruct"
+        if args.model == "instruct"
+        else "meta-llama/Llama-3.2-1B"
+    )
+    print(f"\nLoading weights ({model_id})...")
+    weights = load_weights(model_id)
+
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+
+    rope_lut_bf16 = generate_rope_lut(
+        config=config,
+        seq_len=seq_len + args.n_tokens,
+    ).astype(bfloat16)
+
+    prepare_runtime(
+        prefill_cache, decode_cache, weights, config, seq_len, rope_lut_bf16
+    )
+
+    return Session(
+        config=config,
+        seq_len=seq_len,
+        weights=weights,
+        tokenizer=tokenizer,
+        prefill_cache=prefill_cache,
+        decode_cache=decode_cache,
+        rope_lut_bf16=rope_lut_bf16,
+        model_variant=args.model,
+    )
+
+
+def _tokenize_prompt(session: Session, prompt_text: str) -> list:
+    """Apply chat template if instruct model, then tokenize. Does NOT pad."""
+    if session.model_variant == "instruct":
+        messages = [{"role": "user", "content": prompt_text}]
+        chat_text = session.tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        return session.tokenizer.encode(chat_text)
+    return session.tokenizer.encode(prompt_text)
+
+
+def run_once(
+    session: Session,
+    prompt_text: str,
+    *,
+    n_tokens: int,
+    profile: bool = False,
+    verify: bool = False,
+    cpu_attn: bool = True,
+    on_token: Optional[Callable[[int, str], None]] = None,
+) -> tuple:
+    """Tokenize, pad to seq_len, and call generate(). Returns
+    (generated_token_ids, prompt_len_actual)."""
+    tokens = _tokenize_prompt(session, prompt_text)
+    prompt_len_actual = len(tokens)
+    if len(tokens) < session.seq_len:
+        tokens = tokens + [session.tokenizer.eos_token_id] * (
+            session.seq_len - len(tokens)
+        )
+
+    generated = generate(
+        tokens,
+        session.weights,
+        session.config,
+        session.prefill_cache,
+        session.decode_cache,
+        session.rope_lut_bf16,
+        tokenizer=session.tokenizer,
+        n_tokens=n_tokens,
+        profile=profile,
+        verify=verify,
+        cpu_attn=cpu_attn,
+        on_token=on_token,
+    )
+    return generated, prompt_len_actual
+
+
+def _print_one_shot_output(session, args, generated, prompt_len_actual):
+    """Format and print the final output for non-interactive mode."""
+    print(f"\n{'='*60}")
+    if session.model_variant == "instruct":
+        response = session.tokenizer.decode(generated, skip_special_tokens=True).strip()
+        print(f"Q: {args.prompt}")
+        print(f"A: {response}")
+    else:
+        # Reconstruct the unpadded prompt + generated tokens.
+        prompt_tokens = _tokenize_prompt(session, args.prompt)
+        print(f"Generated text:")
+        print(f"{'='*60}")
+        all_tokens = prompt_tokens[:prompt_len_actual] + generated
+        print(session.tokenizer.decode(all_tokens))
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    from pathlib import Path
-
     parser = argparse.ArgumentParser(description="LLAMA-3.2-1B Inference (NPU)")
     parser.add_argument(
         "--compile-only",
@@ -757,87 +901,15 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    config = LlamaConfig()
-    seq_len = 2048
+    session = build_session(args)
 
-    # --- Step 1: Compile or load kernel caches ---
-    llama_dir = Path(__file__).resolve().parent
-    prefill_cache = KernelCache("prefill_kernel_cache", verbose=args.verbose)
-    decode_cache = KernelCache("decode_kernel_cache", verbose=args.verbose)
-
-    if not args.run_only:
-        print("Compiling prefill kernels...")
-        compile_all_kernels(prefill_cache, config, seq_len, cpu_attn=args.cpu_attn)
-        print("\nCompiling decode kernels...")
-        compile_decode_kernels(decode_cache, config)
-
-    if args.compile_only:
-        sys.exit(0)
-
-    if args.run_only:
-        prefill_cache.load_manifest()
-        decode_cache.load_manifest()
-
-    # --- Step 2: Load model weights and tokenizer ---
-    model_id = (
-        "meta-llama/Llama-3.2-1B-Instruct"
-        if args.model == "instruct"
-        else "meta-llama/Llama-3.2-1B"
-    )
-    print(f"\nLoading weights ({model_id})...")
-    weights = load_weights(model_id)
-
-    from transformers import AutoTokenizer
-
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
-    if args.model == "instruct":
-        # Format prompt with chat template for instruct model
-        messages = [{"role": "user", "content": args.prompt}]
-        chat_text = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
-        prompt_tokens = tokenizer.encode(chat_text)
-    else:
-        prompt_tokens = tokenizer.encode(args.prompt)
-    prompt_len_actual = len(prompt_tokens)
-    if len(prompt_tokens) < seq_len:
-        prompt_tokens = prompt_tokens + [tokenizer.eos_token_id] * (
-            seq_len - len(prompt_tokens)
-        )
-
-    rope_lut_bf16 = generate_rope_lut(
-        config=config,
-        seq_len=seq_len + args.n_tokens,
-    ).astype(bfloat16)
-
-    # --- Step 3: Prepare runtime (one-time init, outside profiling) ---
-    prepare_runtime(
-        prefill_cache, decode_cache, weights, config, seq_len, rope_lut_bf16
-    )
-
-    # --- Step 4: Run inference (timed) ---
-    generated = generate(
-        prompt_tokens,
-        weights,
-        config,
-        prefill_cache,
-        decode_cache,
-        rope_lut_bf16,
-        tokenizer=tokenizer,
+    generated, prompt_len_actual = run_once(
+        session,
+        args.prompt,
         n_tokens=args.n_tokens,
         profile=args.profile,
         verify=args.verify,
         cpu_attn=args.cpu_attn,
     )
 
-    # --- Step 5: Print output ---
-    print(f"\n{'='*60}")
-    if args.model == "instruct":
-        response = tokenizer.decode(generated, skip_special_tokens=True).strip()
-        print(f"Q: {args.prompt}")
-        print(f"A: {response}")
-    else:
-        print(f"Generated text:")
-        print(f"{'='*60}")
-        all_tokens = prompt_tokens[:prompt_len_actual] + generated
-        print(tokenizer.decode(all_tokens))
+    _print_one_shot_output(session, args, generated, prompt_len_actual)
