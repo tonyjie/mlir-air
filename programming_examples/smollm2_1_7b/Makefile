@@ -35,7 +35,7 @@ PHASE4     := smollm2_phase4_test.py
 PHASE5     := smollm2_phase5_test.py
 INFERENCE  := smollm2_inference.py
 
-.PHONY: help compile run profile verify clean \
+.PHONY: help compile run profile verify verify-decode clean \
         compile-prefill compile-decode \
         run-prefill run-decode run-block run-full run-reference run-decode-only
 
@@ -52,7 +52,8 @@ help:
 	@echo "  make compile         Compile prefill + decode kernels (~2 min, one-time)"
 	@echo "  make run             End-to-end NPU inference: prefill + decode ($(N_TOKENS) tokens)"
 	@echo "  make profile         Prefill perf measurement (cold + warm)"
-	@echo "  make verify          Decode with NPU/CPU top-1 match check"
+	@echo "  make verify          End-to-end NPU prefill vs CPU F32: per-layer K/V cosine + final logits"
+	@echo "  make verify-decode   Phase 5 decode-side NPU/CPU top-1 (slow, ~25 s/token)"
 	@echo ""
 	@echo "Compile only:"
 	@echo "  make compile         All kernels (prefill + decode)"
@@ -139,8 +140,13 @@ run-reference:
 ## Prefill perf measurement (alias for run-prefill — Phase 4 already prints timings)
 profile: run-prefill
 
-## Decode with NPU/CPU top-1 verification (slow: ~25 s/token CPU verify; default 4 tokens)
+## End-to-end NPU vs CPU F32 verification: per-layer K/V cosine + final logits cos + top-1 match
 verify:
+	python3 $(srcdir)/$(INFERENCE) --n-tokens 1 --prompt "$(PROMPT)" \
+		--seq-len $(SEQ_LEN) --model $(MODEL) --verify
+
+## Decode-side per-token NPU vs CPU argmax (Phase 5; slow ~25 s/token CPU; default 4 tokens)
+verify-decode:
 	python3 $(srcdir)/$(PHASE5) --n-tokens 4 --prompt "$(PROMPT)" --max-seq $(MAX_SEQ) \
 		--model $(MODEL) --cpu-verify
 
