@@ -4,8 +4,8 @@ End-to-end LLAMA-3.2-1B BF16 inference (prefill + decode) on AMD NPU2 (AIE2P).
 
 ## Status
 
-- **Prefill** (seq_len=2048): 1.15s kernel / 1.374s wall — **2.4x kernel / 2.0x wall vs IRON** (2.744s)
-  - Updated 2026-04-25: prefill LM Head refactored from full-seq GEMM (171 ms) to single-position GEMV reusing decode `lm_head_gemv.elf` (~14 ms). Saves 154 ms wall (5-trial mean). See `docs/profile.md` for details.
+- **Prefill** (seq_len=2048): 1.15s kernel / 1.264s wall — **2.4x kernel / 2.17x wall vs IRON** (2.744s)
+  - Updated 2026-04-25 / 2026-04-26: two back-to-back optimizations bumped this from the original 1.78× wall: (1) prefill LM Head GEMM → GEMV reusing `lm_head_gemv.elf` (saves 154 ms / commit 5de80750); (2) eliminate per-layer `np.astype(bfloat16)` heap churn in o_ffn arg prep via `copy=False` (saves 110 ms / commit a2ad5aa5); (3) dead-code cleanup of unused prefill LM Head GEMM preload (commit b7d8c065). See `docs/profile.md` for the full trajectory.
 - **Decode**: 92ms/token (10.8 tok/s) — **4.0x faster than IRON** (370ms/token)
 - 3 XRT invocations/layer (prefill and decode), + 1 for LM Head
 - Top-1 prediction correct (" Paris" for "The capital of France is")

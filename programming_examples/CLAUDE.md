@@ -211,7 +211,7 @@ fused ELFs cleanly. See `qwen3_0_6b/CLAUDE.md` for the methodology.
 
 | Model | Layers | head_dim | Per-layer rate (decode) | NPU prefill (warm) |
 |---|---|---|---|---|
-| `llama3/`         (Llama-3.2-1B)  | 16 | 64  | 5.75 ms/layer (10.8 tok/s) | 1.15 s kernel / 1.374 s wall (2.0× vs IRON) |
+| `llama3/`         (Llama-3.2-1B)  | 16 | 64  | 5.75 ms/layer (10.8 tok/s) | 1.15 s kernel / 1.264 s wall (2.17× vs IRON) |
 | `smollm2_1_7b/`   (SmolLM2-1.7B)  | 24 | 64  | 5.7 ms/layer (7.3 tok/s)   | 1.88 s |
 | `llama32_3b/`     (Llama-3.2-3B)  | 28 | **128** | 7.7 ms/layer (4.7 tok/s)  | **3.2 s** (NPU FA via Option C) |
 | `qwen25_1_5b/`    (Qwen2.5-1.5B)  | 28 | **128** | 7.7 ms/layer (4.6 tok/s)  | **2.4 s** (NPU FA + GQA-reindexed padding + QKV bias) |

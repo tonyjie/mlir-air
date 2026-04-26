@@ -6,18 +6,30 @@
 
 | Phase | AIR (NPU2) | IRON | Speedup |
 |-------|------------|------|---------|
-| **Prefill** (seq_len=2048) | **1.15s kernel / 1.374s wall** | 2.744s | **2.4x (kernel), 2.0x (wall)** |
+| **Prefill** (seq_len=2048) | **1.15s kernel / 1.264s wall** | 2.744s | **2.4x (kernel), 2.17x (wall)** |
 | **Decode** (steady-state) | **92ms/token (10.8 tok/s)** | 370ms/token (2.7 tok/s) | **4.0x** |
 
 - **Kernel time**: Sum of all `load_and_run()` durations (BO Write + NPU Run + BO Read)
 - **Wall time**: End-to-end from embedding to LM Head argmax (includes Python host overhead)
-- **2026-04-25 update**: prefill LM Head refactored from full-sequence
-  GEMM (171 ms) to single-position GEMV (~14 ms) by reusing the decode
-  `lm_head_gemv.elf`; the full-seq NPU `rmsnorm` (3 ms) was likewise
-  replaced by CPU RMSNorm on the 1×emb_dim last row. Net wall saving:
-  −154 ms (1.528 → 1.374 s, mean over 5 trials each, σ ≈ 10 ms).
-  Headline vs IRON: **1.78× → 2.00×** wall speedup. See "Key
-  Optimizations" below.
+- **2026-04-25 / 2026-04-26 update — two back-to-back optimizations**:
+  1. **LM Head GEMM → GEMV** (commit 5de80750): prefill LM Head
+     refactored from full-sequence GEMM (171 ms) to single-position GEMV
+     (~14 ms) by reusing the decode `lm_head_gemv.elf`; the full-seq NPU
+     `rmsnorm` (3 ms) was likewise replaced by CPU RMSNorm on the
+     1×emb_dim last row. Wall: 1.528 → 1.374 s (−154 ms).
+  2. **Heap-churn fix** (commit a2ad5aa5): the per-call
+     `cached_args[3] = x_bf16.reshape(...).astype(bfloat16)` in the
+     o_ffn argument prep allocated a fresh ~8 MB array per layer
+     (16 layers × ~10 ms = ~160 ms / prefill of glibc growth + page
+     faults on cold heap). Passing `copy=False` makes the .astype a
+     no-op when source is already bf16. Wall: 1.374 → **1.264 s**
+     (−110 ms more, 5-trial mean σ ≈ 5 ms).
+  3. **Dead code removal** (commit b7d8c065): post-(1), the
+     `preload_lm_head_weights` call in `prepare_runtime` is dead
+     (the prefill GEMM ELF it warmed up is no longer invoked). Removed.
+     Side benefit: setup phase ~5 s shorter.
+
+  Headline vs IRON 2.744 s wall: **1.78× → 2.17×**.
 
 ---
 
@@ -66,7 +78,7 @@ Phase 3: Inference
   ┌──────────────────────────────────────────────────────────────┐
   │  PREFILL: 16 layers + CPU final RMSNorm (1 row) + LM Head   │
   │    Kernel time: 1.15s  (BO Write + NPU Run + BO Read)       │
-  │    Wall time:   1.374s (includes Python host overhead)      │
+  │    Wall time:   1.264s (includes Python host overhead)      │
   │    LM Head: NPU GEMV at last position only (reuses decode   │
   │             lm_head_gemv.elf — same path as decode loop)    │
   │  DECODE:  per token (16 layers + LM Head GEMV)    → 92ms    │
@@ -78,7 +90,7 @@ Phase 3: Inference
 **Profiled scope matches IRON**: Both frameworks pre-load weights before timing.
 IRON reports wall time (end-to-end timed section). AIR kernel time (1.15s) is
 the fair comparison to IRON's 2.744s — both measure BO syncs + NPU execution.
-AIR wall time (1.374s) includes minimal Python host overhead (KV cache
+AIR wall time (1.264s) includes minimal Python host overhead (KV cache
 extraction, embedding, numpy views, 1-row CPU RMSNorm) that IRON's C++
 runtime avoids.
 
@@ -90,13 +102,13 @@ Key differences favoring AIR:
 
 ## Prefill Breakdown (seq_len=2048, 16 layers)
 
-### Wall Time Breakdown: 1.374s
+### Wall Time Breakdown: 1.264s
 
 | Component | Time | Notes |
 |-----------|------|-------|
 | **Kernel time** (sum of `load_and_run`) | 1.15s | BO Write + NPU Run + BO Read (49 kernel calls: 16L × 3 + 1 LM Head GEMV) |
-| **Python host overhead** | 0.22s | Everything outside kernel execution |
-| **Total wall time** | **1.374s** | mean over 5 trials, σ ≈ 17 ms |
+| **Python host overhead** | 0.11s | Everything outside kernel execution; halved by heap-churn fix (`copy=False`) |
+| **Total wall time** | **1.264s** | mean over 5 trials, σ ≈ 5 ms |
 
 The 0.22s Python host overhead includes:
 - KV cache extraction (reshape + transpose per layer): ~20ms
@@ -339,7 +351,7 @@ The AMD NPU enters low-power state after ~10 seconds of inactivity:
 | 10+ seconds | +150ms |
 
 In the unified pipeline (`llama3_inference.py`), this is not an issue: the NPU
-prefill (~1.374s of continuous NPU activity) keeps the hardware warm right
+prefill (~1.264s of continuous NPU activity) keeps the hardware warm right
 up until decode starts. No explicit warmup pass is needed.
 
 In the decode-only script (`llama3_decode.py`), the CPU prefill takes ~17s (NPU idle),
@@ -356,6 +368,7 @@ so an explicit warmup pass runs before the timed decode loop.
 | `intermediate_indices` | Skip host→device sync for buffers the kernel overwrites | -150ms prefill, <1% decode overhead |
 | NPU LM Head GEMV | 8-partition GEMV replaces CPU matmul for decode LM Head | 258ms→13.5ms per token |
 | **Decode-GEMV reuse for prefill end** | Last-position-only LM Head: drop full-seq NPU GEMM (171ms) + NPU rmsnorm (3ms), reuse decode `lm_head_gemv.elf` on the last row + 1-row CPU RMSNorm | **−154ms wall (1.528 → 1.374s, 5-trial mean), 1.78× → 2.00× vs IRON** |
+| **Heap-churn fix in o_ffn arg prep** | `cached_args[3] = x_bf16.reshape(...).astype(bfloat16)` defaulted to `copy=True` even when source was already bf16 — fresh ~8 MB alloc per layer × 16 = ~130 MB heap churn per prefill. Pass `copy=False` so `.astype` is a no-op | **−110ms wall (1.374 → 1.264s, 5-trial mean σ ≈ 5ms), 2.00× → 2.17× vs IRON** |
 | External kernel rename | Compile mv.cc with `-D` defines for renamed symbols | Enables K=2048+K=8192 GEMV in one ELF |
 | Seq-first layout | RoPE + FlashAttention natively accept (seq, heads×dim) | Zero host transposes in prefill |
 | `collapse_shape`/`expand_shape` | 2D↔1D type aliasing inside launch bodies | Enables shape-incompatible kernel merging |
