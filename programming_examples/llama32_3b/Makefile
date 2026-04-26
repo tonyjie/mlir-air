@@ -119,7 +119,16 @@ run-reference:
 
 profile: run-prefill
 
+# End-to-end verify: NPU prefill + first LM Head, with per-layer K/V cache
+# vs CPU F32 reference (cosine + max_err + mean_err per layer) and final
+# logits cosine at pred_pos. Mirrors llama3 (1B) `make verify`.
 verify:
+	python3 $(srcdir)/$(INFERENCE) --n-tokens $(N_TOKENS) --prompt "$(PROMPT)" \
+		--seq-len $(SEQ_LEN) --model $(MODEL) --verify
+
+# Decode-only verify: NPU vs CPU per-token argmax across N decode steps.
+# (Was the previous `make verify` target before 2026-04-26.)
+verify-decode:
 	python3 $(srcdir)/$(PHASE5) --n-tokens 4 --prompt "$(PROMPT)" --max-seq $(MAX_SEQ) \
 		--model $(MODEL) --cpu-verify
 

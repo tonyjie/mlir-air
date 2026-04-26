@@ -79,6 +79,16 @@ def main():
     parser.add_argument(
         "--profile", action="store_true", help="Print per-token decode timings"
     )
+    parser.add_argument(
+        "--verify",
+        action="store_true",
+        help=(
+            "Compare NPU prefill vs CPU F32 reference: per-layer K/V cache "
+            "cosine + max_err + mean_err for all 28 layers, plus final logits "
+            "cosine at pred_pos and top-1 match. Mirrors llama3_inference.py "
+            "--verify. Runs CPU forward in parallel — adds ~30s wall."
+        ),
+    )
     parser.add_argument("--compile-only", action="store_true")
     args = parser.parse_args()
 
@@ -186,6 +196,78 @@ def main():
         f"  First LM Head GEMV: {t_first_lm_head*1000:.0f} ms  -> "
         f"{tokenizer.decode([first_token])!r} (id={first_token})"
     )
+
+    if args.verify:
+        print(f"\n{'='*60}")
+        print(
+            f"Verification: NPU prefill vs CPU F32 reference ({config.n_layers} layers)"
+        )
+        print(f"{'='*60}")
+        from llama32_3b_reference import transformer_block as cpu_block
+
+        rope_lut_f32 = rope_lut_bf16[: args.seq_len].astype(np.float32)
+        x_cpu = weights.embed_table[token_ids].astype(np.float32)
+        n_kv_heads = config.n_kv_heads
+        head_dim = config.head_dim
+        n_layer_warns = 0
+        for li in range(config.n_layers):
+            x_cpu, cpu_intermediates = cpu_block(
+                x_cpu, weights.layers[li], rope_lut_f32, config
+            )
+            cpu_k = (
+                cpu_intermediates["k_roped"]
+                .astype(np.float32)
+                .reshape(args.seq_len, n_kv_heads, head_dim)
+                .transpose(1, 0, 2)
+            )
+            cpu_v = (
+                cpu_intermediates["v"]
+                .astype(np.float32)
+                .reshape(args.seq_len, n_kv_heads, head_dim)
+                .transpose(1, 0, 2)
+            )
+            npu_k = k_cache[li, :, : args.seq_len, :].astype(np.float32)
+            npu_v = v_cache[li, :, : args.seq_len, :].astype(np.float32)
+
+            k_corr = np.corrcoef(npu_k.flatten(), cpu_k.flatten())[0, 1]
+            v_corr = np.corrcoef(npu_v.flatten(), cpu_v.flatten())[0, 1]
+            k_maxerr = float(np.max(np.abs(npu_k - cpu_k)))
+            v_maxerr = float(np.max(np.abs(npu_v - cpu_v)))
+            k_meanerr = float(np.mean(np.abs(npu_k - cpu_k)))
+            v_meanerr = float(np.mean(np.abs(npu_v - cpu_v)))
+
+            k_status = "OK" if k_corr > 0.99 else "WARN"
+            v_status = "OK" if v_corr > 0.99 else "WARN"
+            n_layer_warns += int(k_status == "WARN") + int(v_status == "WARN")
+            print(
+                f"  Layer {li:2d} K_cache: [{k_status}] corr={k_corr:.6f}, "
+                f"max_err={k_maxerr:.4f}, mean_err={k_meanerr:.4f}"
+            )
+            print(
+                f"  Layer {li:2d} V_cache: [{v_status}] corr={v_corr:.6f}, "
+                f"max_err={v_maxerr:.4f}, mean_err={v_meanerr:.4f}"
+            )
+
+        # Final RMSNorm + LM Head on CPU side, compare logits at pred_pos
+        x_cpu_normed = llama32_3b_reference.rms_norm(
+            x_cpu, weights.final_norm.astype(np.float32)
+        )
+        cpu_logits_pred = x_cpu_normed[pred_pos] @ weights.lm_head.astype(np.float32).T
+        cpu_pred = int(np.argmax(cpu_logits_pred))
+        npu_logits_f32 = np.asarray(first_logits, dtype=np.float32)
+        logit_corr = float(np.corrcoef(npu_logits_f32, cpu_logits_pred)[0, 1])
+        logit_maxerr = float(np.max(np.abs(npu_logits_f32 - cpu_logits_pred)))
+        logit_meanerr = float(np.mean(np.abs(npu_logits_f32 - cpu_logits_pred)))
+        print(
+            f"\n  Logits (pos {pred_pos}): corr={logit_corr:.6f}, "
+            f"max_err={logit_maxerr:.4f}, mean_err={logit_meanerr:.4f}"
+        )
+        print(f"  NPU top-1: {first_token} ({tokenizer.decode([first_token])!r})")
+        print(f"  CPU top-1: {cpu_pred} ({tokenizer.decode([cpu_pred])!r})")
+        print(f"  Match: {'YES' if first_token == cpu_pred else 'NO'}")
+        print(
+            f"  Per-layer warnings: {n_layer_warns} (informational; BF16 K/V drift across deep stacks is expected)"
+        )
 
     print(f"\n[2/3] NPU decode loop ({args.n_tokens} tokens)...")
     embed_table_f32 = np.asarray(weights.embed_table, dtype=np.float32)
