@@ -6,7 +6,7 @@ End-to-end LLAMA-3.2-1B (1B parameter, BF16) inference running on AMD NPU2 (AIE2
 
 | Phase | Time | vs IRON |
 |-------|------|---------|
-| Prefill (2048 tokens) | 1.30s kernel / 1.54s wall | 2.1x faster |
+| Prefill (2048 tokens) | 1.15s kernel / 1.374s wall | 2.4x kernel / 2.0x wall |
 | Decode | 92ms/token (10.8 tok/s) | 4.0x faster |
 
 ## Prerequisites
