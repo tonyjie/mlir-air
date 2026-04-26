@@ -349,6 +349,7 @@ def run_npu_prefill(
     weights,
     config,
     prefill_cache,
+    decode_cache,
     rope_lut_bf16,
     max_seq,
     tokenizer,
@@ -416,57 +417,37 @@ def run_npu_prefill(
             layer_t = time.perf_counter() - layer_t0
             print(f"  Layer {layer_idx:2d}: {layer_t*1000:.0f}ms")
 
-    # Final RMSNorm (NPU)
-    x_in = np.asarray(x_bf16, dtype=bfloat16).reshape(seq_len, emb_dim)
-    w_in = np.asarray(weights.final_norm, dtype=bfloat16).reshape(emb_dim)
-    y_out = np.zeros((seq_len, emb_dim), dtype=bfloat16)
-    results = _run_cached(prefill_cache, "rmsnorm", _SIMPLE_BACKEND, x_in, w_in, y_out)
-    x_normed = results[-1].reshape(seq_len, emb_dim)
-
-    # LM Head (NPU -- 8-partition multi-launch ELF)
-    vocab_size = weights.lm_head.shape[0]
-    n_part = 16384
-    n_partitions = 8
-
-    _LM_HEAD_BACKEND = {
-        "omit_while_true_loop": False,
-        "output_format": "elf",
-        "instance_name": "lm_head",
-    }
-    x_lm = np.asarray(x_normed, dtype=bfloat16).reshape(seq_len, emb_dim)
-    lm_inputs = [x_lm]
-    output_indices = []
-    for p in range(n_partitions):
-        lm_inputs.append(weights._lm_weight_parts[p])
-        lm_inputs.append(np.zeros((seq_len, n_part), dtype=bfloat16))
-        output_indices.append(2 + 2 * p)
-
-    results = _run_cached(
-        prefill_cache,
-        "lm_head",
-        _LM_HEAD_BACKEND,
-        *lm_inputs,
-        output_indices=output_indices,
-        static_input_indices=(
-            {1 + 2 * p for p in range(n_partitions)}
-            | {2 + 2 * p for p in range(n_partitions)}
-        ),
-        intermediate_indices={2 + 2 * p for p in range(n_partitions)},
-    )
-
-    # Find actual prompt length — only need logits at pred_pos for argmax
+    # Find actual prompt length — only need logits at pred_pos for argmax.
+    # Autoregressive generation only needs the last real-token row of logits;
+    # computing the full (seq_len, vocab) projection wastes ~2047x compute.
+    # Refactored 2026-04-25: drop the full-sequence NPU rmsnorm + 8-partition
+    # GEMM and reuse the decode-side single-position GEMV (~150 ms saved).
     prompt_len = len([t for t in token_ids if t != tokenizer.eos_token_id])
     pred_pos = prompt_len - 1
+    vocab_size = weights.lm_head.shape[0]
 
-    # Assemble logits only at pred_pos (avoids 500MB full-seq assembly + conversion)
-    logits_row = np.zeros(vocab_size, dtype=bfloat16)
-    for p in range(n_partitions):
-        out_idx = 2 + 2 * p
-        n_start = p * n_part
-        n_end = min(n_start + n_part, vocab_size)
-        logits_row[n_start:n_end] = results[out_idx].reshape(seq_len, n_part)[
-            pred_pos, : n_end - n_start
-        ]
+    # CPU RMSNorm at last position only (1 vector, <1 ms)
+    from llama3_reference import rms_norm as _rms_norm
+
+    last_hidden = np.asarray(x_bf16, dtype=np.float32)[pred_pos : pred_pos + 1]
+    last_normed_bf16 = (
+        _rms_norm(last_hidden, weights.final_norm).flatten().astype(bfloat16)
+    )
+
+    # NPU LM Head GEMV — reuse the decode-cache 8-partition GEMV ELF
+    lm_inputs = [last_normed_bf16]
+    for p in range(_LM_N_PARTITIONS):
+        lm_inputs.append(weights._lm_weight_parts_gemv[p])
+        lm_inputs.append(np.zeros(_LM_N_PART, dtype=bfloat16))
+    results = decode_cache.load_and_run(
+        "lm_head_gemv",
+        _LM_GEMV_BACKEND,
+        *lm_inputs,
+        output_indices=[2 + 2 * p for p in range(_LM_N_PARTITIONS)],
+        static_input_indices={1 + 2 * p for p in range(_LM_N_PARTITIONS)},
+        intermediate_indices={2 + 2 * p for p in range(_LM_N_PARTITIONS)},
+    )
+    logits_row = np.concatenate(results, axis=0)[:vocab_size]
     prefill_token = int(np.argmax(logits_row))
 
     t_prefill = time.time() - t_prefill_start
@@ -578,6 +559,7 @@ def generate(
         weights,
         config,
         prefill_cache,
+        decode_cache,
         rope_lut_bf16,
         max_seq,
         tokenizer=tokenizer,
