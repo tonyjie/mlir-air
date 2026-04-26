@@ -1116,7 +1116,13 @@ def run_transformer_block(
         ]
     cached_args = _arg_cache[_offn_key]
     cached_args[0] = np.asarray(attn_out, dtype=bfloat16).reshape(seq_len, emb_dim)
-    cached_args[3] = x_bf16.reshape(seq_len, emb_dim).astype(bfloat16)
+    # `copy=False` so the .astype is a no-op when x_bf16 is already bf16
+    # (it always is in production: layer 0 starts as cast embed table, and
+    # every subsequent layer is the previous o_ffn output). Saves ~12 MB
+    # heap alloc per call → ~330 MB churn per trial on llama32_3b's 28
+    # layers, eliminating the bulk of the trial-1 vs trial-2+ first-prefill
+    # gradient (LESSON 2026-04-25, headfirst_fa.py).
+    cached_args[3] = x_bf16.reshape(seq_len, emb_dim).astype(bfloat16, copy=False)
 
     results = _run_cached(
         cache,

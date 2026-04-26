@@ -48,7 +48,43 @@ HEAD_DIM_128_FA_CONFIG = {"lqp": 256, "lkp": 64, "dk": 128, "dv": 128}
 # Keys: n_heads, n_kv_heads, dk, dv, lkp.
 _HEADFIRST_FA_PARAMS = {}
 
+# Per-shape cache of pre-allocated host transpose buffers. Each entry holds
+# 5 buffers reused across every FA call at that shape. Keyed by the
+# (lq, lk, n_heads, n_kv_heads, dk, dv, lkp) tuple.
+#
+# Rationale (measured on llama32_3b, 2026-04-25): the per-call
+# `np.ascontiguousarray(transpose(...))` pattern allocates ~48 MB of fresh
+# numpy buffers per FA invocation, triggering glibc heap growth + page faults
+# on the first prefill of a fresh process. Total cost: ~510 ms across 28
+# layers (trial 1 vs trial 2 gradient). Reusing pre-allocated buffers via
+# `np.copyto` eliminates the allocation cost; only the memcpy remains.
+_HF_BUF_CACHE: dict = {}
+
 _INSTALLED = False
+
+
+def _get_hf_buffers(lq, lk, n_heads, n_kv_heads, dk, dv, lkp, dv_chunks):
+    """Return cached input/output buffers for the head-first FA shape.
+
+    Buffers:
+      q_hf       : (n_heads, lq, dk)            head-first query
+      k_hf       : (n_kv_heads, lk, dk)         head-first key
+      v_hf       : (n_kv_heads*dv_chunks, lk, lkp)  head-first value (re-tiled along dv)
+      out_hf     : (n_heads*dv_chunks, lq, lkp) head-first attention output (NPU writes here)
+      out_seq    : (lq, n_heads*dv)             seq-first output returned to caller
+    """
+    key = (lq, lk, n_heads, n_kv_heads, dk, dv, lkp)
+    bufs = _HF_BUF_CACHE.get(key)
+    if bufs is None:
+        bufs = {
+            "q_hf": np.empty((n_heads, lq, dk), dtype=bfloat16),
+            "k_hf": np.empty((n_kv_heads, lk, dk), dtype=bfloat16),
+            "v_hf": np.empty((n_kv_heads * dv_chunks, lk, lkp), dtype=bfloat16),
+            "out_hf": np.zeros((n_heads * dv_chunks, lq, lkp), dtype=bfloat16),
+            "out_seq": np.empty((lq, n_heads * dv), dtype=bfloat16),
+        }
+        _HF_BUF_CACHE[key] = bufs
+    return bufs
 
 
 def install_headfirst_fa_wrapper():
@@ -104,20 +140,27 @@ def install_headfirst_fa_wrapper():
         lq = q_seq.shape[0]
         lk = k_seq.shape[0]
 
-        # Seq-first -> head-first transposes (host-side; ~few ms total at this size).
-        q_hf = np.ascontiguousarray(q_seq.reshape(lq, n_heads, dk).transpose(1, 0, 2))
-        k_hf = np.ascontiguousarray(
-            k_seq.reshape(lk, n_kv_heads, dk).transpose(1, 0, 2)
-        )
+        # Seq-first -> head-first transposes. Reuse pre-allocated per-shape
+        # buffers via in-place memcpy (np.copyto) instead of allocating
+        # fresh ones every call. Saves ~510 ms / 28-layer prefill on the
+        # very first prefill of a fresh process by avoiding glibc heap
+        # growth + page faults on the ~48 MB per-call allocations.
+        bufs = _get_hf_buffers(lq, lk, n_heads, n_kv_heads, dk, dv, lkp, dv_chunks)
+        q_hf = bufs["q_hf"]
+        k_hf = bufs["k_hf"]
+        v_hf = bufs["v_hf"]
+        out_hf = bufs["out_hf"]
+        np.copyto(q_hf, q_seq.reshape(lq, n_heads, dk).transpose(1, 0, 2))
+        np.copyto(k_hf, k_seq.reshape(lk, n_kv_heads, dk).transpose(1, 0, 2))
         # V is re-tiled along dv: split dv into dv_chunks of lkp; head-first kernel
         # expects [n_kv_heads * dv_chunks, lk, lkp] in head-then-chunk order
         # (matches attn_npu2.py:1280 reference impl).
-        v_hf = np.ascontiguousarray(
+        np.copyto(
+            v_hf,
             v_seq.reshape(lk, n_kv_heads, dv_chunks, lkp)
             .transpose(1, 2, 0, 3)
-            .reshape(n_kv_heads * dv_chunks, lk, lkp)
+            .reshape(n_kv_heads * dv_chunks, lk, lkp),
         )
-        out_hf = np.zeros((n_heads * dv_chunks, lq, lkp), dtype=bfloat16)
 
         # Optional debug knobs for FA bisect work (see debug-fa-runtime-failure skill).
         _dbg = os.environ.get("HEADFIRST_FA_DEBUG", "")
@@ -151,10 +194,14 @@ def install_headfirst_fa_wrapper():
                 flush=True,
             )
 
-        # Head-first output -> seq-first.
+        # Head-first output -> seq-first. Write into the pre-allocated
+        # `out_seq` buffer via in-place memcpy. We reshape the contiguous
+        # destination to a 4D view (no copy, since out_seq is contiguous),
+        # then assign from the non-contiguous transposed source view.
         out_packed = results_hf[-1].reshape(n_heads, dv_chunks, lq, lkp)
-        out_seq = np.ascontiguousarray(
-            out_packed.transpose(2, 0, 1, 3).reshape(lq, n_heads * dv)
+        out_seq = bufs["out_seq"]
+        out_seq.reshape(lq, n_heads, dv_chunks, lkp)[:] = out_packed.transpose(
+            2, 0, 1, 3
         )
 
         # Caller does `results[-1].reshape(seq_len, n_heads * head_dim)`.
