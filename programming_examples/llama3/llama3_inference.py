@@ -39,7 +39,6 @@ from _llm_shared.kernel_builder.external_kernels import compile_all_external_ker
 from llama3_prefill import (
     compile_all_kernels,
     run_transformer_block,
-    preload_lm_head_weights,
     preload_prefill_weights,
     _run_cached,
     _SIMPLE_BACKEND,
@@ -83,11 +82,18 @@ def prepare_runtime(
     Does:
         1. Compile external C++ kernels from source
         2. Pre-transpose decode GEMV weights
-        3. Pre-load prefill weights into per-layer BOs
-        4. Pre-load prefill LM Head weights
+        3. Tag layers with their index for per-layer BO isolation
+        4. Pre-load prefill weights into per-layer BOs
+           (rms_gemms_rope + o_ffn ELFs, plus the run_transformer_block
+           per-layer arg cache)
         5. Pre-load decode weights into per-layer BOs
-        6. Pre-load decode LM Head GEMV weights
-        7. NPU warmup pass (run one decode token to wake NPU)
+           (rms_gemv_rope + o_gemv_ffn ELFs + lm_head_gemv 8-partition
+           weights — the latter is also reused by prefill's first-token
+           projection at the end of npu_prefill)
+
+    No NPU prefill/decode warmup pass — the NPU prefill itself keeps the
+    NPU active right up until decode starts. (The standalone llama3_decode.py
+    runs CPU prefill which leaves NPU idle, so it does need warmup.)
 
     Args:
         prefill_cache: KernelCache with prefill kernels loaded
@@ -147,15 +153,10 @@ def prepare_runtime(
     # 4. Pre-load prefill weights into per-layer BOs
     preload_prefill_weights(weights, config, prefill_cache, seq_len, rope_lut_bf16)
 
-    # 5. Pre-load prefill LM Head weights
-    preload_lm_head_weights(weights, config, prefill_cache, seq_len)
-
-    # 6. Pre-load decode weights into per-layer BOs
+    # 5. Pre-load decode weights into per-layer BOs (incl. lm_head_gemv,
+    #    which prefill also reuses to project the last-token row at the
+    #    end of npu_prefill — refactored 2026-04-25 from full-seq GEMM).
     _preload_decode_weights(decode_cache, weights, config)
-
-    # Note: NPU warmup pass not needed here — the NPU prefill keeps
-    # the NPU active. Only needed in llama3_decode.py where CPU prefill
-    # leaves the NPU idle for ~17s (triggering power-save).
 
     t_prep = time.time() - t0
     print(f"  Runtime prepared in {t_prep:.1f}s")
