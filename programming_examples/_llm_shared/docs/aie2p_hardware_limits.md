@@ -140,5 +140,5 @@ if down_l2 > 512 * 1024:
     print(f"⚠ Down L2 {down_l2}B > 512KB — need smaller tile_m or herd_m")
 ```
 
-Adding this audit to Phase 1 (`validate-per-kernel-shapes`) catches all
+Adding this audit to Phase 1 (`kernel-validation`) catches all
 four wall types BEFORE compile time, saving ~30 min of debug per failure.

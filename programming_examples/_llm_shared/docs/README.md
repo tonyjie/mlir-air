@@ -12,6 +12,15 @@ status logs, lessons, and progress reports stay under
 
 ## Topic map
 
+### `kernel_registry/`
+Per-kernel × per-shape registry: which shapes have been tested on real
+NPU2, with measured cosine + perf + commands to reproduce.
+
+| File | What it covers |
+|---|---|
+| `kernel_registry/supported_kernels.md` | Model-agnostic index: every leaf kernel + every shape ever tested across deployments |
+| `kernel_registry/llama3.2_1b.md` | Model-specific catalog: exact shapes Llama-3.2-1B uses + verification status per kernel call |
+
 ### `explain.md`
 Compilation pipeline overview: how Linalg MLIR → AIR → AIE → ELF → xclbin
 flows. Kernel directory map. RoPE half-split convention details. Read first

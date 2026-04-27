@@ -143,7 +143,7 @@ def preload_block_weights(cache, weights, config, seq_len, rope_lut_bf16, layer_
     list_of_tuples)` which silently fell back to lazy preload because that
     API actually expects a flat dict — the runner survived but Pattern 2
     (BO pre-loading) was degraded for Phase 2 tests. Caught by
-    evaluate-deployment audit on qwen25_1_5b 2026-04-19. Fixed to use the
+    independent-evaluator audit on qwen25_1_5b 2026-04-19. Fixed to use the
     same warm-up pattern as `llama3_prefill.preload_prefill_weights`.
     """
     from llama3_prefill import _run_cached, run_transformer_block
