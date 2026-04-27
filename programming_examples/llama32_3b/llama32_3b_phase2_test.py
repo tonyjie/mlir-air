@@ -63,7 +63,7 @@ def main():
         action="store_false",
         help="Use NPU FlashAttention (Option C head-first wrapper at head_dim=128)",
     )
-    parser.add_argument("--cache-dir", type=str, default="prefill_kernel_cache")
+    parser.add_argument("--cache-dir", type=str, default="build/prefill_kernel_cache")
     parser.add_argument("--model", type=str, default="meta-llama/Llama-3.2-3B")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--no-preload", action="store_true")

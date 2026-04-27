@@ -57,11 +57,11 @@ def main():
     parser.add_argument("--n-tokens", type=int, default=30)
     parser.add_argument("--prompt", type=str, default="The capital of France is")
     parser.add_argument("--model", type=str, default="Qwen/Qwen3-1.7B")
-    parser.add_argument("--cache-dir", type=str, default="prefill_kernel_cache_2048")
+    parser.add_argument("--cache-dir", type=str, default="build/prefill_kernel_cache_2048")
     parser.add_argument(
         "--decode-cache-dir",
         type=str,
-        default="decode_kernel_cache",
+        default="build/decode_kernel_cache",
         help="Separate cache dir for decode kernels (NPU decode mode only)",
     )
     parser.add_argument(

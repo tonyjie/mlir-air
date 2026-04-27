@@ -134,6 +134,30 @@ make run PEANO_INSTALL_DIR=/path/to/peano  # explicit compiler path
 | `AIE_TARGET` | example-specific | Architecture: `aie2` (NPU1) or `aie2p` (NPU2) |
 
 ### Build directory convention
+
+**LLM deployments (under `programming_examples/llama3,llama32_3b,smollm2_1_7b,
+qwen25_1_5b,qwen3_0_6b,qwen3_1_7b/`)** use a unified `build/` layout:
+
+```
+<deployment>/
+├── build/                       # everything cleanable
+│   ├── external_kernels/        # silu_and_mul.o, rope.o, attn*.o, mv*.o
+│   ├── prefill_kernel_cache/    # cached fused ELFs + manifest.json
+│   ├── decode_kernel_cache/
+│   └── prefill_kernel_cache_$(SEQ_LEN)/   # qwen3 only
+├── air_project/                 # transient aircc working dir (CWD-relative;
+│                                #  aiecc generates linker scripts with
+│                                #  hardcoded `INPUT(air_project/*.o)` so this
+│                                #  cannot move under build/)
+├── air.elf, air.mlir, air.xclbin, air.insts.bin   # last-compile leftovers
+│                                #  (aircc dumps at CWD)
+└── __pycache__/
+```
+
+`make clean` removes all of the above. `.gitignore` covers all of them too.
+
+**Other (non-LLM) examples** still use the legacy `build_peano/` /
+`build_chess/` convention selected by `PEANO_INSTALL_DIR`:
 ```
 build_peano/    # when PEANO_INSTALL_DIR is set
 build_chess/    # when using Chess compiler

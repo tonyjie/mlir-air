@@ -33,7 +33,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--prompt", default="The capital of France is")
     parser.add_argument("--n-tokens", type=int, default=8)
-    parser.add_argument("--cache-dir", default="decode_kernel_cache")
+    parser.add_argument("--cache-dir", default="build/decode_kernel_cache")
     parser.add_argument("--model", default="Qwen/Qwen3-0.6B")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()

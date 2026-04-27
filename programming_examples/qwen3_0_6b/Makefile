@@ -33,7 +33,7 @@ PHASE4     := qwen3_phase4_test.py
 PHASE5     := qwen3_phase5_test.py
 INFERENCE  := qwen3_inference.py
 
-.PHONY: help compile run profile verify clean \
+.PHONY: help compile run profile verify verify-decode clean \
         compile-prefill compile-decode \
         run-prefill run-decode run-block run-full run-reference run-decode-only
 
@@ -50,7 +50,8 @@ help:
 	@echo "  make compile         Compile prefill + decode kernels (one-time)"
 	@echo "  make run             NPU prefill + NPU decode ($(N_TOKENS) tokens, ~10.7 tok/s)"
 	@echo "  make profile         Prefill perf measurement (cold + warm)"
-	@echo "  make verify          Decode with NPU/CPU top-1 match check"
+	@echo "  make verify          End-to-end NPU prefill vs CPU F32: per-layer K/V cosine + final logits"
+	@echo "  make verify-decode   Phase B decode-side NPU/CPU top-1 (~25 s/token CPU verify)"
 	@echo ""
 	@echo "Compile only:"
 	@echo "  make compile         All kernels (prefill + decode)"
@@ -121,25 +122,30 @@ run-reference:
 
 profile: run-prefill
 
-## NPU vs CPU decode per-token top-1 verify (uses Phase B fused decode)
+## End-to-end NPU vs CPU F32 verification: per-layer K/V cosine + final logits cos + top-1 match
+verify:
+	python3 $(srcdir)/$(INFERENCE) --n-tokens 1 --prompt "$(PROMPT)" \
+		--seq-len $(SEQ_LEN) --model $(MODEL) \
+		--cache-dir build/prefill_kernel_cache_$(SEQ_LEN) --verify
+
+## Decode-side per-token NPU vs CPU top-1 (Phase B fused decode; ~25 s/token CPU)
 ##   --prefill-cache name encodes seq_len (LESSON L1: kernel cache name doesn't
 ##   carry seq_len, so we MUST pass the right cache for the requested SEQ_LEN
 ##   or we'll read from a stale-shape ELF and get garbage outputs).
-verify:
+verify-decode:
 	python3 $(srcdir)/qwen3_verify_decode.py --n-tokens 8 --prompt "$(PROMPT)" \
 		--seq-len $(SEQ_LEN) --model $(MODEL) \
-		--prefill-cache prefill_kernel_cache_$(SEQ_LEN)
+		--prefill-cache build/prefill_kernel_cache_$(SEQ_LEN)
 
 ## 6 canonical prompts through full NPU pipeline (NPU prefill + NPU LM head)
 sweep:
 	python3 $(srcdir)/qwen3_canonical_sweep.py --seq-len $(SEQ_LEN) --model $(MODEL) \
-		--prefill-cache prefill_kernel_cache_$(SEQ_LEN)
+		--prefill-cache build/prefill_kernel_cache_$(SEQ_LEN)
 
 # ============================================================
 # Clean
 # ============================================================
 
 clean:
-	rm -rf prefill_kernel_cache decode_kernel_cache air_project build_peano build_chess __pycache__
-	rm -f *.o air.elf air.mlir air.xclbin air.insts.bin
+	rm -rf build/ air_project/ __pycache__/ && rm -f air.elf air.mlir air.xclbin air.insts.bin
 	@echo "Caches cleared. Run 'make compile' to rebuild."

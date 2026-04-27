@@ -95,7 +95,7 @@ def main():
     )
     parser.add_argument("--prompt", type=str, default="The capital of France is")
     parser.add_argument("--model", type=str, default="Qwen/Qwen3-1.7B")
-    parser.add_argument("--cache-dir", type=str, default="prefill_kernel_cache")
+    parser.add_argument("--cache-dir", type=str, default="build/prefill_kernel_cache")
     parser.add_argument(
         "--max-seq",
         type=int,

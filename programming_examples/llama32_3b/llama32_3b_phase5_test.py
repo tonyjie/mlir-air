@@ -56,7 +56,7 @@ def main():
     parser.add_argument(
         "--max-seq", type=int, default=256, help="Max KV-cache positions (default: 256)"
     )
-    parser.add_argument("--cache-dir", type=str, default="decode_kernel_cache")
+    parser.add_argument("--cache-dir", type=str, default="build/decode_kernel_cache")
     parser.add_argument("--model", type=str, default="meta-llama/Llama-3.2-3B")
     parser.add_argument("--cpu-verify", action="store_true", default=True)
     parser.add_argument("--no-cpu-verify", dest="cpu_verify", action="store_false")

@@ -83,7 +83,7 @@ def main():
         default=128,
         help="Max KV-cache positions (default: 128)",
     )
-    parser.add_argument("--cache-dir", type=str, default="decode_kernel_cache")
+    parser.add_argument("--cache-dir", type=str, default="build/decode_kernel_cache")
     parser.add_argument("--model", type=str, default="Qwen/Qwen2.5-1.5B")
     parser.add_argument("--cpu-verify", action="store_true", default=True)
     parser.add_argument("--no-cpu-verify", dest="cpu_verify", action="store_false")

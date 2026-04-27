@@ -233,7 +233,7 @@ def main():
         action="store_false",
         help="Use NPU FlashAttention via Option C wrapper.",
     )
-    parser.add_argument("--cache-dir", type=str, default="prefill_kernel_cache")
+    parser.add_argument("--cache-dir", type=str, default="build/prefill_kernel_cache")
     parser.add_argument("--model", type=str, default="Qwen/Qwen2.5-1.5B")
     parser.add_argument(
         "--diagnostic",

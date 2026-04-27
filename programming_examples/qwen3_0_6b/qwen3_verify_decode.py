@@ -48,8 +48,8 @@ def main():
     # Cache-dir naming MUST match the seq_len the cache was built at (LESSON L1:
     # kernel cache name doesn't encode seq_len; reusing a stale-shape ELF gives
     # garbage outputs). Default matches qwen3_inference.py (--cache-dir).
-    parser.add_argument("--prefill-cache", default="prefill_kernel_cache_2048")
-    parser.add_argument("--decode-cache", default="decode_kernel_cache")
+    parser.add_argument("--prefill-cache", default="build/prefill_kernel_cache_2048")
+    parser.add_argument("--decode-cache", default="build/decode_kernel_cache")
     parser.add_argument("--model", default="Qwen/Qwen3-0.6B")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()

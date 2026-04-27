@@ -156,6 +156,5 @@ verify-decode:
 
 ## Remove kernel caches and build artifacts (keeps source + docs)
 clean:
-	rm -rf prefill_kernel_cache decode_kernel_cache air_project build_peano build_chess __pycache__
-	rm -f *.o air.elf air.mlir air.xclbin air.insts.bin
+	rm -rf build/ air_project/ __pycache__/ && rm -f air.elf air.mlir air.xclbin air.insts.bin
 	@echo "Caches cleared. Run 'make compile' to rebuild."

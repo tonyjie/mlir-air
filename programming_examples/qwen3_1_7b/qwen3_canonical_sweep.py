@@ -66,8 +66,8 @@ def main():
     )
     parser.add_argument("--seq-len", type=int, default=2048)
     # Cache-dir naming MUST match the seq_len the cache was built at (LESSON L1).
-    parser.add_argument("--prefill-cache", default="prefill_kernel_cache_2048")
-    parser.add_argument("--decode-cache", default="decode_kernel_cache")
+    parser.add_argument("--prefill-cache", default="build/prefill_kernel_cache_2048")
+    parser.add_argument("--decode-cache", default="build/decode_kernel_cache")
     parser.add_argument("--model", default="Qwen/Qwen3-1.7B")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()

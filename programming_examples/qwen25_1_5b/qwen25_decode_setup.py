@@ -52,7 +52,12 @@ def ensure_mv_k8960_o():
 
     Idempotent — skips if mv_k8960.o exists in CWD.
     """
-    if Path("mv_k8960.o").exists():
+    from _llm_shared.kernel_builder.external_kernels import (
+        _compile_kernel,
+        KERNEL_OUT_DIR,
+    )
+
+    if (KERNEL_OUT_DIR / "mv_k8960.o").exists():
         return
 
     mv_src = (
@@ -61,36 +66,18 @@ def ensure_mv_k8960_o():
     if not mv_src.exists():
         raise FileNotFoundError(f"Cannot find mv.cc at {mv_src}")
 
-    peano_dir = os.environ.get("PEANO_INSTALL_DIR", "")
-    clang = os.path.join(peano_dir, "bin", "clang++") if peano_dir else "clang++"
-
-    aieopt_dir = os.path.dirname(
-        os.path.dirname(
-            subprocess.check_output(["which", "aie-opt"], text=True).strip()
-        )
-    )
-    flags = [
-        "-O2",
-        "-std=c++20",
-        "--target=aie2p-none-unknown-elf",
-        "-Wno-parentheses",
-        "-Wno-attributes",
-        "-Wno-macro-redefined",
-        "-Wno-empty-body",
-        "-DNDEBUG",
-        f"-I{aieopt_dir}/include",
-        # DIM_M_OUTPUT=2 matches default down_tile_m=2 (the K-loop fits via
-        # the new down_k_split=14 knob in matvec, not via tile_m bump).
-        "-DDIM_M_OUTPUT=2",
-        "-Dmatvec_vectorized_bf16_bf16=dg_matvec_vectorized_bf16_bf16",
-        "-Dlinalg_fill_bf16=dg_linalg_fill_bf16",
-        "-c",
-        str(mv_src),
-        "-o",
-        "mv_k8960.o",
-    ]
     print(f"  Compiling mv_k8960.o (Down GEMV K=8960 renamed symbols)...")
-    subprocess.run([clang] + flags, check=True)
+    _compile_kernel(
+        mv_src,
+        "mv_k8960.o",
+        extra_flags=[
+            # DIM_M_OUTPUT=2 matches default down_tile_m=2 (the K-loop fits via
+            # the new down_k_split=14 knob in matvec, not via tile_m bump).
+            "-DDIM_M_OUTPUT=2",
+            "-Dmatvec_vectorized_bf16_bf16=dg_matvec_vectorized_bf16_bf16",
+            "-Dlinalg_fill_bf16=dg_linalg_fill_bf16",
+        ],
+    )
 
 
 # ---------------------------------------------------------------------------

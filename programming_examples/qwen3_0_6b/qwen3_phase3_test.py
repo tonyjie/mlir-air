@@ -175,7 +175,7 @@ def main():
         help="Phase 3 default = 512 (matches Phase 2 cached kernels). FA at hd=128 needs lqp=256.",
     )
     parser.add_argument("--model", type=str, default="Qwen/Qwen3-0.6B")
-    parser.add_argument("--cache-dir", type=str, default="prefill_kernel_cache")
+    parser.add_argument("--cache-dir", type=str, default="build/prefill_kernel_cache")
     parser.add_argument(
         "--decisive-only",
         action="store_true",

@@ -129,7 +129,7 @@ def main():
         description="Qwen3-0.6B Phase 1 kernel shape sweep"
     )
     parser.add_argument("--seq-len", type=int, default=128)
-    parser.add_argument("--cache-dir", type=str, default="prefill_kernel_cache")
+    parser.add_argument("--cache-dir", type=str, default="build/prefill_kernel_cache")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument(
         "--skip-fa",

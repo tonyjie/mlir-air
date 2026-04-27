@@ -57,11 +57,11 @@ def main():
     parser.add_argument("--n-tokens", type=int, default=30)
     parser.add_argument("--prompt", type=str, default="The capital of France is")
     parser.add_argument("--model", type=str, default="Qwen/Qwen3-0.6B")
-    parser.add_argument("--cache-dir", type=str, default="prefill_kernel_cache_2048")
+    parser.add_argument("--cache-dir", type=str, default="build/prefill_kernel_cache_2048")
     parser.add_argument(
         "--decode-cache-dir",
         type=str,
-        default="decode_kernel_cache",
+        default="build/decode_kernel_cache",
         help="Separate cache dir for decode kernels (NPU decode mode only)",
     )
     parser.add_argument(
@@ -73,6 +73,16 @@ def main():
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument(
+        "--verify",
+        action="store_true",
+        help=(
+            "Compare NPU prefill vs CPU F32 reference: per-layer K/V cache "
+            "cosine + max_err + mean_err for all 28 layers, plus final logits "
+            "cosine at pred_pos and top-1 match. Mirrors llama3 / llama32_3b "
+            "/ smollm2 / qwen25 --verify. Adds ~30s wall (CPU forward)."
+        ),
+    )
     args = parser.parse_args()
 
     os.chdir(_THIS_DIR)
@@ -196,6 +206,95 @@ def main():
     decoded_ids = list(base_ids) + [next_id]
     if args.verbose:
         print(f"  First token: '{tokenizer.decode([next_id])}' (id={next_id})")
+
+    if args.verify:
+        print(f"\n{'='*60}")
+        print(
+            f"Verification: NPU prefill vs CPU F32 reference ({config.n_layers} layers)"
+        )
+        print(f"{'='*60}")
+        from qwen3_reference import (
+            transformer_block as cpu_block,
+            rms_norm as cpu_rms_norm,
+        )
+
+        rope_lut_f32 = rope_lut_bf16[: args.seq_len].astype(np.float32)
+        x_cpu = weights.embed_table[padded_ids].astype(np.float32)
+        n_kv_heads = config.n_kv_heads
+        head_dim = config.head_dim
+        n_layer_warns = 0
+        for li in range(config.n_layers):
+            x_cpu, cpu_intermediates = cpu_block(
+                x_cpu, weights.layers[li], rope_lut_f32, config
+            )
+            cpu_k = (
+                cpu_intermediates["k_roped"]
+                .astype(np.float32)
+                .reshape(args.seq_len, n_kv_heads, head_dim)
+                .transpose(1, 0, 2)
+            )
+            cpu_v = (
+                cpu_intermediates["v"]
+                .astype(np.float32)
+                .reshape(args.seq_len, n_kv_heads, head_dim)
+                .transpose(1, 0, 2)
+            )
+            # NPU k_per_layer[li] / v_per_layer[li] are seq-first
+            # (seq_len, n_kv_heads * head_dim) bf16 — reshape to match.
+            npu_k = (
+                np.asarray(k_per_layer[li], dtype=np.float32)
+                .reshape(args.seq_len, n_kv_heads, head_dim)
+                .transpose(1, 0, 2)
+            )
+            npu_v = (
+                np.asarray(v_per_layer[li], dtype=np.float32)
+                .reshape(args.seq_len, n_kv_heads, head_dim)
+                .transpose(1, 0, 2)
+            )
+
+            k_corr = np.corrcoef(npu_k.flatten(), cpu_k.flatten())[0, 1]
+            v_corr = np.corrcoef(npu_v.flatten(), cpu_v.flatten())[0, 1]
+            k_maxerr = float(np.max(np.abs(npu_k - cpu_k)))
+            v_maxerr = float(np.max(np.abs(npu_v - cpu_v)))
+            k_meanerr = float(np.mean(np.abs(npu_k - cpu_k)))
+            v_meanerr = float(np.mean(np.abs(npu_v - cpu_v)))
+
+            k_status = "OK" if k_corr > 0.99 else "WARN"
+            v_status = "OK" if v_corr > 0.99 else "WARN"
+            n_layer_warns += int(k_status == "WARN") + int(v_status == "WARN")
+            print(
+                f"  Layer {li:2d} K_cache: [{k_status}] corr={k_corr:.6f}, "
+                f"max_err={k_maxerr:.4f}, mean_err={k_meanerr:.4f}"
+            )
+            print(
+                f"  Layer {li:2d} V_cache: [{v_status}] corr={v_corr:.6f}, "
+                f"max_err={v_maxerr:.4f}, mean_err={v_meanerr:.4f}"
+            )
+
+        # Final RMSNorm + LM Head on CPU side, compare logits at pred_pos
+        x_cpu_normed = cpu_rms_norm(
+            x_cpu,
+            weights.final_norm.astype(np.float32),
+            eps=config.rms_norm_eps,
+        )
+        cpu_logits_pred = (
+            x_cpu_normed[real_len - 1] @ weights.lm_head.astype(np.float32).T
+        )
+        cpu_pred = int(np.argmax(cpu_logits_pred))
+        npu_logits_f32 = np.asarray(logits0, dtype=np.float32)
+        logit_corr = float(np.corrcoef(npu_logits_f32, cpu_logits_pred)[0, 1])
+        logit_maxerr = float(np.max(np.abs(npu_logits_f32 - cpu_logits_pred)))
+        logit_meanerr = float(np.mean(np.abs(npu_logits_f32 - cpu_logits_pred)))
+        print(
+            f"\n  Logits (pos {real_len-1}): corr={logit_corr:.6f}, "
+            f"max_err={logit_maxerr:.4f}, mean_err={logit_meanerr:.4f}"
+        )
+        print(f"  NPU top-1: {next_id} ({tokenizer.decode([next_id])!r})")
+        print(f"  CPU top-1: {cpu_pred} ({tokenizer.decode([cpu_pred])!r})")
+        print(f"  Match: {'YES' if next_id == cpu_pred else 'NO'}")
+        print(
+            f"  Per-layer warnings: {n_layer_warns} (informational; BF16 K/V drift across deep stacks is expected)"
+        )
 
     if args.decode == "npu":
         print(f"\nNPU decode loop ({args.n_tokens - 1} more tokens, greedy)...")

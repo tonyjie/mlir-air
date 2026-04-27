@@ -17,12 +17,10 @@
 
 srcdir := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
 
-# Build directory
-ifdef PEANO_INSTALL_DIR
-  BUILD_DIR := build_peano
-else
-  BUILD_DIR := build_chess
-endif
+# All build artifacts land under <deployment>/build/. The python scripts
+# default --cache-dir to "build/prefill_kernel_cache" etc., and shared infra
+# (`_llm_shared/kernel_builder/{cache,external_kernels}.py`) writes
+# air_project/ and external_kernels/*.o under build/ too.
 
 # Configurable parameters
 N_TOKENS ?= 100
@@ -78,22 +76,21 @@ help:
 
 ## Compile all kernels (prefill + decode, ~4 min)
 compile:
-	@mkdir -p $(BUILD_DIR)
-	cd $(BUILD_DIR) && python3 $(srcdir)/llama3_inference.py --compile-only
+	python3 $(srcdir)/llama3_inference.py --compile-only
 
 ## Run unified inference
 run:
-	cd $(BUILD_DIR) && python3 $(srcdir)/llama3_inference.py \
+	python3 $(srcdir)/llama3_inference.py \
 		--run-only --n-tokens $(N_TOKENS) --prompt "$(PROMPT)" --model $(MODEL)
 
 ## Run with detailed profiling breakdown
 profile:
-	cd $(BUILD_DIR) && python3 $(srcdir)/llama3_inference.py \
+	python3 $(srcdir)/llama3_inference.py \
 		--run-only --n-tokens $(N_TOKENS) --profile --prompt "$(PROMPT)" --model $(MODEL)
 
 ## Run with CPU reference verification
 verify:
-	cd $(BUILD_DIR) && python3 $(srcdir)/llama3_inference.py \
+	python3 $(srcdir)/llama3_inference.py \
 		--run-only --n-tokens $(N_TOKENS) --verify --profile --prompt "$(PROMPT)" --model $(MODEL)
 
 ## Compile and run in one step
@@ -105,22 +102,20 @@ all: compile profile
 
 ## Compile prefill kernels only (~4 min)
 compile-prefill:
-	@mkdir -p $(BUILD_DIR)
-	cd $(BUILD_DIR) && python3 $(srcdir)/llama3_prefill.py --compile-only --profile
+	python3 $(srcdir)/llama3_prefill.py --compile-only --profile
 
 ## Compile decode kernels only (~25s)
 compile-decode:
-	@mkdir -p $(BUILD_DIR)
-	cd $(BUILD_DIR) && python3 $(srcdir)/llama3_decode.py --compile-only
+	python3 $(srcdir)/llama3_decode.py --compile-only
 
 ## Run prefill only (16 layers, no decode)
 run-prefill:
-	cd $(BUILD_DIR) && python3 $(srcdir)/llama3_prefill.py \
+	python3 $(srcdir)/llama3_prefill.py \
 		--run-only --n-layers 16 --profile
 
 ## Run decode only (CPU prefill for KV cache + NPU decode)
 run-decode:
-	cd $(BUILD_DIR) && python3 $(srcdir)/llama3_decode.py \
+	python3 $(srcdir)/llama3_decode.py \
 		--run-only --n-tokens $(N_TOKENS) --profile
 
 ## Run CPU-only reference (no NPU)
@@ -133,5 +128,5 @@ run-reference:
 
 ## Remove all build artifacts
 clean:
-	rm -r $(BUILD_DIR) 2>/dev/null || true
+	rm -rf build/ air_project/ __pycache__/ && rm -f air.elf air.mlir air.xclbin air.insts.bin
 	@echo "Build directory removed. Run 'make compile' to rebuild."

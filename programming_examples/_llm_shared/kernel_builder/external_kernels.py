@@ -2,15 +2,20 @@
 
 Compiles all external .o files from source to avoid relying on stale
 pre-compiled artifacts. Each function checks if the .o exists and skips
-recompilation if so (delete the .o to force recompile).
+recompilation if so (delete the .o — or `make clean` — to force recompile).
 
-Compiled .o files are placed in CWD (build_peano/) where aiecc finds them
-via its link_with search path.
+Compiled .o files land in `<cwd>/build/external_kernels/`. `prepare_air_project()`
+in `cache.py` copies them into `<cwd>/build/air_project/` before each kernel
+compile so aiecc resolves the bare `link_with="silu_and_mul.o"` etc. strings.
 """
 
 import os
 import subprocess
 from pathlib import Path
+
+# All build artifacts go under <cwd>/build/.
+BUILD_DIR = Path("build")
+KERNEL_OUT_DIR = BUILD_DIR / "external_kernels"
 
 
 def _get_peano_clang():
@@ -60,11 +65,14 @@ def _compile_kernel(src_path, output_name, extra_flags=None, force=False):
 
     Args:
         src_path: Path to the .cc source file
-        output_name: Name of the output .o file (placed in CWD)
+        output_name: Bare name of the output .o file (e.g. "silu_and_mul.o").
+                     Resolved to `KERNEL_OUT_DIR / output_name`.
         extra_flags: Additional compiler flags (e.g., -D defines)
         force: If True, recompile even if .o exists
     """
-    if not force and Path(output_name).exists():
+    KERNEL_OUT_DIR.mkdir(parents=True, exist_ok=True)
+    output_path = KERNEL_OUT_DIR / output_name
+    if not force and output_path.exists():
         return
 
     src = Path(src_path)
@@ -77,14 +85,14 @@ def _compile_kernel(src_path, output_name, extra_flags=None, force=False):
     cmd = [clang] + _PEANO_FLAGS + [f"-I{include_dir}"]
     if extra_flags:
         cmd.extend(extra_flags)
-    cmd.extend(["-c", str(src), "-o", output_name])
+    cmd.extend(["-c", str(src), "-o", str(output_path)])
 
-    print(f"  Compiling {output_name} from {src.name}...")
+    print(f"  Compiling {output_path} from {src.name}...")
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         # Filter warnings, only show errors
         errors = [l for l in result.stderr.split("\n") if "error" in l.lower()]
-        raise RuntimeError(f"Failed to compile {output_name}: {' '.join(errors[:3])}")
+        raise RuntimeError(f"Failed to compile {output_path}: {' '.join(errors[:3])}")
 
 
 # ---------------------------------------------------------------------------
@@ -197,10 +205,12 @@ def compile_attn_npu2_split(lqp, lkp, dk, dv, num_q_tiles=4, output_name="attn_n
             "-DROUND_CONV_EVEN",
         ],
     )
-    if output_name == "attn_npu2.o" and not Path("attn.o").exists():
+    if output_name == "attn_npu2.o":
         import shutil
 
-        shutil.copy2("attn_npu2.o", "attn.o")
+        attn_o = KERNEL_OUT_DIR / "attn.o"
+        if not attn_o.exists():
+            shutil.copy2(KERNEL_OUT_DIR / "attn_npu2.o", attn_o)
 
 
 def compile_mv_k8192():
@@ -269,8 +279,9 @@ def compile_all_external_kernels(head_dim=64):
     """Compile all external C++ kernels from source.
 
     Call this before kernel compilation to ensure all .o files are fresh.
-    Each kernel is only compiled if its .o doesn't already exist.
-    Delete build_peano/*.o to force recompilation.
+    Each kernel is only compiled if its .o doesn't already exist in
+    `<cwd>/build/external_kernels/` (delete it — or `make clean` — to force
+    recompilation).
     """
     compile_silu_and_mul()
     compile_rope()

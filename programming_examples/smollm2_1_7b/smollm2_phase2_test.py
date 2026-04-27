@@ -58,7 +58,7 @@ def main():
         action="store_false",
         help="Use NPU FlashAttention (seq-first; works fine at head_dim=64)",
     )
-    parser.add_argument("--cache-dir", type=str, default="prefill_kernel_cache")
+    parser.add_argument("--cache-dir", type=str, default="build/prefill_kernel_cache")
     parser.add_argument("--model", type=str, default="HuggingFaceTB/SmolLM2-1.7B")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--no-preload", action="store_true")

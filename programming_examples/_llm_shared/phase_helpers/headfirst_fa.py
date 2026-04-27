@@ -257,8 +257,10 @@ def compile_headfirst_fa_kernel(
 
     # Recompile attn_npu2.o with the per-tile flag conventions (LESSON 3 fix).
     if head_dim == 128:
-        Path("attn_npu2.o").unlink(missing_ok=True)
-        Path("attn.o").unlink(missing_ok=True)
+        from _llm_shared.kernel_builder.external_kernels import KERNEL_OUT_DIR
+
+        (KERNEL_OUT_DIR / "attn_npu2.o").unlink(missing_ok=True)
+        (KERNEL_OUT_DIR / "attn.o").unlink(missing_ok=True)
         compile_attn_npu2_split(**fa_config)
 
     if "flash_attn" in cache.artifacts:

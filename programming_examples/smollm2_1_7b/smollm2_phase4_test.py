@@ -41,7 +41,7 @@ def main():
     parser = argparse.ArgumentParser(description="SmolLM2-1.7B Phase 4 prefill perf")
     parser.add_argument("--seq-len", type=int, default=2048)
     parser.add_argument("--cpu-attn", action="store_true", default=False)
-    parser.add_argument("--cache-dir", type=str, default="prefill_kernel_cache")
+    parser.add_argument("--cache-dir", type=str, default="build/prefill_kernel_cache")
     parser.add_argument("--model", type=str, default="HuggingFaceTB/SmolLM2-1.7B")
     parser.add_argument("--n-warm-runs", type=int, default=3)
     parser.add_argument("--compile-only", action="store_true")

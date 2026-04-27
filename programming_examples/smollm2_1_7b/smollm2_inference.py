@@ -45,8 +45,8 @@ def main():
     parser.add_argument("--n-tokens", type=int, default=10)
     parser.add_argument("--prompt", type=str, default="The capital of France is")
     parser.add_argument("--seq-len", type=int, default=2048)
-    parser.add_argument("--prefill-cache-dir", type=str, default="prefill_kernel_cache")
-    parser.add_argument("--decode-cache-dir", type=str, default="decode_kernel_cache")
+    parser.add_argument("--prefill-cache-dir", type=str, default="build/prefill_kernel_cache")
+    parser.add_argument("--decode-cache-dir", type=str, default="build/decode_kernel_cache")
     parser.add_argument("--model", type=str, default="HuggingFaceTB/SmolLM2-1.7B")
     parser.add_argument(
         "--cpu-attn",

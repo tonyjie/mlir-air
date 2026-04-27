@@ -711,8 +711,8 @@ if __name__ == "__main__":
 
     # --- Step 1: Compile or load kernel caches ---
     llama_dir = Path(__file__).resolve().parent
-    prefill_cache = KernelCache("prefill_kernel_cache", verbose=args.verbose)
-    decode_cache = KernelCache("decode_kernel_cache", verbose=args.verbose)
+    prefill_cache = KernelCache("build/prefill_kernel_cache", verbose=args.verbose)
+    decode_cache = KernelCache("build/decode_kernel_cache", verbose=args.verbose)
 
     if not args.run_only:
         print("Compiling prefill kernels...")

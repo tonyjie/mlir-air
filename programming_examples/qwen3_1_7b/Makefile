@@ -127,18 +127,17 @@ profile: run-prefill
 verify:
 	python3 $(srcdir)/qwen3_verify_decode.py --n-tokens 8 --prompt "$(PROMPT)" \
 		--seq-len $(SEQ_LEN) --model $(MODEL) \
-		--prefill-cache prefill_kernel_cache_$(SEQ_LEN)
+		--prefill-cache build/prefill_kernel_cache_$(SEQ_LEN)
 
 ## 6 canonical prompts through full NPU pipeline (NPU prefill + NPU LM head)
 sweep:
 	python3 $(srcdir)/qwen3_canonical_sweep.py --seq-len $(SEQ_LEN) --model $(MODEL) \
-		--prefill-cache prefill_kernel_cache_$(SEQ_LEN)
+		--prefill-cache build/prefill_kernel_cache_$(SEQ_LEN)
 
 # ============================================================
 # Clean
 # ============================================================
 
 clean:
-	rm -rf prefill_kernel_cache decode_kernel_cache air_project build_peano build_chess __pycache__
-	rm -f *.o air.elf air.mlir air.xclbin air.insts.bin
+	rm -rf build/ air_project/ __pycache__/ && rm -f air.elf air.mlir air.xclbin air.insts.bin
 	@echo "Caches cleared. Run 'make compile' to rebuild."

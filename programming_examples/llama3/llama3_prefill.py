@@ -61,28 +61,16 @@ from llama3_reference import (
 
 
 def prepare_air_project():
-    """Clean and prepare the air_project/ directory for a fresh compilation.
+    """Re-export of `_llm_shared.kernel_builder.cache.prepare_air_project`.
 
-    aircc defaults to 'air_project/' as its working directory. Sequential
-    compilations leave stale artifacts that corrupt subsequent kernels.
-    This method wipes the directory, compiles all external C++ kernels from
-    source, and copies them to air_project/.
+    Kept as a local symbol so existing imports
+    (`from llama3_prefill import prepare_air_project`) keep working in all
+    sibling deployments. The implementation is in shared infra; see there
+    for the build/ layout.
     """
-    air_proj = Path("air_project")
-    if air_proj.exists():
-        shutil.rmtree(air_proj)
-    air_proj.mkdir(parents=True, exist_ok=True)
+    from _llm_shared.kernel_builder.cache import prepare_air_project as _impl
 
-    # Compile external kernels from source (not stale .o copies)
-    from _llm_shared.kernel_builder.external_kernels import compile_all_external_kernels
-
-    compile_all_external_kernels()
-
-    # Copy compiled .o files to air_project/ for aiecc to find
-    for obj_name in ["silu_and_mul.o", "rope.o", "attn.o", "attn_npu2.o", "mv_k8192.o"]:
-        src = Path(obj_name)
-        if src.exists():
-            shutil.copy2(src, air_proj / obj_name)
+    _impl()
 
 
 # ---------------------------------------------------------------------------
@@ -338,7 +326,7 @@ class KernelCache:
 
     def __init__(self, cache_dir=None, verbose=False, profiler=None):
         if cache_dir is None:
-            cache_dir = Path("prefill_kernel_cache")
+            cache_dir = Path("build/prefill_kernel_cache")
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.verbose = verbose

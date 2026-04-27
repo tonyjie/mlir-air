@@ -37,7 +37,7 @@ def main():
     parser.add_argument("--n-tokens", type=int, default=10)
     parser.add_argument("--prompt", type=str, default="The capital of France is")
     parser.add_argument("--max-seq", type=int, default=128)
-    parser.add_argument("--cache-dir", type=str, default="decode_kernel_cache")
+    parser.add_argument("--cache-dir", type=str, default="build/decode_kernel_cache")
     parser.add_argument("--model", type=str, default="HuggingFaceTB/SmolLM2-1.7B")
     parser.add_argument("--cpu-verify", action="store_true", default=True)
     parser.add_argument("--no-cpu-verify", dest="cpu_verify", action="store_false")

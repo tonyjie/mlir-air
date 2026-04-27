@@ -8,14 +8,22 @@ from pathlib import Path
 import numpy as np
 from ml_dtypes import bfloat16
 
+# All build artifacts go under <cwd>/build/.
+BUILD_DIR = Path("build")
+
 
 def prepare_air_project():
-    """Clean and prepare the air_project/ directory for a fresh compilation.
+    """Clean and prepare air_project/ for a fresh aircc compilation.
 
-    aircc defaults to 'air_project/' as its working directory. Sequential
-    compilations leave stale artifacts that corrupt subsequent kernels.
-    This method wipes the directory, compiles all external C++ kernels from
-    source, and copies them to air_project/.
+    `air_project/` MUST live at CWD (not under build/): aiecc generates
+    linker scripts with the hardcoded relative `INPUT(air_project/mv.o)`
+    string, so the path resolves against the process's CWD when ld.lld
+    runs. Sequential compilations leave stale artifacts that corrupt
+    subsequent kernels — wipe and recreate every time.
+
+    .o sources for the linker live under `build/external_kernels/`
+    (kept across `make clean`-able); we copy each one into `air_project/`
+    so aiecc finds them via bare `link_with="*.o"` strings.
     """
     air_proj = Path("air_project")
     if air_proj.exists():
@@ -23,15 +31,20 @@ def prepare_air_project():
     air_proj.mkdir(parents=True, exist_ok=True)
 
     # Compile external kernels from source (not stale .o copies)
-    from _llm_shared.kernel_builder.external_kernels import compile_all_external_kernels
+    from _llm_shared.kernel_builder.external_kernels import (
+        compile_all_external_kernels,
+        KERNEL_OUT_DIR,
+    )
 
     compile_all_external_kernels()
 
-    # Copy compiled .o files to air_project/ for aiecc to find
-    for obj_name in ["silu_and_mul.o", "rope.o", "attn.o", "attn_npu2.o", "mv_k8192.o"]:
-        src = Path(obj_name)
-        if src.exists():
-            shutil.copy2(src, air_proj / obj_name)
+    # Copy every compiled .o (including model-specific ones like mv_k8960.o,
+    # mv_dg_qwen3.o, mv_og.o) into air_project/ so aiecc finds them via
+    # bare `link_with` strings. Glob is used (instead of a hardcoded list)
+    # so model-specific .o producers don't have to update this file.
+    if KERNEL_OUT_DIR.exists():
+        for src in KERNEL_OUT_DIR.glob("*.o"):
+            shutil.copy2(src, air_proj / src.name)
 
 
 class Profiler:
@@ -178,7 +191,7 @@ class KernelCache:
 
     def __init__(self, cache_dir=None, verbose=False, profiler=None):
         if cache_dir is None:
-            cache_dir = Path(__file__).resolve().parent / "kernel_cache"
+            cache_dir = BUILD_DIR / "kernel_cache"
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.verbose = verbose

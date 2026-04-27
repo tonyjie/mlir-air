@@ -1,13 +1,15 @@
-build_peano/
-build_chess/
+# Persistent build artifacts (kernel caches, external_kernels/*.o):
+# all under build/. Single rm rule in the Makefile cleans this whole tree.
+build/
+
+# Transient aircc working dir + per-compile leftovers (must live at CWD
+# because aiecc generates linker scripts with hardcoded `INPUT(air_project/...)`).
+air_project/
+air.elf
+air.mlir
+air.xclbin
+air.insts.bin
+
+# Python
 __pycache__/
 *.pyc
-*.o
-*.elf
-*.xclbin
-*.insts.bin
-*.mlir
-air_project/
-prefill_kernel_cache/
-prefill_kernel_cache_*/
-decode_kernel_cache/

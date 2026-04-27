@@ -59,7 +59,7 @@ def main():
         action="store_false",
         help="Use NPU FA via Option C head-first wrapper (head_dim=128).",
     )
-    parser.add_argument("--cache-dir", type=str, default="prefill_kernel_cache")
+    parser.add_argument("--cache-dir", type=str, default="build/prefill_kernel_cache")
     parser.add_argument("--model", type=str, default="Qwen/Qwen2.5-1.5B")
     parser.add_argument("--n-warm-runs", type=int, default=3)
     parser.add_argument("--compile-only", action="store_true")

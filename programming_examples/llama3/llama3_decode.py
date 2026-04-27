@@ -60,47 +60,14 @@ def _ensure_mv_k8192_o():
       -Dmatvec_vectorized_bf16_bf16=dg_matvec_vectorized_bf16_bf16
       -DDIM_M_OUTPUT=2  (tile_m=2 for K=8192)
     """
-    from pathlib import Path
+    from _llm_shared.kernel_builder.external_kernels import (
+        compile_mv_k8192,
+        KERNEL_OUT_DIR,
+    )
 
-    if Path("mv_k8192.o").exists():
+    if (KERNEL_OUT_DIR / "mv_k8192.o").exists():
         return
-
-    mv_src = (
-        Path(__file__).parent.parent / "matrix_vector_multiplication" / "bf16" / "mv.cc"
-    )
-    if not mv_src.exists():
-        raise FileNotFoundError(f"Cannot find mv.cc at {mv_src}")
-
-    peano_dir = os.environ.get("PEANO_INSTALL_DIR", "")
-    clang = os.path.join(peano_dir, "bin", "clang++") if peano_dir else "clang++"
-
-    import subprocess
-
-    aieopt_dir = os.path.dirname(
-        os.path.dirname(
-            subprocess.check_output(["which", "aie-opt"], text=True).strip()
-        )
-    )
-    flags = [
-        "-O2",
-        "-std=c++20",
-        "--target=aie2p-none-unknown-elf",
-        "-Wno-parentheses",
-        "-Wno-attributes",
-        "-Wno-macro-redefined",
-        "-Wno-empty-body",
-        "-DNDEBUG",
-        f"-I{aieopt_dir}/include",
-        "-DDIM_M_OUTPUT=2",
-        "-Dmatvec_vectorized_bf16_bf16=dg_matvec_vectorized_bf16_bf16",
-        "-Dlinalg_fill_bf16=dg_linalg_fill_bf16",
-        "-c",
-        str(mv_src),
-        "-o",
-        "mv_k8192.o",
-    ]
-    print(f"  Compiling mv_k8192.o (Down GEMV K=8192 renamed symbols)...")
-    subprocess.check_call([clang] + flags)
+    compile_mv_k8192()
 
 
 def compile_decode_kernels(cache, config):
@@ -770,7 +737,7 @@ if __name__ == "__main__":
     # via compile_all_external_kernels(). No manual copying needed.
     config = LlamaConfig()
 
-    cache_dir = "decode_kernel_cache"
+    cache_dir = "build/decode_kernel_cache"
     cache = KernelCache(cache_dir, verbose=args.verbose)
 
     if not args.run_only:
