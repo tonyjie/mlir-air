@@ -81,8 +81,8 @@ qwen3-1.7B). Promoting to its own skill (Option B from the prior session)
 is justified: the methodology generalizes with just shape-parameter swaps.
 
 The Phase 1 *inheritance vs kernel-first decision* bullets added to the
-existing skills (`validate-per-kernel-shapes`, `integrate-single-block`,
-`optimize-decode-perf`) cover the discovery and routing — no new top-level
+existing skills (`kernel-validation`, `single-block-validation`,
+`decode-optimization`) cover the discovery and routing — no new top-level
 skill is strictly required, but the Phase B builders (per-model
 `multi_launch/<group>_<model>_test.py` standalone gates) could be
 templated as a `phase-b-fuse-and-validate` skill if a third deployment

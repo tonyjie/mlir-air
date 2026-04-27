@@ -142,4 +142,4 @@ it in then. Otherwise, defer the F32-output investment.
 | Item | When | Severity |
 |---|---|---|
 | **F32-output Down GEMM**: would push per-layer cos to 0.999+ uniformly and likely move competitive prompts to top-1 match. ~2–4 hour refactor of `o_ffn_multi.py` (shared with llama3 — must revalidate llama3 after change). Not on critical path; only do if a downstream metric demands it. | Phase 4/6 (deferred) | low — accuracy is acceptable |
-| **`validate-full-model-correctness` skill update**: add the "decisive vs competitive prompt" gate distinction (CPU top-1 p > 0.5 → strict top-1 match; p ≤ 0.5 → top-5 overlap). Captures the BF16 reorder reality at depth ≥ ~24 layers without weakening the gate where the model is decisive. | Phase 6 (skill update) | low — captured as Lesson 2 |
+| **`full-model-validation` skill update**: add the "decisive vs competitive prompt" gate distinction (CPU top-1 p > 0.5 → strict top-1 match; p ≤ 0.5 → top-5 overlap). Captures the BF16 reorder reality at depth ≥ ~24 layers without weakening the gate where the model is decisive. | Phase 6 (skill update) | low — captured as Lesson 2 |

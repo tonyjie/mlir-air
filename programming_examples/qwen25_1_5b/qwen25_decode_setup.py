@@ -230,7 +230,7 @@ def preload_qwen25_lm_head(cache, weights, config):
     list_of_tuples)` — but that API actually expects a flat dict, so it
     raised `'list' object has no attribute 'items'` and silently fell back
     to lazy preload, degrading Pattern 3 (NPU LM Head GEMV BO reuse).
-    Caught by evaluate-deployment audit on qwen25_1_5b 2026-04-19.
+    Caught by independent-evaluator audit on qwen25_1_5b 2026-04-19.
     """
     emb_dim = config.emb_dim
     vocab = config.vocab_size

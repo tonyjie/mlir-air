@@ -110,20 +110,20 @@ the smollm2 finalize precedent — we'll re-evaluate after the next deployment.
 
 `docs/development_progress/LESSONS.md` records 2 lessons from this deployment:
 
-1. **`integrate-single-block` per-position cosine threshold needs `head_dim` scaling**.
+1. **`single-block-validation` per-position cosine threshold needs `head_dim` scaling**.
    - At head_dim=128 with K=3072, per-position min ≈ 0.98 (vs 0.99 for head_dim=64).
    - Proposed scaling: head_dim ≤ 64 → 0.99; head_dim = 128 → 0.98; head_dim ≥ 256 → 0.97.
    - MAE remains informational; whole-tensor cos > 0.99 still required.
-   - Skill update needed in `.claude/skills/integrate-single-block/SKILL.md`.
+   - Skill update needed in `.claude/skills/single-block-validation/SKILL.md`.
 
-2. **`validate-full-model-correctness` should classify prompts as decisive vs competitive**.
+2. **`full-model-validation` should classify prompts as decisive vs competitive**.
    - For deeper models (n_layers ≥ 24) and wider models (head_dim ≥ 128), BF16
      accumulation across layers reorders top-K tokens whenever they have close
      probabilities.
    - Decisive prompts (CPU top-1 p > 0.5) → strict top-1 match.
    - Competitive prompts (CPU top-1 p ≤ 0.5) → top-5 overlap (CPU top-1 ∈ NPU
      top-5 AND NPU top-1 ∈ CPU top-5).
-   - Skill update needed in `.claude/skills/validate-full-model-correctness/SKILL.md`.
+   - Skill update needed in `.claude/skills/full-model-validation/SKILL.md`.
    - Canonical prompt set should include ≥ 3 decisive prompts.
 
 ## Open follow-ups

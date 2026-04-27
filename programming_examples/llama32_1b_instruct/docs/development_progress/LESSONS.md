@@ -28,7 +28,7 @@ git-tracked-files-only approach.
 **What happened**: Symlinking `build_peano -> ../llama3/build_peano` skipped the
 4-minute kernel recompile because the shapes (and thus cache keys) are identical.
 
-**Skill update needed**: When `bootstrap-model-config` detects that the new
+**Skill update needed**: When `build-cpu-oracle` detects that the new
 model's resolved config matches an already-deployed model exactly, suggest
 symlinking the build cache as a Phase 1 short-circuit.
 

@@ -11,7 +11,7 @@ inherited unchanged; this doc covers what's different.
 
 | Check | Result |
 |---|---|
-| Auditor agent (`Skill: evaluate-deployment`) | Apr 25: **PASS** (see legacy `evaluation_report_2026-04-25.md` content for the full audit). Phase 2 cosine 0.9992 (real-tok), Phase 3 6/6 strict top-1, adversarial 2/2 in CPU top-5. |
+| Auditor agent (`Skill: independent-evaluator`) | Apr 25: **PASS** (see legacy `evaluation_report_2026-04-25.md` content for the full audit). Phase 2 cosine 0.9992 (real-tok), Phase 3 6/6 strict top-1, adversarial 2/2 in CPU top-5. |
 | `make run` smoke (Apr 26) | First token ` Paris` (id=7042). 30-token greedy: `'The capital of France is Paris.\n\nThe capital of France is Paris.\n...'` (greedy loop on a small model — semantically and topically correct). |
 | `make verify` (NPU vs CPU F32 reference, wired Apr 26) | NPU top-1 == CPU top-1 (` Paris`). Final logits cosine **0.9966** at pred_pos. K/V cache cosine drift **0.9999 → 0.9931 over 24 layers** (clean BF16 noise floor). 0 layer warnings. |
 | HuggingFace F32 cross-check on CPU reference | top-1 ` Paris`, logits correlation **0.99999978** vs HF F32 |

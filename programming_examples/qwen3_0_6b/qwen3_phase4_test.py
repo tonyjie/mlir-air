@@ -3,7 +3,7 @@
 
 """Phase 4 — prefill perf for Qwen3-0.6B on NPU2.
 
-Applies optimization patterns from the `optimize-prefill-perf` skill:
+Applies optimization patterns from the `prefill-optimization` skill:
 
   Pattern 1 (multi-launch merging):     SKIP — split-ELF approach is required
                                          by Q/K Norm placement (RMSNorm doesn't

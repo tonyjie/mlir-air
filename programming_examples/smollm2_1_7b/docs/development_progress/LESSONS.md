@@ -3,7 +3,7 @@
 (Append novel failures and their root-cause fixes here. One section per lesson.
 Cross-link to the per-phase skill that should be updated.)
 
-## Lesson 1 — `integrate-single-block`: MAE < 1e-2 gate is over-strict for BF16 production
+## Lesson 1 — `single-block-validation`: MAE < 1e-2 gate is over-strict for BF16 production
 
 **What happened**: Phase 2 single-block test on SmolLM2 layer 0 produced
 `cosine_sim=0.999`, per-position min `cosine=0.998`, MAE=0.025. The skill's
@@ -19,7 +19,7 @@ and MAE ~0.003; with 7 GEMMs per block + RoPE + softmax, the accumulated
 single-block MAE settles at ~0.025. The skill's `MAE < 1e-2` gate predates
 the F32→BF16 production switch.
 
-**Skill update needed**: `.claude/skills/integrate-single-block/SKILL.md` —
+**Skill update needed**: `.claude/skills/single-block-validation/SKILL.md` —
 either:
 - (a) Relax MAE gate to `< 0.05` to match BF16 production, OR
 - (b) Add a per-position cosine_sim gate (`min over positions > 0.99`) and

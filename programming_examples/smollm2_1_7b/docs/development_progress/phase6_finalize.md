@@ -65,9 +65,9 @@ Audit of code written for SmolLM2 vs what could be promoted to `_llm_shared/`:
 `docs/development_progress/LESSONS.md` already records 4 lessons, with cross-references to
 the skills that should be updated:
 
-1. **`integrate-single-block` MAE gate over-strict for BF16 production** — recommend
+1. **`single-block-validation` MAE gate over-strict for BF16 production** — recommend
    per-position cosine_sim gate as primary, MAE as advisory. Skill author should update
-   `.claude/skills/integrate-single-block/SKILL.md`.
+   `.claude/skills/single-block-validation/SKILL.md`.
 2. **Lift refactor left a stale path** in `_llm_shared/kernel_builder/external_kernels.py:99` —
    fixed during Phase 2; future lifts should run a sweep test from a non-llama3 directory.
 3. **`KernelCache.compile_and_cache` doesn't short-circuit on existing artifacts** —
@@ -80,7 +80,7 @@ the skills that should be updated:
 | Item | Type | Priority | Status / Estimated effort |
 |--|--|--|--|
 | LM Head GEMV right-sizing (`n_partitions=3` exact for vocab=49152) | Perf | Low | OPEN — 1-2 hours; ~3 ms/token saving (~2%) |
-| Skill update: `integrate-single-block` MAE gate | Skill | Medium | OPEN — 30 min, change one gate condition |
+| Skill update: `single-block-validation` MAE gate | Skill | Medium | OPEN — 30 min, change one gate condition |
 | Skill update: `KernelCache.compile_and_cache` short-circuit | Infra | Low | OPEN — 15 min |
 | Edge-LLM survey: SmolLM2-1.7B `rope_θ` was listed as 10k, actual is 130k | Doc | Trivial | **DONE** (fixed in this finalize) |
 | Production-mode: NPU prefill seeds KV cache (vs Phase 5's CPU prefill seed) | Perf | Medium | **DONE 2026-04-17** — `smollm2_inference.py` extracts K/V from `rms_gemms_rope` intermediates. End-to-end: 2.25 s prefill / 137 ms-per-token decode. Per-layer K/V-reshape overhead is ~15 ms/layer (new minor follow-up below). |

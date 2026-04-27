@@ -110,7 +110,7 @@ rates at parity with llama3 despite MHA's 4× larger K/V GEMVs.
 - Edge-LLM survey corrected: SmolLM2-1.7B `rope_θ` (10k → 130k); SmolLM2-135M/360M (10k → 100k)
 - Reusable patterns audited: none ready to promote (kernels and helpers all reused llama3's existing parametric infrastructure — confirms Tier-A classification)
 - 4 lessons captured in `LESSONS.md` with skill-update recommendations:
-  1. `integrate-single-block` MAE gate over-strict for BF16 production
+  1. `single-block-validation` MAE gate over-strict for BF16 production
   2. Lift refactor left a stale path (fixed during Phase 2)
   3. `KernelCache.compile_and_cache` no short-circuit on cached artifacts
   4. SmolLM2 was genuinely Tier-A — minimal-change pattern confirmed

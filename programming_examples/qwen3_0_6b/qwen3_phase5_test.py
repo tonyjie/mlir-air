@@ -17,7 +17,7 @@ For now, this test validates DECODE CORRECTNESS by:
   2. CPU decode loop using qwen3_reference for each new token
   3. Confirms generated tokens are sensible and stable
 
-NPU decode optimization patterns from `optimize-decode-perf` skill that would
+NPU decode optimization patterns from `decode-optimization` skill that would
 apply once GEMV split-ELFs exist:
   - Multi-launch merging (decode variant)
   - Static weight BOs (zero-copy via bo.map())

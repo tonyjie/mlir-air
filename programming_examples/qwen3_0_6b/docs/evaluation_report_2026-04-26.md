@@ -13,7 +13,7 @@ fused multi-launch ELFs live in `qwen3_0_6b/multi_launch/`.
 
 | Check | Result |
 |---|---|
-| Auditor agent (`Skill: evaluate-deployment`) | Apr 26: deployment ran cleanly post-`make clean` (Apr 21 cached ELFs invalidated, recompiled fresh against current shared host code). No stale-cache trap as on qwen25. |
+| Auditor agent (`Skill: independent-evaluator`) | Apr 26: deployment ran cleanly post-`make clean` (Apr 21 cached ELFs invalidated, recompiled fresh against current shared host code). No stale-cache trap as on qwen25. |
 | `make run` smoke (Apr 26) | First token ` Paris` (id=12095). 30-token greedy: `'The capital of France is Paris, ...'` (semantically correct). |
 | `make verify` (NPU vs CPU F32 reference, wired Apr 26) | NPU top-1 == CPU top-1 (` Paris`). Final logits cosine **0.9903** at pred_pos. Per-layer K/V drift larger than llama3-family (L0 cos 0.9999 → L27 K cos 0.96 / V cos 0.72; 50 informational warnings) — see Q1 in Notes. |
 | HuggingFace F32 cross-check on CPU reference | top-1 ` Paris`, logits correlation > 0.9999 vs HF |

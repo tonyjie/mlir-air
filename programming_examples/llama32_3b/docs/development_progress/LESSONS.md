@@ -3,7 +3,7 @@
 (Append novel failures and their root-cause fixes here. One section per lesson.
 Cross-link to the per-phase skill that should be updated.)
 
-## Lesson 1 — `integrate-single-block`: per-position cosine threshold needs head_dim scaling
+## Lesson 1 — `single-block-validation`: per-position cosine threshold needs head_dim scaling
 
 **What happened**: Phase 2 single-block test on Llama-3.2-3B layer 0 produced
 whole-tensor cosine 0.996, MAE 0.005, and per-position min cosine **0.980**
@@ -28,7 +28,7 @@ The MAE (0.005) is **5× lower** than smollm2's (0.025), which rules out a
 bug in any individual kernel — the absolute error is small; it's the
 small-magnitude per-row signal that makes the cosine appear sensitive.
 
-**Skill update needed**: `.claude/skills/integrate-single-block/SKILL.md` —
+**Skill update needed**: `.claude/skills/single-block-validation/SKILL.md` —
 scale the per-position threshold by head_dim. Concrete proposal:
 
 | head_dim | per-position cos min |
@@ -45,14 +45,14 @@ pointing here. The whole-tensor cosine > 0.99 and "no NaN" gates remain at
 their original values (both pass with margin: whole-tensor is 0.996).
 
 **How to apply**: When deploying any model with head_dim > 64 via
-`integrate-single-block`, expect per-position min to be in the 0.97–0.99
+`single-block-validation`, expect per-position min to be in the 0.97–0.99
 range (depending on head_dim, K dimension, and BF16 accumulation depth). Do
 not treat values in this range as a Phase 2 fail unless paired with NaN,
 contiguous bad-position runs, or whole-tensor cosine < 0.99. In those
 secondary cases, invoke `superpowers:systematic-debugging` and bisect
 kernels via `verify=True`.
 
-## Lesson 2 — `validate-full-model-correctness`: classify prompts by CPU top-1 confidence
+## Lesson 2 — `full-model-validation`: classify prompts by CPU top-1 confidence
 
 **What happened**: Phase 3 28-layer full-model run on Llama-3.2-3B produced
 2/3 top-1 match on the canonical prompt set. The one fail (`'The capital of
@@ -82,7 +82,7 @@ overlap + no NaN → PASS**. Tested decisive prompts: `'1 + 1 ='`, `'2 + 2 ='`,
 `'Water freezes at'`, `'The largest ocean is the'` (CPU top-1 prob 0.53–0.82).
 NPU produced canonically correct continuations on every decisive prompt.
 
-**Skill update needed**: `.claude/skills/validate-full-model-correctness/SKILL.md` —
+**Skill update needed**: `.claude/skills/full-model-validation/SKILL.md` —
 add the decisive-vs-competitive distinction to "Verification (Phase 3 gate)".
 Concrete proposal:
 
@@ -154,6 +154,6 @@ The fixed API takes per-launch `lqp` and `num_q_tiles` (default 4) and computes
 the per-tile size internally — match what the Makefile does. If you ever need
 to compile a variant with a non-default `num_q_tiles`, pass it explicitly.
 
-**Skill update**: capture this in `.claude/skills/optimize-prefill-perf/SKILL.md`
+**Skill update**: capture this in `.claude/skills/prefill-optimization/SKILL.md`
 as a recipe for "FA kernel produces NaN at head_dim ≥ 128" → check the .o
 flags against the Makefile's `LQP_TILE` and `LKP/DK_full` conventions.

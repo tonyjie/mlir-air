@@ -14,7 +14,7 @@ hybrid prefill/decode pattern as 0.6B, scaled up.
 
 | Check | Result |
 |---|---|
-| Auditor agent (`Skill: evaluate-deployment`) | Apr 21 PASS-with-warnings (3 audit warnings, 2 already fixed). Re-run today reproduces clean. |
+| Auditor agent (`Skill: independent-evaluator`) | Apr 21 PASS-with-warnings (3 audit warnings, 2 already fixed). Re-run today reproduces clean. |
 | `make run` smoke (Apr 26, post `make clean`) | First token ` Paris` (id=12095). Generated text: `'The capital of France is Paris'` — semantically correct. |
 | `make verify` (NPU vs CPU F32 reference, wired Apr 26) | NPU top-1 == CPU top-1 (` Paris`). Final logits cosine **0.9863** at pred_pos. K/V cache cosine drift **0.9999 → 0.995 over 28 layers** (cleaner than qwen3-0.6B's 0.96 because emb_dim=2048 attenuates per-layer noise vs 0.6B's emb_dim=1024). 29 informational layer warnings (vs 50 on 0.6B). |
 | HuggingFace F32 cross-check on CPU reference | top-1 ` Paris`, logits correlation > 0.9999 vs HF |

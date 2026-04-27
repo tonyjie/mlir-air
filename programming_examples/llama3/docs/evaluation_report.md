@@ -1,6 +1,6 @@
 # Independent evaluation report — programming_examples/llama3/ (Llama-3.2-1B)
 
-**Evaluator**: evaluate-deployment skill (independent agent)
+**Evaluator**: independent-evaluator skill (independent agent)
 **Date**: 2026-04-18
 **Verdict**: PASS
 

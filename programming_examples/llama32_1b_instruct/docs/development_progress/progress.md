@@ -33,10 +33,10 @@ identical compute. Specifically:
   llama3's. Validated there. Cache symlinked: `build_peano -> ../llama3/build_peano`.
 - **Phase 2** (single block): Same code paths as llama3 — already proven cosine_sim > 0.99.
 - **Phase 4** (prefill perf): Same multi-launch ELFs. All 5 patterns from
-  `optimize-prefill-perf` skill already applied to llama3. Latency measurement confirmed
+  `prefill-optimization` skill already applied to llama3. Latency measurement confirmed
   in Phase 3 (1.53s).
 - **Phase 5** (decode perf): Same multi-launch ELFs. All 5 patterns from
-  `optimize-decode-perf` skill already applied. Latency measurement confirmed in Phase 3
+  `decode-optimization` skill already applied. Latency measurement confirmed in Phase 3
   (92 ms/token).
 
 For a future model with **different** architecture (e.g., TinyLlama-1.1B), these phases

@@ -79,7 +79,7 @@ NPU GEMV decode for Qwen3 needs:
 Estimated effort: similar to the Phase 2 prefill split-ELF wiring, ~half
 a deployment session. Adopting the LM head GEMV (8-partition, vocab=151936)
 should drop the LM-head step from CPU 250 ms to NPU ~14 ms, which is the
-biggest single decode win per the `optimize-decode-perf` skill.
+biggest single decode win per the `decode-optimization` skill.
 
 ## Files in this deployment
 

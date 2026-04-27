@@ -101,7 +101,7 @@ Wire all 28 layers, use the canonical prompt set
 
 ### Phase 4 — prefill perf
 
-Apply optimization patterns from `optimize-prefill-perf` skill:
+Apply optimization patterns from `prefill-optimization` skill:
   1. Multi-launch merging (already 3 split ELFs/layer — try to merge where safe)
   2. Per-layer BO pre-loading
   3. Intermediate buffer reuse
@@ -113,7 +113,7 @@ ELF path will be slower than fused — expect 100-130 ms/layer initially.
 
 ### Phase 5 — decode perf
 
-Apply patterns from `optimize-decode-perf`. Need GEMV variants of the
+Apply patterns from `decode-optimization`. Need GEMV variants of the
 split-ELF approach for decode: rms_attn_gemv → host Q/K Norm → rope_qk_gemv.
 The qwen25_1_5b decode path is the closest precedent.
 
@@ -125,7 +125,7 @@ novel failure modes encountered.
 
 ### Phase 7 — evaluate
 
-Invoke the `evaluate-deployment` skill (when available) for an independent
+Invoke the `independent-evaluator` skill (when available) for an independent
 audit. Or skip if not yet packaged as a skill — manually run
 `make verify`, `make profile`, `make run` and document results.
 

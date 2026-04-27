@@ -24,13 +24,13 @@
 ```
 .claude/skills/
 ├── deploy-new-llm/SKILL.md
-├── bootstrap-model-config/SKILL.md
-├── validate-per-kernel-shapes/SKILL.md
-├── integrate-single-block/SKILL.md
-├── validate-full-model-correctness/SKILL.md
-├── optimize-prefill-perf/SKILL.md
-├── optimize-decode-perf/SKILL.md
-├── finalize-deployment/SKILL.md
+├── build-cpu-oracle/SKILL.md
+├── kernel-validation/SKILL.md
+├── single-block-validation/SKILL.md
+├── full-model-validation/SKILL.md
+├── prefill-optimization/SKILL.md
+├── decode-optimization/SKILL.md
+├── finalize-and-learn/SKILL.md
 ├── debug-bo-corruption/SKILL.md
 ├── debug-multi-launch-merge/SKILL.md
 └── merge-multi-launch-kernels/SKILL.md
@@ -584,7 +584,7 @@ Create `/home/jiajli/apps/mlir-air/.claude/skills/merge-multi-launch-kernels/SKI
 ````markdown
 ---
 name: merge-multi-launch-kernels
-description: Use when wanting to fuse multiple separate kernel launches into a single multi-launch ELF (single XRT invocation). The procedural recipe for the actual merge operation. Invoked by optimize-prefill-perf and optimize-decode-perf phase skills.
+description: Use when wanting to fuse multiple separate kernel launches into a single multi-launch ELF (single XRT invocation). The procedural recipe for the actual merge operation. Invoked by prefill-optimization and decode-optimization phase skills.
 ---
 
 ## Purpose
@@ -683,22 +683,22 @@ git commit -m "Add merge-multi-launch-kernels procedural skill"
 
 ---
 
-## Task 7: Author `bootstrap-model-config` skill (Phase 0)
+## Task 7: Author `build-cpu-oracle` skill (Phase 0)
 
 **Files:**
-- Create: `.claude/skills/bootstrap-model-config/SKILL.md`
+- Create: `.claude/skills/build-cpu-oracle/SKILL.md`
 
 - [ ] **Step 1: Create directory and SKILL.md**
 
 ```bash
-mkdir -p /home/jiajli/apps/mlir-air/.claude/skills/bootstrap-model-config
+mkdir -p /home/jiajli/apps/mlir-air/.claude/skills/build-cpu-oracle
 ```
 
-Create `.claude/skills/bootstrap-model-config/SKILL.md`:
+Create `.claude/skills/build-cpu-oracle/SKILL.md`:
 
 ````markdown
 ---
-name: bootstrap-model-config
+name: build-cpu-oracle
 description: Phase 0 of LLM deployment — adapt config dataclass and HuggingFace weight loader for the target model. Produce <model>_weights.py and <model>_reference.py. Invoked by deploy-new-llm after scaffolding.
 ---
 
@@ -786,28 +786,28 @@ Update `<model>/TODO.md`: mark Phase 0 checkbox; populate "Resolved config" sect
 
 ```bash
 cd /home/jiajli/apps/mlir-air
-git add .claude/skills/bootstrap-model-config/SKILL.md
-git commit -m "Add bootstrap-model-config skill (Phase 0)"
+git add .claude/skills/build-cpu-oracle/SKILL.md
+git commit -m "Add build-cpu-oracle skill (Phase 0)"
 ```
 
 ---
 
-## Task 8: Author `validate-per-kernel-shapes` skill (Phase 1)
+## Task 8: Author `kernel-validation` skill (Phase 1)
 
 **Files:**
-- Create: `.claude/skills/validate-per-kernel-shapes/SKILL.md`
+- Create: `.claude/skills/kernel-validation/SKILL.md`
 
 - [ ] **Step 1: Create directory and SKILL.md**
 
 ```bash
-mkdir -p /home/jiajli/apps/mlir-air/.claude/skills/validate-per-kernel-shapes
+mkdir -p /home/jiajli/apps/mlir-air/.claude/skills/kernel-validation
 ```
 
-Create `.claude/skills/validate-per-kernel-shapes/SKILL.md`:
+Create `.claude/skills/kernel-validation/SKILL.md`:
 
 ````markdown
 ---
-name: validate-per-kernel-shapes
+name: kernel-validation
 description: Phase 1 of LLM deployment — verify each unique kernel shape the model needs passes against CPU reference. Invoked by deploy-new-llm after Phase 0 gate passes.
 ---
 
@@ -905,28 +905,28 @@ LLAMA Phase 1 in `progress.md` describes validating 9 kernels at LLAMA-3.2-1B sh
 
 ```bash
 cd /home/jiajli/apps/mlir-air
-git add .claude/skills/validate-per-kernel-shapes/SKILL.md
-git commit -m "Add validate-per-kernel-shapes skill (Phase 1)"
+git add .claude/skills/kernel-validation/SKILL.md
+git commit -m "Add kernel-validation skill (Phase 1)"
 ```
 
 ---
 
-## Task 9: Author `integrate-single-block` skill (Phase 2)
+## Task 9: Author `single-block-validation` skill (Phase 2)
 
 **Files:**
-- Create: `.claude/skills/integrate-single-block/SKILL.md`
+- Create: `.claude/skills/single-block-validation/SKILL.md`
 
 - [ ] **Step 1: Create directory and SKILL.md**
 
 ```bash
-mkdir -p /home/jiajli/apps/mlir-air/.claude/skills/integrate-single-block
+mkdir -p /home/jiajli/apps/mlir-air/.claude/skills/single-block-validation
 ```
 
-Create `.claude/skills/integrate-single-block/SKILL.md`:
+Create `.claude/skills/single-block-validation/SKILL.md`:
 
 ````markdown
 ---
-name: integrate-single-block
+name: single-block-validation
 description: Phase 2 of LLM deployment — assemble one transformer block on NPU and verify cosine similarity > 0.99 against CPU reference. Invoked by deploy-new-llm after Phase 1 gate.
 ---
 
@@ -1005,28 +1005,28 @@ LLAMA's Phase 2 hit specific bugs: non-contiguous weight arrays, wrong output in
 
 ```bash
 cd /home/jiajli/apps/mlir-air
-git add .claude/skills/integrate-single-block/SKILL.md
-git commit -m "Add integrate-single-block skill (Phase 2)"
+git add .claude/skills/single-block-validation/SKILL.md
+git commit -m "Add single-block-validation skill (Phase 2)"
 ```
 
 ---
 
-## Task 10: Author `validate-full-model-correctness` skill (Phase 3)
+## Task 10: Author `full-model-validation` skill (Phase 3)
 
 **Files:**
-- Create: `.claude/skills/validate-full-model-correctness/SKILL.md`
+- Create: `.claude/skills/full-model-validation/SKILL.md`
 
 - [ ] **Step 1: Create directory and SKILL.md**
 
 ```bash
-mkdir -p /home/jiajli/apps/mlir-air/.claude/skills/validate-full-model-correctness
+mkdir -p /home/jiajli/apps/mlir-air/.claude/skills/full-model-validation
 ```
 
-Create `.claude/skills/validate-full-model-correctness/SKILL.md`:
+Create `.claude/skills/full-model-validation/SKILL.md`:
 
 ````markdown
 ---
-name: validate-full-model-correctness
+name: full-model-validation
 description: Phase 3 of LLM deployment — wire all N layers and verify top-1 prediction matches CPU reference for canonical prompts; per-layer correlation > 0.95 throughout. Invoked after Phase 2 gate.
 ---
 
@@ -1090,28 +1090,28 @@ LLAMA Phase 3 documented 0.34 correlation issue (FlashAttention without causal m
 
 ```bash
 cd /home/jiajli/apps/mlir-air
-git add .claude/skills/validate-full-model-correctness/SKILL.md
-git commit -m "Add validate-full-model-correctness skill (Phase 3)"
+git add .claude/skills/full-model-validation/SKILL.md
+git commit -m "Add full-model-validation skill (Phase 3)"
 ```
 
 ---
 
-## Task 11: Author `optimize-prefill-perf` skill (Phase 4)
+## Task 11: Author `prefill-optimization` skill (Phase 4)
 
 **Files:**
-- Create: `.claude/skills/optimize-prefill-perf/SKILL.md`
+- Create: `.claude/skills/prefill-optimization/SKILL.md`
 
 - [ ] **Step 1: Create directory and SKILL.md**
 
 ```bash
-mkdir -p /home/jiajli/apps/mlir-air/.claude/skills/optimize-prefill-perf
+mkdir -p /home/jiajli/apps/mlir-air/.claude/skills/prefill-optimization
 ```
 
-Create `.claude/skills/optimize-prefill-perf/SKILL.md`:
+Create `.claude/skills/prefill-optimization/SKILL.md`:
 
 ````markdown
 ---
-name: optimize-prefill-perf
+name: prefill-optimization
 description: Phase 4 of LLM deployment — apply the 5 known prefill optimization patterns from LLAMA Phase 4 (multi-launch merging, BO pre-loading, intermediate buffer reuse, seq-first layout, CPU→NPU op promotion). Invoked after Phase 3 correctness gate.
 ---
 
@@ -1191,28 +1191,28 @@ Cross-check: each of the 5 patterns is documented in `programming_examples/llama
 
 ```bash
 cd /home/jiajli/apps/mlir-air
-git add .claude/skills/optimize-prefill-perf/SKILL.md
-git commit -m "Add optimize-prefill-perf skill (Phase 4)"
+git add .claude/skills/prefill-optimization/SKILL.md
+git commit -m "Add prefill-optimization skill (Phase 4)"
 ```
 
 ---
 
-## Task 12: Author `optimize-decode-perf` skill (Phase 5)
+## Task 12: Author `decode-optimization` skill (Phase 5)
 
 **Files:**
-- Create: `.claude/skills/optimize-decode-perf/SKILL.md`
+- Create: `.claude/skills/decode-optimization/SKILL.md`
 
 - [ ] **Step 1: Create directory and SKILL.md**
 
 ```bash
-mkdir -p /home/jiajli/apps/mlir-air/.claude/skills/optimize-decode-perf
+mkdir -p /home/jiajli/apps/mlir-air/.claude/skills/decode-optimization
 ```
 
-Create `.claude/skills/optimize-decode-perf/SKILL.md`:
+Create `.claude/skills/decode-optimization/SKILL.md`:
 
 ````markdown
 ---
-name: optimize-decode-perf
+name: decode-optimization
 description: Phase 5 of LLM deployment — apply the 5 known decode optimization patterns from LLAMA Phase 5 (multi-launch merging, static weight BOs, NPU LM Head GEMV, extern kernel rename, CPU→NPU promotion). Invoked after Phase 4 gate.
 ---
 
@@ -1275,28 +1275,28 @@ Each pattern documented in LLAMA decode docs. Grounded.
 
 ```bash
 cd /home/jiajli/apps/mlir-air
-git add .claude/skills/optimize-decode-perf/SKILL.md
-git commit -m "Add optimize-decode-perf skill (Phase 5)"
+git add .claude/skills/decode-optimization/SKILL.md
+git commit -m "Add decode-optimization skill (Phase 5)"
 ```
 
 ---
 
-## Task 13: Author `finalize-deployment` skill (Phase 6)
+## Task 13: Author `finalize-and-learn` skill (Phase 6)
 
 **Files:**
-- Create: `.claude/skills/finalize-deployment/SKILL.md`
+- Create: `.claude/skills/finalize-and-learn/SKILL.md`
 
 - [ ] **Step 1: Create directory and SKILL.md**
 
 ```bash
-mkdir -p /home/jiajli/apps/mlir-air/.claude/skills/finalize-deployment
+mkdir -p /home/jiajli/apps/mlir-air/.claude/skills/finalize-and-learn
 ```
 
-Create `.claude/skills/finalize-deployment/SKILL.md`:
+Create `.claude/skills/finalize-and-learn/SKILL.md`:
 
 ````markdown
 ---
-name: finalize-deployment
+name: finalize-and-learn
 description: Phase 6 of LLM deployment — produce final perf report, update knowledge base with new lessons, harvest any reusable patterns into _llm_shared/. Invoked after Phase 5 gate.
 ---
 
@@ -1357,8 +1357,8 @@ This is the terminal phase. Set `TODO.md` Phase 6 to PASSED. Deployment is compl
 
 ```bash
 cd /home/jiajli/apps/mlir-air
-git add .claude/skills/finalize-deployment/SKILL.md
-git commit -m "Add finalize-deployment skill (Phase 6)"
+git add .claude/skills/finalize-and-learn/SKILL.md
+git commit -m "Add finalize-and-learn skill (Phase 6)"
 ```
 
 ---
@@ -1455,7 +1455,7 @@ Create `<model>/docs/development_progress/`:
 
 ### Step 7: Walk human through phases
 Report current state to human:
-> "Workspace scaffolded at `programming_examples/<dirname>/`. Resolved config: <summary>. Ready to start Phase 0 (Bootstrap). Invoke `bootstrap-model-config` to begin, or say 'go' for me to invoke it now."
+> "Workspace scaffolded at `programming_examples/<dirname>/`. Resolved config: <summary>. Ready to start Phase 0 (Bootstrap). Invoke `build-cpu-oracle` to begin, or say 'go' for me to invoke it now."
 
 For each phase:
 1. Invoke the per-phase skill
@@ -1466,7 +1466,7 @@ For each phase:
 6. Advance to next phase
 
 ### Step 8: On final PASS, hand off
-Once Phase 6 (`finalize-deployment`) is PASS, report:
+Once Phase 6 (`finalize-and-learn`) is PASS, report:
 > "Deployment complete. See `programming_examples/<dirname>/docs/development_progress/progress.md` for the summary."
 
 ## Verification
@@ -1511,7 +1511,7 @@ git commit -m "Add deploy-new-llm entry skill"
 ls /home/jiajli/apps/mlir-air/.claude/skills/
 ```
 
-Expected: 11 directories listed (deploy-new-llm, bootstrap-model-config, validate-per-kernel-shapes, integrate-single-block, validate-full-model-correctness, optimize-prefill-perf, optimize-decode-perf, finalize-deployment, debug-bo-corruption, debug-multi-launch-merge, merge-multi-launch-kernels).
+Expected: 11 directories listed (deploy-new-llm, build-cpu-oracle, kernel-validation, single-block-validation, full-model-validation, prefill-optimization, decode-optimization, finalize-and-learn, debug-bo-corruption, debug-multi-launch-merge, merge-multi-launch-kernels).
 
 - [ ] **Step 2: Confirm Llama-3.2-1B-Instruct weights are accessible**
 
@@ -1694,12 +1694,12 @@ git push origin llm-mapping-skills-v1
 
 **Spec coverage check:**
 - §1 Motivation — context for the plan ✓
-- §2 Scope — encoded in Task 14 (entry skill arch check) and Task 7 (bootstrap-model-config Step 2) ✓
+- §2 Scope — encoded in Task 14 (entry skill arch check) and Task 7 (build-cpu-oracle Step 2) ✓
 - §3 Architecture — Tasks 2 (lift), 4–14 (skills creation), 16 (README) ✓
 - §4 Skill inventory — Tasks 4–14 produce all 11 skills ✓
 - §5 Phase verification gates — encoded in each per-phase skill's "Verification" section ✓
 - §6 State contract (TODO.md) — Task 14 Step 5 produces it; per-phase skills update it ✓
-- §7 Inner debug-loop — encoded in Task 8 Step 2 (validate-per-kernel-shapes) and Task 11 (optimize-prefill-perf) ✓
+- §7 Inner debug-loop — encoded in Task 8 Step 2 (kernel-validation) and Task 11 (prefill-optimization) ✓
 - §8 Knowledge base + skill template — every skill task uses the template; references cite llama3 docs ✓
 - §9 Pilot models — Task 15 covers smoke test (Llama-3.2-1B-Instruct); TinyLlama and SmolLM2 explicitly deferred per "Out of scope" header ✓
 - §10 Non-goals — respected (no perf-parity gate, no autonomous execution, etc.) ✓

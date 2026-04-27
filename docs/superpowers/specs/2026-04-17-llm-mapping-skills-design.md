@@ -37,13 +37,13 @@ Three orthogonal layers:
 ```
 .claude/skills/                          ← Procedure (what to do, in what order)
    deploy-new-llm/                       ← Entry skill
-   bootstrap-model-config/
-   validate-per-kernel-shapes/
-   integrate-single-block/
-   validate-full-model-correctness/
-   optimize-prefill-perf/
-   optimize-decode-perf/
-   finalize-deployment/
+   build-cpu-oracle/
+   kernel-validation/
+   single-block-validation/
+   full-model-validation/
+   prefill-optimization/
+   decode-optimization/
+   finalize-and-learn/
    debug-bo-corruption/                  ← Cross-cutting recipe skills
    debug-multi-launch-merge/
    merge-multi-launch-kernels/
@@ -92,13 +92,13 @@ If the user supplies an out-of-scope model (e.g., `openai/gpt-oss-7b`, which is 
 
 | # | Skill | Purpose |
 |---|-------|---------|
-| 0 | `bootstrap-model-config` | Adapt config dataclass + HF weight loader; produce `<model>_weights.py` and `<model>_reference.py` |
-| 1 | `validate-per-kernel-shapes` | Enumerate unique shapes the model needs; verify each kernel against CPU reference |
-| 2 | `integrate-single-block` | Assemble one transformer block via stitching; verify correlation > 0.99 vs reference |
-| 3 | `validate-full-model-correctness` | Wire all N layers; verify top-1 prediction matches reference for canonical prompts |
-| 4 | `optimize-prefill-perf` | Apply known prefill optimization patterns (multi-launch merging, weight pre-loading, BO reuse, seq-first layout); measure each step |
-| 5 | `optimize-decode-perf` | Apply known decode optimization patterns (multi-launch merging, static weight BOs, NPU LM Head GEMV); measure each step |
-| 6 | `finalize-deployment` | Final perf report, update knowledge base with new lessons, harvest reusable patterns |
+| 0 | `build-cpu-oracle` | Adapt config dataclass + HF weight loader; produce `<model>_weights.py` and `<model>_reference.py` |
+| 1 | `kernel-validation` | Enumerate unique shapes the model needs; verify each kernel against CPU reference |
+| 2 | `single-block-validation` | Assemble one transformer block via stitching; verify correlation > 0.99 vs reference |
+| 3 | `full-model-validation` | Wire all N layers; verify top-1 prediction matches reference for canonical prompts |
+| 4 | `prefill-optimization` | Apply known prefill optimization patterns (multi-launch merging, weight pre-loading, BO reuse, seq-first layout); measure each step |
+| 5 | `decode-optimization` | Apply known decode optimization patterns (multi-launch merging, static weight BOs, NPU LM Head GEMV); measure each step |
+| 6 | `finalize-and-learn` | Final perf report, update knowledge base with new lessons, harvest reusable patterns |
 
 ### 4.3 Cross-cutting (recipe) skills
 
@@ -292,7 +292,7 @@ Rough sequence the implementation plan will detail:
 2. **Author skills in dependency order**: (using `skill-creator` for each)
    - `merge-multi-launch-kernels` (used by perf phases)
    - `debug-bo-corruption`, `debug-multi-launch-merge` (recipes)
-   - `bootstrap-model-config` → `validate-per-kernel-shapes` → `integrate-single-block` → `validate-full-model-correctness` → `optimize-prefill-perf` → `optimize-decode-perf` → `finalize-deployment`
+   - `build-cpu-oracle` → `kernel-validation` → `single-block-validation` → `full-model-validation` → `prefill-optimization` → `decode-optimization` → `finalize-and-learn`
    - `deploy-new-llm` (entry, last because it depends on all the above)
 3. **Smoke test**: Run `/deploy-new-llm` on Llama-3.2-1B-Instruct
 4. **Real pilot**: Run on TinyLlama-1.1B; iterate on skills as friction surfaces

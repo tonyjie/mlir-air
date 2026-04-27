@@ -11,7 +11,7 @@ inherited unchanged; this doc covers what's different.
 
 | Check | Result |
 |---|---|
-| Auditor agent (`Skill: evaluate-deployment`) | Apr 25 FAIL on stale cache; needs re-run on fresh cache. The Apr 25 failure was a `make clean` issue, not a real bug — see "Note on Apr 25 regression" below. |
+| Auditor agent (`Skill: independent-evaluator`) | Apr 25 FAIL on stale cache; needs re-run on fresh cache. The Apr 25 failure was a `make clean` issue, not a real bug — see "Note on Apr 25 regression" below. |
 | `make run` smoke (Apr 26, post `make clean`) | First token ` Paris` (id=12095). 30-token greedy: `'The capital of France is Paris, the capital of the United Kingdom is London, and the capital of the United States is Washington, D.C.'` |
 | `make verify` (NPU vs CPU F32 reference) | NPU top-1 == CPU top-1 (` Paris`). Final logits cosine **0.9797** at pred_pos. Per-layer K/V drift higher than siblings — see Q1 in **Notes** below; doesn't affect top-1. |
 | HuggingFace F32 cross-check on CPU reference | top-1 ` Paris`, logits correlation 0.99999992 vs HF |
@@ -423,7 +423,7 @@ all ELFs against current source and the deployment worked correctly.
 Operational rule: after editing anything under `_llm_shared/` or
 `llama3/multi_launch_builder/`, do `make clean` in each affected
 deployment before relying on its outputs. The auditor agent
-(`Skill: evaluate-deployment`) is the safety net.
+(`Skill: independent-evaluator`) is the safety net.
 
 ---
 

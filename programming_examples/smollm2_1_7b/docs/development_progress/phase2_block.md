@@ -49,7 +49,7 @@ will be the real test in Phase 3.
 
 ## Items surfaced
 
-- 🔸 **MAE gate in `integrate-single-block` skill is over-strict** — see LESSONS.md
+- 🔸 **MAE gate in `single-block-validation` skill is over-strict** — see LESSONS.md
 - 🔸 **NPU FlashAttention with MHA (n_kv_heads=32) validated end-to-end** —
   the same kernel that llama3 uses with n_kv_heads=8 also works at the
   degenerate-GQA (group_size=1) MHA case, no builder change required.

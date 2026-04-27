@@ -96,5 +96,5 @@ non-zero positions), amplified by the wider head_dim and K dimensions.
 | Item | When | Severity |
 |---|---|---|
 | **NPU FlashAttention at head_dim=128**: deferred — needs `compile_attn_npu2_split(lqp, lkp, dk, dv)` API. Not on the critical path for Phase 3 (CPU-attn works for correctness validation), but required for Phase 4 perf. | Phase 4 | medium — perf, not correctness |
-| **integrate-single-block skill update**: per-position threshold should scale with head_dim. Recommend default 0.99 for head_dim ≤ 64, 0.98 for head_dim = 128, 0.97 for head_dim = 256. Or: parameterize by reference deployment's measured per-position min. | Phase 6 (skill update) | low — captured as Lesson 1 |
+| **single-block-validation skill update**: per-position threshold should scale with head_dim. Recommend default 0.99 for head_dim ≤ 64, 0.98 for head_dim = 128, 0.97 for head_dim = 256. Or: parameterize by reference deployment's measured per-position min. | Phase 6 (skill update) | low — captured as Lesson 1 |
 | **Phase 3 expectation**: full-model accumulation will further reduce per-position cosine (28 layers vs 1). The strongest correctness gate is **top-1 token match against HF**; per-layer cosine > 0.95 (skill default for Phase 3) should still hold. | Phase 3 | low |

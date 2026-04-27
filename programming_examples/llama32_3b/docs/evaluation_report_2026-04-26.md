@@ -11,7 +11,7 @@ inherited unchanged; this doc covers what's different.
 
 | Check | Result |
 |---|---|
-| Auditor agent (`Skill: evaluate-deployment`) | Apr 25: **PASS-with-warnings** (see legacy `evaluation_report_2026-04-25.md` content for full audit categories). Warnings were perf-related, not correctness. |
+| Auditor agent (`Skill: independent-evaluator`) | Apr 25: **PASS-with-warnings** (see legacy `evaluation_report_2026-04-25.md` content for full audit categories). Warnings were perf-related, not correctness. |
 | `make run` smoke (Apr 26) | First token ` Paris` (id=12366). 5-trial mean prefill **3.518 s ± 4 ms**. |
 | `make verify` (NPU vs CPU F32 reference) | NPU top-1 == CPU top-1 (` Paris`). Final logits cosine **0.993** at pred_pos. K/V cache cosine drift **0.999 → 0.987 over 28 layers** (within head_dim-scaled BF16 noise floor). |
 | HuggingFace F32 cross-check on CPU reference | top-1 ` Paris`, logits correlation > 0.9999 vs HF |
