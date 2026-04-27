@@ -33,7 +33,7 @@ PHASE5     := qwen3_phase5_test.py
 SWEEP      := qwen3_canonical_sweep.py
 INFERENCE  := qwen3_inference.py
 
-.PHONY: help compile run profile verify clean \
+.PHONY: help compile run profile verify verify-decode clean \
         compile-prefill compile-decode \
         run-prefill run-decode run-block run-full run-reference run-decode-only
 
@@ -120,11 +120,17 @@ run-reference:
 
 profile: run-prefill
 
-## NPU vs CPU decode per-token top-1 verify (uses Phase B fused decode)
+## End-to-end NPU vs CPU F32 verification: per-layer K/V cosine + final logits cos + top-1 match
+verify:
+	python3 $(srcdir)/$(INFERENCE) --n-tokens 1 --prompt "$(PROMPT)" \
+		--seq-len $(SEQ_LEN) --model $(MODEL) \
+		--cache-dir build/prefill_kernel_cache_$(SEQ_LEN) --verify
+
+## Decode-side per-token NPU vs CPU top-1 (Phase B fused decode; ~25 s/token CPU)
 ##   --prefill-cache name encodes seq_len (LESSON L1: kernel cache name doesn't
 ##   carry seq_len, so we MUST pass the right cache for the requested SEQ_LEN
 ##   or we'll read from a stale-shape ELF and get garbage outputs).
-verify:
+verify-decode:
 	python3 $(srcdir)/qwen3_verify_decode.py --n-tokens 8 --prompt "$(PROMPT)" \
 		--seq-len $(SEQ_LEN) --model $(MODEL) \
 		--prefill-cache build/prefill_kernel_cache_$(SEQ_LEN)
