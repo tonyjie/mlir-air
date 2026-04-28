@@ -1,0 +1,13 @@
+# Persistent build artifacts (kernel caches, external_kernels/*.o):
+build/
+
+# Transient aircc working dir + per-compile leftovers
+air_project/
+air.elf
+air.mlir
+air.xclbin
+air.insts.bin
+
+# Python
+__pycache__/
+*.pyc
