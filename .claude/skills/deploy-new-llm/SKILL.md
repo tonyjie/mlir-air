@@ -198,6 +198,51 @@ Create `<model>/docs/development_progress/`:
 - `progress.md` (header only)
 - `LESSONS.md` (header only)
 - `debug_log.md` (header only)
+- `phase_timing.md` (REQUIRED — per-phase wall-clock log; schema below)
+
+**`phase_timing.md` schema** (paper §6 effort-breakdown source). Capture
+the deployment-session start timestamp (`date +"%s"`) at scaffold time.
+Update at every phase boundary:
+
+```markdown
+# <Model> deployment — per-phase wall-clock log
+
+## Baselines
+
+- Deployment session start: <YYYY-MM-DD HH:MM:SS TZ> (epoch=<N>)
+- Scaffold complete:        <YYYY-MM-DD HH:MM:SS TZ> (epoch=<N>)
+
+## Phase log
+
+### Phase N — <Name>  (PENDING / PASS / PASS-with-warnings / BLOCKED, YYYY-MM-DD)
+
+- start_ts:           <epoch s>  (HH:MM:SS TZ)
+- end_ts:             <epoch s>  (HH:MM:SS TZ)
+- wall_min:           **<N>**
+- npu_compile_min:    <N>   (sum of NPU kernel compile times in this phase)
+- npu_runtime_s:      <N>   (sum of XRTRunner / inference NPU run time)
+- dev_min:            **<N>**   ≈ wall - compile - runtime (agent thinking/code/debug)
+- notable_events:     <bullets — record honestly even if "stuck on debug for K min">
+
+## Summary table  (filled at deployment end)
+
+| Phase | wall_min | npu_compile_min | npu_runtime_s | dev_min | notes |
+|---|---:|---:|---:|---:|---|
+| Scaffold + Step 0-3 | | | | | |
+| 0: CPU Oracle | | | | | |
+| ... | | | | | |
+| **Total** | | | | | |
+```
+
+**Why this matters**: `dev_min` (vs `npu_compile_min` / `npu_runtime_s`)
+is the real "agentic deployment cost" — paper §6 cites it. Even
+debug-stuck phases must be honestly recorded — high `dev_min` on a
+phase reveals which architectural axes are genuinely hard, which is
+itself paper-relevant.
+
+After Phase 7 PASS, also update the cross-deployment aggregator at
+`<paper-repo>/materials/LLM-quick-deploy/phase_timing.md` "Per-deployment
+per-phase wall_min" table with this deployment's row.
 
 ### Step 7: Dispatch the 7 phases
 
@@ -222,10 +267,17 @@ Report current state to the human:
 
 For each phase (0 → 6):
 
-1. Invoke the per-phase skill from the table
-2. Wait for the skill to complete or escalate
-3. Report PASS/FAIL/BLOCKED to the human
-4. On PASS: ask permission to advance to next phase
+1. **Capture phase start_ts** via `date +"%s : %Y-%m-%d %H:%M:%S %Z"`,
+   record in `phase_timing.md` under that phase's `start_ts:` line
+2. Invoke the per-phase skill from the table
+3. Wait for the skill to complete or escalate
+4. **Capture phase end_ts** the same way; compute `wall_min`,
+   `npu_compile_min` (from skill output), `npu_runtime_s` (from skill
+   output), `dev_min` (residual). Record in `phase_timing.md` under
+   that phase's section. Even if the phase was stuck on debug for most
+   of the time, record honestly — that's the data paper §6 needs.
+5. Report PASS/FAIL/BLOCKED to the human
+6. On PASS: ask permission to advance to next phase
 5. On BLOCKED: surface the blocker, human resolves
 6. Advance to the next phase
 
@@ -268,8 +320,14 @@ Once Phase 6 PASS AND Phase 7 PASS (or PASS-with-warnings), report:
 
 > "Deployment complete. See:
 > - `programming_examples/<dirname>/docs/development_progress/progress.md` — phase summary
+> - `programming_examples/<dirname>/docs/development_progress/phase_timing.md` — per-phase wall+dev time
 > - `programming_examples/<dirname>/docs/evaluation_report.md` — independent audit
 > - `programming_examples/_llm_shared/docs/kernel_registry/<dirname>.md` — kernel × shape catalog"
+
+Then **append this deployment's row** to the cross-deployment timing
+aggregator at `<paper-repo>/materials/LLM-quick-deploy/phase_timing.md`
+"Per-deployment per-phase wall_min" table. This is the paper §6
+effort-breakdown source — every deployment must contribute its row.
 
 Optional: tag the deployment if the project workflow uses git tags
 (`git tag -a deployment-<dirname>-v1 -m "..."`). Most deployments
@@ -298,5 +356,10 @@ to progress files itself (per-phase skills do that). On all-PASS:
 - `<model>/TODO.md` reflects all 7 phases checked
 - `<model>/docs/development_progress/progress.md` has each phase's
   summary entry (written by per-phase skills)
+- `<model>/docs/development_progress/phase_timing.md` complete with
+  Summary table filled (this skill writes it via Step 7 phase-boundary
+  timestamp captures)
 - `<model>/docs/evaluation_report.md` exists (written by Phase 7)
+- `<paper-repo>/materials/LLM-quick-deploy/phase_timing.md` updated
+  with this deployment's row in the cross-deployment table
 - (optional) git tag created

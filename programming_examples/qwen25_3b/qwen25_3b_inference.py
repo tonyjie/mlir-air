@@ -1,0 +1,423 @@
+# Copyright (C) 2026, Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+"""Qwen2.5-3B end-to-end NPU inference (NPU prefill + NPU decode).
+
+Mirrors qwen25_0_5b/qwen25_0_5b_inference.py with 3B-specific shape:
+- 36 layers (deepest in catalog)
+- emb=2048 unchanged (1024-aligned), hidden 11008 → 12288 padded for prefill
+- head_dim=128 → Option C head-first FA wrapper (NOT seq-first)
+- Decode uses orig hidden=11008, mv_k11008.o, 11×13824 LM head partitions
+"""
+
+import argparse
+import os
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+from ml_dtypes import bfloat16
+
+_THIS_DIR = Path(__file__).resolve().parent
+_EXAMPLES_DIR = _THIS_DIR.parent
+for _p in (
+    _EXAMPLES_DIR,
+    _EXAMPLES_DIR / "llama3",
+    _EXAMPLES_DIR / "qwen25_1_5b",
+    _THIS_DIR,
+):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
+
+from qwen25_3b_weights import LlamaConfig, load_weights, generate_rope_lut
+import qwen25_3b_reference
+
+from llama3_prefill import (
+    KernelCache,
+    prepare_air_project,
+    preload_prefill_weights,
+)
+from llama3_decode import run_decode_block
+
+from _llm_shared.kernel_builder.external_kernels import compile_all_external_kernels
+from _llm_shared.phase_helpers.decode_setup import pre_transpose_decode_weights
+from _llm_shared.phase_helpers.prefill_runner import npu_prefill_with_kv_extraction
+
+from qwen25_bias import install_qkv_bias_wrapper, set_decode_position
+from qwen25_pad import make_padded_config, pad_weights, slice_output
+from qwen25_3b_phase2_test import _compile_qwen25_3b_block_kernels
+from qwen25_3b_phase3_test import _register_all_layer_biases
+from qwen25_3b_phase5_test import _register_decode_biases
+from qwen25_3b_decode_setup import (
+    compile_qwen25_3b_decode_kernels,
+    qwen25_3b_npu_lm_head_gemv,
+    preload_qwen25_3b_lm_head,
+)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Qwen2.5-3B end-to-end NPU inference (prefill + decode)"
+    )
+    parser.add_argument("--n-tokens", type=int, default=20)
+    parser.add_argument("--prompt", type=str, default="The capital of France is")
+    parser.add_argument("--seq-len", type=int, default=2048)
+    parser.add_argument(
+        "--prefill-cache-dir", type=str, default="build/prefill_kernel_cache"
+    )
+    parser.add_argument(
+        "--decode-cache-dir", type=str, default="build/decode_kernel_cache"
+    )
+    parser.add_argument("--model", type=str, default="Qwen/Qwen2.5-3B")
+    parser.add_argument(
+        "--cpu-attn",
+        dest="cpu_attn",
+        action="store_true",
+        default=False,
+        help="Use CPU attention in prefill (default: NPU FA Option C)",
+    )
+    parser.add_argument(
+        "--npu-attn",
+        dest="cpu_attn",
+        action="store_false",
+        help="Use NPU FA Option C head-first wrapper (default; hd=128)",
+    )
+    parser.add_argument("--profile", action="store_true")
+    parser.add_argument(
+        "--verify",
+        action="store_true",
+        help="Compare NPU prefill vs CPU F32 (per-layer K/V cosine + final logits + multi-token greedy)",
+    )
+    parser.add_argument("--compile-only", action="store_true")
+    args = parser.parse_args()
+
+    os.chdir(_THIS_DIR)
+    orig_config = LlamaConfig()
+    padded_config = make_padded_config(
+        orig_config, padded_emb_dim=2048, padded_hidden_dim=12288
+    )
+    print("Qwen2.5-3B end-to-end NPU inference")
+    print(
+        f"  prefill (padded): emb={padded_config.emb_dim}, hidden={padded_config.hidden_dim}, "
+        f"n_heads={padded_config.n_heads}"
+    )
+    print(
+        f"  decode (orig):    emb={orig_config.emb_dim}, hidden={orig_config.hidden_dim}, "
+        f"n_heads={orig_config.n_heads}, vocab={orig_config.vocab_size}"
+    )
+    print(
+        f"  attn={'CPU' if args.cpu_attn else 'NPU FA Option C (hd=128)'}, "
+        f"seq_len={args.seq_len}, n_tokens={args.n_tokens}"
+    )
+
+    print("\n[setup] Kernel caches...")
+    t = time.time()
+    prepare_air_project()
+
+    prefill_cache_dir = _THIS_DIR / args.prefill_cache_dir
+    decode_cache_dir = _THIS_DIR / args.decode_cache_dir
+    prefill_cache = KernelCache(cache_dir=str(prefill_cache_dir))
+    decode_cache = KernelCache(cache_dir=str(decode_cache_dir))
+    if (prefill_cache_dir / "manifest.json").exists():
+        prefill_cache.load_manifest()
+    if (decode_cache_dir / "manifest.json").exists():
+        decode_cache.load_manifest()
+
+    compile_all_external_kernels(head_dim=padded_config.head_dim)
+    _compile_qwen25_3b_block_kernels(
+        prefill_cache, padded_config, args.seq_len, cpu_attn=args.cpu_attn
+    )
+    needed_decode = ["rms_gemv_rope", "o_gemv_ffn", "lm_head_gemv"]
+    if not all(k in decode_cache.artifacts for k in needed_decode):
+        compile_qwen25_3b_decode_kernels(decode_cache, orig_config)
+    t_compile = time.time() - t
+    print(f"  Compile / cache load: {t_compile:.1f}s")
+
+    if args.compile_only:
+        print("--compile-only: kernels compiled, exiting before weight load.")
+        return 0
+
+    print("\n[setup] Weights...")
+    t = time.time()
+    orig_weights = load_weights(args.model, config=orig_config)
+    padded_weights = pad_weights(orig_weights, orig_config, padded_config)
+    t_load = time.time() - t
+    print(f"  Weight load + pad: {t_load:.1f}s")
+
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    padded_rope_bf16 = generate_rope_lut(
+        config=padded_config, seq_len=args.seq_len, dtype=bfloat16
+    )
+    decode_rope_bf16 = generate_rope_lut(
+        config=orig_config, seq_len=args.seq_len, dtype=bfloat16
+    )
+
+    print("\n[setup] Pre-loading BOs and bias registry...")
+    t = time.time()
+    install_qkv_bias_wrapper()
+    _register_all_layer_biases(
+        padded_weights, padded_config, padded_rope_bf16, args.seq_len
+    )
+    pre_transpose_decode_weights(orig_weights, orig_config)
+    preload_prefill_weights(
+        padded_weights, padded_config, prefill_cache, args.seq_len, padded_rope_bf16
+    )
+    preload_qwen25_3b_lm_head(decode_cache, orig_weights, orig_config)
+    t_preload = time.time() - t
+    print(f"  BO preload + bias: {t_preload:.1f}s")
+
+    prompt_tokens = tokenizer.encode(args.prompt)
+    real_len = len(prompt_tokens)
+    if real_len > args.seq_len:
+        prompt_tokens = prompt_tokens[: args.seq_len]
+        real_len = args.seq_len
+    if real_len < args.seq_len:
+        pad = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
+        token_ids = prompt_tokens + [pad] * (args.seq_len - real_len)
+    else:
+        token_ids = prompt_tokens
+    token_ids = np.array(token_ids, dtype=np.int64)
+    pred_pos = real_len - 1
+
+    print(f"\n{'='*60}")
+    print(f"Inference on prompt: {args.prompt!r}")
+    print(f"  ({real_len} real tokens; padded to {args.seq_len})")
+    print(f"{'='*60}")
+
+    print(f"\n[1/3] NPU prefill ({padded_config.n_layers} layers, padded shapes)...")
+    t = time.time()
+    x_prefill, k_cache, v_cache = npu_prefill_with_kv_extraction(
+        token_ids,
+        padded_weights,
+        padded_config,
+        prefill_cache,
+        padded_rope_bf16,
+        max_seq=args.seq_len,
+        cpu_attn=args.cpu_attn,
+    )
+    t_prefill = time.time() - t
+    print(
+        f"  NPU prefill: {t_prefill:.2f}s  "
+        f"({t_prefill/padded_config.n_layers*1000:.0f} ms/layer)"
+    )
+
+    # W2 (UNRESOLVED 2026-04-27): NPU LM Head returns garbage when called via
+    # this code path (NPU prefill → first LM head). Phase 5 standalone path
+    # (CPU prefill seed → NPU decode + NPU LM head) gives 4/4 NPU/CPU match.
+    # Workaround attempts (reset+re-preload) did not fix. Fall back to CPU LM
+    # head for ALL inference.py LM head calls (first_token AND decode loop).
+    # Per-deployment cost: ~20 ms/token CPU LM head vs ~150 ms NPU. Acceptable.
+    # See LESSONS.md W2 entry. Phase 5 standalone proves NPU LM head works.
+    print("\n[w2-workaround] Using CPU LM head for inference.py runner (all calls)")
+    lm_head_f32 = np.asarray(orig_weights.lm_head, dtype=np.float32)
+
+    t = time.time()
+    last_hidden_padded = np.asarray(x_prefill, dtype=np.float32)[
+        pred_pos : pred_pos + 1
+    ]
+    last_hidden = slice_output(last_hidden_padded, orig_config.emb_dim)
+    last_normed_f32 = qwen25_3b_reference.rms_norm(last_hidden, orig_weights.final_norm)
+    first_logits = (last_normed_f32.flatten() @ lm_head_f32.T).astype(np.float32)
+    first_token = int(np.argmax(first_logits))
+    t_first_lm_head = time.time() - t
+    print(
+        f"  First LM Head (CPU): {t_first_lm_head*1000:.0f} ms  -> "
+        f"{tokenizer.decode([first_token])!r} (id={first_token})"
+    )
+
+    if args.verify:
+        print(f"\n{'='*60}")
+        print(
+            f"Verification: NPU prefill vs CPU F32 reference ({orig_config.n_layers} layers)"
+        )
+        print(f"{'='*60}")
+        from qwen25_3b_reference import transformer_block as cpu_block
+
+        rope_lut_f32 = decode_rope_bf16[: args.seq_len].astype(np.float32)
+        x_cpu = orig_weights.embed_table[token_ids].astype(np.float32)
+        n_kv_heads = orig_config.n_kv_heads
+        head_dim = orig_config.head_dim
+        n_layer_warns = 0
+        for li in range(orig_config.n_layers):
+            x_cpu, cpu_intermediates = cpu_block(
+                x_cpu, orig_weights.layers[li], rope_lut_f32, orig_config
+            )
+            cpu_k = (
+                cpu_intermediates["k_roped"]
+                .astype(np.float32)
+                .reshape(args.seq_len, n_kv_heads, head_dim)
+                .transpose(1, 0, 2)
+            )
+            cpu_v = (
+                cpu_intermediates["v"]
+                .astype(np.float32)
+                .reshape(args.seq_len, n_kv_heads, head_dim)
+                .transpose(1, 0, 2)
+            )
+            npu_k = k_cache[li, :, : args.seq_len, :].astype(np.float32)
+            npu_v = v_cache[li, :, : args.seq_len, :].astype(np.float32)
+
+            k_corr = np.corrcoef(npu_k.flatten(), cpu_k.flatten())[0, 1]
+            v_corr = np.corrcoef(npu_v.flatten(), cpu_v.flatten())[0, 1]
+            k_maxerr = float(np.max(np.abs(npu_k - cpu_k)))
+            v_maxerr = float(np.max(np.abs(npu_v - cpu_v)))
+            k_meanerr = float(np.mean(np.abs(npu_k - cpu_k)))
+            v_meanerr = float(np.mean(np.abs(npu_v - cpu_v)))
+
+            k_status = "OK" if k_corr > 0.99 else "WARN"
+            v_status = "OK" if v_corr > 0.99 else "WARN"
+            n_layer_warns += int(k_status == "WARN") + int(v_status == "WARN")
+            print(
+                f"  Layer {li:2d} K_cache: [{k_status}] corr={k_corr:.6f}, "
+                f"max_err={k_maxerr:.4f}, mean_err={k_meanerr:.4f}"
+            )
+            print(
+                f"  Layer {li:2d} V_cache: [{v_status}] corr={v_corr:.6f}, "
+                f"max_err={v_maxerr:.4f}, mean_err={v_meanerr:.4f}"
+            )
+
+        x_cpu_normed = qwen25_3b_reference.rms_norm(
+            x_cpu, orig_weights.final_norm.astype(np.float32)
+        )
+        cpu_logits_pred = (
+            x_cpu_normed[pred_pos] @ orig_weights.lm_head.astype(np.float32).T
+        )
+        cpu_pred = int(np.argmax(cpu_logits_pred))
+        npu_logits_f32 = np.asarray(first_logits, dtype=np.float32)
+        logit_corr = float(np.corrcoef(npu_logits_f32, cpu_logits_pred)[0, 1])
+        logit_maxerr = float(np.max(np.abs(npu_logits_f32 - cpu_logits_pred)))
+        logit_meanerr = float(np.mean(np.abs(npu_logits_f32 - cpu_logits_pred)))
+        print(
+            f"\n  Logits (pos {pred_pos}): corr={logit_corr:.6f}, "
+            f"max_err={logit_maxerr:.4f}, mean_err={logit_meanerr:.4f}"
+        )
+        print(f"  NPU top-1: {first_token} ({tokenizer.decode([first_token])!r})")
+        print(f"  CPU top-1: {cpu_pred} ({tokenizer.decode([cpu_pred])!r})")
+        npu_cpu_match = first_token == cpu_pred
+        print(f"  Match: {'YES' if npu_cpu_match else 'NO'}")
+        print(f"  Per-layer warnings: {n_layer_warns} (informational)")
+
+    print(f"\n[setup] Re-registering bias for decode (orig shapes)...")
+    _register_decode_biases(orig_weights, orig_config, decode_rope_bf16, args.seq_len)
+
+    print(f"\n[2/3] NPU decode loop ({args.n_tokens} tokens)...")
+    embed_table_f32 = np.asarray(orig_weights.embed_table, dtype=np.float32)
+    generated = list(prompt_tokens) + [first_token]
+    decode_times = []
+    current_token = first_token
+
+    npu_decoded_ids = [first_token]
+    for token_idx in range(args.n_tokens - 1):
+        current_pos = len(generated) - 1
+        if current_pos >= args.seq_len:
+            print(f"  Hit seq_len cap at pos={current_pos}, stopping")
+            break
+
+        x_in_bf16 = embed_table_f32[current_token].astype(bfloat16)
+        t = time.time()
+        x_bf16 = x_in_bf16
+        for layer_idx in range(orig_config.n_layers):
+            orig_weights.layers[layer_idx]._layer_idx = layer_idx
+            set_decode_position(current_pos)
+            x_bf16 = run_decode_block(
+                x_bf16,
+                orig_weights.layers[layer_idx],
+                decode_cache,
+                orig_config,
+                k_cache[layer_idx],
+                v_cache[layer_idx],
+                current_pos,
+                decode_rope_bf16,
+            )
+        x_f32 = np.asarray(x_bf16, dtype=np.float32).reshape(1, orig_config.emb_dim)
+        x_normed_f32 = qwen25_3b_reference.rms_norm(x_f32, orig_weights.final_norm)
+        # W2 workaround: CPU LM head (NPU LM head broken via inference.py path)
+        next_logits = (x_normed_f32.flatten() @ lm_head_f32.T).astype(np.float32)
+        next_token = int(np.argmax(next_logits))
+        decode_times.append(time.time() - t)
+
+        if args.profile:
+            print(
+                f"  Tok {token_idx+1:2d} pos={current_pos:3d}  "
+                f"{tokenizer.decode([next_token])!r:<14s}  "
+                f"{decode_times[-1]*1000:.0f} ms"
+            )
+
+        generated.append(next_token)
+        npu_decoded_ids.append(next_token)
+        current_token = next_token
+
+    set_decode_position(None)
+
+    if args.verify and len(npu_decoded_ids) > 1:
+        print(f"\n{'='*60}")
+        print(
+            f"Multi-token greedy match: NPU vs CPU on {len(npu_decoded_ids)} decode tokens"
+        )
+        print(f"{'='*60}")
+        rope_lut_f32 = decode_rope_bf16[: args.seq_len].astype(np.float32)
+        cpu_decoded_ids = []
+        cpu_generated = list(prompt_tokens)
+        for di, _ in enumerate(npu_decoded_ids):
+            x_cpu = embed_table_f32[np.array(cpu_generated, dtype=np.int64)]
+            for layer_idx in range(orig_config.n_layers):
+                x_cpu, _ = qwen25_3b_reference.transformer_block(
+                    x_cpu, orig_weights.layers[layer_idx], rope_lut_f32, orig_config
+                )
+            cpu_normed = qwen25_3b_reference.rms_norm(x_cpu, orig_weights.final_norm)
+            cpu_logits = cpu_normed[-1] @ orig_weights.lm_head.astype(np.float32).T
+            cpu_next = int(np.argmax(cpu_logits))
+            cpu_decoded_ids.append(cpu_next)
+            cpu_generated.append(cpu_next)
+
+        n_match = 0
+        first_diverge = None
+        for i, (npu_id, cpu_id) in enumerate(zip(npu_decoded_ids, cpu_decoded_ids)):
+            ok = npu_id == cpu_id
+            n_match += int(ok)
+            mark = "OK" if ok else "DIFF"
+            print(
+                f"  Tok {i:2d}: NPU={npu_id:6d} {tokenizer.decode([npu_id])!r:<14s}  "
+                f"CPU={cpu_id:6d} {tokenizer.decode([cpu_id])!r:<14s}  [{mark}]"
+            )
+            if not ok and first_diverge is None:
+                first_diverge = i
+        print(
+            f"  Greedy match: {n_match}/{len(npu_decoded_ids)} "
+            f"({'PASS' if n_match == len(npu_decoded_ids) else f'FAIL — first diverge at tok {first_diverge}'})"
+        )
+
+    print(f"\n[3/3] Done.\n{'='*60}")
+    print(f"Generated text:")
+    print(f"  {tokenizer.decode(generated)!r}")
+    print()
+    print(f"Timings (one-time setup):")
+    print(f"  Compile / cache load : {t_compile:.1f}s")
+    print(f"  Weight load + pad    : {t_load:.1f}s")
+    print(f"  BO preload + bias    : {t_preload:.1f}s")
+    print(f"Timings (per inference):")
+    print(
+        f"  NPU prefill ({padded_config.n_layers}L)    : {t_prefill:.2f}s "
+        f"({t_prefill/padded_config.n_layers*1000:.0f} ms/layer)  [TTFT]"
+    )
+    print(f"  First LM Head GEMV   : {t_first_lm_head*1000:.0f} ms")
+    if decode_times:
+        avg_ms = float(np.mean(decode_times)) * 1000
+        med_ms = float(np.median(decode_times)) * 1000
+        n_dec = len(decode_times)
+        tps = 1000 / avg_ms
+        print(
+            f"  Decode {n_dec} tokens     : avg={avg_ms:.0f} ms/token, "
+            f"median={med_ms:.0f} ms/token  [TPS = {tps:.1f} tok/s]"
+        )
+    print(
+        f"  Total inference wall : {t_prefill + t_first_lm_head + sum(decode_times):.2f}s"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
