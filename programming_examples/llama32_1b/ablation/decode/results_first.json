@@ -1,0 +1,91 @@
+{
+  "config": {
+    "seq_len": 1,
+    "emb_dim": 2048,
+    "kv_dim": 512,
+    "n_heads": 32,
+    "n_kv_heads": 8,
+    "head_dim": 64,
+    "hidden_dim": 8192,
+    "n_layers": 16,
+    "max_seq": 2048,
+    "vocab_size": 128256
+  },
+  "current_pos": 7,
+  "prompt_len": 7,
+  "trials": 5,
+  "cells": {
+    "A": {
+      "validation": "PASS",
+      "all_trials_total_s": [
+        0.2604700056836009,
+        0.25669243885204196,
+        0.2578888637945056,
+        0.256254383828491,
+        0.25619783718138933
+      ],
+      "median_total_s": 0.25669243885204196,
+      "min_total_s": 0.25619783718138933,
+      "max_total_s": 0.2578888637945056,
+      "rms_gemv_rope_per_call_median_s": 0.002397577278316021,
+      "o_gemv_ffn_per_call_median_s": 0.012445247266441584,
+      "cpu_attn_total_median_s": 0.004552215337753296,
+      "lm_head_median_s": 0.01367316022515297,
+      "next_token": 69486
+    },
+    "B": {
+      "validation": "PASS",
+      "all_trials_total_s": [
+        0.11697189509868622,
+        0.11470739869400859,
+        0.1169208399951458,
+        0.11625135829672217,
+        0.11773129599168897
+      ],
+      "median_total_s": 0.1169208399951458,
+      "min_total_s": 0.11470739869400859,
+      "max_total_s": 0.11773129599168897,
+      "rms_gemv_rope_per_call_median_s": 0.0014773830771446228,
+      "o_gemv_ffn_per_call_median_s": 0.00461933296173811,
+      "cpu_attn_total_median_s": 0.003855271264910698,
+      "lm_head_median_s": 0.013667099177837372,
+      "next_token": 69486
+    },
+    "C": {
+      "validation": "PASS",
+      "all_trials_total_s": [
+        0.11498852912336588,
+        0.11376840015873313,
+        0.11375624686479568,
+        0.11295310407876968,
+        0.11429904028773308
+      ],
+      "median_total_s": 0.11376840015873313,
+      "min_total_s": 0.11295310407876968,
+      "max_total_s": 0.11429904028773308,
+      "rms_gemv_rope_per_call_median_s": 0.001442156732082367,
+      "o_gemv_ffn_per_call_median_s": 0.004509655758738518,
+      "cpu_attn_total_median_s": 0.003815646283328533,
+      "lm_head_median_s": 0.013617095071822405,
+      "next_token": 69486
+    },
+    "D": {
+      "validation": "PASS",
+      "all_trials_total_s": [
+        0.09066376136615872,
+        0.09064587811008096,
+        0.09056772012263536,
+        0.09062037896364927,
+        0.09068693360313773
+      ],
+      "median_total_s": 0.09064587811008096,
+      "min_total_s": 0.09056772012263536,
+      "max_total_s": 0.09068693360313773,
+      "rms_gemv_rope_per_call_median_s": 0.0008721728809177876,
+      "o_gemv_ffn_per_call_median_s": 0.003667219076305628,
+      "cpu_attn_total_median_s": 0.0036789290606975555,
+      "lm_head_median_s": 0.013623266015201807,
+      "next_token": 69486
+    }
+  }
+}
