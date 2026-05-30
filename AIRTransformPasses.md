@@ -165,20 +165,6 @@ dependence to the induction variables of any parent spatial loop space. Upon
 successful detection, the DMA shall be annotated by an affine set attribute 
 named 'broadcast_pattern'. 
 
-### `-air-collapse-herd`
-
-_Collapse a multi-dimensional air.herd into a single column._
-
-The pass attempts to collapse the air.herd to the left, attempting to occupy 
-complete columns of AIE tiles. The attempt will stop if the number of tiles in 
-air.herd exceeds the user provided max-col-size option.
-
-#### Options
-
-```
--max-col-size : The maximum column size after collapse, before collapse is cancelled. Disabled by default.
-```
-
 ### `-air-construct-ping-pong-dependency-pattern`
 
 _Transform an scf.for loop into ping-pong pattern_
@@ -962,7 +948,7 @@ Optimize the logical data movement by transforming them, represented as air.chan
 
 ```
 -device              : AIE device to target.
--shim-dma-tile-sizes : Shim dma tiling sizes, tiling shim dma bds into smaller repeating ones
+-shim-dma-tile-sizes : Shim dma tiling sizes (global override). Wins over per-launch attribute when non-empty. A single value of 0 (sentinel) disables tiling for all launches. When empty, each `air.launch` op may carry an `air.shim_dma_tile_sizes = array<i64: ...>` attribute to opt in to tiling for that launch only (single value 0 = skip this launch, single value N = auto-expand to perfectly-nested depth, multi-value = use literally). Default when neither global nor per-launch is set: skip tiling (wrap-stride fold collapses loops into multi-D BD descriptors).
 ```
 
 ### `-air-override-memref-memory-space`
@@ -1406,7 +1392,9 @@ _Split L2 memref into smaller buffers to better fit with the data movement harwa
 #### Options
 
 ```
--tiles-per-l2-tile : Number of compute tiles per L2 memory tile. Used to estimate if an air.segment shall allocate to multiple L2 memory tiles, and therefore requires L2 memref splitting.
+-tiles-per-l2-tile        : Number of compute tiles per L2 memory tile. Used to estimate if an air.segment shall allocate to multiple L2 memory tiles, and therefore requires L2 memref splitting.
+-max-launch-channels-mm2s : Per-launch cap on the number of distinct launch-scope channel endpoints in the MM2S direction (air.channel.put ops directly under air.launch, i.e. not nested in any air.segment). Splits are skipped when they would push the count past this cap. 0 = no cap (legacy behavior).
+-max-launch-channels-s2mm : Per-launch cap on the number of distinct launch-scope channel endpoints in the S2MM direction (air.channel.get ops directly under air.launch, i.e. not nested in any air.segment). Splits are skipped when they would push the count past this cap. 0 = no cap (legacy behavior).
 ```
 
 ### `-air-split-launch-for-padding`
@@ -1542,4 +1530,46 @@ func.func @matmul_512x512_1024xi32__dispatch_0_matmul_512x512x1024_i32() {
 
 ```
 -depth : The number of outermost loops in the loop nest to unroll
+```
+
+### `-air-verify-hierarchy-locality`
+
+_Verify locality of kernel operands at the hierarchy's matching memory level._
+
+Statically detect data races on memrefs that an air.launch /
+air.segment / air.herd passes to itself as kernel operands.
+
+Each hierarchy op iterates over an N-dimensional grid (its IVs) and
+has a "natural" memory level: air.herd corresponds to L1 (per-PE
+scratchpad), air.segment to L2 (segment-shared), air.launch to L3
+(host/system). When an operand's memref memory space matches the
+hierarchy's natural level, every distinct iteration instance must
+use a *different* memory region — otherwise iterations race on the
+same buffer.
+
+For each such operand the pass requires one of:
+
+  (R1) The defining op is inside the hierarchy body. Region cloning
+       during outlining gives each iteration instance its own copy.
+
+  (R2) The operand is defined outside, but its access regions over
+       the iteration space are statically provable as pairwise
+       disjoint (i.e., distinct iv tuples touch disjoint memory).
+
+Operands at a memory level *different* from the hierarchy's natural
+level (e.g., an L3 buffer passed into a herd as a fetch source) are
+not subject to this rule and the pass stays silent on them.
+
+The pass is read-only: on a violation it emits an op-level
+diagnostic and signals pass failure; it never mutates IR.
+
+`strict` controls behavior when the analysis can't decide
+(e.g., dynamic sizes, opaque func.call): true reports an error,
+false reports a warning and continues. Definitive races are always
+reported as errors regardless of `strict`.
+
+#### Options
+
+```
+-strict : When access analysis is inconclusive, fail (true) or warn-and-continue (false).
 ```
