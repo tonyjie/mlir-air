@@ -229,9 +229,11 @@ Then audit for promotion candidates (don't promote speculatively — only
 if 2+ uses):
 
 1. Did this deployment **add a new C++ kernel** or a new fused
-   multi-launch ELF under `<model>/multi_launch_builder/`
-   (kernel-first path)? Cross-reference other deployments — if a 2nd
-   uses the same pattern, it's a candidate for a future shared location.
+   multi-launch block builder in `shared/builders/` (kernel-first path,
+   authored via `stitch_elf`)? Since `shared/builders/` is already the
+   shared location, a genuinely new block belongs there directly —
+   cross-reference other deployments to confirm the shape contract is
+   reusable rather than model-specific.
 2. Did this deployment hit a **new per-kernel constraint** or compiler
    quirk (placeability, alignment, max-K) worth recording in that
    kernel's `kernel_registry/details/<Kernel>_bf16.md`?

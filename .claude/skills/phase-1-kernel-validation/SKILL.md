@@ -34,7 +34,7 @@ The core loop is small:
   PyTorch/vLLM's canonical bf16 tolerance; `atol` is sized per kernel to the
   measured datapath error). The registry's `details/<Kernel>_bf16.md`
   §Tolerances documents each kernel's exact `rtol`/`atol`. Upstream ships a
-  harness for the FFN block (`llms/llama_kernel_builder/ffn_swiglu/`) plus
+  harness for the FFN block (`llms/shared/infra/ffn_swiglu/`) plus
   the top-level kernel examples `matrix_multiplication/bf16_in_bf16_out`
   and `matrix_multiplication/bf16_in_fp32_out` (the BF16 GEMM, split by
   output dtype — the legacy `matrix_multiplication/bf16` is kept for NPU1),

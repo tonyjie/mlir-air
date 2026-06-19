@@ -21,7 +21,7 @@ matches your stderr before applying the corresponding remedy.
 - `programming_examples/kernel_registry/supported_kernels.md`
   — per-kernel constraints + silent-corruption traps (the merge
   constraints in context of each leaf kernel)
-- `programming_examples/llms/llama32_1b/multi_launch_builder/` — working
+- `programming_examples/llms/shared/builders/` — working
   fused-ELF builders to diff a failing merge against (what DOES merge,
   and the FA-stays-separate boundary)
 
@@ -77,7 +77,7 @@ check IDs across the merged launches.
 
 **Remedy**: rename channels in one of the offending launches. The
 `_rename_all(text, prefix=...)` helper in
-`llms/llama_kernel_builder/stitching.py` already prefixes every SSA
+`llms/shared/infra/stitching.py` already prefixes every SSA
 name (including channels) per-kernel — confirm your stitching code
 used distinct prefixes per sub-kernel. If two sub-kernels were
 stitched with the same prefix, that's the bug. Re-run stitching with
@@ -110,8 +110,8 @@ the multi-launch builder for `air.herd` ops not wrapped in
 `air.launch + air.segment`.
 
 **Remedy**: wrap via `_wrap_ir_in_launch(mlir_text)` from
-`llms/llama_kernel_builder/stitching.py`. The fused builders in
-`llama32_1b/multi_launch_builder/` apply this wrapper around every bare
+`llms/shared/infra/stitching.py`. The fused builders in
+`shared/builders/` apply this wrapper around every bare
 herd (e.g. the RMSNorm and Eltwise-Add `herd_x=8` builders).
 
 ### Hypothesis 5: DMA stride limitation (sub-32b)

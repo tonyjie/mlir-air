@@ -34,7 +34,7 @@ triages.
   (HF bf16 reference; `make verify` token-set check is the PASS/FAIL gate,
   `make diagnosis` per-layer cosine is the informational lens); every model
   hooks in via its own `verify_adapter.py`, not by copying this.
-- `programming_examples/llms/llama_kernel_builder/` — the **shared** kernel
+- `programming_examples/llms/shared/infra/` — the **shared** kernel
   builder (KernelCache, external kernels, stitching, the `ffn_swiglu/`
   harness); per-model scripts import from it.
 - `programming_examples/kernel_registry/` — the model-agnostic kernel
@@ -95,30 +95,37 @@ If rejected, print clear message and do NOT proceed.
 ### Step 3: Check for the shared infra + reference exemplar
 
 ```bash
-test -d programming_examples/llms/llama_kernel_builder && \
+test -d programming_examples/llms/shared && \
 test -d programming_examples/llms/verify && \
 test -d programming_examples/llms/llama32_1b && echo OK || echo MISSING
 ```
 
 The first two are **required**: every deployment composes kernels via the
-shared `llama_kernel_builder` toolkit and gates on the shared `verify/`
-subsystem. The third, `llama32_1b`, is the **reference exemplar** — read
-to mirror its assembly, and imported directly on a bit-for-bit match. If
-any is missing, halt and instruct the human.
+shared `shared/` package (`shared/infra/` = KernelCache + stitching +
+external kernels; `shared/builders/` = the multi-launch block builders) and
+gates on the shared `verify/` subsystem. The third, `llama32_1b`, is the
+**reference exemplar** — read to mirror its block assembly, and imported
+directly on a bit-for-bit match. If any is missing, halt and instruct the
+human.
 
 ### Step 4: Scaffold `<model>/` directory — kernel-first, minimal
 
 The model lives at `programming_examples/llms/<dirname>/`, a sibling of
 `llms/llama32_1b/` (the reference exemplar) and the shared `llms/verify/`
-+ `llms/llama_kernel_builder/` (the toolkit every deployment builds on).
++ `llms/shared/` (the toolkit every deployment builds on).
 
 **Default mindset: build this model up from registry kernels** using the
-shared `llama_kernel_builder` toolkit (KernelCache, stitching,
-external_kernels). The per-phase skills write the model's own
-`<model>_prefill.py` / `<model>_decode.py` / `multi_launch_builder/` by
-composing the Phase-1-verified leaf kernels, reading `llama32_1b`'s
-assembly as the worked exemplar. This generalizes to any in-scope
-architecture — it does not assume the model resembles llama.
+shared `shared/` package: `shared/infra/` (KernelCache, stitching,
+external_kernels) plus `shared/builders/` (the multi-launch block builders
+— `rms_gemms_rope_multi`, `o_ffn_multi`, etc.). The per-phase skills write
+the model's own `<model>_prefill.py` / `<model>_decode.py` that compose the
+Phase-1-verified leaf kernels into transformer blocks. If the model's block
+matches a shared builder's shape contract, import it directly from
+`shared/builders/`; if the architecture diverges (different launch sequence,
+extra norm, MoE), assemble a new block with `stitch_elf` from
+`shared.infra.stitching` (declare a `KernelSlice` list — see any
+`shared/builders/*_multi.py` as the worked exemplar). This generalizes to
+any in-scope architecture — it does not assume the model resembles llama.
 
 **Do NOT `cp -r llama32_1b <model>`.** Two reasons depending on path
 (the kernel-first-vs-inheritance decision + the bit-for-bit match rule are
@@ -160,10 +167,14 @@ for p in (_LLMS_DIR, _LLMS_DIR / "llama32_1b", _THIS_DIR):
         sys.path.insert(0, str(p))
 
 # ALWAYS — the shared kernel toolkit you compose this model FROM:
-from llama_kernel_builder.external_kernels import compile_all_external_kernels
-from llama_kernel_builder.cache import KernelCache
+from shared.infra.external_kernels import compile_all_external_kernels
+from shared.infra.cache import KernelCache
+# Reuse a shared block builder when the shape contract matches; otherwise
+# assemble a new block declaratively with stitch_elf:
+from shared.builders.rms_gemms_rope_multi import build_rms_gemms_rope_module
+from shared.infra.stitching import stitch_elf, KernelSlice, FuncArg
 
-# DEFAULT (kernel-first) — write <model>_prefill.py / multi_launch_builder/
+# DEFAULT (kernel-first) — write <model>_prefill.py / <model>_decode.py
 # that assemble the registry leaf kernels for THIS model's sequence,
 # mirroring llama32_1b's builders as the worked example.
 
@@ -338,7 +349,7 @@ If the evaluator reports:
   Do NOT hand off. Surface specific failures.
 
 > If this deployment changed shared infra (`kernel_registry/`,
-> `llms/llama_kernel_builder/`, `llms/verify/`, or the reference
+> `llms/shared/infra/`, `llms/verify/`, or the reference
 > `llms/llama32_1b/`), re-run `make verify` on the OTHER deployments under
 > `llms/<model>/` before tagging — a shared-infra change can silently break
 > a sibling. NPU is a singleton, so run sequentially with `flock`.

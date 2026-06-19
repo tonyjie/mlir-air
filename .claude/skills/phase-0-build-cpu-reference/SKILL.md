@@ -17,7 +17,7 @@ produces three things:
    *production* prefill/decode import (default: `rms_norm`,
    `attention_reference`, `softmax`). These are NOT a per-kernel oracle
    catalog — each leaf kernel ships its own NumPy reference inside its
-   `llama_kernel_builder/<kernel>/run.py` harness (Phase 1 uses those).
+   `shared/infra/<kernel>/run.py` harness (Phase 1 uses those).
 3. **HF bf16 baseline confirmation** — verify the target model loads with
    `torch_dtype=torch.bfloat16` and runs the canonical prompt through
    `HfRunner`, producing a sane top-1 and non-degenerate logits. This is
@@ -38,7 +38,7 @@ serve:
 
 1. **Per-kernel references (Phase 1)**: HF cannot expose a single kernel's
    output (RMSNorm alone, RoPE alone, etc.). Each leaf kernel's standalone
-   harness (`llama_kernel_builder/<kernel>/run.py`) carries its own NumPy F32
+   harness (`shared/infra/<kernel>/run.py`) carries its own NumPy F32
    reference for that kernel. `<model>_cpu_helpers.py` only holds the
    helpers production code itself imports at runtime.
 2. **CPU fallbacks (production)**: e.g. prefill `cpu_attn=True` uses
@@ -146,7 +146,7 @@ production prefill/decode actually import:
 
 Rule for what belongs here: a helper goes in `<model>_cpu_helpers.py` ONLY
 if production code imports it at runtime. Per-kernel verification references
-do NOT go here — they live in each `llama_kernel_builder/<kernel>/run.py`. If a
+do NOT go here — they live in each `shared/infra/<kernel>/run.py`. If a
 later phase (4/5) promotes a new CPU fallback op, add its helper then, not
 preemptively.
 

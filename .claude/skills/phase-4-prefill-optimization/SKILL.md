@@ -58,7 +58,7 @@ PRIMARY:
 - `programming_examples/llms/<model>/docs/development_progress/phase3_full.md`
   — Phase 3 baseline timings + cosine numbers (the "before" state to
   measure against and preserve)
-- `programming_examples/llms/llama_kernel_builder/cache.py` — the
+- `programming_examples/llms/shared/infra/cache.py` — the
   `KernelCache` host-optimization knobs (`static_input_indices`,
   `intermediate_indices`); the `opt-buffer-object-reuse` skill owns how to
   wire them, this is just the source file it touches
@@ -66,13 +66,13 @@ PRIMARY:
 REFERENCE EXEMPLARS (read/mirror to compose your own fused ELFs; import
 directly only on a bit-for-bit kernel-sequence match):
 
-- `programming_examples/llms/llama32_1b/multi_launch_builder/` — the full set
+- `programming_examples/llms/shared/builders/` — the full set
   of fused-ELF builders, the worked example of how registry leaf kernels
   stitch into multi-launch ELFs. Mirror these for your model's kernel
   sequence. Two representative ones:
   - `rms_gemms_rope_multi.py` — fused 6-launch ELF for RMSNorm + Q/K/V GEMM + RoPE Q/K
   - `o_ffn_multi.py` — fused 8-launch ELF for O + add + RMSNorm + Gate/Up + SwiGLU + Down + add
-- `programming_examples/llms/llama_kernel_builder/` — the shared toolkit
+- `programming_examples/llms/shared/infra/` — the shared toolkit
   (KernelCache, stitching, external_kernels) every fused-ELF build uses,
   inheritance or kernel-first alike.
 
@@ -101,7 +101,7 @@ the gate is the outcome (faster + `make verify` still PASSES).
 
 | Optimization skill | When it applies to prefill | What it does |
 |---|---|---|
-| `opt-merge-multi-launch-kernels` | almost always (the dominant win) | stitch each leaf kernel's `air.launch` into one fused ELF per kernel-group → one `xrt.run()` per group instead of per kernel (llama3: 16→3 calls/layer). Build the model's `multi_launch_builder/` (kernel-first) or reuse llama's fused ELFs (bit-for-bit inheritance — the verdict made in `phase-2-single-block-validation` Step 1). |
+| `opt-merge-multi-launch-kernels` | almost always (the dominant win) | stitch each leaf kernel's `air.launch` into one fused ELF per kernel-group → one `xrt.run()` per group instead of per kernel (llama3: 16→3 calls/layer). Assemble the block via `stitch_elf` in `shared/builders/` (kernel-first) or reuse llama's fused ELFs (bit-for-bit inheritance — the verdict made in `phase-2-single-block-validation` Step 1). |
 | `opt-buffer-object-reuse` | always | pre-load per-layer weight BOs once (`static_input_indices`) + reuse intermediate BOs (`intermediate_indices`); removes redundant host↔NPU uploads. |
 | `opt-layout-alignment` | only if a host transpose still sits between two kernels | choose seq-first layouts so RoPE/FA/O-proj hand off on-device; skip if the model already runs seq-first end-to-end (most inheritance deployments do). |
 

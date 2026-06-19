@@ -55,7 +55,7 @@ PRIMARY:
   deployment's profiling breakdown; the reference for what "good" looks like
 - `programming_examples/llms/<model>/docs/development_progress/phase4_prefill.md`
   — Phase 4 baseline (prefill numbers + the integration path used)
-- `programming_examples/llms/llama32_1b/multi_launch_builder/o_gemv_ffn_multi.py`
+- `programming_examples/llms/shared/builders/o_gemv_ffn_multi.py`
   — decode-specific merge pattern + 2-K extern kernel rename, in code
 - `programming_examples/kernel_registry/details/GEMV_bf16.md` — per-kernel
   constraints / placeability notes (the authority for that kernel's hard
@@ -65,14 +65,14 @@ PRIMARY:
 REFERENCE EXEMPLARS (read/mirror to compose your own decode ELFs; import
 directly only on a bit-for-bit kernel-sequence match):
 
-- `programming_examples/llms/llama32_1b/multi_launch_builder/rms_gemv_rope_multi.py`
+- `programming_examples/llms/shared/builders/rms_gemv_rope_multi.py`
   — fused 6-launch decode ELF for RMSNorm + Q/K/V GEMV + RoPE Q/K
-- `programming_examples/llms/llama32_1b/multi_launch_builder/o_gemv_ffn_multi.py`
+- `programming_examples/llms/shared/builders/o_gemv_ffn_multi.py`
   — fused 8-launch decode ELF (with 2-K extern rename for K=8192 Down)
-- `programming_examples/llms/llama32_1b/multi_launch_builder/lm_head_gemv_multi.py`
+- `programming_examples/llms/shared/builders/lm_head_gemv_multi.py`
   — vocab-partitioned LM Head GEMV (part of the model's decode assembly,
   built in Phase 3/finalize; profiled here, not a separate optimization)
-- `programming_examples/llms/llama_kernel_builder/` — the shared toolkit
+- `programming_examples/llms/shared/infra/` — the shared toolkit
   every decode-ELF build uses (KernelCache, stitching, external_kernels).
 
 ## Workflow
@@ -98,7 +98,7 @@ differ because decode runs at M=1 per token, calling all N layers per token.
 
 | Optimization skill | When it applies to decode | What it does (decode flavor) |
 |---|---|---|
-| `opt-merge-multi-launch-kernels` | almost always | stitch decode kernel groups (GEMV instead of GEMM) into fused ELFs (10 launches/layer/token → 2–3). Build the model's `multi_launch_builder/` (kernel-first) or reuse llama's fused decode ELFs (bit-for-bit inheritance — the verdict made in `phase-2-single-block-validation` Step 1). **Decode specifics handled by the skill**: N-way extern kernel rename when multiple GEMV K values co-link in one ELF (2-K for llama: `mv.o` K=2048 + `mv_k8192.o`; add a 3rd renamed `.o` when `n_heads·head_dim ≠ emb_dim`), and K-split (`down_k_split`) for K > 8160 (`details/GEMV_bf16.md`). |
+| `opt-merge-multi-launch-kernels` | almost always | stitch decode kernel groups (GEMV instead of GEMM) into fused ELFs (10 launches/layer/token → 2–3). Assemble the decode block via `stitch_elf` in `shared/builders/` (kernel-first) or reuse llama's fused decode ELFs (bit-for-bit inheritance — the verdict made in `phase-2-single-block-validation` Step 1). **Decode specifics handled by the skill**: multiple GEMV K values co-link in one ELF via per-slice `extern_syms` (2-K for llama: `mv.o` K=2048 + `mv_k8192.o`; add a 3rd `.o` to the slice's `extern_syms` when `n_heads·head_dim ≠ emb_dim`), and K-split (`down_k_split`) for K > 8160 (`details/GEMV_bf16.md`). |
 | `opt-buffer-object-reuse` | always — biggest decode win | static weight BOs: weights allocated once, `bo.map()` zero-copy, `static_input_indices` skips re-write on every token. With 16+ layers × ~7 weights × 100 tokens, this is the dominant pre-optimization decode host cost. |
 | `opt-layout-alignment` | usually N/A | only if decode introduced a transpose Phase 4 didn't already fix. |
 

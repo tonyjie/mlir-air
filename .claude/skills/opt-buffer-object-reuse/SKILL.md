@@ -41,10 +41,10 @@ document and keep or revert.
 
 ## Knowledge base references
 
-- `programming_examples/llms/llama_kernel_builder/cache.py` —
+- `programming_examples/llms/shared/infra/cache.py` —
   `KernelCache.load_and_run`, the `static_input_indices` /
   `intermediate_indices` mechanics this skill drives.
-- `programming_examples/llms/llama32_1b/multi_launch_builder/*` — the worked
+- `programming_examples/llms/shared/builders/*` — the worked
   example of weight + intermediate BO slots passed to a fused ELF.
 - `programming_examples/llms/llama32_1b/llama32_1b_inference.py` —
   `prepare_runtime` / setup where per-layer BOs are allocated once.

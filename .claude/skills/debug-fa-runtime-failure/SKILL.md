@@ -22,7 +22,7 @@ documented remedy.
 - `programming_examples/flash_attention/kernel_fusion_based/attn_npu2.py`
   vs `.../attn_npu2_seqfirst.py` — the two Python builders (head-first
   vs seq-first); compile from the same C++ kernel but different IR
-- `programming_examples/llms/llama_kernel_builder/external_kernels.py`
+- `programming_examples/llms/shared/infra/external_kernels.py`
   — the FA compile API that derives per-tile flags correctly (the
   `compile_attn_npu2*` helpers)
 
@@ -67,7 +67,7 @@ LQP_TILE := $(shell echo $$(($(LQP) / $(NUM_Q_TILES))))
 
 **Diagnostic**: diff your compile call against the Makefile. The FA
 compile helper in
-`llms/llama_kernel_builder/external_kernels.py` derives
+`llms/shared/infra/external_kernels.py` derives
 `lqp_tile = lqp // num_q_tiles` internally and emits the right per-tile
 flags.
 

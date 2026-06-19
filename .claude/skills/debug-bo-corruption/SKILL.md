@@ -15,10 +15,10 @@ applying the corresponding remedy.
 
 ## Knowledge base references
 
-- `programming_examples/llms/llama_kernel_builder/cache.py`
+- `programming_examples/llms/shared/infra/cache.py`
   — `static_input_indices`, `intermediate_indices` mechanics (the
   `KernelCache` host-optimization knobs)
-- `programming_examples/llms/llama_kernel_builder/stitching.py`
+- `programming_examples/llms/shared/infra/stitching.py`
   — `_wrap_ir_in_launch` is the helper that wraps a bare herd in
   `air.launch + air.segment` (see hypothesis 4 below); also where
   `airrt.herd_load` vs `airrt.segment_load` semantics matter
@@ -93,8 +93,8 @@ region to the `aie.device` op. A bare herd without the segment wrapper
 gets silently dropped.
 
 **Remedy**: Wrap via `_wrap_ir_in_launch(mlir_text)` from
-`llms/llama_kernel_builder/stitching.py`. The fused multi-launch
-builders in `llama32_1b/multi_launch_builder/` use this wrapper around
+`llms/shared/infra/stitching.py`. The fused multi-launch
+builders in `shared/builders/` use this wrapper around
 every bare herd (e.g. the RMSNorm and Eltwise-Add `herd_x=8` builders,
 which emit bare herds) — mirror that pattern.
 

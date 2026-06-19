@@ -32,14 +32,14 @@ document and accept or revert.
 
 ## Knowledge base references
 
-- `programming_examples/llms/llama_kernel_builder/stitching.py` —
+- `programming_examples/llms/shared/infra/stitching.py` —
   the helpers this recipe uses (`_rename_all`, `_fix_launch_func_args`,
   `_wrap_ir_in_launch`, `_rename_all_with_externs`, `_rename_all_gemv`)
-- `programming_examples/llms/llama32_1b/multi_launch_builder/rms_gemms_rope_multi.py`
+- `programming_examples/llms/shared/builders/rms_gemms_rope_multi.py`
   — reference 6-launch prefill merge (RMSNorm + Q/K/V GEMM + RoPE Q/K)
-- `programming_examples/llms/llama32_1b/multi_launch_builder/o_ffn_multi.py`
+- `programming_examples/llms/shared/builders/o_ffn_multi.py`
   — reference 8-launch prefill merge (O + add + RMSNorm + Gate/Up + SwiGLU + Down + add)
-- `programming_examples/llms/llama32_1b/multi_launch_builder/o_gemv_ffn_multi.py`
+- `programming_examples/llms/shared/builders/o_gemv_ffn_multi.py`
   — decode merge with 2-K extern rename (the pattern to extend to 3-K
   when `n_heads*head_dim != emb_dim`)
 - `programming_examples/kernel_registry/supported_kernels.md`
@@ -72,27 +72,44 @@ typical decoder-only LLM:
 
 For decode, replace GEMM with GEMV throughout.
 
-### Step 3: Author the multi-launch builder
+### Step 3: Author the multi-launch builder (declarative via `stitch_elf`)
 
-For each group, create `<model>/multi_launch_builder/<group_name>_multi.py`
-that:
+Add the group's builder to `shared/builders/` (it's architecture-orthogonal —
+parameterized by shapes — so it belongs in the shared layer, not a per-model
+dir). Compose it declaratively with `stitch_elf`:
 
-1. Builds each sub-kernel's IR via `@module_builder`
-2. Imports stitching helpers: `from llama_kernel_builder.stitching import (_rename_all, _fix_launch_func_args, _wrap_ir_in_launch, ...)` (resolved against the shared `llms/llama_kernel_builder/` via sys.path)
-3. For each sub-kernel: extract its function body via `_extract_between_func_and_return(ir_text)`
-4. Rename SSA values with a per-kernel prefix via `_rename_all(body, prefix=...)` to avoid collisions across the merged module
-5. Remap function arguments to the merged module's args via `_fix_launch_func_args(body, prefix, arg_map)`
-6. Concatenate the renamed bodies into a single `func.func`. If any
-   sub-kernel emits a bare `air.herd` (RMSNorm `herd_x>1`, Eltwise
-   Add at `herd_x>1`), wrap each via `_wrap_ir_in_launch(...)` BEFORE
-   stitching — otherwise the lowering's `airrt-to-npu` pass drops the
-   bare herd
-7. For multi-K GEMV in one ELF (decode kernel-first): use
-   `_rename_all_with_externs` with per-launch extern allowlists to keep
-   different `mv_*.o` symbols distinct (extend the 2-K rename in
-   `o_gemv_ffn_multi.py` to 3-K when `n_heads*head_dim != emb_dim`)
+```python
+from shared.infra.stitching import stitch_elf, KernelSlice, FuncArg, alloc_gemm_scratch
+```
 
-The canonical reference is `rms_gemms_rope_multi.py` — copy from there.
+1. Build each sub-kernel's IR via its `@module_builder` (GEMM/GEMV/RMSNorm/
+   RoPE/SwiGLU/Add). If a sub-kernel emits a bare `air.herd` (RMSNorm
+   `herd_x>1`, Eltwise Add at `herd_x>1`), wrap it via `_wrap_ir_in_launch(...)`
+   BEFORE handing it to `stitch_elf` — otherwise the `airrt-to-npu` pass drops
+   the bare herd.
+2. Declare the combined func signature as a `list[FuncArg]` (`base_args`).
+3. Declare one `KernelSlice(ir, prefix, arg_map, ...)` per sub-kernel:
+   - `arg_map` = {launch-operand-idx: combined-func-arg-idx} — the data-flow
+     wiring (which combined arg feeds each launch operand).
+   - `extern_syms` = the external `.o` symbols this slice must keep un-renamed
+     (e.g. suffixed `mm_*.o` / `mv_*.o` entry points). The union across slices
+     is preserved automatically, so multiple GEMV K-values co-link with distinct
+     symbols — no manual per-launch allowlist threading.
+   - `arg_aliases` + `prelude` for subview-routed operands (see
+     `o_gemv_ffn_multi.py`: residual through an `arg6` row-0 subview).
+4. For fused-cast GEMMs, let `alloc_gemm_scratch(specs_in_order, base_arg_count)`
+   own the f32 C-scratch tail-arg numbering and thread the returned index into
+   each GEMM slice's `arg_map` — this makes the scratch-count transition correct
+   by construction (e.g. GQA 1 scratch → MHA 3), the bug class that helper kills.
+5. Call `stitch_elf(func_name, base_args, slices, scratch_args=..., prelude=...)`.
+   It extracts/renames/fixups each slice, hoists privates + channel decls, and
+   hard-errors on dangling args / out-of-range / arg_map–alias overlap (pass
+   intentional dead-ABI placeholders via `allow_unreferenced_args`).
+
+The canonical reference is `shared/builders/rms_gemms_rope_multi.py` (mixes
+fused-cast + drain GEMMs with registry-driven scratch). Reuse an existing shared
+builder directly when the shape contract matches; only author a new one when the
+block's launch sequence genuinely differs.
 
 ### Step 4: Compile via KernelCache
 
