@@ -89,6 +89,12 @@ This is **documentation, not executable code** — it records results produced b
 | 2048×3072×3072 | **7513** | — | — | 9.9e-3 / — | Llama-3.2-3B Q/O proj (square) | ✅ |
 | 2048×3072×8192 | **7601** | — | — | 9.9e-3 / — | Llama-3.2-3B Gate/Up proj | ✅ |
 | 2048×8192×3072 | **9092** | — | — | 9.7e-3 / — | Llama-3.2-3B Down proj | ✅ |
+| 256×960×960 | — | **1896** (n80/k320) | — | 9.5e-3 / — | SmolVLA Q/O proj (M=256 pad; emb=960) | ✅ |
+| 256×960×320 | — | **1228** (n80/k320) | — | 9.4e-3 / — | SmolVLA K/V proj | ✅ |
+| 256×960×2560 | — | **2838** (n128/k320) | — | 9.4e-3 / — | SmolVLA Gate/Up proj | ✅ |
+| 256×2560×960 | — | **3425** (n80/k320) | — | 9.4e-3 / — | SmolVLA Down proj | ✅ |
+
+> **SmolVLA rows — SmolLM2-360M backbone, emb=960, kv_dim=320, hidden=2560, seq padded 241→256.** All four projections are **small** (M·K·N < 4e9) so `auto`→**drain** (tile_m=32; M=256=32·8 fills exactly one 8-column herd row). emb=960 is not 512-aligned, so N=960/320 use **TILE_N=80** (4·80=320 | 960 and | 320) and N=2560 uses stock TILE_N=128 (4·128·5=2560); K=960/2560 use **tile_k_l2=320** (960/320=3, 2560/320=8). ⚠️ **K=960 with tile_k_l2=160 silently corrupts** (mean_rel_L1≈0.77, not a compile error) — tile_k_l2 ∈ {64,192,320,960} are clean; use 320. All four PASS drain high-precision at 9.4–9.5e-3 (`atol=1.5e-3` near-zero elements are the same harness edge as the Qwen Gate/Up rows, not a datapath failure). bf16-out chosen because the backbone projections feed further matmuls (mirrors every llama/qwen sibling's q/k/v/gate/up/down). GFLOPS are lower than the 2048-row shapes because M=256 is latency-bound, not a datapath difference.
 
 > **Qwen3-4B rows — emb=2560 (512-aligned, NOT 1024-aligned), q_dim=4096 decoupled (≠emb), kv_dim=1024, hidden=9728=512·19.** All proj N divisible by 4·TILE_N=512, so stock TILE_N=128 HERD_N=4 places. Q/K/V/O/Down PASS high-precision fused-cast directly (max_abs ≤ 1.22e-3, well within high-prec tolerance), K=2560/4096/9728 all use tile_k_l2=256. O proj is **decoupled** (K=q_dim=4096, N=emb=2560), the largest non-square O in the registry. **2048×2560×9728 (Gate/Up) ⚠️**: high-precision fused-cast FAILS at compile (`aie.dma_bd op Stride exceeds [1:1048576] range` on the f32-out B-tile DMA at N=9728 — same large-N class as Qwen2.5-3B's N=11008); the low-precision `direct` path (tile_k_l2=128, TILE_N=64) PASSES at max_abs 2.93e-3 — same Gate/Up low-prec tier-down as every Qwen sibling. Large-K Down (K=9728) does NOT trigger the bug (only large-N does). Qwen3-4B uses the qwen25_3b 5-ELF un-merge (o_res_norm / gate / up / HOST SwiGLU / down_add).
 
@@ -179,6 +185,7 @@ This is **documentation, not executable code** — it records results produced b
 | 2048×1536 | 8 | 570 µs | 22.1 GB/s | 4.3e-3 | Qwen2.5-1.5B prefill RMSNorm | ✅ |
 | 2048×2560 | 8 | 867 µs | 24.2 GB/s | 4.2e-3 | Qwen3-4B prefill RMSNorm | ✅ |
 | 2048×3072 | 8 | 1012 µs | **24.9 GB/s** | 4.2e-3 | Llama-3.2-3B prefill RMSNorm | ✅ |
+| 256×960 | 8 | 147 µs | 6.7 GB/s | 4.2e-3 | SmolVLA prefill RMSNorm (emb=960) | ✅ |
 
 > **Qwen3-0.6B QK-norm (2048×128)** is per-head RMSNorm over `head_dim=128` (Qwen3-specific q_norm/k_norm) — the same weighted-RMSNorm kernel with a small `N=128` reduction axis; verified PASS at 4.6e-3, confirming the kernel handles a 128-wide reduction. (Harness `eps = 1e-5`; Qwen3 `eps = 1e-6` — the difference is negligible vs the bf16 datapath error.)
 
@@ -231,6 +238,7 @@ Fused scaled-dot-product attention (online-softmax FlashAttention) with grouped-
 | 3145728 (2048×1536) | 8/1/2048 | 364 µs | 51.9 GB/s | 1.9e-3 | ✅ (Qwen2.5-1.5B residual, seq·emb) |
 | 5242880 (2048×2560) | 8/1/2048 | 516 µs | 61.0 GB/s | 1.9e-3 | ✅ (Qwen3-4B residual, seq·emb) |
 | 6291456 (2048×3072) | 8/1/2048 | 614 µs | 61.4 GB/s | 1.9e-3 | ✅ (Llama-3.2-3B residual, seq·emb) |
+| 245760 (256×960) | 8/1/1920 | 112 µs | 13.2 GB/s | 1.9e-3 | ✅ (SmolVLA residual, seq·emb; tile_n=2048 corrupts → use 1920) |
 
 > `mean_rel_L1 = 1.9e-3` is the lowest in the registry — `c=a+b` rounds each output once (matching `torch.add` bf16: f32 sum, single round, no accumulation), bit-identical across all configs and `N`. Best config `herd_x=8, herd_y=1` for every shape: the 3-DMA-per-tile shim-channel limit caps the herd at one 8-column row (**cannot fill 32 tiles** — `herd_y>1` fails to place), but within that `herd_x` scales near-linearly (9→57.7 GB/s as herd_x 1→8). Highest bandwidth in the registry (pure streaming). See [`details/EltwiseAdd_bf16.md`](details/EltwiseAdd_bf16.md).
 
@@ -252,6 +260,7 @@ Fused scaled-dot-product attention (online-softmax FlashAttention) with grouped-
 | 12582912 | 2048×6144 (seq·hidden) | 8/1/4096 | 3041 µs | 24.8 GB/s | 1.0e-2 | 0.125 | ✅ (Qwen3-1.7B SwiGLU) |
 | 19922944 | 2048×9728 (seq·hidden) | 8/1/4096 | 5077 µs | 23.5 GB/s | 1.0e-2 | 0.125 | ✅ (Qwen3-4B SwiGLU) |
 | 22544384 | 2048×11008 (seq·hidden) | 8/1/4096 | 5694 µs | 23.8 GB/s | 1.0e-2 | 0.188 | ✅ (Qwen2.5-3B SwiGLU) |
+| 655360 | 256×2560 (seq·hidden) | 8/1/4096 | 247 µs | 15.9 GB/s | 1.0e-2 | 0.125 | ✅ (SmolVLA SwiGLU) |
 
 > **Qwen2.5-1.5B SwiGLU**: `N = 18350080 = seq·hidden = 2048·8960` (intermediate size 8960), verified PASS at 1.0e-2 with the default best config.
 
@@ -281,6 +290,7 @@ Rotary Position Embedding applied to Q/K, **half-split** convention (HuggingFace
 | 49152×128 | 8/1 | 667 µs | **56.6 GB/s** | 2.8e-3 | Llama-3.2-3B prefill RoPE-Q (rows=n_heads·seq=24·2048) | ✅ |
 | 24576×128 | 8/1 | 380 µs | 49.7 GB/s | 2.8e-3 | Qwen2.5-1.5B prefill RoPE-Q (rows=n_heads·seq=12·2048) | ✅ |
 | 4096×128 | 8/1 | 149 µs | 21.1 GB/s | 2.8e-3 | Qwen2.5-1.5B + Qwen2.5-3B prefill RoPE-K (rows=n_kv_heads·seq=2·2048) | ✅ |
+| 256×64 | 8/1 | 80 µs | 1.2 GB/s | 2.8e-3 | SmolVLA RoPE-Q/K datapath (head_dim=64, seq 241→256; θ via host LUT) | ✅ |
 
 > **Qwen3-0.6B uses `head_dim = 128`** (vs llama's 64) — the two rows above are the first registry coverage of `head_dim = 128`; same half-split `rope_halfsplit.cc` kernel, verified PASS at 2.8e-3 (accuracy unchanged, set by the datapath not the head dim).
 

@@ -160,6 +160,10 @@ Shapes cover LLM weight-projection shapes (the four 2048-row entries) and a squa
 | 2048×896×896 | 32/128/32/32 | 2516 | 9.4e-3 | ✅ Qwen2.5-0.5B Q/O proj (N=896→TILE_N=32 HERD_N=4; HERD_N=1 fails at runtime) |
 | 2048×896×128 | 32/128/32/32 | 1890 | 9.4e-3 | ✅ Qwen2.5-0.5B K/V proj (thin N=128=4·32) |
 | 2048×1536×256 | 32/256/32/64 | 3770 | 9.3e-3 | ✅ Qwen2.5-1.5B K/V proj (thin N=256=4·64→TILE_N=64) |
+| 256×960×960 | 32/320/32/80 | 1896 | 9.5e-3 | ✅ SmolVLA Q/O proj (M=256→drain tile_m=32; emb=960→TILE_N=80 HERD_N=4; K=960 tile_k_l2=320) |
+| 256×960×320 | 32/320/32/80 | 1228 | 9.4e-3 | ✅ SmolVLA K/V proj (kv_dim=320=4·80; K=960 tile_k_l2=320) |
+| 256×960×2560 | 32/320/32/128 | 2838 | 9.4e-3 | ✅ SmolVLA Gate/Up proj (N=2560=4·128·5; K=960 tile_k_l2=320) |
+| 256×2560×960 | 32/320/32/80 | 3425 | 9.4e-3 | ✅ SmolVLA Down proj (K=2560 tile_k_l2=320; N=960→TILE_N=80) |
 
 ### low-precision (`--high-precision false`), direct-codegen bf16
 

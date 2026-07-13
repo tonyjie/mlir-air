@@ -948,6 +948,94 @@
       "best": {
         "high": "fused-cast"
       }
+    },
+    {
+      "M": 256,
+      "K": 960,
+      "N": 960,
+      "used_by": "SmolVLA Q/O proj (emb=960; drain tile_m=32, TILE_N=80, HERD_N=4; K=960 tile_k_l2=320)",
+      "methods": {
+        "drain": {
+          "tile": {
+            "tile_m": 32,
+            "tile_k_l2": 320,
+            "tile_k_l1": 32,
+            "tile_n": 80
+          },
+          "gflops": 1896,
+          "mean_rel_L1": 0.0095,
+          "tier": "high"
+        }
+      },
+      "best": {
+        "high": "drain"
+      }
+    },
+    {
+      "M": 256,
+      "K": 960,
+      "N": 320,
+      "used_by": "SmolVLA K/V proj (kv_dim=320=4\u00b780; K=960 tile_k_l2=320)",
+      "methods": {
+        "drain": {
+          "tile": {
+            "tile_m": 32,
+            "tile_k_l2": 320,
+            "tile_k_l1": 32,
+            "tile_n": 80
+          },
+          "gflops": 1228,
+          "mean_rel_L1": 0.0094,
+          "tier": "high"
+        }
+      },
+      "best": {
+        "high": "drain"
+      }
+    },
+    {
+      "M": 256,
+      "K": 960,
+      "N": 2560,
+      "used_by": "SmolVLA Gate/Up proj (N=2560=4\u00b7128\u00b75; K=960 tile_k_l2=320)",
+      "methods": {
+        "drain": {
+          "tile": {
+            "tile_m": 32,
+            "tile_k_l2": 320,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 2838,
+          "mean_rel_L1": 0.0094,
+          "tier": "high"
+        }
+      },
+      "best": {
+        "high": "drain"
+      }
+    },
+    {
+      "M": 256,
+      "K": 2560,
+      "N": 960,
+      "used_by": "SmolVLA Down proj (K=2560 tile_k_l2=320; N=960\u2192TILE_N=80)",
+      "methods": {
+        "drain": {
+          "tile": {
+            "tile_m": 32,
+            "tile_k_l2": 320,
+            "tile_k_l1": 32,
+            "tile_n": 80
+          },
+          "gflops": 3425,
+          "mean_rel_L1": 0.0094,
+          "tier": "high"
+        }
+      },
+      "best": {
+        "high": "drain"
+      }
     }
   ]
 }
