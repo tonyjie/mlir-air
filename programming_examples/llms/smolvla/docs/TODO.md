@@ -46,8 +46,11 @@ GEMMs, RoPE, O-proj, residual, SwiGLU FFN) runs on NPU via the fused
 ## NPU-attention GEMM shapes (not in the large-shape registry sweep)
 
 `256×64×256` (S=Q@Kᵀ) and `256×256×64` (O=P@V) are thin attention shapes absent
-from the registry's large-GEMM sweep. Validated directly on NPU by Pearson
-correlation vs FP32 (0.99995 each) in `validate_attn_gemms.py` — the phase-1
-"no-harness" lens (there is no per-shape harness with a tuned rtol/atol; the
-element-wise diffs are the expected bf16/BFP16 tier and these outputs feed
-softmax). Recorded as rows in `kernel_registry/details/GEMM_bf16_in_bf16_out.{md,json}`.
+from the registry's large-GEMM sweep. Validated directly on NPU in
+`validate_attn_gemms.py` by the SAME project-standard metric every other GEMM
+row uses: **mean_rel_L1 = mean|out−ref| / mean|ref| vs the FP32 reference**,
+gated at the bf16-out tier. Measured mean_rel_L1 = 9.57e-3 (QKᵀ) and 9.62e-3
+(P@V) — in line with the other drain rows (9.3-9.9e-3). Pearson correlation
+(0.99995) is reported as a secondary sanity metric only; it is NOT the gate
+(correlation is scale/shift-invariant and cannot catch a systematic scale/bias).
+Recorded as rows in `kernel_registry/details/GEMM_bf16_in_bf16_out.{md,json}`.

@@ -164,8 +164,8 @@ Shapes cover LLM weight-projection shapes (the four 2048-row entries) and a squa
 | 256×960×320 | 32/320/32/80 | 1228 | 9.4e-3 | ✅ SmolVLA K/V proj (kv_dim=320=4·80; K=960 tile_k_l2=320) |
 | 256×960×2560 | 32/320/32/128 | 2838 | 9.4e-3 | ✅ SmolVLA Gate/Up proj (N=2560=4·128·5; K=960 tile_k_l2=320) |
 | 256×2560×960 | 32/320/32/80 | 3425 | 9.4e-3 | ✅ SmolVLA Down proj (K=2560 tile_k_l2=320; N=960→TILE_N=80) |
-| 256×64×256 | 32/64/64/64 | — | corr 0.99995 | ✅ SmolVLA attention S=Q@Kᵀ (per q-head, K=head_dim=64). Thin-K shape not in the large-shape sweep; validated by Pearson correlation vs FP32 (no per-shape harness/rtol), the phase-1 no-harness lens. Element-wise diffs are the bf16/BFP16 tier; output feeds softmax. |
-| 256×256×64 | 32/64/64/16 | — | corr 0.99995 | ✅ SmolVLA attention O=P@V (per q-head, N=head_dim=64→TILE_N=16 HERD_N=4). Correlation-gated as above. |
+| 256×64×256 | 32/64/64/64 | — | 9.6e-3 | ✅ SmolVLA attention S=Q@Kᵀ (per q-head, K=head_dim=64). Thin-K shape not in the large-shape sweep. mean_rel_L1 vs FP32 = 9.57e-3 — bf16-out tier, matches the other drain rows (validate_attn_gemms.py); Pearson corr 0.99995 (secondary sanity metric). |
+| 256×256×64 | 32/64/64/16 | — | 9.6e-3 | ✅ SmolVLA attention O=P@V (per q-head, N=head_dim=64→TILE_N=16 HERD_N=4). mean_rel_L1 vs FP32 = 9.62e-3; corr 0.99995. |
 
 ### low-precision (`--high-precision false`), direct-codegen bf16
 

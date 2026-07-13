@@ -1051,7 +1051,7 @@
             "tile_n": 64
           },
           "gflops": null,
-          "mean_rel_L1": null,
+          "mean_rel_L1": 0.0095708,
           "correlation": 0.999952,
           "tier": "high"
         }
@@ -1071,7 +1071,7 @@
             "tile_n": 16
           },
           "gflops": null,
-          "mean_rel_L1": null,
+          "mean_rel_L1": 0.0096173,
           "correlation": 0.999953,
           "tier": "high"
         }
