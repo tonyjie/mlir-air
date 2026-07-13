@@ -52,6 +52,18 @@ WORKTREE_PYTHON = os.environ.get(
 DEFAULT_PROMPT = "pick up the cube"
 
 
+def normalized_mse(chunk, ref) -> float:
+    """MSE relative to the baseline action's own power: mean((chunk-ref)**2) /
+    mean(ref**2). Magnitude-invariant, so the gate does not depend on the
+    absolute scale of a particular prompt's action chunk (a raw MSE_MAX would
+    silently drift PASS/FAIL as action magnitude changes). Single source of
+    truth shared by test_e2e.py and verify_adapter.py."""
+    chunk = np.asarray(chunk, np.float32)
+    ref = np.asarray(ref, np.float32)
+    power = float(np.mean(ref**2))
+    return float(np.mean((chunk - ref) ** 2) / max(power, 1e-12))
+
+
 def build_config():
     """Minimal config dict for the verify adapter / reporting."""
     return {

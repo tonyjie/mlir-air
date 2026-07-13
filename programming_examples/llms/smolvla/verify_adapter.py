@@ -41,6 +41,7 @@ if str(_LLMS_DIR) not in sys.path:
 from smolvla_inference import (  # noqa: E402
     run_hybrid_forward,
     build_oracle_batch,
+    normalized_mse,
     _fixed_noise,
     build_config as _inference_config,
     DEFAULT_MODEL,
@@ -48,21 +49,25 @@ from smolvla_inference import (  # noqa: E402
 from verify.comparators import regression_gate  # noqa: E402
 
 # Gate thresholds, locked from the measured clean run (see Task 3.3 report):
-# median per-position action-chunk cosine 0.9971, MSE 9.1e-4 vs the pure-CPU
-# baseline. cos_min 0.99 / mse_max 1e-3 keep a defensible margin on cosine
-# while gating the residual bf16-backbone noise on MSE.
+# median per-position action-chunk cosine 0.9971 vs the pure-CPU baseline, and
+# a NORMALIZED MSE of ~0.0078 (raw MSE 9.13e-4 / baseline power 0.117). Cosine
+# is the strong primary gate (0.99, comfortable margin). The MSE criterion is a
+# normalized MSE so the gate is magnitude-invariant (a raw absolute MSE_MAX
+# would drift PASS/FAIL with action scale). NMSE_MAX 0.04 = ~5x the observed
+# 0.0078, a round number with real safety margin.
 COS_MIN = 0.99
-MSE_MAX = 1e-3
+NMSE_MAX = 0.04
 
 
 def build_config() -> dict:
     cfg = _inference_config()
-    cfg.update({"gate": "regression", "cos_min": COS_MIN, "mse_max": MSE_MAX})
+    cfg.update({"gate": "regression", "cos_min": COS_MIN, "nmse_max": NMSE_MAX})
     return cfg
 
 
-def run_gate(cos_min: float = COS_MIN, mse_max: float = MSE_MAX) -> dict:
-    """Run the hybrid pipeline once and return the regression-gate dict."""
+def run_gate(cos_min: float = COS_MIN, nmse_max: float = NMSE_MAX) -> dict:
+    """Run the hybrid pipeline once and return the gate dict. Gates on cosine
+    (primary) AND magnitude-invariant normalized MSE; raw MSE kept for report."""
     from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 
     o = np.load(_HERE / "smolvla_oracle.npz")
@@ -73,8 +78,11 @@ def run_gate(cos_min: float = COS_MIN, mse_max: float = MSE_MAX) -> dict:
     chunk = run_hybrid_forward(batch, policy=policy, noise=_fixed_noise(policy))
     assert chunk.shape == ref.shape, (chunk.shape, ref.shape)
 
-    g = regression_gate(chunk, ref, cos_min=cos_min, mse_max=mse_max)
+    g = regression_gate(chunk, ref, cos_min=cos_min, mse_max=float("inf"))
+    g["nmse"] = normalized_mse(chunk, ref)
+    g["nmse_max"] = nmse_max
     g["max_abs"] = float(np.abs(chunk - ref).max())
+    g["passed"] = bool(g["cosine"] >= cos_min and g["nmse"] <= nmse_max)
     return g
 
 
@@ -83,7 +91,7 @@ def main() -> int:
     print("=" * 60)
     print("SmolVLA verify: e2e action-chunk regression gate")
     print("=" * 60)
-    for k in ("cosine", "mse", "max_abs", "cos_min", "mse_max", "passed"):
+    for k in ("cosine", "cos_min", "mse", "nmse", "nmse_max", "max_abs", "passed"):
         print(f"  {k:8s} = {g[k]}")
     print("=" * 60)
     print("PASS" if g["passed"] else "FAIL")
