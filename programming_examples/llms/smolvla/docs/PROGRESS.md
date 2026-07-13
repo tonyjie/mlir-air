@@ -3,6 +3,13 @@
 Target: lerobot/smolvla_base 16-layer SmolLM2-360M backbone on NPU2.
 Spec: docs/superpowers/specs/2026-07-13-smolvla-backbone-npu-port-design.md
 
+## Milestone A1: COMPLETE
+
+All phases below are done; `make verify` PASSes end-to-end on real NPU2
+hardware (see Task 3.3/3.4). See `README.md` for how to run and
+`ARCHITECTURE.md` for the technical design. A2 (action expert) and A3
+(vision encoder) are future work, not started.
+
 ## Phase status
 - [x] Phase 0: CPU reference + oracle hooks
 - [x] Phase 1: kernel validation (7 existing shapes + non-causal attn)
@@ -18,8 +25,25 @@ action chunk. Execution model = BRIDGED (the two venvs are disjoint).
 - Step-1 exported K/V vs CPU cache (`make export-kv`): K cos min 0.998 / mean
   0.999; V cos min 0.995 / mean 0.998; position_ids match lerobot exactly.
 - E2E action-chunk gate (`make verify`): median per-position cosine **0.9971**,
-  MSE **9.13e-4**, max_abs 0.054 -> **PASS** at cos_min=0.99, mse_max=1e-3.
-  Deterministic (fixed zero noise).
+  raw MSE **9.13e-4**, normalized MSE **0.0078**, max_abs **0.054** -> **PASS**
+  at cos_min=0.99, nmse_max=0.04 (`verify_adapter.py`'s `regression_gate`;
+  nmse is magnitude-invariant, NOT a raw MSE threshold). Deterministic (fixed
+  zero noise). Re-confirmed live on real NPU2 hardware for Task 3.4.
+
+## Task 3.4 — finalize (DONE)
+`README.md` + `ARCHITECTURE.md` written; Makefile confirmed coherent
+(help/oracle/export-kv/run/verify/diagnosis/clean — no changes needed, a
+SmolVLA VLA has no autoregressive `chat`/`profile`-over-tokens analog).
+`make verify` re-run end-to-end on real NPU2 hardware, confirmed PASS with the
+numbers above. A1 milestone complete.
+
+Gotcha found + documented (README/ARCHITECTURE): this Makefile's targets
+already self-lock (`$(NPU_LOCK)` inside each recipe), unlike some sibling
+Makefiles that expect the caller to wrap `make run` in an external `flock`.
+Wrapping `make verify` in an *additional* outer `flock
+/tmp/mlir-air-npu.lock` self-deadlocks (nested flock on the same path from a
+parent/child process pair) and times out after 30 min as `make: ***
+[Makefile:54: verify] Error 1` — run `make verify` directly, no outer flock.
 
 ## Tested (kernel, shape) — filled in Phase 1
 
