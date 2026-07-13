@@ -51,7 +51,7 @@ reading the loaded model config — NOT from paper prose.
 | num_key_value_heads | **5** (GQA group = 3) |
 | head_dim | **64** (< 128 → no FA-hang risk) |
 | layers used | **16** (first half of 32; `text_model.layers[:16]`) |
-| rope_theta | **100000** (`rope_type=default`, `rope_interleaved=False` → half-split) |
+| rope_base | **10000** (⚠️ HF config reports `rope_theta=100000`, but `apply_rope()` at `smolvlm_with_expert.py:28` defaults `max_wavelength=10_000` and no call site overrides it — runtime uses **10000**. Verified via Phase-0 cosine gate. `rope_interleaved=False` → half-split) |
 | rms_norm_eps | 1e-5 |
 | input RMSNorm | done in **fp32** (reduction), matching registry RMSNorm-fp32 |
 
@@ -70,7 +70,7 @@ reading the loaded model config — NOT from paper prose.
 | input RMSNorm | (241,960) fp32 |
 | q_proj (GEMM) | (241,960) → (241,960) |
 | k/v_proj (GEMM) | (241,960) → (241,320) |
-| RoPE | head_dim=64, θ=100000, half-split |
+| RoPE | head_dim=64, θ=**10000**, half-split |
 | **attention QKᵀ** | (15, 241, 241) — **non-causal (prefix-bidirectional mask)** |
 | o_proj (GEMM) | (241,960) → (241,960) |
 | residual add | (241,960) |
@@ -113,7 +113,7 @@ kernels at new shapes (Phase-1 re-validation work).
 | input/post RMSNorm | RMSNorm BF16 (fp32 reduce) | 241×960 | ⚠️ new shape |
 | q_proj | GEMM bf16 | 241×960×960 | ⚠️ new shape |
 | k/v_proj | GEMM bf16 | 241×960×320 | ⚠️ new shape (GQA narrow) |
-| RoPE | RoPE BF16 half-split | head_dim=64, θ=100000 | ⚠️ new shape |
+| RoPE | RoPE BF16 half-split | head_dim=64, θ=10000 | ⚠️ new shape |
 | **non-causal attention** | — (FA is causal-pinned) | 241×241 bidirectional | ❌ **NEW KERNEL** |
 | o_proj | GEMM bf16 | 241×960×960 | ⚠️ new shape |
 | residual add | Element-wise Add BF16 | 241×960 | ⚠️ new shape |
