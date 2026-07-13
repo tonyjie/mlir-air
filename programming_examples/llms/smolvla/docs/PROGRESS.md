@@ -4,10 +4,22 @@ Target: lerobot/smolvla_base 16-layer SmolLM2-360M backbone on NPU2.
 Spec: docs/superpowers/specs/2026-07-13-smolvla-backbone-npu-port-design.md
 
 ## Phase status
-- [ ] Phase 0: CPU reference + oracle hooks
-- [ ] Phase 1: kernel validation (7 existing shapes + non-causal attn)
-- [ ] Phase 2: single-block validation
-- [ ] Phase 3: full-backbone + end-to-end action-chunk gate
+- [x] Phase 0: CPU reference + oracle hooks
+- [x] Phase 1: kernel validation (7 existing shapes + non-causal attn)
+- [x] Phase 2: single-block validation
+- [x] Phase 3: full-backbone + end-to-end action-chunk gate
+
+## Task 3.3 — end-to-end hybrid inference (DONE)
+Hybrid pipeline: CPU vision+prefix (lerobot venv) -> NPU 16-layer backbone
+prefill (worktree python, subprocess bridge) -> inject per-layer post-RoPE K/V
+into the CPU expert past_key_values -> unchanged 10-step denoise -> (1,50,6)
+action chunk. Execution model = BRIDGED (the two venvs are disjoint).
+
+- Step-1 exported K/V vs CPU cache (`make export-kv`): K cos min 0.998 / mean
+  0.999; V cos min 0.995 / mean 0.998; position_ids match lerobot exactly.
+- E2E action-chunk gate (`make verify`): median per-position cosine **0.9971**,
+  MSE **9.13e-4**, max_abs 0.054 -> **PASS** at cos_min=0.99, mse_max=1e-3.
+  Deterministic (fixed zero noise).
 
 ## Tested (kernel, shape) — filled in Phase 1
 
