@@ -38,7 +38,11 @@ if _LLMS_DIR not in sys.path:
     sys.path.insert(0, _LLMS_DIR)
 
 from smolvla_backbone_weights import SmolVLABackboneConfig
-from smolvla_cpu_helpers import noncausal_attention_reference, _rope_half_split
+from smolvla_cpu_helpers import (
+    noncausal_attention_reference,
+    _rope_half_split,
+    rms_norm,
+)
 from shared.infra.cache import KernelCache, Profiler  # noqa: F401 (re-exported)
 from shared.infra.backend_presets import (  # noqa: F401 (re-exported for callers)
     SIMPLE_BACKEND,
@@ -404,3 +408,79 @@ def run_transformer_block(
     intermediates["ffn_out"] = output_bf16
 
     return output_bf16, intermediates
+
+
+# ---------------------------------------------------------------------------
+# Full 16-layer backbone execution
+# ---------------------------------------------------------------------------
+
+
+def run_backbone_prefill(
+    prefix_embed_bf16,
+    weights,
+    config,
+    cache,
+    mask,
+    positions,
+    rope_lut,
+    cpu_attn=True,
+    verbose=False,
+):
+    """Run the full N-layer SmolVLA backbone prefill on NPU.
+
+    Loops every transformer layer (feeding each layer's output as the next
+    layer's input), collects per-layer outputs for cosine diagnosis, then
+    applies the final RMSNorm (weights.final_norm). The oracle's
+    `final_norm_hidden` is `text_model.norm` applied to the layer-15 output, so
+    the final norm here matches that exactly.
+
+    The final RMSNorm runs on CPU (F32) -- the same choice every llama/qwen
+    sibling makes (llama32_1b_inference.py:453, verify_adapter.py:219): it is a
+    single (seq, emb) RMSNorm on the last hidden state, not inside the per-layer
+    hot loop, so it adds no per-token NPU work and reuses the exact F32 reference
+    math the oracle was generated with. This is a deliberate, sibling-consistent
+    CPU op (not a fallback from a broken NPU path); logged in docs/TODO.md under
+    "NPU-execution exceptions".
+
+    Args:
+        prefix_embed_bf16: (seq_len, emb_dim) bfloat16 padded prefix embedding.
+        weights: backbone weights (weights.layers is the per-layer list,
+            weights.final_norm is the final RMSNorm weight).
+        config: SmolVLABackboneConfig.
+        cache: KernelCache with kernels pre-compiled (compile_all_kernels).
+        mask: (seq_len, seq_len) additive F32 prefix/padding attention mask.
+        positions: (seq_len,) int RoPE positions (padding-frozen).
+        rope_lut: (seq_len, head_dim) bfloat16 RoPE LUT, gathered per token.
+        cpu_attn: forwarded to run_transformer_block.
+        verbose: per-layer progress printing.
+
+    Returns:
+        (final_hidden, per_layer_list):
+            final_hidden: (seq_len, emb_dim) F32 = RMSNorm(layer[-1] out).
+            per_layer_list: list of N (seq_len, emb_dim) bf16 per-layer outputs.
+    """
+    x = np.asarray(prefix_embed_bf16, dtype=bfloat16)
+    per_layer_list = []
+    n_layers = len(weights.layers)
+    for layer_idx, lw in enumerate(weights.layers):
+        if verbose:
+            print(f"\n--- Backbone layer {layer_idx}/{n_layers - 1} ---")
+        x, _inter = run_transformer_block(
+            x,
+            lw,
+            rope_lut,
+            config,
+            cache,
+            mask,
+            positions,
+            layer_idx=layer_idx,
+            cpu_attn=cpu_attn,
+            verbose=verbose,
+        )
+        per_layer_list.append(x)
+
+    # Final RMSNorm (text_model.norm) on the last hidden state -- CPU F32, same
+    # as every llama/qwen sibling (see docstring).
+    last_hidden_f32 = np.asarray(x, dtype=np.float32)
+    final_hidden = rms_norm(last_hidden_f32, weights.final_norm, config.rms_norm_eps)
+    return final_hidden, per_layer_list
