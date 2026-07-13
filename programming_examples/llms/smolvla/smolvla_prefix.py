@@ -112,8 +112,19 @@ def main():
         )
 
     with torch.no_grad():
+        # Downcast the residual input to the o_proj output dtype (bf16) before
+        # summing. The real model accumulates the residual IN-PLACE on a bf16
+        # tensor (`out_emb += hidden_states`), truncating to bf16 at that step.
+        # For layer 0, hidden_in[0] is the raw fp32 embedding (no bf16 layer has
+        # run yet), so an out-of-place Python `+` would trigger torch type
+        # promotion and upcast the whole sum to fp32 -- keeping precision the real
+        # inference never has (~5.36 max abs diff vs the true layer-0 output tapped
+        # at layer[1].input_layernorm; matters for the layer-0 gate). Forcing bf16
+        # here reproduces the in-place semantics; harmless for layers 1-15 (their
+        # hidden_in is already a captured bf16 tensor).
         layer_outputs = [
-            hidden_in[i] + o_proj_out[i] + mlp_out[i] for i in range(n_layers)
+            hidden_in[i].to(o_proj_out[i].dtype) + o_proj_out[i] + mlp_out[i]
+            for i in range(n_layers)
         ]
         final_norm_hidden = tm.norm(layer_outputs[-1])
 
