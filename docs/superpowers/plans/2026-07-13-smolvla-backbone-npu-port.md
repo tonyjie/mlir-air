@@ -439,29 +439,73 @@ git add programming_examples/kernel_registry/details/
 git commit -m "[kernel_registry] record SmolVLA backbone tested shapes (7 kernels @ seq=256)"
 ```
 
-### Task 1.2: Build the non-causal masked-attention kernel (add-kernel)
+### Task 1.2: Non-causal masked attention — compose GEMM + full-row masked softmax (approach B)
+
+**DECISION (2026-07-13, supersedes the original add-kernel plan):** The original plan
+was to fork the causal FlashAttention kernel. Scouting the FA kernel
+(`flash_attention/kernel_fusion_based/attn_npu2_seqfirst.py` + `attn_npu2.cc`)
+found: (1) causality is device-side, computed per-block from indices, with NO
+host-mask infrastructure; (2) softmax is ONLINE/flash (streamed per K-chunk), so
+an arbitrary mask must be applied per (q_block,kv_block) tile matching G's 8×8
+column-major layout — invasive and error-prone; (3) it needs a 3rd DMA stream
+(tight budget) and GQA 15/5 forces hpu=1 (half-array). Meanwhile seq=256 is tiny
+(QKᵀ=256×256≈128KB fp32, fits L2) so the flash online-softmax buys nothing.
+
+**Approach B — compose already-verified pieces, no new fused AIE kernel:**
+Attention per head = `S = Q@Kᵀ * (1/√64)` → `S += host_mask` → full-row softmax →
+`O = P@V`. The two matmuls are registry GEMM (same family as Task 1.1); the only
+new device piece is a **full-row masked softmax** (mask-agnostic: materialize the
+256-wide score row, add the host additive mask, softmax). This is forked from
+`programming_examples/softmax/` (which does a plain per-row softmax already), NOT
+from FlashAttention.
 
 **Files:**
-- Create: `programming_examples/kernel_registry/` new kernel dir (via add-kernel skill)
-- The kernel: small-matrix non-flash masked attention, 241²(pad 256), head_dim=64, GQA 15/5.
+- Create: `programming_examples/masked_softmax/` — fork of `programming_examples/softmax/` (`softmax.py`, `softmax.cc`, `Makefile`, an npu2 lit) adding a second L3 input (the additive mask) that is added to the row before the existing softmax.
+- Test: the fork's own harness compares against an FP32 masked-softmax reference.
 
-- [ ] **Step 1: Invoke the add-kernel skill/agent-team**
+- [ ] **Step 1: Fork the softmax example, add a mask input**
 
-Use the `add-kernel` skill to add "Masked Attention (BF16, non-causal, small-matrix)". Provide it this spec: per-head `S = Q@Kᵀ/√64` (GEMM 256×64×256), host-supplied additive mask added to S, device softmax (reuse the registry masked-softmax algorithm), `O = P@V` (GEMM 256×256×64). GQA: 15 q-heads reuse 5 kv-heads (group 3). The mask is a host input, not computed on-device.
+Copy `programming_examples/softmax/` → `programming_examples/masked_softmax/`. The
+existing kernel does per-row softmax over `n` (tile_n per core). Add a second L3
+memref `mask` of the same shape as the input; in the herd body, DMA the mask tile
+alongside the data tile and do `row = row + mask_tile` before calling the softmax
+routine (either add a `masked_softmax_bf16` variant in the `.cc`, or add elementwise
+in-MLIR before the existing `softmax_bf16` call). Keep the row-wise softmax
+numerics from the sibling (LUT-based exp). The additive mask uses 0 / large-negative
+(match `torch.finfo(bf16).min`, NOT -inf, to avoid NaN on fully-masked rows — the
+real model uses `torch.where(...finfo.min)`; a fully-masked row yields a uniform row).
 
-- [ ] **Step 2: Verify the kernel's standalone harness PASSES on NPU2**
+- [ ] **Step 2: Write the masked-softmax test (TDD)**
 
-Run: `flock -x -w 1800 /tmp/mlir-air-npu.lock make -C <new kernel dir> run`
-Expected: `PASS` vs an FP32 non-causal attention reference (use `noncausal_attention_reference` from Task 0.3 as the oracle, tolerance ~4e-2 matching the FA tier).
+The harness builds a random `(rows, 256)` score matrix + a random 0/finfo.min mask,
+runs the NPU kernel, and compares to an FP32 reference:
+`ref = softmax(scores + mask, axis=-1)` (with the finfo.min → uniform-row semantics).
+PASS at bf16 softmax tolerance (rtol 1.6e-2 / atol ~3e-2, matching the registry
+softmax/attention tier). Run:
+`flock -x -w 1800 /tmp/mlir-air-npu.lock make -C programming_examples/masked_softmax run`
+Expected: harness prints PASS.
 
-- [ ] **Step 3: Record tested shape + commit** (add-kernel handles registry docs; verify the row exists)
+- [ ] **Step 3: Assemble the attention path in the prefill module (deferred to Task 2.1)**
+
+The full per-head attention (GEMM QKᵀ → masked_softmax → GEMM PV, GQA 15/5 host-side
+head loop) is WIRED in Task 2.1's `smolvla_backbone_prefill.py`, reusing the
+registry GEMM (Task 1.1 shapes: 256×64×256 for QKᵀ needs a new 256×64×256 / 256×256×64
+GEMM shape — validate these two additional GEMM shapes here in Step 3 the same way
+Task 1.1 did, recording rows). GQA repeat is host-side (q-head h uses kv-head h//3).
+
+- [ ] **Step 4: Record tested shapes + commit**
+
+Record the masked_softmax (256-wide) and the two attention GEMM shapes
+(256×64×256, 256×256×64) as registry tested rows (masked_softmax gets its own
+detail page or a note; the GEMM shapes append to `GEMM_bf16_in_bf16_out.md`).
 
 ```bash
-git add programming_examples/kernel_registry/
-git commit -m "[kernel_registry] add non-causal masked attention (BF16, 256², GQA 15/5)"
+git add programming_examples/masked_softmax/ programming_examples/kernel_registry/ programming_examples/llms/smolvla/docs/PROGRESS.md
+git commit -m "[smolvla] non-causal attention via GEMM + masked softmax (approach B)"
 ```
 
-**Phase 1 gate:** all 8 kernels PASS at SmolVLA shapes on NPU2. Update `docs/PROGRESS.md`.
+**Phase 1 gate:** the 7 registry kernels (Task 1.1) + masked_softmax + the two
+attention GEMM shapes all PASS at SmolVLA shapes on NPU2. Update `docs/PROGRESS.md`.
 
 ---
 
