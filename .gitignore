@@ -1,10 +1,18 @@
-# Version-control .claude/skills/ (the shared LLM-deployment skills) while
-# keeping every other .claude/ entry (personal settings, worktrees, memory,
-# IDE config) local and untracked. `!.claude/` also guards against
-# environments that globally ignore .claude/ (e.g. a ~/.gitignore_global rule).
+# Version-control the shared workflow assets under .claude/ (skills, the
+# multi-agent workflow definitions, their command entry points, and the parity
+# checklists that define "done") while keeping every other .claude/ entry
+# (personal settings, worktrees, per-agent runtime memory, IDE config) local
+# and untracked. `!.claude/` also guards against environments that globally
+# ignore .claude/ (e.g. a ~/.gitignore_global rule).
+#
+# Tracked:   skills/, agents/, commands/, checklists/
+# Untracked: agent-memory/ (runtime state), settings*.json, worktrees/, everything else
 !.claude/
 .claude/*
 !.claude/skills/
+!.claude/agents/
+!.claude/commands/
+!.claude/checklists/
 
 # make artifacts
 CMakeFiles/
