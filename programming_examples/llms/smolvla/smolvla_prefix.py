@@ -93,12 +93,37 @@ def main():
             )
         )
 
+    # Capture prefix_pad_masks (bool[241]: True=real token, False=tokenizer
+    # padding). SmolVLA's language block is tokenized with padding="max_length"
+    # (48 slots) but "pick up the cube" is only ~4 real tokens -- the other ~44
+    # slots are padding that the real model excludes from attention entirely
+    # (make_att_2d_masks' pad_2d_masks term) and that freeze position_ids at
+    # the last real position (position_ids = cumsum(pad_masks) - 1). Both
+    # details are needed by cpu_backbone_forward to match this oracle, so we
+    # capture them by wrapping the bound method actually used on the
+    # select_action() code path (VLAFlowMatching.sample_actions calls
+    # self.embed_prefix(...) directly; no submodule hook point exists for it).
+    orig_embed_prefix = policy.model.embed_prefix
+    captured_pad_masks = {}
+
+    def _wrapped_embed_prefix(*args, **kwargs):
+        embs, pad_masks, att_masks = orig_embed_prefix(*args, **kwargs)
+        captured_pad_masks["prefix_pad_masks"] = pad_masks.detach().clone()
+        return embs, pad_masks, att_masks
+
+    policy.model.embed_prefix = _wrapped_embed_prefix
+
     batch = build_batch(policy)
     policy.reset()
     with torch.no_grad():
         action = policy.select_action(batch)
+    policy.model.embed_prefix = orig_embed_prefix
     for h in hooks:
         h.remove()
+
+    if "prefix_pad_masks" not in captured_pad_masks:
+        raise RuntimeError("Failed to capture prefix_pad_masks from embed_prefix")
+    prefix_pad_masks = captured_pad_masks["prefix_pad_masks"].bool().numpy()[0]
 
     missing = [
         i
@@ -138,10 +163,12 @@ def main():
         layer_hidden=layer_hidden,
         final_norm_hidden=final_norm_hidden_np,
         action=action.numpy(),
+        prefix_pad_masks=prefix_pad_masks,
     )
     print(
         f"[oracle] wrote {OUT}: prefix{prefix_embed.shape} "
-        f"layers{layer_hidden.shape} action{tuple(action.shape)}"
+        f"layers{layer_hidden.shape} action{tuple(action.shape)} "
+        f"pad_masks{prefix_pad_masks.shape} (real={int(prefix_pad_masks.sum())})"
     )
 
 

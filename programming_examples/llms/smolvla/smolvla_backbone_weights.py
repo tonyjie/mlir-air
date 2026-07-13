@@ -59,7 +59,16 @@ class SmolVLABackboneConfig:
     n_kv_heads: int = 5  # GQA: 15/5 = group of 3 Q heads per KV head
     hidden_dim: int = 2560
     vocab_size: int = 49280
-    rope_base: float = 100000.0
+    # NOTE: the text model's HF config reports rope_theta=100000, but SmolVLA's
+    # custom VLM+expert attention (smolvlm_with_expert.py apply_rope) calls
+    # apply_rope(query_states, position_ids_) WITHOUT passing rope_theta, so it
+    # silently falls back to apply_rope's own default max_wavelength=10_000.
+    # That means the *actual* prefix rope base at inference time is 10000, not
+    # the HF config's 100000. Verified empirically: using 100000 here degrades
+    # the Task-0.5 CPU-vs-oracle final-norm cosine to ~0.9995 (worst at the few
+    # real language/state tokens, whose larger RoPE positions amplify the
+    # angle error from the wrong base); using 10000 raises it to ~0.99996.
+    rope_base: float = 10000.0
     rms_norm_eps: float = 1e-5
     dtype: Any = bfloat16
 
