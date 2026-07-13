@@ -242,8 +242,8 @@ def _check_shape(name: str, arr: np.ndarray, expected: tuple) -> None:
 
 def load_backbone_weights(
     model_name_or_path: str,
-    config: Optional[SmolVLABackboneConfig] = None,
     dtype=bfloat16,
+    config: Optional[SmolVLABackboneConfig] = None,
 ) -> LlamaWeights:
     """Load the SmolVLA language-backbone weights from safetensors.
 
@@ -255,9 +255,9 @@ def load_backbone_weights(
     Args:
         model_name_or_path: Path to a local directory containing .safetensors
             files, or a HuggingFace model ID like "lerobot/smolvla_base".
+        dtype: Target numpy dtype for all weight arrays. Default is bfloat16.
         config: Optional SmolVLABackboneConfig. If None, uses the default
             SmolVLA backbone config.
-        dtype: Target numpy dtype for all weight arrays. Default is bfloat16.
 
     Returns:
         A LlamaWeights instance with all backbone weights loaded and
@@ -555,16 +555,25 @@ if __name__ == "__main__":
     print()
 
     # --- Task 0.2 Step 4 smoke-test assertions ---
+    # Expected shapes are derived from `config` (not magic literals) so they
+    # track any config change instead of silently drifting.
     errors = []
     if len(weights.layers) != config.n_layers:
         errors.append(f"expected {config.n_layers} layers, got {len(weights.layers)}")
     l0 = weights.layers[0]
-    if l0.wq.shape != (960, 960):
-        errors.append(f"wq.shape expected (960, 960), got {l0.wq.shape}")
-    if l0.wk.shape != (960, 320):
-        errors.append(f"wk.shape expected (960, 320), got {l0.wk.shape}")
-    if l0.w_gate.shape != (960, 2560):
-        errors.append(f"w_gate.shape expected (960, 2560), got {l0.w_gate.shape}")
+    exp_wq = (config.emb_dim, config.n_heads * config.head_dim)
+    exp_wk = (config.emb_dim, config.n_kv_heads * config.head_dim)
+    exp_wgate = (config.emb_dim, config.hidden_dim)
+    if l0.wq.shape != exp_wq:
+        errors.append(f"wq.shape expected {exp_wq}, got {l0.wq.shape}")
+    if l0.wk.shape != exp_wk:
+        errors.append(f"wk.shape expected {exp_wk}, got {l0.wk.shape}")
+    if l0.w_gate.shape != exp_wgate:
+        errors.append(f"w_gate.shape expected {exp_wgate}, got {l0.w_gate.shape}")
+    # SmolVLA-specific invariant: lm_head is untied (the checkpoint carries a
+    # dedicated lm_head.weight), unlike the tied-embedding SmolLM2 sibling.
+    if weights.lm_head is weights.embed_table:
+        errors.append("lm_head is tied to embed_table, expected untied lm_head")
 
     if errors:
         print("SMOKE TEST FAILED:")
@@ -574,6 +583,7 @@ if __name__ == "__main__":
 
     print(
         f"Smoke test OK: {config.n_layers} layers loaded; "
-        f"wq={l0.wq.shape}, wk={l0.wk.shape}, w_gate={l0.w_gate.shape}."
+        f"wq={l0.wq.shape}, wk={l0.wk.shape}, w_gate={l0.w_gate.shape}; "
+        f"lm_head untied."
     )
     print("All weights loaded successfully.")
