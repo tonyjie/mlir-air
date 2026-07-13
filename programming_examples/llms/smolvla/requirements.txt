@@ -1,0 +1,8 @@
+# SmolVLA backbone NPU2 port — mirrors sibling smollm2_1_7b deps.
+# The CPU oracle (lerobot) lives in ~/Projects/smolvla_playground/.venv and is
+# NOT installed here; this file covers the mlir-air-side verify deps only.
+transformers>=5.3.0
+numpy
+ml_dtypes
+safetensors
+huggingface_hub
