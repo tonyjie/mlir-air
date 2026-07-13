@@ -113,13 +113,65 @@ def main():
 
     policy.model.embed_prefix = _wrapped_embed_prefix
 
+    # Capture the real CPU KV cache + the actual prefix position_ids that the
+    # action expert consumes. sample_actions() calls vlm_with_expert.forward(
+    # ..., fill_kv_cache=True) once to build past_key_values, then runs the
+    # 10-step denoise loop reading it. We wrap vlm_with_expert.forward to grab
+    # the returned past_key_values on the fill call, and grab position_ids off
+    # the call kwargs (== cumsum(prefix_pad_masks)-1 from sample_actions). These
+    # are the ground truth the NPU-exported K/V must match (K post-RoPE, V raw;
+    # each entry (1, ORACLE_LEN, 5, 64) bf16).
+    vwe = policy.model.vlm_with_expert
+    orig_vwe_forward = vwe.forward
+    captured_kv = {}
+
+    def _wrapped_vwe_forward(*args, **kwargs):
+        out = orig_vwe_forward(*args, **kwargs)
+        if kwargs.get("fill_kv_cache", False):
+            pkv = out[1]
+            captured_kv["past_key_values"] = pkv
+            pos = kwargs.get("position_ids")
+            if pos is not None:
+                captured_kv["position_ids"] = pos.detach().clone()
+        return out
+
+    vwe.forward = _wrapped_vwe_forward
+
     batch = build_batch(policy)
     policy.reset()
     with torch.no_grad():
         action = policy.select_action(batch)
+        # Also capture the FULL 50-step action chunk with FIXED noise, so the
+        # end-to-end hybrid pipeline has a deterministic apples-to-apples
+        # baseline. select_action returns only the first of the 50 steps; the
+        # e2e gate compares the whole (1,50,6) chunk. Fixed noise removes the
+        # sampling stochasticity that would otherwise dominate the gate.
+        chunk_batch = build_batch(policy)
+        policy.reset()
+        bsize = 1
+        noise = torch.zeros(
+            (bsize, policy.config.chunk_size, policy.config.max_action_dim),
+            dtype=torch.float32,
+        )
+        action_chunk = policy.predict_action_chunk(chunk_batch, noise=noise)
     policy.model.embed_prefix = orig_embed_prefix
+    vwe.forward = orig_vwe_forward
     for h in hooks:
         h.remove()
+
+    if "past_key_values" not in captured_kv:
+        raise RuntimeError("Failed to capture past_key_values from vlm_with_expert")
+    pkv = captured_kv["past_key_values"]
+    cpu_k = np.stack(
+        [pkv[i]["key_states"].detach().float().numpy()[0] for i in range(n_layers)]
+    )  # (L, ORACLE_LEN, 5, 64)
+    cpu_v = np.stack(
+        [pkv[i]["value_states"].detach().float().numpy()[0] for i in range(n_layers)]
+    )
+    prefix_position_ids = (
+        captured_kv["position_ids"].detach().numpy()[0].astype(np.int64)
+    )
+    action_chunk_np = action_chunk.detach().float().numpy()
 
     if "prefix_pad_masks" not in captured_pad_masks:
         raise RuntimeError("Failed to capture prefix_pad_masks from embed_prefix")
@@ -164,11 +216,16 @@ def main():
         final_norm_hidden=final_norm_hidden_np,
         action=action.numpy(),
         prefix_pad_masks=prefix_pad_masks,
+        cpu_k=cpu_k,
+        cpu_v=cpu_v,
+        prefix_position_ids=prefix_position_ids,
+        action_chunk=action_chunk_np,
     )
     print(
         f"[oracle] wrote {OUT}: prefix{prefix_embed.shape} "
         f"layers{layer_hidden.shape} action{tuple(action.shape)} "
-        f"pad_masks{prefix_pad_masks.shape} (real={int(prefix_pad_masks.sum())})"
+        f"pad_masks{prefix_pad_masks.shape} (real={int(prefix_pad_masks.sum())}) "
+        f"cpu_k{cpu_k.shape} action_chunk{action_chunk_np.shape}"
     )
 
 

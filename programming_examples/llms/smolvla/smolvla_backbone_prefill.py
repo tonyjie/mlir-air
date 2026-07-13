@@ -628,6 +628,7 @@ def run_backbone_prefill(
     rope_lut,
     cpu_attn=True,
     verbose=False,
+    return_kv=False,
 ):
     """Run the full N-layer SmolVLA backbone prefill on NPU.
 
@@ -656,15 +657,33 @@ def run_backbone_prefill(
         rope_lut: (seq_len, head_dim) bfloat16 RoPE LUT, gathered per token.
         cpu_attn: forwarded to run_transformer_block.
         verbose: per-layer progress printing.
+        return_kv: if True, additionally return the per-layer post-RoPE K and
+            raw V (5 kv-heads) exactly as the SmolVLA action expert would cache
+            them during its prefill (`fill_kv_cache=True`). These come straight
+            from the fused RMS+QKV+RoPE ELF's outputs (k_roped, v) that
+            run_transformer_block already surfaces in its intermediates dict --
+            no recompute. Used by the end-to-end hybrid pipeline
+            (smolvla_inference.py) to inject the NPU KV into the CPU expert's
+            past_key_values.
 
     Returns:
-        (final_hidden, per_layer_list):
-            final_hidden: (seq_len, emb_dim) F32 = RMSNorm(layer[-1] out).
-            per_layer_list: list of N (seq_len, emb_dim) bf16 per-layer outputs.
+        If return_kv is False (default):
+            (final_hidden, per_layer_list):
+                final_hidden: (seq_len, emb_dim) F32 = RMSNorm(layer[-1] out).
+                per_layer_list: list of N (seq_len, emb_dim) bf16 per-layer outputs.
+        If return_kv is True:
+            (final_hidden, per_layer_list, kv_list) where kv_list is a list of
+            N (k_h, v_h) tuples, each (seq_len, n_kv_heads, head_dim) bf16.
+            k_h is POST-RoPE (the same quantity apply_rope produces before the
+            cache write); v_h is un-rotated.
     """
     x = np.asarray(prefix_embed_bf16, dtype=bfloat16)
     per_layer_list = []
+    kv_list = []
     n_layers = len(weights.layers)
+    n_kv_heads = config.n_kv_heads
+    head_dim = config.head_dim
+    seq_len = x.shape[0]
     for layer_idx, lw in enumerate(weights.layers):
         if verbose:
             print(f"\n--- Backbone layer {layer_idx}/{n_layers - 1} ---")
@@ -681,9 +700,22 @@ def run_backbone_prefill(
             verbose=verbose,
         )
         per_layer_list.append(x)
+        if return_kv:
+            # k_roped: (seq_len, n_kv_heads*head_dim) post-RoPE; v: (seq_len,
+            # n_kv_heads*head_dim) un-rotated. Reshape to per-head (L, Hkv, D)
+            # -- the (B,L,H,D) layout (minus batch) the expert cache expects.
+            k_h = np.asarray(_inter["k_roped"], dtype=bfloat16).reshape(
+                seq_len, n_kv_heads, head_dim
+            )
+            v_h = np.asarray(_inter["v"], dtype=bfloat16).reshape(
+                seq_len, n_kv_heads, head_dim
+            )
+            kv_list.append((k_h, v_h))
 
     # Final RMSNorm (text_model.norm) on the last hidden state -- CPU F32, same
     # as every llama/qwen sibling (see docstring).
     last_hidden_f32 = np.asarray(x, dtype=np.float32)
     final_hidden = rms_norm(last_hidden_f32, weights.final_norm, config.rms_norm_eps)
+    if return_kv:
+        return final_hidden, per_layer_list, kv_list
     return final_hidden, per_layer_list
