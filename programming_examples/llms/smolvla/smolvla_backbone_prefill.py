@@ -210,10 +210,7 @@ def compile_all_kernels(cache, config, seq_len, cpu_attn=True):
     cache.compile_and_cache("o_ffn", _o_ffn_mod, o_ffn_backend)
 
     if not cpu_attn:
-        raise NotImplementedError(
-            "Step B (NPU attention via masked_softmax + per-head GEMMs) is not "
-            "wired into compile_all_kernels yet -- use cpu_attn=True (Step A)."
-        )
+        _compile_npu_attention_kernels(cache, seq_len, head_dim, n_heads)
     else:
         print("  Skipping NPU-attention compilation (Step A: CPU attention fallback)")
 
@@ -225,6 +222,196 @@ def compile_all_kernels(cache, config, seq_len, cpu_attn=True):
     if cache.profiler.enabled:
         total = sum(cache.profiler.compile_times.values())
         print(f"Total compilation time: {total:.1f}s")
+
+
+def _attn_gemm_backend(instance_name="matmul_bf16"):
+    return {
+        "omit_while_true_loop": False,
+        "output_format": "elf",
+        "instance_name": instance_name,
+        "runtime_loop_tiling_sizes": [4, 4],
+    }
+
+
+def _masked_softmax_backend():
+    return {
+        "omit_while_true_loop": False,
+        "output_format": "elf",
+        "instance_name": "masked_softmax",
+        "runtime_loop_tiling_sizes": [4, 4],
+    }
+
+
+# Attention GEMM tile configs (validated on NPU in validate_attn_gemms.py;
+# recorded in kernel_registry GEMM_bf16_in_bf16_out for shapes 256x64x256 and
+# 256x256x64). Drain method (tile_m=32), bf16-in/bf16-out.
+_QKT_TILE_N = 64  # N=seq_len=256 -> tile_n=64, herd_n=4
+_QKT_TILE_K = None  # = head_dim, filled at compile time
+_PV_TILE_N = 16  # N=head_dim=64 -> tile_n=16, herd_n=4
+_PV_TILE_K = 64  # K=seq_len chunk; tile_k_l1=64 divides 256
+
+
+def _compile_npu_attention_kernels(cache, seq_len, head_dim, n_heads):
+    """Compile the NPU attention ELFs (Step B, cpu_attn=False):
+      - qkt : per-head S = Qh @ Khᵀ  (seq x head_dim x seq)
+      - pv  : per-head O = P @ Vh     (seq x seq x head_dim)
+      - masked_softmax : batched row-softmax over all heads' (seq x seq) scores.
+
+    Each GEMM is a standalone ELF that bakes mm.o (DIM_M/N/K) at compile time,
+    so the qkt (tile_n=64) and pv (tile_n=16) configs never collide -- each
+    compile_and_cache's prepare_air_project rebuilds mm.o fresh. masked_softmax.o
+    is compiled + staged into air_project/ for its ELF's link.
+    """
+    import shutil
+    from pathlib import Path as _Path
+    from shared.infra.external_kernels import compile_gemm_mm, compile_masked_softmax
+    from matrix_multiplication.bf16_in_bf16_out.run import (
+        build_module as _build_gemm,
+    )
+    from masked_softmax.masked_softmax import build_module as _build_masked_softmax
+
+    print("  Compiling NPU attention kernels (Step B: qkt + pv GEMMs + masked_softmax)")
+
+    # 1. QKᵀ GEMM: (seq, head_dim) @ (head_dim, seq) -> (seq, seq).
+    compile_gemm_mm(
+        tile_m=32,
+        tile_n=_QKT_TILE_N,
+        tile_k_l1=head_dim,
+        sym_suffix="",
+        out_name="mm.o",
+    )
+    qkt_mod = _build_gemm(
+        seq_len,
+        head_dim,
+        seq_len,
+        32,
+        head_dim,
+        head_dim,
+        _QKT_TILE_N,
+        8,
+        4,
+        bfloat16,
+        bfloat16,
+        arch="aie2p",
+        emit_external_call=True,
+    )
+    cache.compile_and_cache("qkt", qkt_mod, _attn_gemm_backend())
+
+    # 2. P@V GEMM: (seq, seq) @ (seq, head_dim) -> (seq, head_dim).
+    compile_gemm_mm(
+        tile_m=32,
+        tile_n=_PV_TILE_N,
+        tile_k_l1=_PV_TILE_K,
+        sym_suffix="",
+        out_name="mm.o",
+    )
+    pv_mod = _build_gemm(
+        seq_len,
+        seq_len,
+        head_dim,
+        32,
+        _PV_TILE_K,
+        _PV_TILE_K,
+        _PV_TILE_N,
+        8,
+        4,
+        bfloat16,
+        bfloat16,
+        arch="aie2p",
+        emit_external_call=True,
+    )
+    cache.compile_and_cache("pv", pv_mod, _attn_gemm_backend())
+
+    # 3. masked_softmax over ALL heads at once: n = n_heads * seq * seq, row
+    #    width tile_n = seq (softmax reduction axis).
+    compile_masked_softmax()
+    ms_n = n_heads * seq_len * seq_len
+    ms_mod = _build_masked_softmax(ms_n, seq_len, 4, bfloat16)
+    cache.compile_and_cache("masked_softmax", ms_mod, _masked_softmax_backend())
+    # prepare_air_project (inside compile_and_cache) now stages masked_softmax.o
+    # because compile_masked_softmax() ran first (existence-guarded copy).
+
+
+def _npu_attention(q_roped, k_roped, v, kernel_mask, config, cache, seq_len, layer_idx):
+    """Non-causal GQA attention on NPU (Step B). Per q-head:
+        S = (Qh * 1/sqrt(d)) @ Khᵀ    [qkt GEMM ELF]
+    then all heads' scores are row-softmaxed in ONE masked_softmax dispatch:
+        P = softmax(S + mask)          [masked_softmax ELF, batched over heads]
+    then per q-head:
+        O = P @ Vh                     [pv GEMM ELF]
+
+    The additive mask (0 / BF16_MIN) is head-independent; it is folded into the
+    score buffer on host before the batched softmax (the kernel's own mask input
+    is left zero). All matmuls + the softmax run on NPU; the host only does
+    layout glue (transpose Kh, gather per-head slices).
+
+    Returns attn_out (seq_len, n_heads*head_dim) bf16.
+    """
+    n_heads = config.n_heads
+    n_kv_heads = config.n_kv_heads
+    hd = config.head_dim
+    group = n_heads // n_kv_heads
+    scale = 1.0 / np.sqrt(hd)
+
+    q_h = np.asarray(q_roped, dtype=np.float32).reshape(seq_len, n_heads, hd)
+    k_h = np.asarray(k_roped, dtype=np.float32).reshape(seq_len, n_kv_heads, hd)
+    v_h = np.asarray(v, dtype=np.float32).reshape(seq_len, n_kv_heads, hd)
+
+    # --- Step 1: per-head QKᵀ GEMM -> scores (seq, seq) for every head. ---
+    scores = np.empty((n_heads, seq_len, seq_len), dtype=bfloat16)
+    for h in range(n_heads):
+        kv = h // group
+        Qh = (q_h[:, h, :] * scale).astype(bfloat16)
+        Kh_T = np.ascontiguousarray(k_h[:, kv, :].T).astype(bfloat16)  # (hd, seq)
+        s_out = np.zeros(seq_len * seq_len, dtype=bfloat16)
+        res = cache.load_and_run(
+            "qkt",
+            _attn_gemm_backend(),
+            Qh.reshape(-1),
+            Kh_T.reshape(-1),
+            s_out,
+            output_indices=[2],
+            bo_key="qkt",
+        )
+        scores[h] = res[2].reshape(seq_len, seq_len)
+
+    # --- Step 2: fold additive mask, batched row-softmax over all heads. ---
+    scores_f32 = scores.astype(np.float32) + kernel_mask[None, :, :]
+    ms_in = scores_f32.astype(bfloat16).reshape(-1)
+    ms_n = n_heads * seq_len * seq_len
+    zero_mask = np.zeros(ms_n, dtype=bfloat16)  # mask already folded in
+    ms_out = np.zeros(ms_n, dtype=bfloat16)
+    res = cache.load_and_run(
+        "masked_softmax",
+        _masked_softmax_backend(),
+        ms_in,
+        zero_mask,
+        ms_out,
+        output_indices=[2],
+        intermediate_indices={1},  # zero mask static-once
+        bo_key="ms",
+    )
+    probs = res[2].reshape(n_heads, seq_len, seq_len).astype(bfloat16)
+
+    # --- Step 3: per-head P@V GEMM -> per-head output. ---
+    attn_out = np.empty((seq_len, n_heads * hd), dtype=bfloat16)
+    for h in range(n_heads):
+        kv = h // group
+        Ph = np.ascontiguousarray(probs[h]).astype(bfloat16)  # (seq, seq)
+        Vh = np.ascontiguousarray(v_h[:, kv, :]).astype(bfloat16)  # (seq, hd)
+        o_out = np.zeros(seq_len * hd, dtype=bfloat16)
+        res = cache.load_and_run(
+            "pv",
+            _attn_gemm_backend(),
+            Ph.reshape(-1),
+            Vh.reshape(-1),
+            o_out,
+            output_indices=[2],
+            bo_key="pv",
+        )
+        attn_out[:, h * hd : (h + 1) * hd] = res[2].reshape(seq_len, hd)
+
+    return attn_out
 
 
 # ---------------------------------------------------------------------------
@@ -264,11 +451,6 @@ def run_transformer_block(
     Returns:
         (output_bf16, npu_intermediates_dict)
     """
-    if not cpu_attn:
-        raise NotImplementedError(
-            "Step B (NPU attention) is not wired into run_transformer_block yet."
-        )
-
     seq_len = x_bf16.shape[0]
     emb_dim = config.emb_dim
     n_heads = config.n_heads
@@ -332,21 +514,42 @@ def run_transformer_block(
     intermediates["k_roped"] = k_roped
     intermediates["q_roped"] = q_roped
 
-    # 7. Attention (Step A: CPU, non-causal, GQA, prefix-mask + padding-frozen
-    # positions). NOT llama32_1b's causal attention_reference -- this is the
-    # key SmolVLA divergence.
-    if verbose:
-        print(
-            f"    Step 7: Attention GQA [CPU non-causal] ({n_heads}Q/{n_kv_heads}KV heads)"
+    # 7. Attention (non-causal, GQA, prefix-mask + padding-frozen positions).
+    # NOT llama32_1b's causal attention_reference -- this is the key SmolVLA
+    # divergence. Two paths:
+    #   Step A (cpu_attn=True): noncausal_attention_reference on CPU.
+    #   Step B (cpu_attn=False): _npu_attention -- per-head QKᵀ/PV GEMMs on NPU +
+    #     a batched masked_softmax on NPU (all matmuls + softmax run on NPU;
+    #     host only does layout glue).
+    if cpu_attn:
+        if verbose:
+            print(
+                f"    Step 7: Attention GQA [CPU non-causal] "
+                f"({n_heads}Q/{n_kv_heads}KV heads)"
+            )
+        with cache.profiler.time_cpu("prefill_cpu_attention"):
+            q_h = q_roped.astype(np.float32).reshape(seq_len, n_heads, head_dim)
+            k_h = k_roped.astype(np.float32).reshape(seq_len, n_kv_heads, head_dim)
+            v_h = v.astype(np.float32).reshape(seq_len, n_kv_heads, head_dim)
+            attn_out_f32 = noncausal_attention_reference(
+                q_h, k_h, v_h, mask, n_heads, n_kv_heads
+            )
+            attn_out = attn_out_f32.reshape(seq_len, n_heads * head_dim).astype(
+                bfloat16
+            )
+    else:
+        if verbose:
+            print(
+                f"    Step 7: Attention GQA [NPU: qkt+softmax+pv] "
+                f"({n_heads}Q/{n_kv_heads}KV heads)"
+            )
+        # Convert the additive -inf mask to the kernel's 0 / BF16_MIN form.
+        from masked_softmax.masked_softmax import BF16_MIN
+
+        kernel_mask = np.where(np.isneginf(mask), BF16_MIN, 0.0).astype(np.float32)
+        attn_out = _npu_attention(
+            q_roped, k_roped, v, kernel_mask, config, cache, seq_len, layer_idx
         )
-    with cache.profiler.time_cpu("prefill_cpu_attention"):
-        q_h = q_roped.astype(np.float32).reshape(seq_len, n_heads, head_dim)
-        k_h = k_roped.astype(np.float32).reshape(seq_len, n_kv_heads, head_dim)
-        v_h = v.astype(np.float32).reshape(seq_len, n_kv_heads, head_dim)
-        attn_out_f32 = noncausal_attention_reference(
-            q_h, k_h, v_h, mask, n_heads, n_kv_heads
-        )
-        attn_out = attn_out_f32.reshape(seq_len, n_heads * head_dim).astype(bfloat16)
     intermediates["attn_out"] = attn_out
 
     # 8-15. O GEMM + Residual Add + FFN [8-launch multi-launch ELF]

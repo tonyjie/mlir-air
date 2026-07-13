@@ -57,6 +57,10 @@ def prepare_air_project(quant: str = "bf16"):
         "mm.o",
         "mm_m32.o",
         "mm_m64.o",
+        # masked_softmax.o: SmolVLA NPU attention (S=Q@Kᵀ→+mask→softmax→P@V).
+        # Only built by the SmolVLA backbone; existence-guarded copy below is a
+        # no-op for every other model (the .o simply won't exist in CWD).
+        "masked_softmax.o",
     ]
     if quant == "awq":
         obj_names.append("mv_int4_bf16.o")

@@ -123,6 +123,18 @@ def compile_silu_and_mul():
     _compile_kernel(src, "silu_and_mul.o", extra_flags=extra)
 
 
+def compile_masked_softmax():
+    """Compile masked_softmax.o from programming_examples/masked_softmax/masked_softmax.cc.
+
+    The masked full-row softmax micro-kernel used by SmolVLA's NPU attention path
+    (S = Q@Kᵀ → +mask → row-softmax → P@V). Only the SmolVLA backbone links it;
+    other models leave it unbuilt (the file simply won't exist, and
+    prepare_air_project's existence-guarded copy skips it).
+    """
+    src = _PROJ_ROOT / "masked_softmax" / "masked_softmax.cc"
+    _compile_kernel(src, "masked_softmax.o", extra_flags=["-DBIT_WIDTH=8"])
+
+
 def compile_gemm_mm(
     tile_m=64, tile_n=128, tile_k_l1=32, sym_suffix="", out_name="mm.o"
 ):
