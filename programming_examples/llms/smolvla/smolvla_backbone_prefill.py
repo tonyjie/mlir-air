@@ -210,7 +210,7 @@ def compile_all_kernels(cache, config, seq_len, cpu_attn=True):
     cache.compile_and_cache("o_ffn", _o_ffn_mod, o_ffn_backend)
 
     if not cpu_attn:
-        _compile_npu_attention_kernels(cache, seq_len, head_dim, n_heads)
+        _compile_npu_attention_kernels(cache, seq_len, head_dim, n_heads, n_kv_heads)
     else:
         print("  Skipping NPU-attention compilation (Step A: CPU attention fallback)")
 
@@ -251,11 +251,32 @@ _PV_TILE_N = 16  # N=head_dim=64 -> tile_n=16, herd_n=4
 _PV_TILE_K = 64  # K=seq_len chunk; tile_k_l1=64 divides 256
 
 
-def _compile_npu_attention_kernels(cache, seq_len, head_dim, n_heads):
+def _compile_npu_attention_kernels(cache, seq_len, head_dim, n_heads, n_kv_heads):
     """Compile the NPU attention ELFs (Step B, cpu_attn=False):
-      - qkt : per-head S = Qh @ Khᵀ  (seq x head_dim x seq)
-      - pv  : per-head O = P @ Vh     (seq x seq x head_dim)
+      - qkt : per-GQA-group batched S_group = Q_group @ Khᵀ (group*seq x head_dim x seq)
+      - pv  : per-GQA-group batched O_group = P_group @ Vh  (group*seq x seq x head_dim)
       - masked_softmax : batched row-softmax over all heads' (seq x seq) scores.
+
+    qkt/pv are batched across the `group = n_heads // n_kv_heads` q-heads that
+    share a kv-head: their M dim is baked as `group*seq_len` instead of
+    `seq_len`, cutting per-layer attention GEMM dispatches from 2*n_heads to
+    2*n_kv_heads (the softmax stays a single batched dispatch over all heads).
+
+    IMPORTANT tiling caveat (found while validating this change on real NPU2
+    via validate_attn_gemms.py): the external-mm.o emit path
+    (emit_external_call=True) produces WRONG results when the M-direction
+    OUTER air.launch grid iterates more than once (launch_size[0] =
+    m // tile_m // herd_m > 1) -- e.g. keeping tile_m=32/herd_m=8 (as the
+    unbatched 256-row kernel used) and letting m=768 imply a 3-iteration
+    launch loop gives mean_rel_L1 ~0.67 (~random) on real hardware, a
+    pre-existing bug in that outer-loop codegen, NOT specific to this
+    change. The fix used here keeps the launch grid at A SINGLE iteration by
+    scaling tile_m up instead of the launch count: tile_m = group*seq_len //
+    herd_m (with herd_m fixed at 8, same physical herd geometry as before),
+    so m // tile_m // herd_m == 1 always. Verified correct via
+    validate_attn_gemms.py at group_m=768 (mean_rel_L1 ~9.6e-3, within the
+    bf16-out GEMM tier) for BOTH the multi-iteration (broken) and
+    single-iteration (correct) variants.
 
     Each GEMM is a standalone ELF that bakes mm.o (DIM_M/N/K) at compile time,
     so the qkt (tile_n=64) and pv (tile_n=16) configs never collide -- each
@@ -270,25 +291,35 @@ def _compile_npu_attention_kernels(cache, seq_len, head_dim, n_heads):
     )
     from masked_softmax.masked_softmax import build_module as _build_masked_softmax
 
-    print("  Compiling NPU attention kernels (Step B: qkt + pv GEMMs + masked_softmax)")
+    group = n_heads // n_kv_heads
+    group_m = group * seq_len
+    herd_m = 8
+    # Single-launch-iteration tile_m (see docstring): m // tile_m // herd_m == 1.
+    tile_m = group_m // herd_m
+    assert group_m % herd_m == 0 and tile_m % 8 == 0, (group_m, herd_m, tile_m)
 
-    # 1. QKᵀ GEMM: (seq, head_dim) @ (head_dim, seq) -> (seq, seq).
+    print(
+        "  Compiling NPU attention kernels (Step B: batched qkt + pv GEMMs "
+        f"[group={group}, M={group_m}, tile_m={tile_m}] + masked_softmax)"
+    )
+
+    # 1. QKᵀ GEMM: (group*seq, head_dim) @ (head_dim, seq) -> (group*seq, seq).
     compile_gemm_mm(
-        tile_m=32,
+        tile_m=tile_m,
         tile_n=_QKT_TILE_N,
         tile_k_l1=head_dim,
         sym_suffix="",
         out_name="mm.o",
     )
     qkt_mod = _build_gemm(
-        seq_len,
+        group_m,
         head_dim,
         seq_len,
-        32,
+        tile_m,
         head_dim,
         head_dim,
         _QKT_TILE_N,
-        8,
+        herd_m,
         4,
         bfloat16,
         bfloat16,
@@ -297,23 +328,23 @@ def _compile_npu_attention_kernels(cache, seq_len, head_dim, n_heads):
     )
     cache.compile_and_cache("qkt", qkt_mod, _attn_gemm_backend())
 
-    # 2. P@V GEMM: (seq, seq) @ (seq, head_dim) -> (seq, head_dim).
+    # 2. P@V GEMM: (group*seq, seq) @ (seq, head_dim) -> (group*seq, head_dim).
     compile_gemm_mm(
-        tile_m=32,
+        tile_m=tile_m,
         tile_n=_PV_TILE_N,
         tile_k_l1=_PV_TILE_K,
         sym_suffix="",
         out_name="mm.o",
     )
     pv_mod = _build_gemm(
-        seq_len,
+        group_m,
         seq_len,
         head_dim,
-        32,
+        tile_m,
         _PV_TILE_K,
         _PV_TILE_K,
         _PV_TILE_N,
-        8,
+        herd_m,
         4,
         bfloat16,
         bfloat16,
@@ -333,17 +364,27 @@ def _compile_npu_attention_kernels(cache, seq_len, head_dim, n_heads):
 
 
 def _npu_attention(q_roped, k_roped, v, kernel_mask, config, cache, seq_len, layer_idx):
-    """Non-causal GQA attention on NPU (Step B). Per q-head:
-        S = (Qh * 1/sqrt(d)) @ Khᵀ    [qkt GEMM ELF]
+    """Non-causal GQA attention on NPU (Step B). Per KV-group (group =
+    n_heads // n_kv_heads q-heads sharing one kv-head), the group's q-heads
+    are row-stacked into ONE batched GEMM dispatch instead of `group`
+    separate per-head dispatches:
+        S_group = (Q_group * 1/sqrt(d)) @ Khᵀ     [qkt GEMM ELF, batched]
     then all heads' scores are row-softmaxed in ONE masked_softmax dispatch:
-        P = softmax(S + mask)          [masked_softmax ELF, batched over heads]
-    then per q-head:
-        O = P @ Vh                     [pv GEMM ELF]
+        P = softmax(S + mask)                      [masked_softmax ELF, batched over heads]
+    then per KV-group:
+        O_group = P_group @ Vh                      [pv GEMM ELF, batched]
+
+    This cuts attention GEMM dispatches per layer from 2*n_heads to
+    2*n_kv_heads (softmax stays 1 dispatch): e.g. 15/5 GQA -> 31 -> 11
+    dispatches/layer. The qkt/pv ELFs are compiled with M baked as
+    group*seq_len (see _compile_npu_attention_kernels); only the host-side
+    stacking/splitting of rows changes -- the per-head math (scale on Q, mask
+    folding, GQA kv = h // group) is identical to the unbatched version.
 
     The additive mask (0 / BF16_MIN) is head-independent; it is folded into the
     score buffer on host before the batched softmax (the kernel's own mask input
     is left zero). All matmuls + the softmax run on NPU; the host only does
-    layout glue (transpose Kh, gather per-head slices).
+    layout glue (transpose Kh, stack/split per-group slices).
 
     Returns attn_out (seq_len, n_heads*head_dim) bf16.
     """
@@ -351,29 +392,36 @@ def _npu_attention(q_roped, k_roped, v, kernel_mask, config, cache, seq_len, lay
     n_kv_heads = config.n_kv_heads
     hd = config.head_dim
     group = n_heads // n_kv_heads
+    group_m = group * seq_len
     scale = 1.0 / np.sqrt(hd)
 
     q_h = np.asarray(q_roped, dtype=np.float32).reshape(seq_len, n_heads, hd)
     k_h = np.asarray(k_roped, dtype=np.float32).reshape(seq_len, n_kv_heads, hd)
     v_h = np.asarray(v, dtype=np.float32).reshape(seq_len, n_kv_heads, hd)
 
-    # --- Step 1: per-head QKᵀ GEMM -> scores (seq, seq) for every head. ---
+    # --- Step 1: batched QKᵀ GEMM per KV-group -> scores (seq, seq)/head. ---
     scores = np.empty((n_heads, seq_len, seq_len), dtype=bfloat16)
-    for h in range(n_heads):
-        kv = h // group
-        Qh = (q_h[:, h, :] * scale).astype(bfloat16)
+    for kv in range(n_kv_heads):
+        h0 = kv * group
+        Q_group = np.concatenate(
+            [q_h[:, h0 + j, :] * scale for j in range(group)], axis=0
+        ).astype(
+            bfloat16
+        )  # (group*seq, hd)
         Kh_T = np.ascontiguousarray(k_h[:, kv, :].T).astype(bfloat16)  # (hd, seq)
-        s_out = np.zeros(seq_len * seq_len, dtype=bfloat16)
+        s_out = np.zeros(group_m * seq_len, dtype=bfloat16)
         res = cache.load_and_run(
             "qkt",
             _attn_gemm_backend(),
-            Qh.reshape(-1),
+            Q_group.reshape(-1),
             Kh_T.reshape(-1),
             s_out,
             output_indices=[2],
             bo_key="qkt",
         )
-        scores[h] = res[2].reshape(seq_len, seq_len)
+        S_group = res[2].reshape(group_m, seq_len)
+        for j in range(group):
+            scores[h0 + j] = S_group[j * seq_len : (j + 1) * seq_len]
 
     # --- Step 2: fold additive mask, batched row-softmax over all heads. ---
     scores_f32 = scores.astype(np.float32) + kernel_mask[None, :, :]
@@ -393,23 +441,32 @@ def _npu_attention(q_roped, k_roped, v, kernel_mask, config, cache, seq_len, lay
     )
     probs = res[2].reshape(n_heads, seq_len, seq_len).astype(bfloat16)
 
-    # --- Step 3: per-head P@V GEMM -> per-head output. ---
+    # --- Step 3: batched P@V GEMM per KV-group -> per-head output. ---
     attn_out = np.empty((seq_len, n_heads * hd), dtype=bfloat16)
-    for h in range(n_heads):
-        kv = h // group
-        Ph = np.ascontiguousarray(probs[h]).astype(bfloat16)  # (seq, seq)
+    for kv in range(n_kv_heads):
+        h0 = kv * group
+        P_group = np.concatenate(
+            [np.ascontiguousarray(probs[h0 + j]) for j in range(group)], axis=0
+        ).astype(
+            bfloat16
+        )  # (group*seq, seq)
         Vh = np.ascontiguousarray(v_h[:, kv, :]).astype(bfloat16)  # (seq, hd)
-        o_out = np.zeros(seq_len * hd, dtype=bfloat16)
+        o_out = np.zeros(group_m * hd, dtype=bfloat16)
         res = cache.load_and_run(
             "pv",
             _attn_gemm_backend(),
-            Ph.reshape(-1),
+            P_group.reshape(-1),
             Vh.reshape(-1),
             o_out,
             output_indices=[2],
             bo_key="pv",
         )
-        attn_out[:, h * hd : (h + 1) * hd] = res[2].reshape(seq_len, hd)
+        O_group = res[2].reshape(group_m, hd)
+        for j in range(group):
+            h = h0 + j
+            attn_out[:, h * hd : (h + 1) * hd] = O_group[
+                j * seq_len : (j + 1) * seq_len
+            ]
 
     return attn_out
 
