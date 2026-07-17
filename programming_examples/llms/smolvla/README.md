@@ -104,37 +104,61 @@ Two independent tracks, both required to call a phase done — see
 
 Both numbers are measured on real NPU2 hardware, not simulated.
 
-## Performance (measured, UNOPTIMIZED baseline)
+## Performance (measured)
 
-This port is **correctness-first**; the numbers below are a pre-optimization
-lower bound (`bench_backbone.py`, NPU2, median of 5, one-time kernel compile
-excluded):
+This port was **correctness-first**, then went through a Phase-4 optimization
+pass. Both states are measured on real NPU2 hardware with `bench_backbone.py`
+(median of 5, one-time kernel compile excluded):
 
-| stage | latency | notes |
+| stage | before opt (correctness-first) | after opt (Route 1 applied) |
 |---|---|---|
-| NPU backbone, 16 layers (`cpu_attn=False`) | **~400 ms** | full NPU attention path |
-| CPU backbone, 16 layers (numpy fp32) | **~344 ms** | same math, reference |
-| **ratio** | **NPU 1.16x slower** | apples-to-apples backbone only |
-| CPU full `select_action` (vision+backbone+expert+10-step denoise) | **~1083 ms** | backbone ~1/3 of it |
-| one-time NPU kernel compile | ~68 s | not per-inference |
+| NPU backbone, 16 layers (`cpu_attn=False`) | ~400 ms | **~226 ms** |
+| CPU backbone, 16 layers (numpy fp32) | ~344 ms | ~321–353 ms (run-to-run) |
+| ratio NPU/CPU | 1.16x (NPU slower) | **0.71x (NPU faster)** |
+| attention dispatches/layer | 31 (15 QKᵀ + 1 softmax + 15 PV) | 11 (5 QKᵀ + 1 softmax + 5 PV) |
+| total dispatches (16 layers) | ~528 | ~208 |
+| CPU full `select_action` (vision+backbone+expert+10-step denoise) | ~1083 ms | unchanged (backbone is ~1/3 of it) |
+| one-time NPU kernel compile | ~68 s | ~69 s (not per-inference) |
 
-**Why it is currently slower** (all known, documented optimization gaps, not
-architectural faults):
+### Route 1 — batch attention GEMMs per GQA group (APPLIED, commit `f404998e`)
 
-1. **Attention is unfused** — the per-head design issues ~31 XRT dispatches per
-   layer (15 QKᵀ + 1 masked-softmax + 15 PV) × 16 layers ≈ **~500 dispatches**,
-   each ~50–200 µs of pure launch overhead. This dominates the latency.
-2. No cross-call ELF reuse (recompiles each run).
-3. Two-process npz bridge (lerobot venv ↔ worktree python) — a harness cost, not
-   compute.
-4. bf16 NPU vs fp32 CPU-numpy — not the same numeric basis.
+The original per-head attention loop issued one QKᵀ and one PV dispatch per
+q-head (15 + 15 = 30) plus one masked-softmax = 31 XRT dispatches/layer. Each
+GQA group's 3 q-heads share a K/V head, so row-stacking a group's q-heads
+into a single batched qkt/pv GEMM cuts this to 5 kv-groups × 2 + 1 softmax =
+**11 dispatches/layer** (31→11, ~1.8x backbone speedup, 400ms→226ms). The
+NPU backbone is now **faster than the CPU-numpy reference** (0.71x, was
+1.16x). `make verify` is unaffected (cosine 0.9971 / nmse 0.0078 — the
+batching is math-equivalent, not an approximation) — PASS.
 
-**Optimization path (Phase 4/5, the shared opt skillset):**
-`opt-merge-multi-launch-kernels` to fuse the ~31 per-layer dispatches into a
-handful, `opt-buffer-object-reuse` to pre-load weight BOs, seq-first layout to
-drop host transposes. These are the same techniques already validated on the
-llama/qwen deployments. The current number reflects "correct but untuned," not
-the NPU ceiling.
+While validating this on real NPU2 hardware (`validate_attn_gemms.py`), we
+found a real mm.o codegen bug: the external-call GEMM path produces garbage
+when the M-direction outer `air.launch` loop iterates more than once. Worked
+around by scaling `tile_m` so the batched M (`group*seq_len` = 768) fits in a
+single launch iteration (`tile_m=96`, `herd_m=8`) instead of reusing the
+unbatched kernel's `tile_m=32` (which would imply a 3-iteration launch loop).
+This is a pre-existing codegen limitation, not specific to this change.
+
+### Route 2 — buffer-object reuse (already in place / N/A for attention)
+
+The non-attention fused ELFs (`rms_gemms_rope`, `o_ffn`) already use
+`static_input_indices` (per-layer weight + RoPE-LUT BOs pre-loaded once,
+keyed `bo_key=f"..._L{idx}"`) plus `intermediate_indices` — inherited from
+the sibling llama/qwen pattern — so `KernelCache` already skips host→device
+sync for those cached BO keys. The attention GEMMs (qkt/pv) have no static
+weights: their inputs (Q/K/V/probs) are per-layer activations that change
+every call, so there is nothing to pre-load — marking activations `static`
+would cause stale-data corruption. Route 2 is therefore "already applied
+where applicable; structurally not applicable to attention," not a
+skipped-out-of-laziness gap.
+
+**Remaining headroom (Route 3, not yet applied):** the ~208 total dispatches
+across 16 layers are still the main cost. The next step is fusing attention
+into the per-layer fused ELF (alongside `rms_gemms_rope`/`o_ffn`) via
+`opt-merge-multi-launch-kernels`, which would cut dispatches further below
+the current 11/layer for attention. Two-process npz bridge overhead
+(lerobot venv ↔ worktree python) and the bf16-NPU-vs-fp32-CPU numeric basis
+remain unchanged harness/precision factors, not optimization targets.
 
 Reproduce: `flock -x -w 1800 /tmp/mlir-air-npu.lock python bench_backbone.py --iters 5`
 

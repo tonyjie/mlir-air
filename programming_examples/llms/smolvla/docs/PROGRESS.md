@@ -73,3 +73,32 @@ Non-obvious findings (also recorded in the registry detail pages):
 - RoPE θ: harness hardcodes θ=500000 for its LUT; deployment uses θ=10000 via a
   host-provided LUT. The kernel only applies the rotation, so the 256×64 datapath
   test is valid regardless of θ.
+
+## Phase 4: prefill optimization
+
+Applied the shared opt skillset to the A1 backbone after the correctness-first
+port landed. Both routes evaluated on real NPU2 hardware; results measured
+with `bench_backbone.py` (median of 5, one-time compile excluded) and gated
+with `make verify`.
+
+| Route | Outcome | Result |
+|---|---|---|
+| Route 1 — batch attention GEMMs per GQA group | **APPLIED** (commit `f404998e`) | 31→11 dispatches/layer; NPU backbone 400ms→226ms (~1.8x); NPU/CPU ratio 1.16x→0.71x (NPU now faster than CPU-numpy); `make verify` unaffected (cosine 0.9971 / nmse 0.0078, PASS) |
+| Route 2 — buffer-object reuse | **already in place / N/A for attention** | `rms_gemms_rope` and `o_ffn` already use `static_input_indices` (per-layer weight+LUT BOs) + `intermediate_indices`, inherited from the llama/qwen pattern. Attention GEMMs (qkt/pv) take only per-layer activations (Q/K/V/probs) as input — no static weights exist to pre-load; marking activations `static` would corrupt across calls. Structural conclusion, not a skipped optimization. |
+| Route 3 — fuse attention into the per-layer fused ELF | **future work** | The ~208 total remaining dispatches (16 layers × 11 dispatches + per-layer `rms_gemms_rope`/`o_ffn`) are still the main latency cost. Folding attention's 11 dispatches/layer into the existing fused ELF (alongside `rms_gemms_rope`/`o_ffn`) via `opt-merge-multi-launch-kernels` is the next headroom. |
+
+Before/after backbone latency (16 layers, `cpu_attn=False`, NPU2):
+
+| stage | before opt | after opt |
+|---|---|---|
+| NPU backbone | ~400 ms | ~226 ms |
+| CPU backbone (numpy fp32) | ~344 ms | ~321-353 ms (run-to-run) |
+| ratio NPU/CPU | 1.16x (slower) | 0.71x (NPU faster) |
+
+Non-obvious finding from Route 1: the external-mm.o codegen path produces
+wrong results when the M-direction outer `air.launch` loop iterates more than
+once (found via `validate_attn_gemms.py`, mean_rel_L1 ~0.67 at M=768 with
+tile_m=32/herd_m=8 — a pre-existing bug, not specific to this change). Worked
+around by scaling `tile_m` (96) to keep the batched M=768 within a single
+launch iteration; verified correct (mean_rel_L1 ~9.6e-3, within the bf16-out
+GEMM tier).

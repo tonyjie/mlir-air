@@ -1,0 +1,562 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<title>SmolVLA — 模型架构说明 (Model Architecture Explainer)</title>
+<style>
+  :root {
+    --bg: #fafaf7; --fg: #1f2937; --muted: #6b7280; --accent: #2563eb;
+    --card-bg: #ffffff; --card-border: #e5e7eb;
+    --part-a: #fdf2f8; --part-b: #eff6ff; --part-c: #f0fdf4; --part-d: #f5f3ff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+    background: var(--bg); color: var(--fg); line-height: 1.7;
+    margin: 0; padding: 2rem;
+    max-width: 1200px; margin-left: auto; margin-right: auto;
+  }
+  h1 { font-size: 2rem; margin-bottom: 0.3rem; color: #111827; }
+  h2 { font-size: 1.5rem; margin-top: 3rem; padding-bottom: 0.4rem; border-bottom: 3px solid var(--accent); color: #111827; }
+  h2.part-header { font-size: 1.8rem; padding: 0.7rem 1rem; border-radius: 6px; border-bottom: none; margin-top: 4rem; }
+  h2.part-a { background: var(--part-a); border-left: 6px solid #be185d; }
+  h2.part-b { background: var(--part-b); border-left: 6px solid var(--accent); }
+  h2.part-c { background: var(--part-c); border-left: 6px solid #15803d; }
+  h2.part-d { background: var(--part-d); border-left: 6px solid #7c3aed; }
+  h3 { font-size: 1.2rem; margin-top: 2rem; color: #1f2937; }
+  h4 { font-size: 1rem; margin-top: 1.5rem; color: #374151; }
+  .subtitle { color: var(--muted); font-size: 1.05rem; margin-bottom: 2rem; }
+  .nav {
+    position: fixed; left: 0; top: 0; bottom: 0; width: 270px;
+    background: var(--card-bg); border-right: 1px solid var(--card-border);
+    padding: 1.2rem 1.2rem 1.2rem 1.4rem;
+    overflow-y: auto; z-index: 10;
+    box-shadow: 2px 0 6px rgba(0,0,0,0.04);
+  }
+  body { padding-left: 300px; }
+  .nav h4 { margin: 0 0 0.6rem; font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
+  .nav .nav-part {
+    display: block; margin: 1rem 0 0.3rem;
+    font-size: 0.72rem; font-weight: 700; color: var(--muted);
+    text-transform: uppercase; letter-spacing: 0.06em;
+  }
+  .nav .nav-part:first-of-type { margin-top: 0.3rem; }
+  .nav a {
+    display: block; color: var(--accent); text-decoration: none;
+    font-size: 0.85rem; line-height: 1.4;
+    padding: 0.3rem 0.5rem; border-radius: 4px;
+  }
+  .nav a:hover { background: #eef2ff; }
+  .nav-toggle {
+    position: absolute; top: 0.6rem; right: 0.6rem;
+    background: #f1f5f9; border: 1px solid var(--card-border);
+    border-radius: 4px; padding: 0.2rem 0.55rem;
+    font-size: 0.72rem; font-weight: 600; color: var(--muted);
+    cursor: pointer; line-height: 1.2;
+  }
+  .nav-toggle:hover { background: #e2e8f0; color: var(--fg); }
+  #nav-show {
+    display: none;
+    position: fixed; top: 0.6rem; left: 0.8rem; z-index: 11;
+    background: var(--card-bg); border: 1px solid var(--card-border);
+    border-radius: 999px; padding: 0.35rem 0.95rem;
+    font-size: 0.78rem; font-weight: 600; color: var(--accent);
+    cursor: pointer; box-shadow: 0 2px 6px rgba(0,0,0,0.08);
+  }
+  #nav-show:hover { background: #eef2ff; }
+  body.nav-hidden { padding-left: 2rem; }
+  body.nav-hidden .nav { display: none; }
+  body.nav-hidden #nav-show { display: inline-block; }
+  @media (max-width: 900px) {
+    body { padding-left: 2rem; }
+    .nav { box-shadow: 4px 0 12px rgba(0,0,0,0.12); }
+  }
+  .card {
+    background: var(--card-bg); border: 1px solid var(--card-border);
+    border-radius: 8px; padding: 1.2rem 1.5rem; margin: 1rem 0;
+  }
+  .row { display: flex; gap: 1rem; flex-wrap: wrap; }
+  .col { flex: 1; min-width: 280px; }
+  table { border-collapse: collapse; width: 100%; margin: 0.5rem 0; }
+  th, td { padding: 0.5rem 0.7rem; text-align: left; border-bottom: 1px solid var(--card-border); vertical-align: top; }
+  th { background: #f1f5f9; font-weight: 600; }
+  td.num { font-variant-numeric: tabular-nums; text-align: right; }
+  code {
+    background: #f1f5f9; padding: 0.1rem 0.4rem; border-radius: 3px;
+    font-size: 0.92em; font-family: ui-monospace, monospace; color: #0f172a;
+  }
+  pre {
+    background: #1e293b; color: #e2e8f0;
+    padding: 1rem 1.2rem; border-radius: 6px;
+    overflow-x: auto; font-size: 0.875rem; line-height: 1.5;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  }
+  .pill {
+    display: inline-block; padding: 0.15rem 0.6rem; border-radius: 999px;
+    font-size: 0.8rem; font-weight: 600;
+  }
+  .pill-vlm { background: #ede9fe; color: #5b21b6; }
+  .pill-expert { background: #ccfbf1; color: #0f766e; }
+  .pill-vision { background: #fef3c7; color: #92400e; }
+  .pill-shared { background: #f3f4f6; color: #374151; }
+  .highlight {
+    border-left: 4px solid var(--accent);
+    background: #eff6ff; padding: 1rem 1.2rem; margin: 1rem 0;
+    border-radius: 4px;
+  }
+  .highlight-warn {
+    border-left: 4px solid #f59e0b;
+    background: #fffbeb; padding: 1rem 1.2rem; margin: 1rem 0;
+    border-radius: 4px;
+  }
+  .highlight strong { color: #1e40af; }
+  .highlight-warn strong { color: #92400e; }
+  .small { font-size: 0.85rem; color: var(--muted); }
+  .kernel-bullet { background: white; border: 1px solid var(--card-border); border-radius: 6px; padding: 0.7rem 1rem; margin: 0.5rem 0; }
+  .kernel-bullet strong { color: var(--accent); }
+  .kernel-bullet ul { margin: 0.3rem 0; padding-left: 1.4rem; }
+  .kernel-bullet li { margin: 0.1rem 0; font-size: 0.92rem; }
+  .kernel-bullet code { font-size: 0.88em; }
+  .ramp-legend { display: flex; gap: 1.2rem; flex-wrap: wrap; margin: 0.5rem 0 1rem; font-size: 0.85rem; }
+  .ramp-legend > div { display: flex; align-items: center; gap: 0.4rem; }
+  .ramp-legend .swatch { width: 16px; height: 16px; border-radius: 3px; border: 2px solid; }
+  .ramp-vlm { background: #ede9fe; border-color: #8b5cf6; }
+  .ramp-vision { background: #fef3c7; border-color: #f59e0b; }
+  .ramp-expert { background: #ccfbf1; border-color: #0d9488; }
+  .ramp-gray { background: #f3f4f6; border-color: #6b7280; }
+  /* SVG model diagrams */
+  svg.model-svg { display: block; margin: 1.5rem auto; max-width: 720px; width: 100%; height: auto; background: #fafaf7; border: 1px solid var(--card-border); border-radius: 8px; padding: 0.5rem; }
+  svg.model-svg text.th { font: 600 14px -apple-system, system-ui, sans-serif; dominant-baseline: central; text-anchor: middle; fill: var(--fg); }
+  svg.model-svg text.ts { font: 12px ui-monospace, Menlo, monospace; dominant-baseline: central; text-anchor: middle; fill: var(--muted); }
+  svg.model-svg text.t-row3 { font: 11px ui-monospace, Menlo, monospace; dominant-baseline: central; text-anchor: middle; fill: var(--muted); font-style: italic; }
+  svg.model-svg text.edge-label { font: 11px ui-monospace, monospace; fill: var(--muted); dominant-baseline: central; }
+  svg.model-svg .arr { stroke: #374151; stroke-width: 2; fill: none; }
+  svg.model-svg .arr-side { stroke: #9ca3af; stroke-width: 1.5; stroke-dasharray: 5 4; fill: none; }
+  svg.model-svg .c-purple rect { fill: #ede9fe; stroke: #8b5cf6; stroke-width: 2; }
+  svg.model-svg .c-purple text.th { fill: #5b21b6; }
+  svg.model-svg .c-teal rect { fill: #ccfbf1; stroke: #0d9488; stroke-width: 2; }
+  svg.model-svg .c-teal text.th { fill: #0f766e; }
+  svg.model-svg .c-amber rect { fill: #fef3c7; stroke: #f59e0b; stroke-width: 2; }
+  svg.model-svg .c-amber text.th { fill: #92400e; }
+  svg.model-svg .c-gray rect { fill: #f3f4f6; stroke: #6b7280; stroke-width: 2; }
+  svg.model-svg .c-gray text.th { fill: #374151; }
+  footer {
+    margin-top: 3rem; padding-top: 1rem;
+    border-top: 1px solid var(--card-border);
+    font-size: 0.85rem; color: var(--muted);
+  }
+  footer a { color: var(--accent); }
+</style>
+</head>
+<body>
+
+<div class="nav" id="nav">
+  <button type="button" class="nav-toggle" id="nav-toggle" title="隐藏侧栏 (h)">隐藏 ←</button>
+  <div class="nav-body">
+    <h4>目录 Contents</h4>
+    <span class="nav-part">Part A — 模型总览</span>
+    <a href="#what">A1. SmolVLA 是什么</a>
+    <a href="#config">A2. 超参数与参数量</a>
+    <a href="#pipeline">A3. 端到端数据流</a>
+    <span class="nav-part">Part B — VLM Backbone</span>
+    <a href="#vision">B1. Vision encoder (SigLIP)</a>
+    <a href="#llm">B2. Language decoder (SmolLM2)</a>
+    <a href="#llm-block">B3. LM block 算子与 shape</a>
+    <span class="nav-part">Part C — Action Expert</span>
+    <a href="#expert">C1. Action expert 总体</a>
+    <a href="#interleave">C2. Self/Cross-attn 交替</a>
+    <a href="#flow">C3. Flow-matching 动作头</a>
+    <a href="#expert-block">C4. Expert block 算子与 shape</a>
+    <span class="nav-part">Part D — 参考</span>
+    <a href="#kernels">D1. 算子清单汇总</a>
+    <a href="#sources">D2. 来源与不确定项</a>
+  </div>
+</div>
+<div id="nav-show">显示目录 →</div>
+
+<h1>SmolVLA — 模型架构说明</h1>
+<p class="subtitle">A model-first walkthrough of HuggingFace LeRobot's <strong>SmolVLA</strong> (~450M Vision-Language-Action model). 本文档<strong>只讲模型本身</strong>：它由什么组成、每个子模块的算子 / shape / dtype / 参数量。<em>不涉及 NPU 实现</em>（本 repo 暂未部署 SmolVLA）。</p>
+
+<div class="card" style="background:#fef9e8;border-color:#f0c674">
+<strong>⚠️ 关于准确性 / On accuracy.</strong> 所有数值均来自官方源（arXiv 2506.01844、HuggingFace blog、<code>lerobot/smolvla_base/config.json</code>、<code>SmolVLM2-500M-Video-Instruct/config.json</code>、lerobot 源码）。少数无法从 config 直接读出的值（如 SigLIP 内部层数）已在 <a href="#sources">D2</a> 明确标为「推断」。<strong>常见误传修正</strong>：action expert 宽度是 <code>720</code>（= 0.75 × 960），不是某些三方文章写的 576——因为 backbone 文本维度是 960 而非 768。</div>
+
+<!-- ============================================================ -->
+<h2 class="part-header part-a">Part A — 模型总览 (Model Overview)</h2>
+
+<h2 id="what">A1. SmolVLA 是什么</h2>
+
+<div class="card">
+<p>SmolVLA 是一个 <strong>Vision-Language-Action (VLA)</strong> 机器人策略模型：输入是<strong>多路相机图像 + 一句自然语言指令 + 机器人本体状态 (proprioceptive state)</strong>，输出是<strong>一段连续动作序列 (action chunk)</strong>。它把一个预训练 VLM 当作「感知 + 语言理解」的大脑，再接一个轻量 <strong>action expert</strong> 把多模态特征翻译成电机指令。</p>
+
+<p>它由<strong>两大组件</strong>构成：</p>
+<ul>
+<li><span class="pill pill-vlm">VLM backbone</span> <strong>SmolVLM2-500M-Video-Instruct</strong> — 由 SigLIP vision encoder + SmolLM2 语言 decoder 组成。SmolVLA <strong>只用其语言 decoder 的前 16 层</strong>（共 32 层）。</li>
+<li><span class="pill pill-expert">Action expert</span> <strong>~100M</strong> 的小 transformer，用 <strong>flow-matching</strong> 目标训练，输出动作。它在部分层<strong>复用 VLM 的 KV</strong> 来读取多模态上下文。</li>
+</ul>
+
+<p>与纯 LLM（如 Llama-3.2-1B）相比，关键区别：</p>
+<ul>
+<li><strong>多模态输入</strong>：不是 token 序列，而是 图像 patch + 文本 token + state token 拼成的前缀 (prefix)。</li>
+<li><strong>输出是连续动作</strong>：不是 vocab 上的 logits + 采样，而是 flow-matching 用 Euler 积分 10 步生成的实数向量序列。</li>
+<li><strong>双塔交错</strong>：VLM 和 action expert 是两个不同宽度的 transformer，通过 cross-attention 在每隔一层耦合。</li>
+</ul>
+</div>
+
+<h2 id="config">A2. 超参数与参数量</h2>
+
+<h3>顶层配置（来自 <code>lerobot/smolvla_base/config.json</code>）</h3>
+<table>
+<tr><th>配置项</th><th>值</th><th>含义</th></tr>
+<tr><td><code>vlm_model_name</code></td><td>SmolVLM2-500M-Video-Instruct</td><td>backbone checkpoint</td></tr>
+<tr><td><code>num_vlm_layers</code></td><td class="num">16</td><td>实际使用的 LM decoder 层数（backbone 共 32 层，只取前半）</td></tr>
+<tr><td><code>expert_width_multiplier</code></td><td class="num">0.75</td><td>expert 宽度 = 0.75 × 960 = <strong>720</strong></td></tr>
+<tr><td><code>self_attn_every_n_layers</code></td><td class="num">2</td><td>每 2 层一个 self-attn，其余为 cross-attn</td></tr>
+<tr><td><code>attention_mode</code></td><td>cross_attn</td><td>expert 与 VLM 的耦合方式</td></tr>
+<tr><td><code>chunk_size</code></td><td class="num">50</td><td>一次推理输出的动作步数 (action horizon)</td></tr>
+<tr><td><code>n_action_steps</code></td><td class="num">50</td><td>实际执行的动作步数</td></tr>
+<tr><td><code>num_steps</code></td><td class="num">10</td><td>flow-matching Euler 积分步数</td></tr>
+<tr><td><code>max_state_dim</code> / <code>max_action_dim</code></td><td class="num">32 / 32</td><td>state / action 维度上限（SO-100 真实为 6，padding 到 32）</td></tr>
+<tr><td>相机输入</td><td>3 × [3, 256, 256]</td><td>3 路相机；resize+pad 到 512×512 喂给 SigLIP</td></tr>
+<tr><td><code>tokenizer_max_length</code></td><td class="num">48</td><td>语言指令最大 token 数</td></tr>
+</table>
+
+<h3>VLM backbone 维度（来自 SmolVLM2-500M 的 <code>text_config</code> / <code>vision_config</code>）</h3>
+<table>
+<tr><th>符号</th><th>含义</th><th>值</th></tr>
+<tr><td><code>D</code></td><td>LM hidden dim (d_model)</td><td class="num">960</td></tr>
+<tr><td><code>L_used</code></td><td>SmolVLA 使用的 LM 层数</td><td class="num">16 (of 32)</td></tr>
+<tr><td><code>H</code></td><td>Q head 数</td><td class="num">15</td></tr>
+<tr><td><code>H_kv</code></td><td>KV head 数 (GQA)</td><td class="num">5</td></tr>
+<tr><td><code>G</code></td><td>GQA group = H / H_kv</td><td class="num">3</td></tr>
+<tr><td><code>d_h</code></td><td>per-head dim (= 15×64=960)</td><td class="num">64</td></tr>
+<tr><td><code>F</code></td><td>LM FFN intermediate dim</td><td class="num">2560</td></tr>
+<tr><td><code>V</code></td><td>vocab size（SmolVLA 动作路径不用 LM Head）</td><td class="num">49280</td></tr>
+<tr><td>RoPE θ</td><td>rope_theta</td><td class="num">100000</td></tr>
+<tr><td>norm</td><td>RMSNorm, ε</td><td class="num">1e-5</td></tr>
+<tr><td>vision</td><td>SigLIP-base-patch16-512</td><td>768d / patch16 / 512px / 64 tok/帧</td></tr>
+</table>
+
+<h3>Action expert 维度</h3>
+<table>
+<tr><th>符号</th><th>含义</th><th>值</th></tr>
+<tr><td><code>D_x</code></td><td>expert hidden dim (= 0.75×960)</td><td class="num">720</td></tr>
+<tr><td>层数</td><td>镜像 num_vlm_layers</td><td class="num">16</td></tr>
+<tr><td>head 几何</td><td>沿用 VLM 的 H / H_kv / d_h</td><td class="num">15 / 5 / 64</td></tr>
+<tr><td><code>F_x</code></td><td>expert FFN（Llama-SwiGLU 取整规则，build 时算出）</td><td>~256 的倍数</td></tr>
+<tr><td>flow 头宽度</td><td>action_in/out_proj、time MLP</td><td class="num">720</td></tr>
+</table>
+
+<div class="highlight"><strong>参数量 (~450M total).</strong> 论文给的整数：<strong>~100M 在 action expert</strong>，其余在 VLM（且只用前 16 层 LM）。Vision encoder (SigLIP-base) ≈ 93M。精确切分由 config 推导，论文数字是约数。</div>
+
+<h2 id="pipeline">A3. 端到端数据流 (top-level pipeline)</h2>
+
+<svg viewBox="0 0 720 470" class="model-svg" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M2 1L8 5L2 9" fill="none" stroke="#374151" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+  </defs>
+
+  <!-- inputs row -->
+  <g class="c-amber"><rect x="20" y="20" width="180" height="56" rx="8"/>
+    <text x="110" y="42" class="th">3× 相机图像</text><text x="110" y="62" class="ts">[3, 3, 256, 256]</text></g>
+  <g class="c-gray"><rect x="270" y="20" width="180" height="56" rx="8"/>
+    <text x="360" y="42" class="th">语言指令</text><text x="360" y="62" class="ts">≤ 48 tokens</text></g>
+  <g class="c-gray"><rect x="520" y="20" width="180" height="56" rx="8"/>
+    <text x="610" y="42" class="th">机器人 state</text><text x="610" y="62" class="ts">[6] → pad [32]</text></g>
+
+  <!-- arrows to encoders -->
+  <line x1="110" y1="76" x2="110" y2="110" class="arr" marker-end="url(#arr)"/>
+  <line x1="360" y1="76" x2="360" y2="170" class="arr" marker-end="url(#arr)"/>
+  <line x1="610" y1="76" x2="610" y2="110" class="arr" marker-end="url(#arr)"/>
+
+  <!-- SigLIP -->
+  <g class="c-amber"><rect x="20" y="110" width="180" height="56" rx="8"/>
+    <text x="110" y="132" class="th">SigLIP + PixelShuffle</text><text x="110" y="152" class="ts">→ 64 tok/帧 × 3</text></g>
+  <!-- state proj -->
+  <g class="c-teal"><rect x="520" y="110" width="180" height="56" rx="8"/>
+    <text x="610" y="132" class="th">state_proj</text><text x="610" y="152" class="ts">[32]→[960] 1 token</text></g>
+
+  <line x1="110" y1="166" x2="110" y2="200" class="arr" marker-end="url(#arr)"/>
+  <line x1="610" y1="166" x2="610" y2="200" class="arr" marker-end="url(#arr)"/>
+
+  <!-- prefix concat -->
+  <g class="c-gray"><rect x="160" y="200" width="400" height="50" rx="8"/>
+    <text x="360" y="218" class="th">Prefix 序列 = [图像 tok | 文本 tok | state tok]</text>
+    <text x="360" y="237" class="ts">每个 token 宽度 D = 960</text></g>
+
+  <line x1="360" y1="250" x2="360" y2="285" class="arr" marker-end="url(#arr)"/>
+
+  <!-- VLM backbone -->
+  <g class="c-purple"><rect x="120" y="285" width="480" height="64" rx="8"/>
+    <text x="360" y="307" class="th">VLM backbone — SmolLM2 decoder ×16 层</text>
+    <text x="360" y="328" class="ts">RMSNorm · GQA attn(RoPE) · SwiGLU FFN  → 产出 prefix 的 K/V cache</text></g>
+
+  <!-- KV down to expert -->
+  <path d="M 600 317 L 660 317 L 660 400 L 600 400" class="arr-side" marker-end="url(#arr)"/>
+  <text x="665" y="360" class="edge-label" text-anchor="start">VLM KV</text>
+
+  <line x1="360" y1="349" x2="360" y2="383" class="arr" marker-end="url(#arr)"/>
+
+  <!-- action expert -->
+  <g class="c-teal"><rect x="120" y="383" width="480" height="64" rx="8"/>
+    <text x="360" y="405" class="th">Action Expert ×16 层 (width 720)</text>
+    <text x="360" y="426" class="ts">self-attn(偶) / cross-attn(奇,读 VLM KV) · flow-matching 10 步 Euler</text></g>
+
+  <!-- output -->
+  <text x="360" y="462" class="edge-label" text-anchor="middle">→ 动作序列 action chunk [B, 50, 6] (内部 pad 到 32)</text>
+</svg>
+
+<p class="small">注：state 经 <code>state_proj</code> 投影成 <strong>1 个</strong> 宽度 960 的 token，拼在 prefix 末尾；noisy action（flow-matching 的积分变量）单独经 <code>action_in_proj</code> 进入 expert，不在 prefix 里。</p>
+
+<!-- ============================================================ -->
+<h2 class="part-header part-b">Part B — VLM Backbone</h2>
+
+<div class="ramp-legend">
+  <div><div class="swatch ramp-vision"></div><b>Vision</b> — SigLIP encoder + pixel-shuffle connector</div>
+  <div><div class="swatch ramp-vlm"></div><b>Language</b> — SmolLM2 decoder 层（线性/注意力/FFN）</div>
+  <div><div class="swatch ramp-expert"></div><b>Action expert</b> — 见 Part C</div>
+  <div><div class="swatch ramp-gray"></div><b>数据/结构</b> — 输入输出张量</div>
+</div>
+
+<h2 id="vision">B1. Vision encoder — SigLIP</h2>
+<div class="card">
+<p>每路相机图像（resize + pad 到 512×512）送进 <strong>SigLIP-base-patch16-512</strong>：</p>
+<table style="max-width:680px">
+<tr><th>属性</th><th>值</th><th>说明</th></tr>
+<tr><td>模型</td><td>google/siglip-base-patch16-512</td><td>SmolVLM2-500M 的视觉塔</td></tr>
+<tr><td>hidden_size</td><td class="num">768</td><td>vision embedding 宽度</td></tr>
+<tr><td>image_size / patch_size</td><td class="num">512 / 16</td><td>→ (512/16)² = 1024 patch/帧</td></tr>
+<tr><td>num_heads</td><td class="num">12</td><td>vision attention heads</td></tr>
+<tr><td>num_layers / intermediate</td><td class="num">12 / 3072</td><td><span class="pill pill-shared">推断</span> 来自 SigLIP-base 规格，非 checkpoint 直读</td></tr>
+<tr><td>connector</td><td>PixelShuffle ×4</td><td><code>scale_factor=4</code>，1024 patch → <strong>64 token</strong>/帧</td></tr>
+</table>
+<p><strong>PixelShuffle 的作用</strong>：把 1024 个 patch token 在空间上 4×4 合并降采样到 64 个，大幅减少喂给语言塔的视觉 token 数（3 路相机 = 192 个视觉 token）。SmolVLA 运行时只用全局图像，不做 tiling。</p>
+</div>
+
+<h2 id="llm">B2. Language decoder — SmolLM2</h2>
+<div class="card">
+<p>视觉 token + 文本 token + state token 拼成 prefix，过 SmolLM2 风格的 decoder。它是标准 <strong>Llama 家族</strong> block：RMSNorm + GQA 注意力(RoPE) + SwiGLU FFN。<strong>SmolVLA 只跑前 16 层</strong>（backbone 实际有 32 层），attention 在这 16 层填好 prefix 的 KV cache 供 action expert 读取。</p>
+<div class="highlight-warn"><strong>层裁剪 (layer truncation).</strong> 只用前 16/32 层 是 SmolVLA 省算力的关键设计之一——多模态感知不需要语言塔的全部深度。这与 Llama 部署「用满所有层」不同。</div>
+</div>
+
+<h2 id="llm-block">B3. 一个 LM block 的算子与 shape</h2>
+
+<p>下图是 VLM backbone 中<strong>一个</strong> decoder 层（×16）。符号见 <a href="#config">A2</a>：D=960, H=15, H_kv=5, d_h=64, F=2560。<code>P</code> = prefix 长度（≈ 192 视觉 + 文本 + 1 state）。</p>
+
+<svg viewBox="0 0 680 720" class="model-svg" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="arr-b" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M2 1L8 5L2 9" fill="none" stroke="#374151" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+  </defs>
+  <g class="c-gray"><rect x="230" y="20" width="220" height="52" rx="8"/>
+    <text x="340" y="40" class="th">Input x</text><text x="340" y="59" class="ts">[B, P, D]</text></g>
+  <path d="M 450 46 L 615 46 L 615 470 L 450 470" class="arr-side" marker-end="url(#arr-b)"/>
+  <text x="608" y="32" class="edge-label" text-anchor="end">residual</text>
+  <line x1="340" y1="72" x2="340" y2="106" class="arr" marker-end="url(#arr-b)"/>
+  <g class="c-teal"><rect x="230" y="106" width="220" height="52" rx="8"/>
+    <text x="340" y="126" class="th">RMSNorm</text><text x="340" y="145" class="ts">γ:[D], 沿 D 逐行</text></g>
+
+  <line x1="340" y1="158" x2="340" y2="182" class="arr"/>
+  <path d="M 340 182 L 150 182 L 150 210" class="arr" marker-end="url(#arr-b)"/>
+  <line x1="340" y1="182" x2="340" y2="210" class="arr" marker-end="url(#arr-b)"/>
+  <path d="M 340 182 L 530 182 L 530 210" class="arr" marker-end="url(#arr-b)"/>
+
+  <g class="c-purple"><rect x="70" y="210" width="160" height="52" rx="8"/>
+    <text x="150" y="230" class="th">Q proj</text><text x="150" y="249" class="ts">[D, 960]</text></g>
+  <g class="c-purple"><rect x="260" y="210" width="160" height="52" rx="8"/>
+    <text x="340" y="230" class="th">K proj</text><text x="340" y="249" class="ts">[D, 320]</text></g>
+  <g class="c-purple"><rect x="450" y="210" width="160" height="52" rx="8"/>
+    <text x="530" y="230" class="th">V proj</text><text x="530" y="249" class="ts">[D, 320]</text></g>
+
+  <line x1="150" y1="262" x2="150" y2="300" class="arr" marker-end="url(#arr-b)"/>
+  <line x1="340" y1="262" x2="340" y2="300" class="arr" marker-end="url(#arr-b)"/>
+  <line x1="530" y1="262" x2="530" y2="300" class="arr" marker-end="url(#arr-b)"/>
+  <g class="c-teal"><rect x="70" y="300" width="160" height="48" rx="8"/>
+    <text x="150" y="324" class="th">RoPE(Q)</text></g>
+  <g class="c-teal"><rect x="260" y="300" width="160" height="48" rx="8"/>
+    <text x="340" y="324" class="th">RoPE(K)</text></g>
+  <g class="c-gray"><rect x="450" y="300" width="160" height="48" rx="8"/>
+    <text x="530" y="324" class="th">V passthrough</text></g>
+
+  <path d="M 150 348 L 150 380 L 250 380 L 250 410" class="arr" marker-end="url(#arr-b)"/>
+  <line x1="340" y1="348" x2="340" y2="410" class="arr" marker-end="url(#arr-b)"/>
+  <path d="M 530 348 L 530 380 L 430 380 L 430 410" class="arr" marker-end="url(#arr-b)"/>
+
+  <g class="c-teal"><rect x="110" y="410" width="460" height="76" rx="8"/>
+    <text x="340" y="432" class="th">GQA 注意力 (causal, 3 Q/KV)</text>
+    <text x="340" y="453" class="ts">softmax(Q·Kᵀ/√d_h) · V</text>
+    <text x="340" y="470" class="t-row3">无可学习权重；这一层的 K/V 会被 action expert 复用</text></g>
+
+  <line x1="340" y1="486" x2="340" y2="520" class="arr" marker-end="url(#arr-b)"/>
+  <g class="c-purple"><rect x="230" y="520" width="220" height="52" rx="8"/>
+    <text x="340" y="540" class="th">O proj</text><text x="340" y="559" class="ts">[960, D]</text></g>
+
+  <line x1="340" y1="572" x2="340" y2="600" class="arr" marker-end="url(#arr-b)"/>
+  <g class="c-gray"><rect x="230" y="600" width="220" height="44" rx="8"/>
+    <text x="340" y="622" class="th">+ residual → FFN(SwiGLU)</text></g>
+  <line x1="340" y1="644" x2="340" y2="672" class="arr" marker-end="url(#arr-b)"/>
+  <g class="c-purple"><rect x="170" y="672" width="340" height="40" rx="8"/>
+    <text x="340" y="692" class="th">gate/up [D,F=2560] · SiLU · down [F,D] · +residual</text></g>
+</svg>
+
+<h4>逐算子说明 (per-kernel)</h4>
+<div class="kernel-bullet"><strong>RMSNorm</strong>
+<ul><li><b>Shape:</b> <code>[B,P,D]→[B,P,D]</code>, γ:<code>[D]</code></li>
+<li><b>Op:</b> <code>y = x·rsqrt(mean(x²)+ε)·γ</code>，沿 D=960 逐行；无均值减、无 bias</li></ul></div>
+<div class="kernel-bullet"><strong>Q / K / V projection (GEMM)</strong>
+<ul><li><b>Shape:</b> Q <code>[D,960]</code>，K/V <code>[D,320]</code>（GQA：KV 比 Q 窄，5×64=320）</li>
+<li><b>Op:</b> <code>Y = X @ W</code>，无 bias；prefill 是 M=P 的 GEMM</li></ul></div>
+<div class="kernel-bullet"><strong>RoPE</strong>
+<ul><li><b>作用于</b> Q、K 的每个 head（d_h=64），θ=100000；V 不旋转</li></ul></div>
+<div class="kernel-bullet"><strong>GQA scaled-dot-product attention</strong>
+<ul><li>causal mask；每 3 个 Q head 共享 1 个 KV head；无权重</li>
+<li><b>关键：</b>这 16 层产出的 prefix K/V 是 action expert cross-attn 的输入</li></ul></div>
+<div class="kernel-bullet"><strong>SwiGLU FFN</strong>
+<ul><li>gate/up <code>[D,2560]</code>，SiLU(gate)·up，down <code>[2560,D]</code></li></ul></div>
+
+<!-- ============================================================ -->
+<h2 class="part-header part-c">Part C — Action Expert</h2>
+
+<h2 id="expert">C1. Action expert 总体</h2>
+<div class="card">
+<p>Action expert 是一个 <strong>16 层、宽度 720</strong> 的 transformer，结构镜像 SmolLM2 block（RMSNorm + RoPE + SwiGLU），但更窄（0.75×960）。它<strong>不处理图像/文本</strong>——那是 VLM 的活——它处理的是 flow-matching 的<strong>含噪动作 (noisy action)</strong>，并通过 cross-attention 去「看」VLM 已经算好的多模态特征。</p>
+<table style="max-width:680px">
+<tr><th>属性</th><th>值</th></tr>
+<tr><td>层数</td><td class="num">16（= num_vlm_layers）</td></tr>
+<tr><td>hidden dim D_x</td><td class="num">720</td></tr>
+<tr><td>head 几何</td><td>沿用 VLM：15 Q / 5 KV / d_h 64</td></tr>
+<tr><td>训练目标</td><td>conditional flow matching（非 DDPM 扩散）</td></tr>
+<tr><td>训练策略</td><td><code>train_expert_only=true</code>，<code>freeze_vision_encoder=true</code>（base ckpt）</td></tr>
+</table>
+</div>
+
+<h2 id="interleave">C2. Self-attn / Cross-attn 交替</h2>
+<div class="card">
+<p>由 <code>self_attn_every_n_layers=2</code> + <code>attention_mode="cross_attn"</code> 控制：</p>
+<ul>
+<li><strong>偶数层 (idx % 2 == 0)</strong> → <span class="pill pill-expert">self-attention</span>：动作 token 之间互相注意。</li>
+<li><strong>奇数层</strong> → <span class="pill pill-vlm">cross-attention</span>：Query 来自 expert 自己的动作 token，Key/Value 来自<strong>冻结的 VLM prefix KV</strong>（图像+文本+state 的上下文）。</li>
+</ul>
+<p>这就是 SmolVLA「复用 VLM KV」的含义——cross-attn 层不重新编码图像/文本，直接读 VLM backbone 算好的 K/V，省掉重复计算。</p>
+</div>
+
+<svg viewBox="0 0 700 250" class="model-svg" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="arr-c" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M2 1L8 5L2 9" fill="none" stroke="#374151" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+  </defs>
+  <!-- VLM KV source -->
+  <g class="c-purple"><rect x="20" y="95" width="150" height="60" rx="8"/>
+    <text x="95" y="117" class="th">VLM prefix KV</text><text x="95" y="137" class="ts">(16 层, 冻结)</text></g>
+
+  <!-- layer stack -->
+  <g class="c-teal"><rect x="250" y="20" width="180" height="44" rx="8"/>
+    <text x="340" y="42" class="th">Layer 0 — self-attn</text></g>
+  <g class="c-purple"><rect x="250" y="74" width="180" height="44" rx="8"/>
+    <text x="340" y="96" class="th">Layer 1 — cross-attn</text></g>
+  <g class="c-teal"><rect x="250" y="128" width="180" height="44" rx="8"/>
+    <text x="340" y="150" class="th">Layer 2 — self-attn</text></g>
+  <g class="c-purple"><rect x="250" y="182" width="180" height="44" rx="8"/>
+    <text x="340" y="204" class="th">Layer 3 — cross-attn …</text></g>
+
+  <!-- KV feeds cross-attn layers -->
+  <path d="M 170 120 L 210 120 L 210 96 L 250 96" class="arr-side" marker-end="url(#arr-c)"/>
+  <path d="M 170 130 L 200 130 L 200 204 L 250 204" class="arr-side" marker-end="url(#arr-c)"/>
+  <text x="180" y="240" class="edge-label" text-anchor="start">奇数层从 VLM KV 取 K/V</text>
+
+  <!-- flow head -->
+  <g class="c-gray"><rect x="500" y="95" width="180" height="60" rx="8"/>
+    <text x="590" y="117" class="th">flow-matching 头</text><text x="590" y="137" class="ts">10 步 Euler → 动作</text></g>
+  <line x1="430" y1="120" x2="500" y2="120" class="arr" marker-end="url(#arr-c)"/>
+</svg>
+
+<h2 id="flow">C3. Flow-matching 动作头</h2>
+<div class="card">
+<p>SmolVLA 不在 vocab 上采 token，而是用 <strong>conditional flow matching</strong> 生成连续动作。推理时从纯噪声 <code>t=1</code> 沿学到的速度场 <code>v_t</code> Euler 积分到 <code>t=0</code>，共 <code>num_steps=10</code> 步。</p>
+<h4>路径上的投影（flow 头，在 transformer block 之外）</h4>
+<table style="max-width:700px">
+<tr><th>模块</th><th>Shape</th><th>说明</th></tr>
+<tr><td><code>action_in_proj</code></td><td>[32, 720]</td><td>noisy action（pad 到 32）→ expert 宽度</td></tr>
+<tr><td>timestep embed</td><td>sinusoid → [720]</td><td><code>min_period=4e-3, max_period=4.0</code></td></tr>
+<tr><td><code>action_time_mlp_in</code></td><td>[1440, 720]</td><td>concat(action, time)=1440 → 720</td></tr>
+<tr><td><code>action_time_mlp_out</code></td><td>[720, 720]</td><td>SiLU 后再投影</td></tr>
+<tr><td><code>action_out_proj</code></td><td>[720, 32]</td><td>expert 输出 → 速度场 v_t（动作维度）</td></tr>
+<tr><td><code>state_proj</code></td><td>[32, 960]</td><td>state（pad 到 32）→ VLM 宽度，作 1 个 prefix token</td></tr>
+</table>
+<p class="small">最终动作 chunk 形状 <code>[B, 50, ≤32]</code>，切到真实动作维度（base 模型 SO-100 为 6）。</p>
+</div>
+
+<h2 id="expert-block">C4. 一个 expert block 的算子与 shape</h2>
+<div class="card">
+<p>每层结构（D_x=720，head 几何沿用 VLM 的 15/5/64）：</p>
+<div class="kernel-bullet"><strong>input RMSNorm</strong> — γ:<code>[720]</code></div>
+<div class="kernel-bullet"><strong>注意力（偶=self / 奇=cross）</strong>
+<ul>
+<li><b>self (偶层):</b> Q/K/V/O 在 720 宽度上投影，按 VLM head 几何切头，RoPE(θ=10000)</li>
+<li><b>cross (奇层):</b> Q 来自 expert 动作 token <code>[720→H·d_h]</code>；K/V 由 <strong>VLM KV</strong>（宽 320）重投影进注意力空间；O 投回 720</li>
+</ul></div>
+<div class="kernel-bullet"><strong>post-attn RMSNorm</strong> — γ:<code>[720]</code></div>
+<div class="kernel-bullet"><strong>SwiGLU FFN</strong> — gate/up <code>[720, F_x]</code>，down <code>[F_x, 720]</code>，SiLU</div>
+<p class="small"><span class="pill pill-shared">不确定</span> F_x 与 expert 自注意力在 720 宽度下投影的精确 in/out 维度由 build 时的 Llama-SwiGLU 取整规则算出，非 config 静态数。需精确整数时请实例化 <code>SmolVLAPolicy</code> 后打印模块确认。</p>
+</div>
+
+<!-- ============================================================ -->
+<h2 class="part-header part-d">Part D — 参考 (Reference)</h2>
+
+<h2 id="kernels">D1. 算子清单汇总</h2>
+<p>把 SmolVLA 用到的 leaf 算子按类型汇总（与纯 LLM 高度重合，这也是它适合复用 LLM kernel 的原因）：</p>
+<table>
+<tr><th>算子</th><th>出现位置</th><th>典型 shape（per token / per 层）</th><th>类比 LLM kernel</th></tr>
+<tr><td>RMSNorm</td><td>VLM 层 ×2，expert 层 ×2，final</td><td>γ:[960] 或 [720]</td><td>RMSNorm</td></tr>
+<tr><td>GEMM (Q/K/V/O)</td><td>VLM + expert 注意力</td><td>[960,960]/[960,320]；expert 720 宽</td><td>GEMM / GEMV</td></tr>
+<tr><td>RoPE</td><td>VLM + expert self-attn</td><td>d_h=64，θ=100000 / 10000</td><td>RoPE</td></tr>
+<tr><td>GQA attention</td><td>VLM self；expert self/cross</td><td>15 Q / 5 KV / 64</td><td>FlashAttention (GQA)</td></tr>
+<tr><td>SwiGLU FFN</td><td>VLM + expert</td><td>gate/up [960,2560]；expert [720,F_x]</td><td>SiLU + Mul + GEMM</td></tr>
+<tr><td>Linear proj（flow 头）</td><td>action_in/out, time MLP, state_proj</td><td>见 C3 表</td><td>GEMM / GEMV</td></tr>
+<tr><td>SigLIP vision</td><td>图像编码</td><td>768d / patch16 / 12 层</td><td>(ViT：GEMM+LayerNorm+GELU+attn)</td></tr>
+<tr><td>PixelShuffle</td><td>vision connector</td><td>×4 空间合并</td><td>(reshape/重排，非 matmul)</td></tr>
+</table>
+
+<div class="highlight"><strong>观察.</strong> 除 SigLIP vision 塔（ViT 风格，用 LayerNorm + GELU）和 PixelShuffle 外，SmolVLA 的语言塔和 action expert 都是 <strong>Llama 家族算子</strong>（RMSNorm / RoPE / GQA / SwiGLU），与本 repo kernel_registry 已有的 leaf kernel 同族。差异点在于：① cross-attention 复用外部 KV；② flow-matching 的若干小 Linear + 时间嵌入；③ vision 塔是独立子系统。</div>
+
+<h2 id="sources">D2. 来源与不确定项</h2>
+<div class="card">
+<h4>主要来源 (primary sources)</h4>
+<ul class="small">
+<li><a href="https://arxiv.org/abs/2506.01844">SmolVLA paper — arXiv 2506.01844</a></li>
+<li><a href="https://huggingface.co/blog/smolvla">HuggingFace blog — SmolVLA</a></li>
+<li><a href="https://huggingface.co/lerobot/smolvla_base/blob/main/config.json">lerobot/smolvla_base/config.json</a>（已发布 checkpoint，权威）</li>
+<li><a href="https://huggingface.co/HuggingFaceTB/SmolVLM2-500M-Video-Instruct/blob/main/config.json">SmolVLM2-500M-Video-Instruct/config.json</a>（backbone text_config / vision_config）</li>
+<li><a href="https://github.com/huggingface/lerobot/blob/main/src/lerobot/policies/smolvla/configuration_smolvla.py">lerobot configuration_smolvla.py</a> · <a href="https://github.com/huggingface/lerobot/blob/main/src/lerobot/policies/smolvla/modeling_smolvla.py">modeling_smolvla.py</a> · <a href="https://github.com/huggingface/lerobot/blob/main/src/lerobot/policies/smolvla/smolvlm_with_expert.py">smolvlm_with_expert.py</a></li>
+</ul>
+<h4>明确标注的不确定项 (uncertainties)</h4>
+<ul class="small">
+<li><strong>SigLIP 内部 num_layers=12 / intermediate=3072</strong>：来自 "SigLIP-base-patch16-512" 规格推断，未从 checkpoint JSON 直读。需确认请加载模型。</li>
+<li><strong>Expert FFN F_x 与 self-attn 在 720 宽度下的精确投影维度</strong>：build 时由 Llama-SwiGLU 取整规则算出，非静态 config 数。</li>
+<li><strong>"~100M action expert / ~450M total"</strong>：论文约数，精确切分由 config 推导。</li>
+<li><strong>text tower hidden_act=SiLU</strong>：从 Llama 架构 (VLlama3ForCausalLM) 推断，JSON 顶层未直接序列化。</li>
+<li><strong>常见误传</strong>：expert 宽度是 <strong>720</strong>（0.75×960），非 576。</li>
+</ul>
+</div>
+
+<footer>
+SmolVLA 模型架构说明 · 纯模型层面（无 NPU 实现）· 数值截至各官方源 2026-06 可见版本 · 镜像 <code>llms/llama32_1b/docs/detail/</code> 文档风格生成。
+</footer>
+
+<script>
+  // sidebar toggle + keyboard shortcut 'h'
+  (function () {
+    var body = document.body, hide = document.getElementById('nav-toggle'), show = document.getElementById('nav-show');
+    function setHidden(h) { body.classList.toggle('nav-hidden', h); }
+    if (hide) hide.addEventListener('click', function () { setHidden(true); });
+    if (show) show.addEventListener('click', function () { setHidden(false); });
+    document.addEventListener('keydown', function (e) {
+      if (e.key === 'h' && !/INPUT|TEXTAREA/.test((e.target||{}).tagName||'')) setHidden(!body.classList.contains('nav-hidden'));
+    });
+  })();
+</script>
+</body>
+</html>

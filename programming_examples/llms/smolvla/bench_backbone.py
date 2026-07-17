@@ -5,9 +5,11 @@ Apples-to-apples INFERENCE latency for the SmolLM2-360M backbone at seq=256:
 - times N NPU run_backbone_prefill calls (cpu_attn=False, full NPU attention)
 - times N cpu_backbone_forward calls (pure-numpy fp32, the verified reference)
 
-This is an unoptimized lower bound: NPU attention issues ~31 XRT dispatches/layer
-(15 QKt + 1 softmax + 15 PV) x 16 layers, unfused. Reports the split so Phase-4/5
-fusion headroom is explicit. Does NOT include one-time kernel compile (~min) or the
+After the Phase-4 GQA-group batching optimization (commit f404998e), NPU
+attention issues ~11 XRT dispatches/layer (5 QKt + 1 softmax + 5 PV; was
+31/layer before batching) x 16 layers. Reports the split so remaining
+fusion headroom (Route 3: fold attention into the per-layer fused ELF) is
+explicit. Does NOT include one-time kernel compile (~min) or the
 two-process npz bridge — those are deployment-harness costs, not inference cost.
 
 Run under the NPU lock, worktree python:
@@ -151,9 +153,11 @@ def main():
     print(
         f"\n  one-time NPU compile = {t_compile:.1f}s (NOT in the per-inference numbers)"
     )
-    print("  NOTE: NPU path is UNFUSED — ~31 dispatches/layer x 16 = ~500 XRT calls.")
     print(
-        "  Phase-4/5 multi-launch fusion is the documented path to cut dispatch overhead."
+        "  NOTE: ~11 dispatches/layer x 16 = ~176 (after GQA-group batching; was 31/layer)."
+    )
+    print(
+        "  Route 3 (fuse attention into the per-layer fused ELF) is the remaining path to cut dispatch overhead further."
     )
 
 
