@@ -104,6 +104,40 @@ Two independent tracks, both required to call a phase done — see
 
 Both numbers are measured on real NPU2 hardware, not simulated.
 
+## Performance (measured, UNOPTIMIZED baseline)
+
+This port is **correctness-first**; the numbers below are a pre-optimization
+lower bound (`bench_backbone.py`, NPU2, median of 5, one-time kernel compile
+excluded):
+
+| stage | latency | notes |
+|---|---|---|
+| NPU backbone, 16 layers (`cpu_attn=False`) | **~400 ms** | full NPU attention path |
+| CPU backbone, 16 layers (numpy fp32) | **~344 ms** | same math, reference |
+| **ratio** | **NPU 1.16x slower** | apples-to-apples backbone only |
+| CPU full `select_action` (vision+backbone+expert+10-step denoise) | **~1083 ms** | backbone ~1/3 of it |
+| one-time NPU kernel compile | ~68 s | not per-inference |
+
+**Why it is currently slower** (all known, documented optimization gaps, not
+architectural faults):
+
+1. **Attention is unfused** — the per-head design issues ~31 XRT dispatches per
+   layer (15 QKᵀ + 1 masked-softmax + 15 PV) × 16 layers ≈ **~500 dispatches**,
+   each ~50–200 µs of pure launch overhead. This dominates the latency.
+2. No cross-call ELF reuse (recompiles each run).
+3. Two-process npz bridge (lerobot venv ↔ worktree python) — a harness cost, not
+   compute.
+4. bf16 NPU vs fp32 CPU-numpy — not the same numeric basis.
+
+**Optimization path (Phase 4/5, the shared opt skillset):**
+`opt-merge-multi-launch-kernels` to fuse the ~31 per-layer dispatches into a
+handful, `opt-buffer-object-reuse` to pre-load weight BOs, seq-first layout to
+drop host transposes. These are the same techniques already validated on the
+llama/qwen deployments. The current number reflects "correct but untuned," not
+the NPU ceiling.
+
+Reproduce: `flock -x -w 1800 /tmp/mlir-air-npu.lock python bench_backbone.py --iters 5`
+
 ## Scope (A1)
 
 - **On NPU:** all 16 backbone layers' RMSNorm, Q/K/V GEMM projections, RoPE,
