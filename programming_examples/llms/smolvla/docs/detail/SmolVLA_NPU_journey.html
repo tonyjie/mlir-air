@@ -90,6 +90,7 @@
   /* NPU-availability labels (Part B only) */
   .knl { display:inline-block; font-family:"SF Mono",Menlo,Consolas,monospace; font-size:0.76rem; background:#ecfdf5; color:#065f46; border:1px solid #6ee7b7; border-radius:4px; padding:0.02rem 0.3rem; }
   .knl.miss { background:#fef2f2; color:#991b1b; border-color:#fca5a5; }
+  .knl.adapt { background:#fffbeb; color:#92400e; border-color:#fcd34d; }
   table.arch { font-size: 0.85rem; }
   table.arch td { vertical-align: top; }
   table.arch th { background:#eff6ff; }
@@ -553,30 +554,34 @@
   </div>
 
   <p>
-    A "kernel" is a low-level operation compiled to run on the NPU. From earlier NPU work (deploying Llama/Qwen
-    language models) we already have a <b>validated kernel library</b> — the
-    <code>programming_examples/kernel_registry</code>, which currently holds 8 verified kernels:
-    <b>GEMM</b> (bf16→fp32 and bf16→bf16), <b>GEMV</b>, <b>RMSNorm</b>, <b>FlashAttention</b> (GQA),
-    <b>Element-wise Add</b>, <b>SiLU-and-Mul</b>, and <b>RoPE</b>, each with a table of NPU2-tested shapes.
-    The question for SmolVLA is: which of its operations (from Part A) already have a kernel, at what shape, and
-    which would need new ones? The "shape SmolVLA needs" column below is what the backbone actually requires
-    (prefix seq = 241, padded to 256 on the NPU).
+    A "kernel" is a low-level operation compiled to run on the NPU. Two sources matter here:
+    (1) the <b>kernel_registry</b> — 8 kernels <em>curated and shape-validated for LLM deployment</em>
+    (GEMM bf16→fp32 &amp; bf16→bf16, GEMV, RMSNorm, FlashAttention, Element-wise Add, SiLU-and-Mul, RoPE); and
+    (2) the wider <code>programming_examples/</code> tree, which has <em>additional</em> kernels that exist but
+    haven't been through the registry's LLM-deployment validation. So each SmolVLA operation falls into one of
+    three tiers, not just "have / don't have":
   </p>
+  <div class="legend">
+    <span class="knl">✓ in registry</span> = LLM-validated, ready to use ·
+    <span class="knl adapt">◐ example exists</span> = a kernel exists in <code>programming_examples/</code> but needs
+    validating/adapting at SmolVLA's shape/dtype ·
+    <span class="knl miss">✗ truly new</span> = no implementation yet.
+  </div>
   <table class="arch">
-    <tr><th>Operation in SmolVLA</th><th>In the registry?</th><th>Shape SmolVLA needs (backbone)</th><th>Used by which stage</th></tr>
-    <tr><td>matmul / Linear (GEMM, prefill)</td><td><span class="knl">✓ have it</span></td><td><span class="shape">256×960×960</span> (Q/O), <span class="shape">256×960×320</span> (K/V), <span class="shape">256×960×2560</span> / <span class="shape">256×2560×960</span> (MLP)</td><td>all three stages</td></tr>
-    <tr><td>matmul / Linear (GEMV, decode, batch=1)</td><td><span class="knl">✓ have it</span></td><td>not used — SmolVLA backbone is prefill-only (no decode loop)</td><td>(n/a here)</td></tr>
-    <tr><td>RMSNorm</td><td><span class="knl">✓ have it</span></td><td><span class="shape">256×960</span></td><td>backbone, expert</td></tr>
-    <tr><td>RoPE (rotary position)</td><td><span class="knl">✓ have it</span></td><td>head_dim=64, θ=10000, seq 256</td><td>backbone</td></tr>
-    <tr><td>SiLU-and-Mul (SwiGLU)</td><td><span class="knl">✓ have it</span></td><td><span class="shape">256×2560</span></td><td>backbone, expert</td></tr>
-    <tr><td>element-wise add (residual)</td><td><span class="knl">✓ have it</span></td><td><span class="shape">256×960</span></td><td>backbone, expert</td></tr>
-    <tr><td><b>FlashAttention</b> (fused, GQA, causal/non-causal)</td><td><span class="knl">✓ have it</span> — <b>but mask model doesn't fit</b> (see below)</td><td>would be <span class="shape">241×241</span>, 15q/5kv, head_dim 64</td><td>backbone / expert attention</td></tr>
-    <tr><td><b>masked softmax</b> (arbitrary host mask)</td><td><span class="knl">✓ built new (this project)</span></td><td>scores <span class="shape">(15,256,256)</span>, batched over heads</td><td>backbone (prefix attention)</td></tr>
-    <tr><td>LayerNorm</td><td><span class="knl miss">✗ missing</span></td><td><span class="shape">(1,1024,768)</span> (vision)</td><td>vision</td></tr>
-    <tr><td>GELU-tanh</td><td><span class="knl miss">✗ missing</span></td><td><span class="shape">(1,1024,3072)</span> (vision)</td><td>vision</td></tr>
-    <tr><td>conv2d (patch embed)</td><td><span class="knl miss">✗ missing</span></td><td><span class="shape">(1,3,512,512)</span>→<span class="shape">(1,768,32,32)</span></td><td>vision</td></tr>
-    <tr><td>pixel-shuffle</td><td><span class="knl miss">✗ missing</span></td><td><span class="shape">(1,1024,768)</span>→<span class="shape">(1,64,12288)</span></td><td>connector</td></tr>
-    <tr><td>sin/cos time embedding</td><td><span class="knl miss">✗ missing</span></td><td><span class="shape">(1,50,720)</span></td><td>action expert</td></tr>
+    <tr><th>Operation in SmolVLA</th><th>Status</th><th>Shape SmolVLA needs</th><th>Stage</th></tr>
+    <tr><td>matmul / Linear (GEMM, prefill)</td><td><span class="knl">✓ in registry</span></td><td><span class="shape">256×960×960</span> (Q/O), <span class="shape">256×960×320</span> (K/V), <span class="shape">256×960×2560</span> / <span class="shape">256×2560×960</span> (MLP)</td><td>all</td></tr>
+    <tr><td>matmul / Linear (GEMV, decode, batch=1)</td><td><span class="knl">✓ in registry</span></td><td>not used — SmolVLA backbone is prefill-only</td><td>(n/a)</td></tr>
+    <tr><td>RMSNorm</td><td><span class="knl">✓ in registry</span></td><td><span class="shape">256×960</span></td><td>backbone, expert</td></tr>
+    <tr><td>RoPE (rotary position)</td><td><span class="knl">✓ in registry</span></td><td>head_dim=64, θ=10000, seq 256</td><td>backbone</td></tr>
+    <tr><td>SiLU-and-Mul (SwiGLU)</td><td><span class="knl">✓ in registry</span></td><td><span class="shape">256×2560</span></td><td>backbone, expert</td></tr>
+    <tr><td>element-wise add (residual)</td><td><span class="knl">✓ in registry</span></td><td><span class="shape">256×960</span></td><td>backbone, expert</td></tr>
+    <tr><td><b>FlashAttention</b> (fused, GQA, causal/non-causal)</td><td><span class="knl">✓ in registry</span> — <b>but mask model doesn't fit</b> (see below)</td><td>would be <span class="shape">241×241</span>, 15q/5kv, head_dim 64</td><td>backbone / expert attn</td></tr>
+    <tr><td><b>masked softmax</b> (arbitrary host mask)</td><td><span class="knl">✓ built new (this project)</span></td><td>scores <span class="shape">(15,256,256)</span>, batched over heads</td><td>backbone attn</td></tr>
+    <tr><td>GELU-tanh</td><td><span class="knl adapt">◐ example exists</span> — <code>gelu/</code>, bf16, uses NPU2 <code>__builtin_aie2p_tanh</code></td><td><span class="shape">(1,1024,3072)</span></td><td>vision</td></tr>
+    <tr><td>LayerNorm</td><td><span class="knl adapt">◐ example exists</span> — <code>layer_norm/</code>, bf16</td><td><span class="shape">(1,1024,768)</span></td><td>vision</td></tr>
+    <tr><td>conv2d (patch embed)</td><td><span class="knl adapt">◐ example exists</span> — <code>conv2d/</code> (int32) &amp; <code>conv2d_14x14/</code> (bf16, NPU2); needs SmolVLA's dtype/shape</td><td><span class="shape">(1,3,512,512)</span>→<span class="shape">(1,768,32,32)</span></td><td>vision</td></tr>
+    <tr><td>sin/cos time embedding</td><td><span class="knl adapt">◐ example exists</span> — <code>sine_cosine/</code> (bf16, NPU1 lit) &amp; <code>rope_sincos/</code></td><td><span class="shape">(1,50,720)</span></td><td>action expert</td></tr>
+    <tr><td>pixel-shuffle (space-to-depth)</td><td><span class="knl miss">✗ truly new</span> — pure reshape; <code>data_transfer_transpose/dma_bf16</code> is a starting point</td><td><span class="shape">(1,1024,768)</span>→<span class="shape">(1,64,12288)</span></td><td>connector</td></tr>
   </table>
 
   <div class="callout warn">
@@ -598,10 +603,13 @@
   </div>
 
   <div class="callout">
-    <b>This table decides the strategy.</b> The <b>backbone</b> uses only operations we already have (plus one
-    new masked-softmax we built) → it can move to the NPU now. The <b>vision</b> stage needs 4 brand-new
-    kernels (LayerNorm, GELU-tanh, conv2d, pixel-shuffle) → hardest. The <b>action expert</b> reuses the
-    backbone's kernels at smaller shapes, plus a small sin/cos → feasible next.
+    <b>This table decides the strategy.</b> The <b>backbone</b> is entirely tier-1 (registry) plus the one
+    masked-softmax we built → it can move to the NPU now. The <b>vision</b> stage is mostly tier-2: GELU-tanh,
+    LayerNorm and conv2d all have <code>programming_examples/</code> implementations that need validating/adapting
+    at SigLIP's shape/dtype — only <b>pixel-shuffle</b> is genuinely new (and it's just a reshape). Its remaining
+    difficulty is the large 1024×1024 attention, not a pile of from-scratch kernels. The <b>action expert</b>
+    reuses the backbone's kernels at smaller shapes; its sin/cos also already has an example. So "how much is truly
+    new" is small — the milestones are gated more by integration + validation effort than by missing kernels.
   </div>
 
   <!-- ============================================================ -->
@@ -791,7 +799,7 @@
   <table>
     <tr><th>Milestone</th><th>Scope</th><th>Why / status</th></tr>
     <tr><td><b>A2</b></td><td>Move the <b>action expert</b> onto the NPU (cross-attention + 10-step denoise)</td><td>20% of runtime; reuses backbone kernels → <span class="pill future">planned</span></td></tr>
-    <tr><td><b>A3</b></td><td>Move the <b>vision encoder</b> onto the NPU (needs LayerNorm, GELU, conv2d, pixel-shuffle, bidirectional attention)</td><td>74% of runtime = biggest prize, but 4 new kernels → <span class="pill future">longer-term</span></td></tr>
+    <tr><td><b>A3</b></td><td>Move the <b>vision encoder</b> onto the NPU (GELU/LayerNorm/conv2d have examples to adapt; only pixel-shuffle is new; plus a large 1024×1024 attention)</td><td>74% of runtime = biggest prize → <span class="pill future">longer-term</span></td></tr>
     <tr><td><b>Route 3</b></td><td>Fuse backbone attention further to cut the remaining ~208 launches</td><td><span class="pill future">optimization headroom</span></td></tr>
   </table>
 
