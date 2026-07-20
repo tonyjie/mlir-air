@@ -351,6 +351,35 @@
     is "non-causal."
   </p>
 
+  <h3>How attention works (read once — the tables below use this notation)</h3>
+  <p>
+    All three stages use the same attention recipe; only three things change between them: the
+    <b>sequence lengths</b>, <b>where K/V come from</b>, and the <b>mask</b>. Given an input of
+    <span class="shape">(seq, d)</span>, one attention does:
+  </p>
+  <div class="card" style="font-size:0.92rem">
+    <ol style="margin:0.3rem 0 0.3rem 1.2rem;padding:0">
+      <li><b>Project</b> to Q, K, V (three matmuls with learned weights), then split into <code>h</code> heads of width <code>head_dim</code>:
+        Q → <span class="shape">(h, seq_q, head_dim)</span>, &nbsp; K, V → <span class="shape">(h, seq_k, head_dim)</span>.</li>
+      <li><b>Scores</b> = Q · Kᵀ / √head_dim → <span class="shape">(h, seq_q, seq_k)</span> — row <code>i</code>, col <code>j</code> = "how much query token <code>i</code> attends to key token <code>j</code>."</li>
+      <li><b>Mask + softmax</b> over the last axis (<code>seq_k</code>): add the mask (0 = visible, −∞ = hidden), then softmax so each row sums to 1 → <span class="shape">(h, seq_q, seq_k)</span>.</li>
+      <li><b>Weighted sum of V</b>: P · V → <span class="shape">(h, seq_q, head_dim)</span>, concat heads → <span class="shape">(seq_q, h·head_dim)</span>, then an output projection (O-proj).</li>
+    </ol>
+    <p style="margin:0.7rem 0 0">
+      <b>Shorthand used below:</b> <span class="shape">Q seq_q × K seq_k → scores (seq_q, seq_k)</span>.
+      <b>self-attention</b> = K/V come from the same tokens as Q (so seq_q = seq_k); <b>cross-attention</b> =
+      K/V come from a different source (seq_q ≠ seq_k). <b>GQA</b> (grouped-query): fewer K/V heads than Q heads,
+      so K/V-proj is narrower — several Q heads share one K/V head.
+    </p>
+  </div>
+  <p class="legend">
+    The three masks, concretely: <b>SigLIP</b> = no mask (all 1024 patches see each other). <b>backbone</b> =
+    a (241,241) prefix-LM mask — the top-left 240×240 block is all-visible (0), and only the state column (the
+    241st) is −∞ for the first 240 rows (prefix can't see state; state sees everything). <b>expert self-attn</b> =
+    causal among the 50 action tokens; <b>expert cross-attn</b> = no mask (all 50 actions attend to all 241 prefix
+    tokens).
+  </p>
+
   <!-- STAGE 1 vision -->
   <div class="stage-h v">① Vision encoder: SigLIP + connector</div>
   <p>
@@ -368,8 +397,9 @@
     <tr><td>flatten + position embedding → 1024 patch tokens</td><td>→ <span class="shape">(1,1024,768)</span></td><td><span class="op">embedding</span></td></tr>
     <tr><td colspan="3" style="background:#fdf2f8;font-weight:600">↓ the following operations repeat inside each of the 12 ViT blocks</td></tr>
     <tr><td>LayerNorm (before attention)</td><td><span class="shape">(1,1024,768)</span></td><td><span class="op">LayerNorm</span></td></tr>
-    <tr><td>self-attention Q/K/V/O projections (12 heads)</td><td><span class="shape">(1,1024,768)</span> → <span class="shape">(1,1024,768)</span></td><td><span class="op">matmul</span></td></tr>
-    <tr><td>attention scores (<b>bidirectional</b>) + softmax</td><td>QKᵀ = <span class="shape">(12,1024,1024)</span></td><td><span class="op">matmul</span> + <span class="op">softmax</span></td></tr>
+    <tr><td>self-attn Q/K/V projections → 12 heads (head_dim=64)</td><td>Q,K,V each <span class="shape">(1,1024,768)</span> → <span class="shape">(1,12,1024,64)</span></td><td><span class="op">matmul</span></td></tr>
+    <tr><td>self-attention, <b>no mask</b> (all patches visible): Q 1024 × K 1024</td><td>scores <span class="shape">(1,12,1024,1024)</span> → softmax → ×V → <span class="shape">(1,12,1024,64)</span></td><td><span class="op">matmul</span>+<span class="op">softmax</span>+<span class="op">matmul</span></td></tr>
+    <tr><td>concat heads + O projection</td><td><span class="shape">(1,1024,768)</span> → <span class="shape">(1,1024,768)</span></td><td><span class="op">matmul</span></td></tr>
     <tr><td>LayerNorm (before MLP)</td><td><span class="shape">(1,1024,768)</span></td><td><span class="op">LayerNorm</span></td></tr>
     <tr><td>MLP: fc1 → GELU → fc2</td><td><span class="shape">(1,1024,768)</span> → <span class="shape">(1,1024,3072)</span> → <span class="shape">(1,1024,768)</span></td><td><span class="op">matmul</span> + <span class="op">GELU-tanh</span></td></tr>
   </table>
@@ -397,10 +427,10 @@
   <table class="arch">
     <tr><th>Step (per layer)</th><th>Input → output shape</th><th>Operation</th></tr>
     <tr><td>1. input RMSNorm</td><td><span class="shape">(1,241,960)</span></td><td><span class="op">RMSNorm</span></td></tr>
-    <tr><td>2. Q projection (15 heads)</td><td><span class="shape">(1,241,960)</span> → <span class="shape">(1,241,960)</span></td><td><span class="op">matmul</span></td></tr>
-    <tr><td>&nbsp;&nbsp;&nbsp;K / V projection (GQA, 5 heads)</td><td><span class="shape">(1,241,960)</span> → <span class="shape">(1,241,320)</span></td><td><span class="op">matmul</span></td></tr>
+    <tr><td>2. Q projection → 15 heads (head_dim=64)</td><td><span class="shape">(1,241,960)</span> → <span class="shape">(1,15,241,64)</span></td><td><span class="op">matmul</span></td></tr>
+    <tr><td>&nbsp;&nbsp;&nbsp;K / V projection → <b>GQA</b>, 5 heads (each shared by 3 Q heads)</td><td><span class="shape">(1,241,960)</span> → <span class="shape">(1,5,241,64)</span></td><td><span class="op">matmul</span></td></tr>
     <tr><td>3. RoPE positional encoding (on Q, K)</td><td>head_dim=64, θ=10000</td><td><span class="op">RoPE</span></td></tr>
-    <tr><td>4. <b>non-causal attention</b> (241×241)</td><td>QKᵀ → softmax → ×V</td><td><span class="op">matmul</span>+<span class="op">softmax</span>+<span class="op">matmul</span></td></tr>
+    <tr><td>4. self-attention, <b>prefix-LM mask</b>: Q 241 × K 241</td><td>scores <span class="shape">(1,15,241,241)</span> → +mask → softmax → ×V → <span class="shape">(1,15,241,64)</span></td><td><span class="op">matmul</span>+<span class="op">softmax</span>+<span class="op">matmul</span></td></tr>
     <tr><td>5. O projection</td><td><span class="shape">(1,241,960)</span> → <span class="shape">(1,241,960)</span></td><td><span class="op">matmul</span></td></tr>
     <tr><td>6. residual add + post-attention RMSNorm</td><td><span class="shape">(1,241,960)</span></td><td><span class="op">add</span>+<span class="op">RMSNorm</span></td></tr>
     <tr><td>7. SwiGLU MLP: gate/up → SiLU → down</td><td><span class="shape">(1,241,960)</span> → <span class="shape">(1,241,2560)</span> → <span class="shape">(1,241,960)</span></td><td><span class="op">matmul</span>+<span class="op">SiLU</span>+<span class="op">matmul</span></td></tr>
@@ -471,8 +501,8 @@
 
   <table class="arch">
     <tr><th>Step</th><th>Input → output shape</th><th>Operation / interaction</th></tr>
-    <tr><td><b>Even layers — self-attention</b> (50 action tokens attend to each other)</td><td>Q <span class="shape">(1,50,960)</span> &nbsp; K,V <span class="shape">(1,50,320)</span></td><td><span class="op">matmul</span>+<span class="op">softmax</span></td></tr>
-    <tr><td><b>Odd layers — cross-attention</b> (action tokens attend to the backbone)</td><td>Q <span class="shape">(1,50,960)</span> &nbsp; but K,V <span class="shape">(1,241,320)</span> <b>from the backbone cache</b></td><td><span class="op">matmul</span>+<span class="op">softmax</span> + <b>reads backbone K/V</b></td></tr>
+    <tr><td><b>Even layers — self-attention</b>, causal: Q 50 × K 50 (K/V from the action tokens)</td><td>Q <span class="shape">(1,15,50,64)</span>, K/V <span class="shape">(1,5,50,64)</span> → scores <span class="shape">(1,15,50,50)</span> → ×V → <span class="shape">(1,15,50,64)</span></td><td><span class="op">matmul</span>+<span class="op">softmax</span>+<span class="op">matmul</span></td></tr>
+    <tr><td><b>Odd layers — cross-attention</b>, no mask: Q 50 × K 241 (K/V from the backbone cache)</td><td>Q <span class="shape">(1,15,50,64)</span>, K/V <span class="shape">(1,5,241,64)</span> → scores <span class="shape">(1,15,50,241)</span> → ×V → <span class="shape">(1,15,50,64)</span></td><td><span class="op">matmul</span>+<span class="op">softmax</span>+<span class="op">matmul</span></td></tr>
     <tr><td>SwiGLU MLP (each layer)</td><td><span class="shape">(1,50,720)</span> → <span class="shape">(1,50,2048)</span> → <span class="shape">(1,50,720)</span></td><td><span class="op">matmul</span>+<span class="op">SiLU</span></td></tr>
     <tr><td>action_out_proj (final)</td><td><span class="shape">(1,50,720)</span> → <span class="shape">(1,50,32)</span></td><td><span class="op">matmul</span></td></tr>
   </table>
