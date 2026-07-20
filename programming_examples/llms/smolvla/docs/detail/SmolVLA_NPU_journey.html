@@ -973,10 +973,27 @@ once after 16 layers: (HOST) final RMSNorm [256,960]
     (median of 20, warm, one-time compile excluded; <code>bench_single_kernel.py</code>):
   </p>
   <table>
-    <tr><th>Op (SmolVLA shape)</th><th>NPU</th><th>CPU (PyTorch bf16)</th><th>Winner</th></tr>
+    <tr><th>Op (SmolVLA shape)</th><th>NPU @ SmolVLA shape</th><th>CPU (PyTorch bf16)</th><th>Winner</th></tr>
     <tr><td>GEMM 256×960×960 (Q/O proj)</td><td>~230 µs · <b>2049 GFLOPS</b></td><td>~340–590 µs · 800–1400 GFLOPS</td><td><b>NPU ~2.6×</b></td></tr>
     <tr><td>FlashAttention 256×256, 15q/5kv, hd64</td><td>~900 µs · <b>280 GFLOPS</b></td><td>~500–780 µs · 320–500 GFLOPS</td><td><b>CPU</b></td></tr>
   </table>
+  <p>
+    …and the <b>same NPU kernels at the large shapes they were tuned for</b> (from the kernel_registry), to show
+    how far below peak SmolVLA's small shapes run — this is the core of the "under-fed array" effect:
+  </p>
+  <table>
+    <tr><th>NPU kernel</th><th>SmolVLA small shape</th><th>Large shape (registry peak)</th><th>Utilization</th></tr>
+    <tr><td>GEMM (bf16-out)</td><td>256×960×960 → <b>2049</b> GFLOPS</td><td>2048×8192×2048 → <b>8898</b> GFLOPS</td><td>~23% of peak</td></tr>
+    <tr><td>&nbsp;&nbsp;(mid shape for reference)</td><td colspan="2">2048×2048×2048 → 6215 · 2048×2048×1024 → 5392</td><td>—</td></tr>
+    <tr><td>FlashAttention</td><td>256×256, 15q/5kv → <b>280</b> GFLOPS</td><td>2048×2048, 32q/8kv → <b>1065</b> GFLOPS (peak 2031 at 32q/32kv)</td><td>~13–26% of peak</td></tr>
+    <tr><td>&nbsp;&nbsp;(mid shape for reference)</td><td colspan="2">512×512, 12q/6kv → 661 · 512×512, 64q/8kv → 1135</td><td>—</td></tr>
+  </table>
+  <p class="legend">
+    The NPU's 8×4 MMA array only approaches peak when M/N/K are large enough to keep every tile busy and amortize
+    DMA. At SmolVLA's seq=256 both kernels run at ~15–25% of their large-shape throughput. GEMM still wins vs CPU
+    (its peak is so high that even 23% beats CPU BLAS); FA doesn't (its absolute peak is ~8× lower than GEMM's, so
+    at 13–26% it falls below CPU). This is the quantitative face of "the backbone is the smallest-shape stage."
+  </p>
   <div class="callout warn">
     <b>The result overturns the simple "small shapes lose on NPU" story — it's more specific.</b>
     <ul class="clean" style="margin:0.5rem 0 0">
