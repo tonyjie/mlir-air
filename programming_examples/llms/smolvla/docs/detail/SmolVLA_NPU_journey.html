@@ -926,6 +926,30 @@ once after 16 layers: (HOST) final RMSNorm [256,960]
     <tr><td>approach-B (GEMM + masked_softmax)</td><td>~217 ms</td><td>11</td><td><b>0.9971</b></td><td>PASS</td></tr>
     <tr><td>non-causal FlashAttention</td><td><b>~105 ms</b></td><td>1</td><td>0.9828</td><td><b>FAIL</b> (&lt; 0.99)</td></tr>
   </table>
+  <p>
+    Same per-layer diagram as Section 6, but with the attention block swapped for FlashAttention — note how much
+    simpler the host glue and dispatch count become (this is where the speed comes from):
+  </p>
+  <div class="card" style="font-family:'SF Mono',Menlo,Consolas,monospace;font-size:0.82rem;line-height:1.7;white-space:pre-wrap">
+<span style="color:#374151">x [256,960]</span>
+ ─<span style="color:#1e40af;font-weight:700">[NPU elf:rms_gemms_rope]</span>  <span class="knl">FUSED, 6 launches, 1 ELF</span>  <span style="color:#6b7280">(unchanged from approach-B)</span>
+     → q_roped[256,960]  k_roped[256,320]  v[256,320]
+ ─<b>attention</b>  <span class="knl">1 dispatch</span> <span style="color:#6b7280">· vs approach-B's 11</span>
+     (HOST) just make Q/K/V contiguous — <b>no transpose, no per-head stacking, no mask fold</b>
+     1× <span style="color:#1e40af;font-weight:700">[NPU elf:flash_attn]</span>  seq-first, non-causal, 15q/5kv, hd=64, <b>no mask</b>
+        Q[256,960] K[256,320] V[256,320] → attn_out[256,960]   <span style="color:#991b1b">(⚠ state col + 15 pad leak in)</span>
+ ─<span style="color:#1e40af;font-weight:700">[NPU elf:o_ffn]</span>  <span class="knl">FUSED, 8 launches, 1 ELF</span>  <span style="color:#6b7280">(unchanged from approach-B)</span>
+     → layer_out[256,960]
+
+once after 16 layers: (HOST) final RMSNorm [256,960]
+  </div>
+  <p class="legend">
+    <b>Totals per layer:</b> 2 fused ELFs + 1 attention dispatch = <b>3 XRT dispatches/layer × 16 = 48</b>
+    (vs approach-B's 13/layer = 208). The whole attention host-glue block (reshape-to-heads, Kᵀ transpose,
+    per-group stacking, mask folding) <em>disappears</em> — FA takes seq-first Q/K/V directly and does everything
+    on-device in one shot. That's the 2.1× win. The cost is in the ⚠ line: <code>causal=False</code> has no mask
+    input, so the state column and the 15 padding tokens are not excluded.
+  </p>
   <div class="callout warn">
     <b>Result: FA is 2.1× faster but fails correctness.</b> Dropping attention from 11 dispatches to 1 cut the NPU
     backbone from ~217 ms to <b>~105 ms</b>. But with no mask, the first 240 prefix tokens wrongly see the state
