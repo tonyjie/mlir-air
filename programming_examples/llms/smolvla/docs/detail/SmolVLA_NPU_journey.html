@@ -656,6 +656,34 @@
     <tr><td><code>o_proj</code> + residual</td><td><span class="knl">GEMM</span> + <span class="knl">EltwiseAdd</span> (fused into the o_ffn ELF)</td><td>—</td></tr>
     <tr><td><code>LlamaMLP</code> (SwiGLU)</td><td><span class="knl">gate/up GEMM</span> + <span class="knl">SiLU-Mul</span> + <span class="knl">down GEMM</span> (o_ffn ELF)</td><td>(1,241,960)→(1,241,2560)→(1,241,960)</td></tr>
   </table>
+  <p class="legend">
+    Every kernel above is from the <b>registry</b> (the 6 tier-1 kernels), reused at SmolVLA's shapes — except
+    <code>masked_softmax</code>, which we built new. The backbone runs seq=241 padded to <b>256</b>; the GEMMs pick
+    fused-cast vs drain per shape via <code>gemm_registry_config</code> (registry-driven, same mechanism as the
+    llama/qwen siblings).
+  </p>
+
+  <h3>How one backbone layer actually runs on the NPU</h3>
+  <p>
+    The per-layer operations are packed into a small number of <b>fused ELFs</b> (one compiled NPU program that
+    chains several kernels, so it's one XRT dispatch instead of many). The two non-attention groups reuse the
+    <em>exact</em> fused ELFs built for the llama/qwen deployments; attention is host-orchestrated from 3 small
+    kernels. Concretely, per layer (this is the <code>make verify</code> path, attention on NPU):
+  </p>
+  <div class="card" style="font-family:'SF Mono',Menlo,Consolas,monospace;font-size:0.85rem;line-height:1.8">
+    <b>rms_gemms_rope.elf</b> &nbsp;— 1 dispatch &nbsp;<span style="color:#6b7280">(RMSNorm + Q/K/V GEMM + RoPE Q/K)</span> &nbsp;<span class="knl">reused from llama</span><br>
+    &nbsp;&nbsp;→ <b>attention</b> &nbsp;— 11 dispatches &nbsp;<span style="color:#6b7280">(5× <b>qkt</b> GEMM · 1× <b>masked_softmax</b> · 5× <b>pv</b> GEMM)</span><br>
+    &nbsp;&nbsp;→ <b>o_ffn.elf</b> &nbsp;— 1 dispatch &nbsp;<span style="color:#6b7280">(O proj + add + RMSNorm + Gate/Up + SwiGLU + Down + add)</span> &nbsp;<span class="knl">reused from llama</span><br>
+    <span style="color:#374151">= <b>13 XRT dispatches/layer × 16 layers = 208 total.</b> 5 distinct ELFs compiled once + cached:
+    <code>rms_gemms_rope</code>, <code>qkt</code>, <code>masked_softmax</code>, <code>pv</code>, <code>o_ffn</code>.</span>
+  </div>
+  <p class="legend">
+    <b>The attention 11 dispatches</b> = the batched per-head design (from GQA: 15 q-heads share 5 kv-heads, so
+    5 qkt + 5 pv, each batching 3 heads via a stacked matmul; plus 1 masked_softmax over all heads). Compare the
+    2 fused non-attention ELFs — the attention is the <em>un-fused</em> part, and cutting those 11 dispatches is
+    exactly what the Section 9 optimization and the future Route 3 target. (The final RMSNorm after layer 16 runs
+    on CPU, outside the per-layer loop — same choice as the llama/qwen siblings.)
+  </p>
 
   <div class="card">
     <p style="margin-top:0"><b>Key design: how the non-causal attention was built</b></p>
@@ -673,9 +701,12 @@
   </div>
 
   <div class="callout warn">
-    <b>What remains on CPU:</b> ① vision and ③ the action expert. Section 5's table shows why — vision needs 4 new
-    kernels; the expert reuses backbone kernels and is the natural next milestone (its cross-attention already
-    reads the backbone's K/V cache, which the hybrid pipeline already produces).
+    <b>Is the whole backbone on the NPU? Yes — but only the backbone.</b> All 16 backbone layers' compute
+    (RMSNorm, every GEMM projection, RoPE, attention, SwiGLU) runs on NPU; only the single post-layer-16 RMSNorm
+    stays on CPU (outside the hot loop, sibling-consistent). What is <em>not</em> on the NPU at all: ① the vision
+    encoder + connector and ③ the action expert + 10-step denoise loop — these remain fully on CPU (see Section 5
+    for what each would need; the expert is the natural next milestone since its cross-attention already reads the
+    backbone K/V cache the hybrid pipeline produces).
   </div>
 
   <!-- ============================================================ -->
@@ -751,8 +782,9 @@
 
   <p>
     This project was <b>correctness-first, then optimize speed</b>. On the first measurement the NPU backbone was
-    a bit <em>slower</em> than the CPU backbone — because the attention part split the 15 heads into many small jobs,
-    and the <b>job-launch overhead</b> added up (31 launches per layer, ~500 across 16 layers).
+    slower than it needed to be — because the attention part split the 15 heads into many small jobs, so each layer
+    issued <b>31 attention dispatches</b> (15 QKᵀ + 1 softmax + 15 PV) on top of the 2 fused ELFs = 33/layer, and
+    the <b>job-launch overhead</b> added up (~528 across 16 layers).
   </p>
   <div class="analogy">
     <b>Analogy:</b> like 15 small files each making a separate trip to the printer — the walking takes longer than
@@ -763,24 +795,32 @@
     matrix multiplication — cutting per-layer launches from 31 to 11 (total ~528 → ~208).
   </p>
   <table>
-    <tr><th>Metric (backbone only)</th><th>Before opt</th><th>After opt</th></tr>
-    <tr><td>NPU backbone latency (16 layers)</td><td>~400 ms</td><td><b>~226 ms</b></td></tr>
-    <tr><td>CPU backbone latency (same compute)</td><td>~344 ms</td><td>~340 ms</td></tr>
-    <tr><td>NPU / CPU ratio</td><td>1.16× (NPU slower)</td><td><b>0.71× (NPU faster)</b></td></tr>
-    <tr><td>attention launches / layer</td><td>31</td><td>11</td></tr>
+    <tr><th>Metric (backbone only, 16 layers)</th><th>Before opt</th><th>After opt</th></tr>
+    <tr><td>NPU backbone latency</td><td>~400 ms</td><td><b>~226 ms</b></td></tr>
+    <tr><td>CPU-NumPy reference latency (same math, fp32)</td><td>~344 ms</td><td>~340 ms</td></tr>
+    <tr><td>NPU / CPU-NumPy ratio</td><td>1.16× (NPU slower)</td><td><b>0.71× (NPU faster)</b></td></tr>
+    <tr><td>XRT dispatches / layer</td><td>33 (31 attention)</td><td>13 (11 attention)</td></tr>
     <tr><td>correctness (<code>make verify</code>)</td><td>PASS</td><td>PASS (bit-identical)</td></tr>
   </table>
   <div class="callout">
-    <b>Result: the NPU backbone went from 400ms to 226ms (~1.8× faster), now beating the CPU backbone.</b>
-    Correctness is bit-identical after the optimization — batching only changes how work is submitted, not the math.
+    <b>Result: the NPU backbone went from 400ms to 226ms (~1.8× faster).</b> After the optimization it beats the
+    NumPy reference (0.71×). Correctness is bit-identical — batching only changes how the work is submitted, not
+    the math.
   </div>
   <div class="callout warn">
-    <b>Whole-model perspective (from Section 4):</b> the backbone is only 5.8% of the end-to-end CPU time, so
-    speeding it up moves a small slice of the total. A1 proves the <em>method</em> works; the biggest performance
-    prizes are <b>vision (73.6%, milestone A3)</b> and the <b>action expert (20.1%, A2)</b>. Vision was
-    deprioritized on engineering difficulty (4 new kernels + a 1024×1024 attention), but this profile shows it is
-    also the biggest performance opportunity — a trade-off worth revisiting. Remaining backbone headroom: fusing
-    the ~208 launches further (Route 3).
+    <b>Two different "CPU backbone" numbers — don't confuse them.</b> Section 4's profiling says the backbone is
+    <b>56.8 ms</b>; the table above says <b>~340 ms</b>. Both are correct — they are <em>different CPU
+    implementations</em>: Section 4 is the real LeRobot model (<b>PyTorch</b>, heavily-optimized MKL matmuls),
+    while the table's reference is our own <b>plain NumPy fp32</b> backbone (<code>cpu_backbone_forward</code>),
+    used only as a like-for-like yardstick for the NPU bench (compile + bridge excluded). So the fair headline is
+    "NPU backbone ≈ 226 ms." Versus the optimized <b>PyTorch</b> backbone (56.8 ms) the NPU is currently
+    <em>slower</em> — expected for an un-fused, first-pass port whose attention still costs 11 dispatches/layer.
+  </div>
+  <div class="callout warn">
+    <b>Whole-model perspective (from Section 4):</b> the backbone is only 5.8% of the end-to-end CPU time
+    (56.8 of 1044 ms), so speeding it up moves a small slice of the total. A1 proves the <em>method</em> works;
+    the biggest performance prizes are <b>vision (73.6%, milestone A3)</b> and the <b>action expert (20.1%, A2)</b>.
+    Remaining backbone headroom: fusing the 11 attention dispatches into the layer's ELF (Route 3).
   </div>
 
   <!-- ============================================================ -->
