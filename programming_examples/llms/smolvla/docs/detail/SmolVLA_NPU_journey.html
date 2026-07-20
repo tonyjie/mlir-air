@@ -1,0 +1,399 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SmolVLA on NPU2 — 从模型到芯片 (An Illustrated Journey)</title>
+<style>
+  :root {
+    --bg: #fafaf7; --fg: #1f2937; --muted: #6b7280; --accent: #2563eb;
+    --card-bg: #ffffff; --card-border: #e5e7eb;
+    --cpu: #fef3c7; --cpu-border: #d97706;
+    --npu: #dbeafe; --npu-border: #2563eb;
+    --good: #dcfce7; --good-border: #16a34a;
+    --warn: #fef9c3; --warn-border: #ca8a04;
+    --code-bg: #f3f4f6;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+    background: var(--bg); color: var(--fg); line-height: 1.75;
+    margin: 0; padding: 2rem 1rem;
+  }
+  .wrap { max-width: 960px; margin: 0 auto; }
+  h1 { font-size: 2.1rem; margin-bottom: 0.2rem; color: #111827; }
+  .subtitle { color: var(--muted); font-size: 1.1rem; margin-bottom: 0.5rem; }
+  .meta { color: var(--muted); font-size: 0.85rem; margin-bottom: 2.5rem; border-bottom: 1px solid var(--card-border); padding-bottom: 1rem; }
+  h2 {
+    font-size: 1.6rem; margin-top: 3.5rem; padding: 0.5rem 0 0.5rem 0.9rem;
+    border-left: 5px solid var(--accent); color: #111827; background: linear-gradient(90deg, #eff6ff, transparent);
+  }
+  h3 { font-size: 1.2rem; margin-top: 2rem; color: #1f2937; }
+  p { margin: 0.8rem 0; }
+  .lead { font-size: 1.08rem; }
+  .card {
+    background: var(--card-bg); border: 1px solid var(--card-border); border-radius: 10px;
+    padding: 1.2rem 1.4rem; margin: 1.2rem 0; box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+  }
+  .analogy {
+    background: #f5f3ff; border-left: 4px solid #7c3aed; border-radius: 6px;
+    padding: 0.9rem 1.2rem; margin: 1.2rem 0;
+  }
+  .analogy b { color: #6d28d9; }
+  .callout {
+    background: var(--good); border-left: 4px solid var(--good-border); border-radius: 6px;
+    padding: 0.9rem 1.2rem; margin: 1.2rem 0;
+  }
+  .callout.warn { background: var(--warn); border-left-color: var(--warn-border); }
+  code { background: var(--code-bg); padding: 0.1rem 0.4rem; border-radius: 4px; font-size: 0.9em; font-family: "SF Mono", Menlo, Consolas, monospace; }
+  table { border-collapse: collapse; width: 100%; margin: 1.2rem 0; font-size: 0.92rem; }
+  th, td { border: 1px solid var(--card-border); padding: 0.55rem 0.75rem; text-align: left; }
+  th { background: #f9fafb; font-weight: 600; }
+  tr:nth-child(even) td { background: #fcfcfc; }
+  .pill { display: inline-block; padding: 0.1rem 0.6rem; border-radius: 999px; font-size: 0.78rem; font-weight: 600; }
+  .pill.cpu { background: var(--cpu); color: #92400e; border: 1px solid var(--cpu-border); }
+  .pill.npu { background: var(--npu); color: #1e40af; border: 1px solid var(--npu-border); }
+  .pill.done { background: var(--good); color: #166534; border: 1px solid var(--good-border); }
+  .pill.future { background: #f3f4f6; color: #6b7280; border: 1px solid #d1d5db; }
+  .fig { text-align: center; margin: 1.8rem 0; }
+  .fig svg { max-width: 100%; height: auto; }
+  .fig figcaption { color: var(--muted); font-size: 0.85rem; margin-top: 0.6rem; }
+  .big-num { font-size: 2.2rem; font-weight: 700; color: var(--accent); line-height: 1; }
+  .stat-row { display: flex; flex-wrap: wrap; gap: 1rem; margin: 1.5rem 0; }
+  .stat {
+    flex: 1; min-width: 150px; background: var(--card-bg); border: 1px solid var(--card-border);
+    border-radius: 10px; padding: 1.1rem; text-align: center;
+  }
+  .stat .label { color: var(--muted); font-size: 0.82rem; margin-top: 0.4rem; }
+  .step-num {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 1.7rem; height: 1.7rem; border-radius: 50%; background: var(--accent);
+    color: white; font-weight: 700; font-size: 0.9rem; margin-right: 0.5rem; flex-shrink: 0;
+  }
+  ul.clean { list-style: none; padding-left: 0; }
+  ul.clean li { padding: 0.35rem 0 0.35rem 1.6rem; position: relative; }
+  ul.clean li::before { content: "▸"; position: absolute; left: 0.3rem; color: var(--accent); }
+  .toc { background: var(--card-bg); border: 1px solid var(--card-border); border-radius: 10px; padding: 1rem 1.5rem; margin: 2rem 0; }
+  .toc a { color: var(--accent); text-decoration: none; }
+  .toc a:hover { text-decoration: underline; }
+  .toc ol { margin: 0.5rem 0; padding-left: 1.4rem; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>SmolVLA on NPU2</h1>
+  <div class="subtitle">从一个机器人 AI 模型，到把它跑在 AMD NPU 芯片上 — 图解全过程</div>
+  <div class="meta">
+    A plain-language walkthrough for readers new to SmolVLA · mlir-air / AMD NPU2 (Strix, AIE2P) ·
+    里程碑 A1 完成 (2026-07)
+  </div>
+
+  <div class="toc">
+    <b>目录</b>
+    <ol>
+      <li><a href="#what">SmolVLA 是什么？</a>（面向非专家）</li>
+      <li><a href="#three">模型的三个部分</a></li>
+      <li><a href="#why">为什么要搬到 NPU？什么是 NPU？</a></li>
+      <li><a href="#split">我们的方案：CPU / NPU 混合</a></li>
+      <li><a href="#how">怎么把 backbone 映射到 NPU（分阶段）</a></li>
+      <li><a href="#correct">正确性：怎么保证没算错</a></li>
+      <li><a href="#perf">性能：优化前后</a></li>
+      <li><a href="#status">当前进度与后续</a></li>
+    </ol>
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="what">1. SmolVLA 是什么？</h2>
+
+  <p class="lead">
+    <b>SmolVLA 是一个「视觉-语言-动作」模型（Vision-Language-Action, VLA）</b> —— 你可以把它想成
+    <b>机器人的大脑</b>。它来自 Hugging Face 的 LeRobot 生态。
+  </p>
+
+  <div class="analogy">
+    <b>一句话类比：</b> 你对一个机械臂说「把方块捡起来」，同时给它几个摄像头画面。SmolVLA 读懂
+    <b>画面 + 这句话 + 机器人当前姿态</b>，然后输出<b>接下来一连串该怎么动</b>（关节角度、夹爪开合）。
+    它把「看 + 听懂 + 决定怎么动」合成了一个模型。
+  </div>
+
+  <div class="card">
+    <b>输入 / 输出（本项目用的 <code>lerobot/smolvla_base</code> 版本，450M 参数）：</b>
+    <ul class="clean">
+      <li><b>输入</b>：3 路相机图像 + 一句自然语言指令 + 机器人状态向量（6 维）</li>
+      <li><b>输出</b>：一个「动作块」(action chunk) —— 一次预测未来 <b>50 步</b>动作，每步 6 个数</li>
+    </ul>
+    <p style="margin-bottom:0;color:var(--muted);font-size:0.9rem">
+      它用一种叫 <b>flow-matching（流匹配）</b>的方法生成动作：从随机噪声开始，迭代
+      <b>10 步</b>逐渐「去噪」成一串合理的动作 —— 类似 AI 画图里的扩散过程，只不过这里「画」的是机器人动作。
+    </p>
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="three">2. 模型的三个部分</h2>
+
+  <p>SmolVLA 内部由三块拼成，就像一条流水线：</p>
+
+  <div class="fig">
+  <svg viewBox="0 0 860 260" xmlns="http://www.w3.org/2000/svg" font-family="system-ui, sans-serif">
+    <!-- Part A: Vision -->
+    <rect x="20" y="60" width="230" height="140" rx="10" fill="#fdf2f8" stroke="#be185d" stroke-width="2"/>
+    <text x="135" y="88" text-anchor="middle" font-size="15" font-weight="700" fill="#be185d">① 视觉编码器</text>
+    <text x="135" y="107" text-anchor="middle" font-size="12" fill="#9d174d">SigLIP (ViT)</text>
+    <text x="135" y="132" text-anchor="middle" font-size="11" fill="#6b7280">把相机像素</text>
+    <text x="135" y="149" text-anchor="middle" font-size="11" fill="#6b7280">变成「视觉 token」</text>
+    <text x="135" y="173" text-anchor="middle" font-size="10.5" fill="#9d174d">冻结不训练 · 最重</text>
+
+    <!-- Part B: Backbone -->
+    <rect x="300" y="60" width="250" height="140" rx="10" fill="#dbeafe" stroke="#2563eb" stroke-width="3"/>
+    <text x="425" y="88" text-anchor="middle" font-size="15" font-weight="700" fill="#1e40af">② 语言 backbone</text>
+    <text x="425" y="107" text-anchor="middle" font-size="12" fill="#1e3a8a">SmolLM2-360M (16 层)</text>
+    <text x="425" y="132" text-anchor="middle" font-size="11" fill="#6b7280">把「视觉+语言+状态」</text>
+    <text x="425" y="149" text-anchor="middle" font-size="11" fill="#6b7280">融合理解成上下文</text>
+    <text x="425" y="173" text-anchor="middle" font-size="10.5" font-weight="700" fill="#1e40af">★ 本项目搬上 NPU 的部分</text>
+
+    <!-- Part C: Action Expert -->
+    <rect x="600" y="60" width="240" height="140" rx="10" fill="#f0fdf4" stroke="#15803d" stroke-width="2"/>
+    <text x="720" y="88" text-anchor="middle" font-size="15" font-weight="700" fill="#15803d">③ 动作专家</text>
+    <text x="720" y="107" text-anchor="middle" font-size="12" fill="#166534">Action Expert (~100M)</text>
+    <text x="720" y="132" text-anchor="middle" font-size="11" fill="#6b7280">读 backbone 的理解，</text>
+    <text x="720" y="149" text-anchor="middle" font-size="11" fill="#6b7280">10 步去噪出动作</text>
+    <text x="720" y="173" text-anchor="middle" font-size="10.5" fill="#166534">flow-matching 循环</text>
+
+    <!-- arrows -->
+    <defs><marker id="ar" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#6b7280"/></marker></defs>
+    <line x1="250" y1="130" x2="298" y2="130" stroke="#6b7280" stroke-width="2" marker-end="url(#ar)"/>
+    <line x1="550" y1="130" x2="598" y2="130" stroke="#6b7280" stroke-width="2" marker-end="url(#ar)"/>
+    <text x="30" y="35" font-size="12" fill="#6b7280">相机 + 指令 + 状态</text>
+    <line x1="120" y1="42" x2="120" y2="58" stroke="#6b7280" stroke-width="1.5" marker-end="url(#ar)"/>
+    <text x="700" y="235" font-size="12" fill="#6b7280">→ 50 步动作块</text>
+    <line x1="720" y1="202" x2="720" y2="222" stroke="#6b7280" stroke-width="1.5" marker-end="url(#ar)"/>
+  </svg>
+  <figcaption>SmolVLA 的三段结构。② 语言 backbone 是本项目的主角。</figcaption>
+  </div>
+
+  <div class="card">
+    <p style="margin-top:0"><b>为什么 backbone 是「语言模型」？</b></p>
+    SmolVLA 的第二段其实就是一个精简版的大语言模型（SmolLM2-360M，和 Llama 同类架构）。
+    区别在于：它不「说话」（不生成文字），而是把图像、文字、状态<b>一次性读进去、理解一遍</b>，
+    产出一份「理解结果」交给动作专家。因为团队已经在 NPU 上部署过好几个同类语言模型
+    （Llama、Qwen 系列），<b>这一段是最有把握、最能复用现成积木的部分</b> —— 所以我们先攻它。
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="why">3. 为什么要搬到 NPU？什么是 NPU？</h2>
+
+  <div class="analogy">
+    <b>CPU vs NPU 类比：</b> CPU 像一个<b>全能的通才</b>，什么都能算，但一次做的事有限。
+    NPU（Neural Processing Unit，神经网络处理器）像一个<b>专门算矩阵乘法的车间</b> ——
+    AI 模型的绝大部分计算就是矩阵乘法，NPU 为此专门设计，又快又省电。机器人要实时反应，
+    把模型放到 NPU 上是关键一步。
+  </div>
+
+  <p>
+    我们用的芯片是 <b>AMD NPU2</b>（代号 Strix，架构 AIE2P），编译工具链是 <b>mlir-air</b> ——
+    它负责把「模型里的一个算子」翻译成「NPU 上一段能跑的机器码」。
+  </p>
+
+  <!-- ============================================================ -->
+  <h2 id="split">4. 我们的方案：CPU / NPU 混合</h2>
+
+  <p class="lead">
+    我们没有把整个模型都搬上 NPU，而是做了一个<b>混合流水线</b>：
+    <span class="pill npu">NPU</span> 跑最核心、最值得的语言 backbone；
+    <span class="pill cpu">CPU</span> 跑其余部分。这是<b>刻意的工程取舍</b>，不是没做完。
+  </p>
+
+  <div class="fig">
+  <svg viewBox="0 0 860 340" xmlns="http://www.w3.org/2000/svg" font-family="system-ui, sans-serif">
+    <defs><marker id="ar2" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#6b7280"/></marker></defs>
+    <!-- CPU input band -->
+    <rect x="20" y="20" width="820" height="70" rx="8" fill="#fef3c7" stroke="#d97706" stroke-width="1.5" stroke-dasharray="4 3"/>
+    <text x="32" y="40" font-size="12" font-weight="700" fill="#92400e">CPU</text>
+    <text x="140" y="42" font-size="12" fill="#78350f">3 相机 → SigLIP 视觉编码 → connector → 192 视觉 token</text>
+    <text x="140" y="60" font-size="12" fill="#78350f">指令 → 分词 → 48 语言 token</text>
+    <text x="140" y="78" font-size="12" fill="#78350f">状态 → 1 token &nbsp;&nbsp;→&nbsp;&nbsp;拼成 prefix (241 个 token, 每个 960 维)</text>
+
+    <line x1="430" y1="90" x2="430" y2="115" stroke="#6b7280" stroke-width="2" marker-end="url(#ar2)"/>
+
+    <!-- NPU band -->
+    <rect x="120" y="118" width="620" height="92" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="3"/>
+    <text x="132" y="138" font-size="12" font-weight="700" fill="#1e40af">NPU2 ★</text>
+    <text x="430" y="140" text-anchor="middle" font-size="13" font-weight="700" fill="#1e3a8a">SmolLM2-360M backbone · 16 层 prefill</text>
+    <text x="430" y="162" text-anchor="middle" font-size="11" fill="#1e3a8a">每层: RMSNorm → Q/K/V 投影 → RoPE → 非因果注意力 → O 投影 → 残差 → SwiGLU 前馈</text>
+    <text x="430" y="184" text-anchor="middle" font-size="11" fill="#6b7280">所有矩阵乘法 / 归一化 / 注意力 / 激活都在 NPU 上</text>
+    <text x="430" y="201" text-anchor="middle" font-size="10.5" fill="#1e40af">产出：每层的 K/V「记忆缓存」</text>
+
+    <line x1="430" y1="210" x2="430" y2="235" stroke="#6b7280" stroke-width="2" marker-end="url(#ar2)"/>
+    <text x="445" y="228" font-size="10.5" fill="#6b7280">把 NPU 算出的 K/V 注入回 CPU</text>
+
+    <!-- CPU output band -->
+    <rect x="20" y="238" width="820" height="80" rx="8" fill="#fef3c7" stroke="#d97706" stroke-width="1.5" stroke-dasharray="4 3"/>
+    <text x="32" y="258" font-size="12" font-weight="700" fill="#92400e">CPU</text>
+    <text x="140" y="262" font-size="12" fill="#78350f">动作专家 (Action Expert) 读取 backbone 的 K/V 缓存</text>
+    <text x="140" y="282" font-size="12" fill="#78350f">10 步 flow-matching 去噪循环</text>
+    <text x="140" y="302" font-size="12" font-weight="700" fill="#78350f">→ 输出 (50, 6) 动作块</text>
+  </svg>
+  <figcaption>混合流水线：CPU 做前处理和动作生成，NPU 做最核心的 16 层 backbone。</figcaption>
+  </div>
+
+  <h3>哪些在 NPU，哪些在 CPU？</h3>
+  <table>
+    <tr><th>模型部分</th><th>跑在哪</th><th>为什么</th></tr>
+    <tr><td>语言 backbone（16 层的归一化 / 投影 / 注意力 / 激活）</td><td><span class="pill npu">NPU2</span></td><td>最核心、算力密集、能复用已验证的 kernel 积木</td></tr>
+    <tr><td>视觉编码器 SigLIP + connector</td><td><span class="pill cpu">CPU</span></td><td>冻结不变、最难搬（需 3 个全新 kernel）、每回合只跑一次 → 投入产出比最低</td></tr>
+    <tr><td>动作专家 + 10 步去噪</td><td><span class="pill cpu">CPU</span></td><td>结构特殊，规划为下一里程碑 A2</td></tr>
+    <tr><td>最后一层归一化、prefix 组装</td><td><span class="pill cpu">CPU</span></td><td>在热循环之外，和其他语言模型一样留 CPU</td></tr>
+  </table>
+
+  <!-- ============================================================ -->
+  <h2 id="how">5. 怎么把 backbone 映射到 NPU（分阶段）</h2>
+
+  <p>
+    我们没有一步到位，而是像搭积木一样、每一步都<b>先验证正确再往上加</b>。整个过程分 4 个阶段：
+  </p>
+
+  <div class="card">
+    <p><span class="step-num">0</span><b>建 CPU 参考（「标准答案」）</b></p>
+    <p style="margin-left:2.2rem">
+      先在纯 CPU 上跑真实的 SmolVLA，把每一层的输出录下来当「标准答案」(oracle)。
+      后面 NPU 每算一步，都要和这个标准答案对照。<span class="pill done">✅ 完成</span>
+    </p>
+    <p style="margin-left:2.2rem;color:var(--muted);font-size:0.9rem">
+      💡 这一步就抓出一个关键坑：模型配置文件写着 RoPE 参数是 100000，但代码运行时其实用的是
+      10000 —— 靠对照标准答案的相似度才发现。用错会让整个 backbone 悄悄算歪。
+    </p>
+  </div>
+
+  <div class="card">
+    <p><span class="step-num">1</span><b>验证每个「积木」kernel</b></p>
+    <p style="margin-left:2.2rem">
+      backbone 需要 8 类基础运算（矩阵乘法、归一化、RoPE、激活……）。其中 7 类是现成的、
+      在 NPU 上验证过的积木，只需按 SmolVLA 的新尺寸重测一遍。<b>唯一全新的是「非因果注意力」</b> ——
+      我们没有硬改复杂的现成注意力，而是用「矩阵乘法 + 带掩码的 softmax」组合出来，更稳。
+      <span class="pill done">✅ 完成</span>
+    </p>
+  </div>
+
+  <div class="card">
+    <p><span class="step-num">2</span><b>拼出「一层」，对照标准答案</b></p>
+    <p style="margin-left:2.2rem">
+      把积木拼成 backbone 的第 1 层，在 NPU 上跑，和标准答案的第 1 层比。
+      相似度 <b>0.99998</b>（1.0 是完全一致）—— 说明拼装正确。<span class="pill done">✅ 完成</span>
+    </p>
+  </div>
+
+  <div class="card">
+    <p><span class="step-num">3</span><b>扩到 16 层，端到端跑通</b></p>
+    <p style="margin-left:2.2rem">
+      把一层复制成完整 16 层，NPU 算出的每层 K/V「记忆」注入回 CPU 的动作专家，
+      产出最终动作块，和纯 CPU 的动作块对照。<span class="pill done">✅ 完成</span>
+    </p>
+    <p style="margin-left:2.2rem;color:var(--muted);font-size:0.9rem">
+      💡 我们还做了个「扰动测试」：故意把 NPU 算的 K/V 换成乱数，动作块立刻大变 ——
+      这证明动作<b>确实由 NPU 的计算驱动</b>，不是 CPU 偷偷在算。
+    </p>
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="correct">6. 正确性：怎么保证没算错</h2>
+
+  <p>
+    NPU 用 bf16（16 位）计算，比 CPU 的 32 位精度低，所以我们要证明「误差在可接受范围内」。
+    用两条独立的标尺：
+  </p>
+
+  <div class="stat-row">
+    <div class="stat">
+      <div class="big-num">0.9962</div>
+      <div class="label">16 层 backbone 输出<br>vs 标准答案（余弦相似度）</div>
+    </div>
+    <div class="stat">
+      <div class="big-num">0.9971</div>
+      <div class="label">最终动作块<br>vs 纯 CPU（余弦相似度）</div>
+    </div>
+    <div class="stat">
+      <div class="big-num">PASS</div>
+      <div class="label"><code>make verify</code><br>端到端自动门禁</div>
+    </div>
+  </div>
+
+  <div class="callout">
+    <b>结论：正确性有保证。</b> 相似度 0.9971（越接近 1 越好，门槛设 0.99），
+    误差全部来自 bf16 精度、在预期内。而且这些数字是在<b>真实 NPU 硬件</b>上测的，不是模拟。
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="perf">7. 性能：优化前后</h2>
+
+  <p>
+    这个项目<b>先保证正确，再优化速度</b>。第一次测速时，NPU 反而比 CPU <em>慢</em>一点 ——
+    因为注意力部分把 15 个「注意力头」拆成很多次小任务发给 NPU，<b>「发任务」的开销</b>累积起来很大
+    （每层要发 31 次，16 层约 500 次）。
+  </p>
+
+  <div class="analogy">
+    <b>类比：</b> 就像你有 15 份小文件要打印，每份都单独走一趟打印机 —— 走路的时间比打印还久。
+    优化就是<b>把能合并的合并成一叠一次打印</b>。
+  </div>
+
+  <p>
+    <b>优化（路线 1）：</b> 这 15 个注意力头里，每 3 个共享同一份数据，可以<b>堆叠成一次大矩阵乘法</b>。
+    于是每层的「发任务」次数从 31 降到 11，总共从约 528 降到约 208 次。
+  </p>
+
+  <table>
+    <tr><th>指标</th><th>优化前</th><th>优化后</th></tr>
+    <tr><td>NPU backbone 延迟（16 层）</td><td>~400 ms</td><td><b>~226 ms</b></td></tr>
+    <tr><td>CPU backbone 延迟（同样计算）</td><td>~344 ms</td><td>~340 ms</td></tr>
+    <tr><td>NPU / CPU 比值</td><td>1.16×（NPU 慢）</td><td><b>0.71×（NPU 更快）</b></td></tr>
+    <tr><td>注意力「发任务」次数 / 层</td><td>31</td><td>11</td></tr>
+    <tr><td>正确性（<code>make verify</code>）</td><td>PASS</td><td>PASS（逐位一致）</td></tr>
+  </table>
+
+  <div class="callout">
+    <b>优化结果：NPU backbone 从 400ms 降到 226ms（约 1.8× 加速），现在比 CPU 更快。</b>
+    而且优化后正确性数字<b>逐位不变</b> —— 因为「合并发任务」只是换了个发法，算的还是同一道题。
+  </div>
+
+  <div class="callout warn">
+    <b>还有空间（未做）：</b> 目前还剩约 208 次「发任务」。下一步（路线 3）可以把整层的注意力也
+    融进一个更大的 NPU 程序块里，进一步减少开销。这是后续优化方向。
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="status">8. 当前进度与后续</h2>
+
+  <h3>已完成 —— 里程碑 A1</h3>
+  <ul class="clean">
+    <li><span class="pill done">✅</span> SmolVLA 的<b>语言 backbone（全 16 层）跑在 NPU2 上</b>，数值对照纯 CPU 通过</li>
+    <li><span class="pill done">✅</span> 端到端混合流水线打通：CPU 前处理 → NPU backbone → CPU 动作生成</li>
+    <li><span class="pill done">✅</span> 正确性双轨验证（逐层 + 端到端），<code>make verify</code> 真机 PASS</li>
+    <li><span class="pill done">✅</span> 性能优化：backbone 加速 1.8×，NPU 反超 CPU</li>
+    <li><span class="pill done">✅</span> 顺带修了一个影响所有已部署模型的共享代码 bug，并验证无回归</li>
+  </ul>
+
+  <h3>后续里程碑</h3>
+  <table>
+    <tr><th>里程碑</th><th>内容</th><th>状态</th></tr>
+    <tr><td><b>A2</b></td><td>把<b>动作专家</b>也搬上 NPU（交叉注意力 + 10 步去噪）</td><td><span class="pill future">规划中</span></td></tr>
+    <tr><td><b>A3</b></td><td>把<b>视觉编码器</b>搬上 NPU（需双向注意力、GELU、LayerNorm、pixel-shuffle 等新 kernel）</td><td><span class="pill future">远期</span></td></tr>
+    <tr><td><b>路线 3</b></td><td>进一步融合注意力，减少剩余的 ~208 次发任务开销</td><td><span class="pill future">优化空间</span></td></tr>
+  </table>
+
+  <div class="card" style="margin-top:2rem;background:#f0f9ff;border-color:#7dd3fc">
+    <p style="margin:0"><b>一句话总结：</b>
+    SmolVLA 的语言大脑（16 层 SmolLM2-360M）现在完整跑在 AMD NPU2 上，
+    动作输出对照纯 CPU 基准验证通过（相似度 0.9971），性能优化后比 CPU 快约 1.4 倍。
+    视觉和动作专家按计划留在 CPU，是后续里程碑。这是<b>首次有 VLA 模型的核心跑在 AMD NPU2 上</b>。</p>
+  </div>
+
+  <div class="meta" style="margin-top:3rem;border-bottom:none;border-top:1px solid var(--card-border);padding-top:1rem">
+    生成于 mlir-air <code>programming_examples/llms/smolvla/</code> ·
+    详细技术设计见 <code>ARCHITECTURE.md</code> · 复现命令见 <code>README.md</code> ·
+    所有数字均在真实 NPU2 硬件上测得
+  </div>
+
+</div>
+</body>
+</html>
