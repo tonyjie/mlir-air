@@ -24,8 +24,14 @@
   h1 { font-size: 2.1rem; margin-bottom: 0.2rem; color: #111827; }
   .subtitle { color: var(--muted); font-size: 1.1rem; margin-bottom: 0.5rem; }
   .meta { color: var(--muted); font-size: 0.85rem; margin-bottom: 2.5rem; border-bottom: 1px solid var(--card-border); padding-bottom: 1rem; }
+  .part-banner {
+    margin-top: 3.5rem; padding: 1rem 1.4rem; border-radius: 10px; font-size: 1.35rem; font-weight: 700;
+  }
+  .part-banner.a { background: linear-gradient(90deg,#eef2ff,#f5f3ff); border:1px solid #c7d2fe; color:#3730a3; }
+  .part-banner.b { background: linear-gradient(90deg,#dbeafe,#eff6ff); border:1px solid #93c5fd; color:#1e40af; }
+  .part-banner .sub { display:block; font-size:0.92rem; font-weight:400; color:var(--muted); margin-top:0.3rem; }
   h2 {
-    font-size: 1.6rem; margin-top: 3.5rem; padding: 0.5rem 0 0.5rem 0.9rem;
+    font-size: 1.5rem; margin-top: 2.8rem; padding: 0.5rem 0 0.5rem 0.9rem;
     border-left: 5px solid var(--accent); color: #111827; background: linear-gradient(90deg, #eff6ff, transparent);
   }
   h3 { font-size: 1.2rem; margin-top: 2rem; color: #1f2937; }
@@ -77,8 +83,12 @@
   .toc a { color: var(--accent); text-decoration: none; }
   .toc a:hover { text-decoration: underline; }
   .toc ol { margin: 0.5rem 0; padding-left: 1.4rem; }
+  .toc .grp { font-weight: 700; color: #3730a3; margin-top: 0.6rem; }
   .shape { font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 0.82rem; background: #eef2ff; color: #3730a3; padding: 0.05rem 0.35rem; border-radius: 4px; white-space: nowrap; }
-  .knl { display:inline-block; font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 0.76rem; background:#ecfdf5; color:#065f46; border:1px solid #6ee7b7; border-radius:4px; padding:0.02rem 0.3rem; }
+  /* neutral op label (Part A: just names the math operation) */
+  .op { display:inline-block; font-family:"SF Mono",Menlo,Consolas,monospace; font-size:0.76rem; background:#f3f4f6; color:#374151; border:1px solid #d1d5db; border-radius:4px; padding:0.02rem 0.3rem; }
+  /* NPU-availability labels (Part B only) */
+  .knl { display:inline-block; font-family:"SF Mono",Menlo,Consolas,monospace; font-size:0.76rem; background:#ecfdf5; color:#065f46; border:1px solid #6ee7b7; border-radius:4px; padding:0.02rem 0.3rem; }
   .knl.miss { background:#fef2f2; color:#991b1b; border-color:#fca5a5; }
   table.arch { font-size: 0.85rem; }
   table.arch td { vertical-align: top; }
@@ -87,7 +97,6 @@
   .stage-h.v { background:#fdf2f8; border-left:5px solid #be185d; color:#9d174d; }
   .stage-h.b { background:#dbeafe; border-left:5px solid #2563eb; color:#1e40af; }
   .stage-h.e { background:#f0fdf4; border-left:5px solid #15803d; color:#166534; }
-  .stage-h.x { background:#eef2ff; border-left:5px solid #6366f1; color:#3730a3; }
   .legend { font-size:0.85rem; color:var(--muted); margin:0.6rem 0; }
   .hier { font-size:0.9rem; margin:0.4rem 0 1rem; }
   .hier .mod { font-weight:600; color:#1e40af; }
@@ -102,23 +111,32 @@
   <div class="subtitle">From a robot-AI model to running it on an AMD NPU chip — an illustrated walkthrough</div>
   <div class="meta">
     A plain-language guide for readers new to SmolVLA · mlir-air / AMD NPU2 (Strix, AIE2P) ·
-    Milestone A1 complete (2026-07) · all shapes measured on the real checkpoint, all numbers on real NPU2 hardware
+    all shapes measured on the real checkpoint, all timings on real hardware
   </div>
 
   <div class="toc">
     <b>Contents</b>
+    <div class="grp">Part A — The SmolVLA model (no NPU yet)</div>
     <ol>
       <li><a href="#what">What is SmolVLA?</a> (for non-experts)</li>
       <li><a href="#three">The three parts of the model</a></li>
-      <li><a href="#why">Why move it to an NPU? What is an NPU?</a></li>
-      <li><a href="#arch">Full architecture: every step from input to output</a> (module → kernel, with shapes)</li>
-      <li><a href="#split">Our approach: a CPU / NPU hybrid</a></li>
-      <li><a href="#mapping">The current NPU mapping: which kernel replaced which step</a></li>
-      <li><a href="#how">How we mapped the backbone onto the NPU (phase by phase)</a></li>
-      <li><a href="#correct">Correctness: how we prove nothing is miscomputed</a></li>
-      <li><a href="#perf">Performance: before vs after optimization</a></li>
+      <li><a href="#arch">Full architecture: every step from input to output</a></li>
+      <li><a href="#profile">Where the model spends its time (CPU profiling)</a></li>
+    </ol>
+    <div class="grp">Part B — Running it on the NPU</div>
+    <ol start="5">
+      <li><a href="#why">Why an NPU, and which kernels we already have</a></li>
+      <li><a href="#mapping">Our mapping solution: the CPU / NPU hybrid</a></li>
+      <li><a href="#how">How we mapped the backbone (phase by phase)</a></li>
+      <li><a href="#correct">Correctness: how we verify it</a></li>
+      <li><a href="#perf">Performance on the NPU (before vs after optimization)</a></li>
       <li><a href="#status">Current status and next steps</a></li>
     </ol>
+  </div>
+
+  <!-- ####################  PART A  #################### -->
+  <div class="part-banner a">Part A — The SmolVLA model
+    <span class="sub">Understanding the model itself and its CPU behavior. Nothing about the NPU yet.</span>
   </div>
 
   <!-- ============================================================ -->
@@ -137,7 +155,7 @@
   </div>
 
   <div class="card">
-    <b>Inputs / outputs (the <code>lerobot/smolvla_base</code> checkpoint used here, 450M params):</b>
+    <b>Inputs / outputs (the <code>lerobot/smolvla_base</code> checkpoint, 450M params):</b>
     <ul class="clean">
       <li><b>Inputs</b>: 3 camera images + one natural-language instruction + a robot-state vector</li>
       <li><b>Output</b>: an "action chunk" — it predicts the next <b>50 steps</b> of actions at once</li>
@@ -161,14 +179,14 @@
     <text x="135" y="107" text-anchor="middle" font-size="12" fill="#9d174d">SigLIP (ViT)</text>
     <text x="135" y="132" text-anchor="middle" font-size="11" fill="#6b7280">turns camera pixels</text>
     <text x="135" y="149" text-anchor="middle" font-size="11" fill="#6b7280">into "vision tokens"</text>
-    <text x="135" y="173" text-anchor="middle" font-size="10.5" fill="#9d174d">frozen · heaviest</text>
+    <text x="135" y="173" text-anchor="middle" font-size="10.5" fill="#9d174d">frozen</text>
 
-    <rect x="300" y="60" width="250" height="140" rx="10" fill="#dbeafe" stroke="#2563eb" stroke-width="3"/>
+    <rect x="300" y="60" width="250" height="140" rx="10" fill="#dbeafe" stroke="#2563eb" stroke-width="2"/>
     <text x="425" y="88" text-anchor="middle" font-size="15" font-weight="700" fill="#1e40af">② Language backbone</text>
     <text x="425" y="107" text-anchor="middle" font-size="12" fill="#1e3a8a">SmolLM2-360M (16 layers)</text>
     <text x="425" y="132" text-anchor="middle" font-size="11" fill="#6b7280">fuses vision + language + state</text>
     <text x="425" y="149" text-anchor="middle" font-size="11" fill="#6b7280">into an understanding</text>
-    <text x="425" y="173" text-anchor="middle" font-size="10.5" font-weight="700" fill="#1e40af">★ what we moved to the NPU</text>
+    <text x="425" y="173" text-anchor="middle" font-size="10.5" fill="#1e40af">a compact LLM</text>
 
     <rect x="600" y="60" width="240" height="140" rx="10" fill="#f0fdf4" stroke="#15803d" stroke-width="2"/>
     <text x="720" y="88" text-anchor="middle" font-size="15" font-weight="700" fill="#15803d">③ Action expert</text>
@@ -185,7 +203,7 @@
     <text x="690" y="235" font-size="12" fill="#6b7280">→ 50-step action chunk</text>
     <line x1="720" y1="202" x2="720" y2="222" stroke="#6b7280" stroke-width="1.5" marker-end="url(#ar)"/>
   </svg>
-  <figcaption>SmolVLA's three-part structure. Part ② (the language backbone) is the focus of this project.</figcaption>
+  <figcaption>SmolVLA's three-part structure.</figcaption>
   </div>
 
   <div class="card">
@@ -193,46 +211,26 @@
     SmolVLA's second block is really a compact large-language model (SmolLM2-360M, same family as Llama).
     The difference: it doesn't "speak" (it generates no text). Instead it reads the images, text, and state
     <b>all at once, understands them in a single pass</b>, and hands an "understanding" to the action expert.
-    Because the team has already deployed several models of this kind on the NPU (Llama, Qwen families),
-    <b>this block is the most predictable and the most reusable of existing building blocks</b> — so we tackled it first.
   </div>
 
   <!-- ============================================================ -->
-  <h2 id="why">3. Why move it to an NPU? What is an NPU?</h2>
-
-  <div class="analogy">
-    <b>CPU vs NPU analogy:</b> a CPU is a <b>versatile generalist</b> — it can compute anything, but only
-    so much at once. An NPU (Neural Processing Unit) is like a <b>workshop built specifically for matrix
-    multiplication</b> — and the vast majority of an AI model's compute is matrix multiplication, so an NPU
-    does it faster and with far less power. A robot needs to react in real time, so moving the model onto an
-    NPU is a key step.
-  </div>
-
-  <p>
-    Our chip is the <b>AMD NPU2</b> (codename Strix, architecture AIE2P), and the compiler toolchain is
-    <b>mlir-air</b> — it translates "one operator in the model" into "a chunk of machine code that runs on the NPU."
-  </p>
-
-  <!-- ============================================================ -->
-  <h2 id="arch">4. Full architecture: every step from input to output</h2>
+  <h2 id="arch">3. Full architecture: every step from input to output</h2>
 
   <p class="lead">
-    This section breaks the whole pipeline down to <b>every module, every kernel, and every tensor shape</b>,
-    so you can judge what can (and already does) map onto the NPU. Every shape below is <b>measured on the
-    real checkpoint</b> (batch = 1), and the data flow was verified against the LeRobot source
-    (<code>modeling_smolvla.py</code> · <code>embed_prefix</code> / <code>embed_suffix</code>) — not inferred from the paper.
+    This section breaks the whole pipeline down to <b>every module, every operation, and every tensor shape</b>.
+    Every shape below is <b>measured on the real checkpoint</b> (batch = 1), and the data flow was verified
+    against the LeRobot source (<code>modeling_smolvla.py</code> · <code>embed_prefix</code> / <code>embed_suffix</code>).
   </p>
 
   <div class="legend">
     Legend: <span class="shape">(tensor shape)</span> ·
-    <span class="knl">has an NPU kernel</span> ·
-    <span class="knl miss">no NPU kernel yet (needs new work)</span> ·
-    a <b>module</b> is a named sub-network; a <b>kernel</b> is the low-level op that runs on the chip.
+    <span class="op">operation</span> = the kind of math a step performs ·
+    a <b>module</b> is a named sub-network; the tables below show which <b>operations</b> run inside each module.
   </div>
 
   <h3>High-level architecture (how the modules connect, with shapes on the wires)</h3>
   <p>
-    Read this diagram first — it shows how the three inputs flow through the modules to the final action,
+    Read this diagram first — it shows how the four inputs flow through the modules to the final action,
     and the tensor shape on every connection. The tables further down zoom into what happens
     <em>inside</em> each module.
   </p>
@@ -240,7 +238,7 @@
   <svg viewBox="0 0 880 440" xmlns="http://www.w3.org/2000/svg" font-family="system-ui, sans-serif">
     <defs><marker id="aa" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#4b5563"/></marker></defs>
 
-    <!-- inputs (left column) -->
+    <!-- inputs -->
     <rect x="10" y="20" width="150" height="42" rx="6" fill="#f3f4f6" stroke="#9ca3af"/>
     <text x="85" y="38" text-anchor="middle" font-size="11.5" fill="#374151">3 camera images</text>
     <text x="85" y="53" text-anchor="middle" font-size="10" fill="#6b7280">(3,3,512,512)</text>
@@ -254,7 +252,7 @@
     <text x="85" y="348" text-anchor="middle" font-size="11.5" fill="#374151">random noise</text>
     <text x="85" y="363" text-anchor="middle" font-size="10" fill="#6b7280">(1,50,32)</text>
 
-    <!-- embed modules (2nd column) -->
+    <!-- embed modules -->
     <rect x="195" y="16" width="140" height="50" rx="6" fill="#fdf2f8" stroke="#be185d"/>
     <text x="265" y="35" text-anchor="middle" font-size="11" font-weight="600" fill="#9d174d">① SigLIP + connector</text>
     <text x="265" y="52" text-anchor="middle" font-size="10" fill="#9d174d">→ 64 tokens/img</text>
@@ -265,7 +263,6 @@
     <text x="265" y="226" text-anchor="middle" font-size="10.5" font-weight="600" fill="#3730a3">state_proj</text>
     <text x="265" y="242" text-anchor="middle" font-size="10" fill="#3730a3">Linear</text>
 
-    <!-- arrows inputs->embed with shapes -->
     <line x1="160" y1="41" x2="193" y2="41" stroke="#4b5563" stroke-width="1.5" marker-end="url(#aa)"/>
     <line x1="160" y1="141" x2="193" y2="141" stroke="#4b5563" stroke-width="1.5" marker-end="url(#aa)"/>
     <line x1="160" y1="231" x2="193" y2="231" stroke="#4b5563" stroke-width="1.5" marker-end="url(#aa)"/>
@@ -280,12 +277,11 @@
     <line x1="335" y1="231" x2="358" y2="180" stroke="#4b5563" stroke-width="1.3" marker-end="url(#aa)"/>
     <text x="332" y="210" font-size="9.5" fill="#6b7280">(1,960)</text>
 
-    <!-- backbone -->
-    <rect x="470" y="70" width="150" height="150" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="3"/>
-    <text x="545" y="96" text-anchor="middle" font-size="12" font-weight="700" fill="#1e40af">② backbone</text>
-    <text x="545" y="113" text-anchor="middle" font-size="10" fill="#1e3a8a">SmolLM2-360M</text>
-    <text x="545" y="128" text-anchor="middle" font-size="10" fill="#1e3a8a">16 layers, runs 1×</text>
-    <text x="545" y="150" text-anchor="middle" font-size="9.5" fill="#1e40af">NPU2 ★</text>
+    <!-- backbone (NPU-neutral in Part A) -->
+    <rect x="470" y="70" width="150" height="150" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="2"/>
+    <text x="545" y="98" text-anchor="middle" font-size="12" font-weight="700" fill="#1e40af">② backbone</text>
+    <text x="545" y="115" text-anchor="middle" font-size="10" fill="#1e3a8a">SmolLM2-360M</text>
+    <text x="545" y="130" text-anchor="middle" font-size="10" fill="#1e3a8a">16 layers, runs 1×</text>
     <text x="545" y="182" text-anchor="middle" font-size="9.5" fill="#6b7280">outputs per-layer</text>
     <text x="545" y="196" text-anchor="middle" font-size="9.5" fill="#6b7280">K/V cache</text>
     <line x1="430" y1="145" x2="468" y2="145" stroke="#4b5563" stroke-width="2" marker-end="url(#aa)"/>
@@ -299,18 +295,14 @@
     <text x="740" y="150" text-anchor="middle" font-size="9.5" fill="#166534">even layer: self-attn</text>
     <text x="740" y="164" text-anchor="middle" font-size="9.5" fill="#166534">odd layer: cross-attn ↓</text>
     <text x="740" y="182" text-anchor="middle" font-size="9" fill="#6b7280">(reads backbone K/V)</text>
-    <!-- backbone KV -> expert (the key interaction) -->
     <line x1="620" y1="175" x2="658" y2="160" stroke="#15803d" stroke-width="2" stroke-dasharray="4 2" marker-end="url(#aa)"/>
     <text x="600" y="238" font-size="9.5" fill="#15803d" font-weight="600">K/V cache (1,241,320)/layer</text>
-    <!-- noise -> expert -->
     <line x1="160" y1="351" x2="655" y2="240" stroke="#4b5563" stroke-width="1.3" marker-end="url(#aa)"/>
     <text x="300" y="330" font-size="9.5" fill="#6b7280">noise (1,50,32) → action_in_proj</text>
 
-    <!-- denoise loop arrow -->
     <path d="M 740 250 q 40 40 0 60 q -40 20 -80 0" fill="none" stroke="#15803d" stroke-width="1.5" stroke-dasharray="3 2" marker-end="url(#aa)"/>
     <text x="700" y="330" font-size="9.5" fill="#15803d">× 10 steps</text>
 
-    <!-- output -->
     <rect x="670" y="360" width="150" height="42" rx="6" fill="#f3f4f6" stroke="#9ca3af"/>
     <text x="745" y="378" text-anchor="middle" font-size="11.5" fill="#374151">action chunk</text>
     <text x="745" y="393" text-anchor="middle" font-size="10" fill="#6b7280">(1,50,6)</text>
@@ -321,11 +313,11 @@
   10 denoise iterations.</figcaption>
   </div>
 
-  <h3>How all THREE inputs become tokens (verified)</h3>
+  <h3>How all THREE conditioning inputs become tokens (verified)</h3>
   <p>
     A common confusion: the vision encoder handles images — but what about the instruction and the state?
-    All three inputs are turned into <b>tokens</b> (fixed-width vectors) and concatenated into one sequence
-    called the <b>prefix</b>. Here is the exact, source-verified flow:
+    All three are turned into <b>tokens</b> (fixed-width vectors) and concatenated into one sequence called the
+    <b>prefix</b>. Here is the exact, source-verified flow:
   </p>
   <table class="arch">
     <tr><th>Input</th><th>Module that embeds it</th><th>Shape flow</th><th>Result</th></tr>
@@ -337,13 +329,13 @@
     </tr>
     <tr>
       <td><b>Instruction text</b></td>
-      <td><code>embed_language_tokens</code> = a token-embedding lookup table (same one every LLM uses)</td>
+      <td><code>embed_language_tokens</code> = a token-embedding lookup table</td>
       <td>tokenizer → <span class="shape">(1,48)</span> ids → <span class="shape">(48,960)</span></td>
       <td><b>48</b> language tokens</td>
     </tr>
     <tr>
       <td><b>Robot state</b></td>
-      <td><code>state_proj</code> = a single <span class="knl">Linear</span> (GEMM)</td>
+      <td><code>state_proj</code> = a single Linear</td>
       <td><span class="shape">(1,32)</span> → <span class="shape">(1,960)</span></td>
       <td><b>1</b> state token</td>
     </tr>
@@ -355,77 +347,69 @@
   <p class="legend">
     So the backbone doesn't just see images — it sees <b>images + words + state</b> as one 241-token sequence.
     The attention mask (verified in <code>embed_prefix</code>) makes image + language tokens attend to each
-    other <b>bidirectionally</b>, while the state token starts a new block — this is why the backbone's
-    attention is "non-causal," which matters a lot for the NPU mapping (Section 6).
+    other <b>bidirectionally</b>, while the state token starts a new block — i.e. the backbone's attention
+    is "non-causal."
   </p>
 
-  <!-- ---------- STAGE 1 vision ---------- -->
-  <div class="stage-h v">① Vision encoder: SigLIP + connector &nbsp;<span class="pill cpu">CPU</span></div>
+  <!-- STAGE 1 vision -->
+  <div class="stage-h v">① Vision encoder: SigLIP + connector</div>
   <p>
-    Turns each camera image into a handful of vision tokens. The core is a <b>12-layer ViT</b>
-    (Vision Transformer). "A ViT block" is a repeating module; below, each row is a <b>kernel</b> inside
-    one such block, so you can see the module → kernel hierarchy clearly.
+    Turns each camera image into a handful of vision tokens. The core is a <b>12-layer ViT</b> (Vision Transformer).
+    "A ViT block" is a repeating module; below, each row is an <b>operation</b> inside one such block, so you can
+    see the module → operation hierarchy clearly.
   </p>
   <div class="hier">
     <div class="mod">Module: SigLIP ViT (repeats its encoder block ×12)</div>
-    <div class="sub">each encoder block = LayerNorm → self-attention (LayerNorm, QKV, softmax, O) → LayerNorm → MLP (fc1, GELU, fc2)</div>
+    <div class="sub">each encoder block = LayerNorm → self-attention (QKV, softmax, O) → LayerNorm → MLP (fc1, GELU, fc2)</div>
   </div>
   <table class="arch">
-    <tr><th>Step (kernel)</th><th>Input → output shape</th><th>NPU kernel</th></tr>
-    <tr><td>patch embedding — a Conv2d, 16×16 patches</td><td><span class="shape">(1,3,512,512)</span> → <span class="shape">(1,768,32,32)</span></td><td><span class="knl miss">conv2d</span></td></tr>
-    <tr><td>flatten + position embedding → 1024 patch tokens</td><td>→ <span class="shape">(1,1024,768)</span></td><td><span class="knl">embedding</span></td></tr>
-    <tr><td colspan="3" style="background:#fdf2f8;font-weight:600">↓ the following 6 kernels repeat inside each of the 12 ViT blocks</td></tr>
-    <tr><td>LayerNorm (before attention)</td><td><span class="shape">(1,1024,768)</span></td><td><span class="knl miss">LayerNorm</span></td></tr>
-    <tr><td>self-attention Q/K/V/O projections (12 heads)</td><td><span class="shape">(1,1024,768)</span> → <span class="shape">(1,1024,768)</span></td><td><span class="knl">GEMM</span></td></tr>
-    <tr><td>attention scores (<b>bidirectional</b>) + softmax</td><td>QKᵀ = <span class="shape">(12,1024,1024)</span></td><td><span class="knl">GEMM</span> + <span class="knl miss">softmax</span></td></tr>
-    <tr><td>LayerNorm (before MLP)</td><td><span class="shape">(1,1024,768)</span></td><td><span class="knl miss">LayerNorm</span></td></tr>
-    <tr><td>MLP: fc1 → GELU → fc2</td><td><span class="shape">(1,1024,768)</span> → <span class="shape">(1,1024,3072)</span> → <span class="shape">(1,1024,768)</span></td><td><span class="knl">GEMM</span> + <span class="knl miss">GELU-tanh</span></td></tr>
+    <tr><th>Step</th><th>Input → output shape</th><th>Operation</th></tr>
+    <tr><td>patch embedding — a Conv2d, 16×16 patches</td><td><span class="shape">(1,3,512,512)</span> → <span class="shape">(1,768,32,32)</span></td><td><span class="op">conv2d</span></td></tr>
+    <tr><td>flatten + position embedding → 1024 patch tokens</td><td>→ <span class="shape">(1,1024,768)</span></td><td><span class="op">embedding</span></td></tr>
+    <tr><td colspan="3" style="background:#fdf2f8;font-weight:600">↓ the following operations repeat inside each of the 12 ViT blocks</td></tr>
+    <tr><td>LayerNorm (before attention)</td><td><span class="shape">(1,1024,768)</span></td><td><span class="op">LayerNorm</span></td></tr>
+    <tr><td>self-attention Q/K/V/O projections (12 heads)</td><td><span class="shape">(1,1024,768)</span> → <span class="shape">(1,1024,768)</span></td><td><span class="op">matmul</span></td></tr>
+    <tr><td>attention scores (<b>bidirectional</b>) + softmax</td><td>QKᵀ = <span class="shape">(12,1024,1024)</span></td><td><span class="op">matmul</span> + <span class="op">softmax</span></td></tr>
+    <tr><td>LayerNorm (before MLP)</td><td><span class="shape">(1,1024,768)</span></td><td><span class="op">LayerNorm</span></td></tr>
+    <tr><td>MLP: fc1 → GELU → fc2</td><td><span class="shape">(1,1024,768)</span> → <span class="shape">(1,1024,3072)</span> → <span class="shape">(1,1024,768)</span></td><td><span class="op">matmul</span> + <span class="op">GELU-tanh</span></td></tr>
   </table>
   <div class="hier" style="margin-top:1.2rem">
     <div class="mod">Module: connector (vision → language dimension)</div>
     <div class="sub">pixel-shuffle (space-to-depth) → Linear projection</div>
   </div>
   <table class="arch">
-    <tr><th>Step (kernel)</th><th>Input → output shape</th><th>NPU kernel</th></tr>
-    <tr><td>pixel-shuffle — groups 4×4 neighboring patches (pure reshape)</td><td><span class="shape">(1,1024,768)</span> → <span class="shape">(1,64,12288)</span></td><td><span class="knl miss">pixel-shuffle</span></td></tr>
-    <tr><td>projection Linear</td><td><span class="shape">(1,64,12288)</span> → <span class="shape">(1,64,960)</span></td><td><span class="knl">GEMM</span></td></tr>
+    <tr><th>Step</th><th>Input → output shape</th><th>Operation</th></tr>
+    <tr><td>pixel-shuffle — groups 4×4 neighboring patches (pure reshape)</td><td><span class="shape">(1,1024,768)</span> → <span class="shape">(1,64,12288)</span></td><td><span class="op">pixel-shuffle</span></td></tr>
+    <tr><td>projection Linear</td><td><span class="shape">(1,64,12288)</span> → <span class="shape">(1,64,960)</span></td><td><span class="op">matmul</span></td></tr>
   </table>
-  <p class="legend">
-    → <b>64 vision tokens</b> (960-dim) per image. This stage needs 4 kernels the NPU doesn't have yet
-    (conv2d, LayerNorm, GELU-tanh, pixel-shuffle) plus a large attention matrix (1024×1024), which makes it
-    the hardest to move — so it stays on CPU (milestone A3).
-  </p>
+  <p class="legend">→ <b>64 vision tokens</b> (960-dim) per image. Note the large attention matrix (1024×1024) — remember this for the profiling in Section 4.</p>
 
-  <!-- ---------- STAGE 2 backbone ---------- -->
-  <div class="stage-h b">② Language backbone: SmolLM2-360M (16 layers) &nbsp;<span class="pill npu">NPU2 ★</span></div>
+  <!-- STAGE 2 backbone -->
+  <div class="stage-h b">② Language backbone: SmolLM2-360M (16 layers)</div>
   <p>
     Reads the 241-token prefix once and produces a K/V "memory cache" for every layer. It's a Llama-style
-    decoder; each of the 16 layers runs the same 7 kernels below.
+    decoder; each of the 16 layers runs the same operations below.
   </p>
   <div class="hier">
     <div class="mod">Module: transformer layer (repeats ×16)</div>
     <div class="sub">RMSNorm → attention (Q/K/V, RoPE, scores+softmax, O) → residual → RMSNorm → SwiGLU MLP → residual</div>
   </div>
   <table class="arch">
-    <tr><th>Step (kernel, per layer)</th><th>Input → output shape</th><th>NPU kernel</th></tr>
-    <tr><td>1. input RMSNorm (fp32 reduction)</td><td><span class="shape">(241,960)</span></td><td><span class="knl">RMSNorm</span></td></tr>
-    <tr><td>2. Q projection (15 heads)</td><td><span class="shape">(1,241,960)</span> → <span class="shape">(1,241,960)</span></td><td><span class="knl">GEMM</span></td></tr>
-    <tr><td>&nbsp;&nbsp;&nbsp;K / V projection (GQA, 5 heads)</td><td><span class="shape">(1,241,960)</span> → <span class="shape">(1,241,320)</span></td><td><span class="knl">GEMM</span></td></tr>
-    <tr><td>3. RoPE positional encoding (on Q, K)</td><td>head_dim=64, θ=10000</td><td><span class="knl">RoPE</span></td></tr>
-    <tr><td>4. <b>non-causal attention</b> (241×241)</td><td>QKᵀ → softmax → ×V</td><td><span class="knl">GEMM</span>+<span class="knl">masked-softmax</span>+<span class="knl">GEMM</span></td></tr>
-    <tr><td>5. O projection</td><td><span class="shape">(1,241,960)</span> → <span class="shape">(1,241,960)</span></td><td><span class="knl">GEMM</span></td></tr>
-    <tr><td>6. residual add + post-attention RMSNorm</td><td><span class="shape">(241,960)</span></td><td><span class="knl">EltwiseAdd</span>+<span class="knl">RMSNorm</span></td></tr>
-    <tr><td>7. SwiGLU MLP: gate/up → SiLU → down</td><td><span class="shape">(241,960)</span> → <span class="shape">(241,2560)</span> → <span class="shape">(241,960)</span></td><td><span class="knl">GEMM</span>+<span class="knl">SiLU-Mul</span>+<span class="knl">GEMM</span></td></tr>
-    <tr><td>(after all 16 layers) final RMSNorm</td><td><span class="shape">(241,960)</span></td><td><span class="pill cpu">CPU</span> RMSNorm</td></tr>
+    <tr><th>Step (per layer)</th><th>Input → output shape</th><th>Operation</th></tr>
+    <tr><td>1. input RMSNorm</td><td><span class="shape">(1,241,960)</span></td><td><span class="op">RMSNorm</span></td></tr>
+    <tr><td>2. Q projection (15 heads)</td><td><span class="shape">(1,241,960)</span> → <span class="shape">(1,241,960)</span></td><td><span class="op">matmul</span></td></tr>
+    <tr><td>&nbsp;&nbsp;&nbsp;K / V projection (GQA, 5 heads)</td><td><span class="shape">(1,241,960)</span> → <span class="shape">(1,241,320)</span></td><td><span class="op">matmul</span></td></tr>
+    <tr><td>3. RoPE positional encoding (on Q, K)</td><td>head_dim=64, θ=10000</td><td><span class="op">RoPE</span></td></tr>
+    <tr><td>4. <b>non-causal attention</b> (241×241)</td><td>QKᵀ → softmax → ×V</td><td><span class="op">matmul</span>+<span class="op">softmax</span>+<span class="op">matmul</span></td></tr>
+    <tr><td>5. O projection</td><td><span class="shape">(1,241,960)</span> → <span class="shape">(1,241,960)</span></td><td><span class="op">matmul</span></td></tr>
+    <tr><td>6. residual add + post-attention RMSNorm</td><td><span class="shape">(1,241,960)</span></td><td><span class="op">add</span>+<span class="op">RMSNorm</span></td></tr>
+    <tr><td>7. SwiGLU MLP: gate/up → SiLU → down</td><td><span class="shape">(1,241,960)</span> → <span class="shape">(1,241,2560)</span> → <span class="shape">(1,241,960)</span></td><td><span class="op">matmul</span>+<span class="op">SiLU</span>+<span class="op">matmul</span></td></tr>
+    <tr><td>(after all 16 layers) final RMSNorm</td><td><span class="shape">(1,241,960)</span></td><td><span class="op">RMSNorm</span></td></tr>
   </table>
-  <p class="legend">
-    → produces a 16-layer K/V cache (each layer <span class="shape">(241,5,64)</span>). <b>Every kernel here is
-    already validated on the NPU</b> — that's exactly why we could move this whole block onto the chip. The
-    attention was built from "GEMM + masked softmax" rather than the complex causal FlashAttention (see Section 6).
-  </p>
+  <p class="legend">→ produces a 16-layer K/V cache (each layer <span class="shape">(241,5,64)</span>). This block's operation set is identical-in-kind to a standard Llama/Qwen decoder — remember this for Section 5.</p>
 
-  <!-- ---------- STAGE 3 expert ---------- -->
-  <div class="stage-h e">③ Action expert (16 layers, ×10 denoise loop) &nbsp;<span class="pill cpu">CPU</span></div>
+  <!-- STAGE 3 expert -->
+  <div class="stage-h e">③ Action expert (16 layers, ×10 denoise loop)</div>
   <p>
     Starting from random noise, it runs this 16-layer expert once per denoise step, gradually turning noise into
     actions. First the action + timestep inputs are embedded (verified in <code>embed_suffix</code>):
@@ -435,10 +419,10 @@
     <div class="sub">action_in_proj (Linear) · sinusoidal time embedding · concat(action, time) → action_time_mlp (Linear → SiLU → Linear)</div>
   </div>
   <table class="arch">
-    <tr><th>Step (kernel)</th><th>Input → output shape</th><th>NPU kernel</th></tr>
-    <tr><td>action_in_proj</td><td><span class="shape">(1,50,32)→(1,50,720)</span></td><td><span class="knl">GEMM</span></td></tr>
-    <tr><td>time embedding (sine/cosine) + concat with action</td><td>→ <span class="shape">(1,50,1440)</span></td><td><span class="knl miss">sin/cos</span></td></tr>
-    <tr><td>action_time_mlp: in → SiLU → out</td><td><span class="shape">(1,50,1440)</span> → <span class="shape">(1,50,720)</span> → <span class="shape">(1,50,720)</span></td><td><span class="knl">GEMM</span>+<span class="knl">SiLU</span></td></tr>
+    <tr><th>Step</th><th>Input → output shape</th><th>Operation</th></tr>
+    <tr><td>action_in_proj</td><td><span class="shape">(1,50,32)</span> → <span class="shape">(1,50,720)</span></td><td><span class="op">matmul</span></td></tr>
+    <tr><td>time embedding (sine/cosine) + concat with action</td><td>→ <span class="shape">(1,50,1440)</span></td><td><span class="op">sin/cos</span></td></tr>
+    <tr><td>action_time_mlp: in → SiLU → out</td><td><span class="shape">(1,50,1440)</span> → <span class="shape">(1,50,720)</span> → <span class="shape">(1,50,720)</span></td><td><span class="op">matmul</span>+<span class="op">SiLU</span></td></tr>
   </table>
   <div class="hier" style="margin-top:1.2rem">
     <div class="mod">Module: expert transformer layer (repeats ×16, width 720)</div>
@@ -449,8 +433,6 @@
   <div class="fig">
   <svg viewBox="0 0 820 300" xmlns="http://www.w3.org/2000/svg" font-family="system-ui, sans-serif">
     <defs><marker id="ae" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#4b5563"/></marker></defs>
-
-    <!-- EVEN layer: self-attention -->
     <text x="200" y="24" text-anchor="middle" font-size="13" font-weight="700" fill="#15803d">EVEN layers (0,2,4…): self-attention</text>
     <rect x="60" y="45" width="120" height="46" rx="6" fill="#f0fdf4" stroke="#15803d"/>
     <text x="120" y="64" text-anchor="middle" font-size="10.5" fill="#166534">50 action tokens</text>
@@ -458,17 +440,14 @@
     <rect x="250" y="45" width="110" height="46" rx="6" fill="#ecfdf5" stroke="#059669"/>
     <text x="305" y="66" text-anchor="middle" font-size="10.5" font-weight="600" fill="#065f46">attention</text>
     <text x="305" y="82" text-anchor="middle" font-size="9" fill="#065f46">Q,K,V all from actions</text>
-    <!-- Q K V arrows self -->
     <line x1="180" y1="60" x2="248" y2="60" stroke="#15803d" stroke-width="1.5" marker-end="url(#ae)"/>
     <text x="195" y="54" font-size="9" fill="#166534">Q</text>
     <path d="M 120 91 q 0 40 90 40 q 40 0 60 -30" fill="none" stroke="#15803d" stroke-width="1.5" marker-end="url(#ae)"/>
     <text x="150" y="145" font-size="9" fill="#166534">K, V (also from the 50 action tokens)</text>
     <text x="120" y="185" text-anchor="middle" font-size="9.5" fill="#6b7280">→ action tokens mix among themselves</text>
 
-    <!-- divider -->
     <line x1="410" y1="35" x2="410" y2="270" stroke="#e5e7eb" stroke-width="1.5"/>
 
-    <!-- ODD layer: cross-attention -->
     <text x="620" y="24" text-anchor="middle" font-size="13" font-weight="700" fill="#2563eb">ODD layers (1,3,5…): cross-attention</text>
     <rect x="470" y="45" width="120" height="46" rx="6" fill="#f0fdf4" stroke="#15803d"/>
     <text x="530" y="64" text-anchor="middle" font-size="10.5" fill="#166534">50 action tokens</text>
@@ -478,7 +457,6 @@
     <text x="715" y="82" text-anchor="middle" font-size="9" fill="#065f46">Q from actions</text>
     <line x1="590" y1="60" x2="658" y2="60" stroke="#2563eb" stroke-width="1.5" marker-end="url(#ae)"/>
     <text x="605" y="54" font-size="9" fill="#1e40af">Q</text>
-    <!-- backbone cache box -->
     <rect x="600" y="150" width="200" height="60" rx="6" fill="#dbeafe" stroke="#2563eb" stroke-width="2"/>
     <text x="700" y="172" text-anchor="middle" font-size="10.5" font-weight="700" fill="#1e40af">② backbone K/V cache</text>
     <text x="700" y="189" text-anchor="middle" font-size="9.5" fill="#1e3a8a">computed ONCE, (1,241,320)/layer</text>
@@ -487,40 +465,96 @@
     <text x="600" y="130" font-size="9.5" fill="#1e40af" font-weight="600">K, V come from the backbone, NOT the actions</text>
     <text x="530" y="240" text-anchor="middle" font-size="9.5" fill="#6b7280">→ action tokens absorb the vision/language context</text>
   </svg>
-  <figcaption>Both layer types run the same attention kernel; only the <b>source of K and V</b> differs. This is why
-  the A1 K/V-injection mechanism (feeding the NPU backbone's K/V into the cache) is exactly what the action expert
-  needs — making the expert (A2) a natural reuse of work already done.</figcaption>
+  <figcaption>Both layer types run the same attention operation; only the <b>source of K and V</b> differs —
+  self-attention uses the action tokens' own K/V, cross-attention reuses the backbone's frozen K/V cache.</figcaption>
   </div>
 
   <table class="arch">
-    <tr><th>Step (kernel)</th><th>Input → output shape</th><th>kernel / interaction</th></tr>
-    <tr><td><b>Even layers — self-attention</b> (50 action tokens attend to each other)</td><td>Q <span class="shape">(1,50,960)</span> &nbsp; K,V <span class="shape">(1,50,320)</span></td><td><span class="knl">GEMM</span>+<span class="knl">softmax</span> (new small shape, seq=50)</td></tr>
-    <tr><td><b>Odd layers — cross-attention</b> (action tokens attend to the backbone)</td><td>Q <span class="shape">(1,50,960)</span> &nbsp; but K,V <span class="shape">(1,241,320)</span> <b>from the backbone cache</b></td><td><span class="knl">GEMM</span>+<span class="knl">softmax</span> + <b>reads backbone K/V</b></td></tr>
-    <tr><td>SwiGLU MLP (each layer)</td><td><span class="shape">(1,50,720)</span> → <span class="shape">(1,50,2048)</span> → <span class="shape">(1,50,720)</span></td><td><span class="knl">GEMM</span>+<span class="knl">SiLU-Mul</span></td></tr>
-    <tr><td>action_out_proj (final)</td><td><span class="shape">(1,50,720)→(1,50,32)</span></td><td><span class="knl">GEMM</span></td></tr>
+    <tr><th>Step</th><th>Input → output shape</th><th>Operation / interaction</th></tr>
+    <tr><td><b>Even layers — self-attention</b> (50 action tokens attend to each other)</td><td>Q <span class="shape">(1,50,960)</span> &nbsp; K,V <span class="shape">(1,50,320)</span></td><td><span class="op">matmul</span>+<span class="op">softmax</span></td></tr>
+    <tr><td><b>Odd layers — cross-attention</b> (action tokens attend to the backbone)</td><td>Q <span class="shape">(1,50,960)</span> &nbsp; but K,V <span class="shape">(1,241,320)</span> <b>from the backbone cache</b></td><td><span class="op">matmul</span>+<span class="op">softmax</span> + <b>reads backbone K/V</b></td></tr>
+    <tr><td>SwiGLU MLP (each layer)</td><td><span class="shape">(1,50,720)</span> → <span class="shape">(1,50,2048)</span> → <span class="shape">(1,50,720)</span></td><td><span class="op">matmul</span>+<span class="op">SiLU</span></td></tr>
+    <tr><td>action_out_proj (final)</td><td><span class="shape">(1,50,720)</span> → <span class="shape">(1,50,32)</span></td><td><span class="op">matmul</span></td></tr>
   </table>
   <p class="legend">
     → the final action chunk is <span class="shape">(1,50,6)</span> (only the first 6 dims = the action dimension).
-    The expert reuses the same <em>kinds</em> of kernels as the backbone, just at a smaller shape (seq=50), plus the
-    "cross-attention reads backbone K/V" wiring — and that K/V-injection mechanism was already built in A1.
-    <b>So the action expert is the natural next step (A2).</b> Note: the expert runs <b>10 times</b> (once per denoise
-    step); the backbone runs only <b>once</b>.
+    The expert runs <b>10 times</b> (once per denoise step); the backbone runs only <b>once</b>.
   </p>
 
-  <div class="callout">
-    <b>Once you see this whole map, "can it map onto the NPU?" becomes clear:</b>
-    ② the backbone's kernels all exist → <b>done</b>;
-    ③ the expert reuses the same kernels + the existing K/V injection → <b>feasible, A2</b>;
-    ① vision needs 4–5 brand-new kernels + a large attention → <b>hardest, A3</b>.
+  <!-- ============================================================ -->
+  <h2 id="profile">4. Where the model spends its time (CPU profiling)</h2>
+
+  <p class="lead">
+    Before touching any accelerator, we profiled the <b>real CPU baseline</b> — the unmodified
+    <code>lerobot/smolvla_base</code> running its own <code>predict_action_chunk</code> (a true reference,
+    not a reimplementation). The loaded weights are already <b>bfloat16</b> (474 bf16 + 26 fp32 tensors,
+    the fp32 ones being norms / state_proj). One action chunk takes <b>~1044 ms</b> on CPU.
+  </p>
+  <table>
+    <tr><th>Stage</th><th>CPU time / chunk</th><th>Share</th><th>Runs per chunk</th></tr>
+    <tr><td>① vision (SigLIP)</td><td><b>719 ms</b></td><td><b>73.6%</b></td><td>1×</td></tr>
+    <tr><td>①b connector</td><td>4.5 ms</td><td>0.5%</td><td>1×</td></tr>
+    <tr><td>② backbone</td><td>56.8 ms</td><td>5.8%</td><td>1×</td></tr>
+    <tr><td>③ action expert</td><td>196.8 ms</td><td>20.1%</td><td>10× (denoise loop)</td></tr>
+  </table>
+  <p class="legend">By operation type across the whole model: matmul 55% · attention 36% · norm 4.4% · activation 3.7% · conv 0.4%.</p>
+
+  <div class="callout warn">
+    <b>The surprising bottleneck: vision (73.6%).</b> Nearly three-quarters of the time is the SigLIP vision
+    encoder — because its attention matrix is large (1024×1024) and it has 12 layers. The language backbone,
+    despite being the "main" model, is only 5.8% (it runs just once). The action expert is 20.1% because it runs
+    10 times in the denoise loop. This breakdown tells us <b>where acceleration would matter most</b> — a fact
+    we return to in Part B.
+  </div>
+
+  <!-- ####################  PART B  #################### -->
+  <div class="part-banner b">Part B — Running it on the NPU
+    <span class="sub">Now the hardware: which kernels the NPU has, how we mapped SmolVLA onto it, and the results.</span>
   </div>
 
   <!-- ============================================================ -->
-  <h2 id="split">5. Our approach: a CPU / NPU hybrid</h2>
+  <h2 id="why">5. Why an NPU, and which kernels we already have</h2>
+
+  <div class="analogy">
+    <b>CPU vs NPU analogy:</b> a CPU is a <b>versatile generalist</b> — it can compute anything, but only so much
+    at once. An NPU (Neural Processing Unit) is like a <b>workshop built for matrix multiplication</b> — and most
+    of an AI model's compute is exactly that. A robot needs to react in real time, so moving the model onto an NPU
+    is a key step. Our chip is the <b>AMD NPU2</b> (Strix, AIE2P); the compiler is <b>mlir-air</b>.
+  </div>
+
+  <p>
+    A "kernel" is a low-level operation compiled to run on the NPU. From earlier NPU work (deploying Llama/Qwen
+    language models) we already have a <b>library of validated kernels</b>. The question for SmolVLA is: which of
+    its operations (from Part A) already have a kernel, and which would need new ones?
+  </p>
+  <table class="arch">
+    <tr><th>Operation in SmolVLA</th><th>NPU kernel?</th><th>Used by which stage</th></tr>
+    <tr><td>matmul / Linear (GEMM)</td><td><span class="knl">✓ have it</span></td><td>all three stages</td></tr>
+    <tr><td>RMSNorm</td><td><span class="knl">✓ have it</span></td><td>backbone, expert</td></tr>
+    <tr><td>RoPE (rotary position)</td><td><span class="knl">✓ have it</span></td><td>backbone</td></tr>
+    <tr><td>SiLU / SwiGLU activation</td><td><span class="knl">✓ have it</span></td><td>backbone, expert</td></tr>
+    <tr><td>element-wise add (residual)</td><td><span class="knl">✓ have it</span></td><td>backbone, expert</td></tr>
+    <tr><td>softmax (causal, for attention)</td><td><span class="knl">✓ have it</span></td><td>backbone, expert</td></tr>
+    <tr><td><b>non-causal masked softmax</b></td><td><span class="knl">✓ built new (this project)</span></td><td>backbone (prefix attention)</td></tr>
+    <tr><td>LayerNorm</td><td><span class="knl miss">✗ missing</span></td><td>vision</td></tr>
+    <tr><td>GELU-tanh</td><td><span class="knl miss">✗ missing</span></td><td>vision</td></tr>
+    <tr><td>conv2d</td><td><span class="knl miss">✗ missing</span></td><td>vision (patch embed)</td></tr>
+    <tr><td>pixel-shuffle</td><td><span class="knl miss">✗ missing</span></td><td>connector</td></tr>
+    <tr><td>sin/cos time embedding</td><td><span class="knl miss">✗ missing</span></td><td>action expert</td></tr>
+  </table>
+  <div class="callout">
+    <b>This table decides the strategy.</b> The <b>backbone</b> uses only operations we already have (plus one
+    new non-causal softmax we built) → it can move to the NPU now. The <b>vision</b> stage needs 4 brand-new
+    kernels (LayerNorm, GELU-tanh, conv2d, pixel-shuffle) → hardest. The <b>action expert</b> reuses the
+    backbone's kernels at smaller shapes, plus a small sin/cos → feasible next.
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="mapping">6. Our mapping solution: the CPU / NPU hybrid</h2>
 
   <p class="lead">
-    We did not move the whole model onto the NPU. We built a <b>hybrid pipeline</b>:
-    <span class="pill npu">NPU</span> runs the most valuable, most core language backbone;
-    <span class="pill cpu">CPU</span> runs the rest. This is a <b>deliberate engineering trade-off</b>, not unfinished work.
+    Given the kernel availability above, we built a <b>hybrid pipeline</b>: the NPU runs the language backbone
+    (all its kernels exist); the CPU runs the rest. This is milestone <b>A1</b>.
   </p>
 
   <div class="fig">
@@ -531,19 +565,15 @@
     <text x="140" y="42" font-size="12" fill="#78350f">3 cameras → SigLIP vision encoder → connector → 192 vision tokens</text>
     <text x="140" y="60" font-size="12" fill="#78350f">instruction → tokenize → 48 language tokens</text>
     <text x="140" y="78" font-size="12" fill="#78350f">state → 1 token &nbsp;&nbsp;→&nbsp;&nbsp;concatenate into a prefix (241 tokens, 960-dim each)</text>
-
     <line x1="430" y1="90" x2="430" y2="115" stroke="#6b7280" stroke-width="2" marker-end="url(#ar2)"/>
-
     <rect x="120" y="118" width="620" height="92" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="3"/>
     <text x="132" y="138" font-size="12" font-weight="700" fill="#1e40af">NPU2 ★</text>
     <text x="430" y="140" text-anchor="middle" font-size="13" font-weight="700" fill="#1e3a8a">SmolLM2-360M backbone · 16-layer prefill</text>
     <text x="430" y="162" text-anchor="middle" font-size="11" fill="#1e3a8a">per layer: RMSNorm → Q/K/V proj → RoPE → non-causal attention → O proj → residual → SwiGLU MLP</text>
     <text x="430" y="184" text-anchor="middle" font-size="11" fill="#6b7280">all matrix mults / norms / attention / activations run on the NPU</text>
     <text x="430" y="201" text-anchor="middle" font-size="10.5" fill="#1e40af">produces: each layer's K/V "memory cache"</text>
-
     <line x1="430" y1="210" x2="430" y2="235" stroke="#6b7280" stroke-width="2" marker-end="url(#ar2)"/>
     <text x="445" y="228" font-size="10.5" fill="#6b7280">inject the NPU-computed K/V back into the CPU</text>
-
     <rect x="20" y="238" width="820" height="80" rx="8" fill="#fef3c7" stroke="#d97706" stroke-width="1.5" stroke-dasharray="4 3"/>
     <text x="32" y="258" font-size="12" font-weight="700" fill="#92400e">CPU</text>
     <text x="140" y="262" font-size="12" fill="#78350f">action expert reads the backbone's K/V cache</text>
@@ -553,214 +583,139 @@
   <figcaption>The hybrid pipeline: CPU handles pre-processing and action generation; the NPU runs the core 16-layer backbone.</figcaption>
   </div>
 
-  <h3>What runs where, and why</h3>
-  <table>
-    <tr><th>Model part</th><th>Runs on</th><th>Why</th></tr>
-    <tr><td>Language backbone (16 layers: norms / projections / attention / activations)</td><td><span class="pill npu">NPU2</span></td><td>Core, compute-heavy, reuses already-validated kernel building blocks</td></tr>
-    <tr><td>Vision encoder SigLIP + connector</td><td><span class="pill cpu">CPU</span></td><td>Frozen, hardest to move (needs 4–5 new kernels), runs once per episode → lowest payoff</td></tr>
-    <tr><td>Action expert + 10-step denoise</td><td><span class="pill cpu">CPU</span></td><td>Special structure; planned as the next milestone, A2</td></tr>
-    <tr><td>Final norm, prefix assembly</td><td><span class="pill cpu">CPU</span></td><td>Outside the per-layer hot loop, same choice as every LLM sibling</td></tr>
-  </table>
-
-  <!-- ============================================================ -->
-  <h2 id="mapping">6. The current NPU mapping: which kernel replaced which step</h2>
-
-  <p class="lead">
-    Section 4 showed the full architecture; this section states precisely <b>which NPU kernels the current
-    implementation calls, and which original backbone operator each one replaces</b>. For every step:
-    the original PyTorch operator → the NPU kernel we call.
-  </p>
-
+  <h3>Which original operator each NPU kernel replaces</h3>
   <table class="arch">
     <tr><th>Original operator (PyTorch)</th><th>Replaced by NPU kernel</th><th>Notes</th></tr>
     <tr><td><code>LlamaRMSNorm</code> (input / post)</td><td><span class="knl">RMSNorm</span> ELF</td><td>fp32 reduction, same as llama/qwen; shape 241×960 validated</td></tr>
-    <tr><td><code>q_proj / k_proj / v_proj</code></td><td><span class="knl">GEMM</span> (fused into the rms_gemms_rope ELF)</td><td>GQA: Q (1,241,960)→(1,241,960), K/V (1,241,960)→(1,241,320)</td></tr>
+    <tr><td><code>q_proj / k_proj / v_proj</code></td><td><span class="knl">GEMM</span> (fused into the rms_gemms_rope ELF)</td><td>GQA: Q (1,241,960)→(1,241,960), K/V →(1,241,320)</td></tr>
     <tr><td><code>apply_rotary_pos_emb</code> (RoPE)</td><td><span class="knl">RoPE</span> (same fused ELF)</td><td>half-split, θ=10000 (measured value, not the config's 100000)</td></tr>
     <tr><td><code>eager_attention_forward</code> (non-causal)</td><td><span class="knl">qkt GEMM</span> + <span class="knl">masked_softmax</span> + <span class="knl">pv GEMM</span></td><td>custom composition, not FlashAttention (see below)</td></tr>
     <tr><td><code>o_proj</code> + residual</td><td><span class="knl">GEMM</span> + <span class="knl">EltwiseAdd</span> (fused into the o_ffn ELF)</td><td>—</td></tr>
-    <tr><td><code>LlamaMLP</code> (SwiGLU)</td><td><span class="knl">gate/up GEMM</span> + <span class="knl">SiLU-Mul</span> + <span class="knl">down GEMM</span> (o_ffn ELF)</td><td>(241,960)→(241,2560)→(241,960)</td></tr>
+    <tr><td><code>LlamaMLP</code> (SwiGLU)</td><td><span class="knl">gate/up GEMM</span> + <span class="knl">SiLU-Mul</span> + <span class="knl">down GEMM</span> (o_ffn ELF)</td><td>(1,241,960)→(1,241,2560)→(1,241,960)</td></tr>
   </table>
 
   <div class="card">
     <p style="margin-top:0"><b>Key design: how the non-causal attention was built</b></p>
-    <p>
-      The original attention is "non-causal" (within the prefix, image and text tokens can all see each other —
-      unlike GPT, which only looks backward). The NPU's ready-made FlashAttention is hard-wired to be
-      <em>causal</em> and internally complex; reworking it is risky. And the backbone's attention matrix is only
-      <span class="shape">241×241</span> — small enough to fit in on-chip memory, so FlashAttention's
-      memory-saving tricks aren't needed anyway.
-    </p>
     <p style="margin-bottom:0">
-      So we compose attention from <b>three simple building blocks</b>: a <span class="knl">GEMM</span> for Q×Kᵀ →
-      <span class="knl">masked_softmax</span> (a new kernel that handles all heads + the mask in one shot) →
-      a <span class="knl">GEMM</span> for probabilities×V. The mask is computed on the host and passed in, so
-      causal, bidirectional, or padding-aware are all possible — flexible and reliable.
-    </p>
-  </div>
-
-  <div class="card">
-    <p style="margin-top:0"><b>Three fused ELFs: one layer = 3 big blocks, not 33 tiny calls</b></p>
-    <p style="margin-bottom:0">
-      To reduce "dispatch" (job-launch) overhead, each backbone layer's operators are packed into 3 fused NPU
-      programs (ELFs): ① <code>rms_gemms_rope</code> (RMSNorm + QKV + RoPE) ② attention (GEMM + softmax + GEMM)
-      ③ <code>o_ffn</code> (O + residual + RMSNorm + SwiGLU). The first two are reused/adapted from the already-deployed
-      llama/qwen models; the attention is new in this project. The performance work in Section 9 mainly compresses
-      the number of calls inside ② (attention).
+      The backbone's attention is "non-causal" (image and text tokens see each other both ways). The NPU's
+      ready-made FlashAttention is hard-wired to be <em>causal</em> and complex to rework. And the attention
+      matrix is only <span class="shape">241×241</span> — small enough to fit on-chip, so FlashAttention's tricks
+      aren't needed. So we compose attention from three simple blocks: <span class="knl">GEMM</span> for Q×Kᵀ →
+      <span class="knl">masked_softmax</span> (a new kernel handling all heads + the mask at once) →
+      <span class="knl">GEMM</span> for probabilities×V. The mask is supplied by the host, so causal, bidirectional,
+      or padding-aware are all possible.
     </p>
   </div>
 
   <div class="callout warn">
-    <b>③ the action expert and ① vision are still entirely on CPU</b> — no NPU kernel replaces them yet.
-    Section 4 already lists what each needs (expert: reuse backbone kernels + cross-attention wiring;
-    vision: new kernels like conv2d / LayerNorm / GELU-tanh / softmax / pixel-shuffle). Those are the A2 / A3 work.
+    <b>What remains on CPU:</b> ① vision and ③ the action expert. Section 5's table shows why — vision needs 4 new
+    kernels; the expert reuses backbone kernels and is the natural next milestone (its cross-attention already
+    reads the backbone's K/V cache, which the hybrid pipeline already produces).
   </div>
 
   <!-- ============================================================ -->
-  <h2 id="how">7. How we mapped the backbone onto the NPU (phase by phase)</h2>
+  <h2 id="how">7. How we mapped the backbone (phase by phase)</h2>
 
-  <p>
-    We didn't do it all at once. Like stacking bricks, <b>every step was verified correct before adding the next</b>.
-    The process had 4 phases:
-  </p>
+  <p>Like stacking bricks, <b>every step was verified correct before adding the next</b>. Four phases:</p>
 
   <div class="card">
     <p><span class="step-num">0</span><b>Build a CPU reference (the "answer key")</b></p>
     <p style="margin-left:2.2rem">
-      First run the real SmolVLA on plain CPU and record every layer's output as the "answer key" (oracle).
-      Everything the NPU computes afterward is checked against it. <span class="pill done">✅ done</span>
+      Run the real SmolVLA on CPU and record every layer's output as the oracle. Everything the NPU computes is
+      checked against it. <span class="pill done">✅ done</span>
     </p>
     <p style="margin-left:2.2rem;color:var(--muted);font-size:0.9rem">
-      💡 This step already caught a key trap: the config file says the RoPE parameter is 100000, but the code
-      actually uses 10000 at runtime — only found by comparing similarity against the answer key. Using the wrong
-      value would silently corrupt the whole backbone.
+      💡 This caught a trap: the config says the RoPE parameter is 100000, but the code uses 10000 at runtime —
+      found only by comparing against the answer key. The wrong value would silently corrupt the backbone.
     </p>
   </div>
-
   <div class="card">
-    <p><span class="step-num">1</span><b>Validate each "brick" kernel</b></p>
+    <p><span class="step-num">1</span><b>Validate each kernel</b></p>
     <p style="margin-left:2.2rem">
-      The backbone needs 8 kinds of basic operation (matrix mult, norm, RoPE, activation…). Seven are existing,
-      NPU-validated bricks that just needed re-testing at SmolVLA's new sizes. <b>The only brand-new one is the
-      "non-causal attention"</b> — instead of hacking the complex existing attention, we composed it from
-      "matrix mult + masked softmax," which is more robust. <span class="pill done">✅ done</span>
+      Re-test the 7 existing kernels at SmolVLA's sizes, and build the one new kernel (non-causal masked softmax)
+      from "matmul + masked softmax." <span class="pill done">✅ done</span>
     </p>
   </div>
-
   <div class="card">
-    <p><span class="step-num">2</span><b>Assemble ONE layer, check against the answer key</b></p>
+    <p><span class="step-num">2</span><b>Assemble ONE layer</b></p>
     <p style="margin-left:2.2rem">
-      Assemble the bricks into the backbone's first layer, run on the NPU, compare with the answer key's layer 1.
-      Similarity <b>0.99998</b> (1.0 is identical) — assembly is correct. <span class="pill done">✅ done</span>
+      Run the backbone's first layer on the NPU, compare with the answer key: similarity <b>0.99998</b>
+      (1.0 = identical). <span class="pill done">✅ done</span>
     </p>
   </div>
-
   <div class="card">
     <p><span class="step-num">3</span><b>Scale to 16 layers, run end to end</b></p>
     <p style="margin-left:2.2rem">
-      Replicate one layer into the full 16, inject the NPU-computed per-layer K/V "memory" back into the CPU action
-      expert, produce the final action chunk, and compare with the pure-CPU chunk. <span class="pill done">✅ done</span>
+      Run all 16 layers, inject the NPU K/V into the CPU action expert, produce the action chunk, compare with the
+      pure-CPU chunk. <span class="pill done">✅ done</span>
     </p>
     <p style="margin-left:2.2rem;color:var(--muted);font-size:0.9rem">
-      💡 We also ran a "perturbation test": deliberately replacing the NPU-computed K/V with random noise makes the
-      action chunk change drastically — proving the action is <b>genuinely driven by the NPU's computation</b>, not
-      secretly by the CPU.
+      💡 A "perturbation test" (replacing the NPU K/V with random noise makes the action change drastically)
+      proves the action is genuinely driven by the NPU's computation, not the CPU.
     </p>
   </div>
 
   <!-- ============================================================ -->
-  <h2 id="correct">8. Correctness: how we prove nothing is miscomputed</h2>
+  <h2 id="correct">8. Correctness: how we verify it</h2>
 
   <p>
-    The NPU computes in bf16 (16-bit), lower precision than the CPU's 32-bit, so we must prove "the error is within
-    an acceptable range." We use two independent yardsticks:
+    The NPU computes in bf16 — the same precision as the CPU baseline (Section 4), so this is an apples-to-apples
+    comparison. We use two independent yardsticks:
   </p>
-
   <div class="stat-row">
     <div class="stat">
       <div class="big-num">0.9962</div>
-      <div class="label">16-layer backbone output<br>vs answer key (cosine similarity)</div>
+      <div class="label">16-layer backbone output<br>vs answer key (cosine)</div>
     </div>
     <div class="stat">
       <div class="big-num">0.9971</div>
-      <div class="label">final action chunk<br>vs pure CPU (cosine similarity)</div>
+      <div class="label">final action chunk<br>vs pure CPU (cosine)</div>
     </div>
     <div class="stat">
       <div class="big-num">PASS</div>
       <div class="label"><code>make verify</code><br>end-to-end automated gate</div>
     </div>
   </div>
-
   <div class="callout">
-    <b>Conclusion: correctness is guaranteed.</b> Similarity 0.9971 (closer to 1 is better; threshold set at 0.99),
-    and all the error comes from bf16 precision, within expectations. These numbers are measured on
-    <b>real NPU2 hardware</b>, not simulated.
+    <b>Correctness is verified.</b> Cosine similarity 0.9971 (threshold 0.99); all the error is bf16 rounding,
+    within expectations. Measured on <b>real NPU2 hardware</b>, not simulated.
   </div>
 
   <!-- ============================================================ -->
-  <h2 id="perf">9. Performance: before vs after optimization</h2>
+  <h2 id="perf">9. Performance on the NPU (before vs after optimization)</h2>
 
-  <h3>First: where does the CPU baseline actually spend its time?</h3>
   <p>
-    To know where moving to the NPU helps, we first profiled the <b>real CPU baseline</b> — the unmodified
-    <code>lerobot/smolvla_base</code> running its own <code>predict_action_chunk</code> (so this is a true
-    apples-to-apples reference, not a custom reimplementation). The loaded weights are already
-    <b>bfloat16</b> (474 bf16 + 26 fp32 tensors, the fp32 ones being norms/state_proj), so the CPU baseline
-    computes in the same numeric precision as the NPU. One action chunk takes <b>~1044 ms</b> on CPU.
+    This project was <b>correctness-first, then optimize speed</b>. On the first measurement the NPU backbone was
+    a bit <em>slower</em> than the CPU backbone — because the attention part split the 15 heads into many small jobs,
+    and the <b>job-launch overhead</b> added up (31 launches per layer, ~500 across 16 layers).
   </p>
-  <table>
-    <tr><th>Stage</th><th>CPU time / chunk</th><th>Share</th><th>Runs</th><th>Where it is now</th></tr>
-    <tr><td>① vision (SigLIP)</td><td><b>719 ms</b></td><td><b>73.6%</b></td><td>1×</td><td><span class="pill cpu">CPU</span> (A3)</td></tr>
-    <tr><td>①b connector</td><td>4.5 ms</td><td>0.5%</td><td>1×</td><td><span class="pill cpu">CPU</span></td></tr>
-    <tr><td>② backbone</td><td>56.8 ms</td><td>5.8%</td><td>1×</td><td><span class="pill npu">NPU2 ✓</span> (A1 done)</td></tr>
-    <tr><td>③ action expert</td><td>196.8 ms</td><td>20.1%</td><td>10×</td><td><span class="pill cpu">CPU</span> (A2)</td></tr>
-  </table>
-  <p class="legend">By op type across the whole model: Linear/GEMM 55% · attention 36% · norm 4.4% · activation 3.7% · conv 0.4%.</p>
-
-  <div class="callout warn">
-    <b>The key insight from this breakdown:</b> the bottleneck is <b>vision (73.6%)</b>, not the backbone we
-    moved to the NPU in A1 (only 5.8%). So A1 proves the <em>method</em> works and makes the backbone itself
-    faster, but it moves only a small slice of the end-to-end time. <b>The biggest performance lever is
-    vision (A3), then the action expert (A2)</b> — which runs 10× in the denoise loop. Vision was deprioritized
-    on <em>engineering difficulty</em> (5 new kernels + a 1024×1024 attention), but this profile shows it is
-    also the biggest <em>performance</em> prize — a trade-off worth revisiting.
-  </div>
-
-  <h3>The backbone itself: before vs after optimization</h3>
-  <p>
-    This project was <b>correctness-first, then optimize speed</b>. On the first measurement the NPU was actually
-    a bit <em>slower</em> than CPU — because the attention part split the 15 "attention heads" into many small jobs
-    sent to the NPU, and the <b>job-launch overhead</b> added up (31 launches per layer, ~500 across 16 layers).
-  </p>
-
   <div class="analogy">
-    <b>Analogy:</b> like having 15 small files to print, each making a separate trip to the printer — the walking
-    takes longer than the printing. The optimization is to <b>batch what can be batched into one print job</b>.
+    <b>Analogy:</b> like 15 small files each making a separate trip to the printer — the walking takes longer than
+    the printing. The fix is to <b>batch what can be batched into one print job</b>.
   </div>
-
   <p>
-    <b>Optimization (Route 1):</b> among the 15 attention heads, every 3 share the same data, so they can be
-    <b>stacked into one larger matrix multiplication</b>. This cut per-layer launches from 31 to 11, and the total
-    from ~528 to ~208.
+    <b>Optimization (Route 1):</b> every 3 attention heads share the same data, so they stack into one larger
+    matrix multiplication — cutting per-layer launches from 31 to 11 (total ~528 → ~208).
   </p>
-
   <table>
-    <tr><th>Metric</th><th>Before opt</th><th>After opt</th></tr>
+    <tr><th>Metric (backbone only)</th><th>Before opt</th><th>After opt</th></tr>
     <tr><td>NPU backbone latency (16 layers)</td><td>~400 ms</td><td><b>~226 ms</b></td></tr>
     <tr><td>CPU backbone latency (same compute)</td><td>~344 ms</td><td>~340 ms</td></tr>
     <tr><td>NPU / CPU ratio</td><td>1.16× (NPU slower)</td><td><b>0.71× (NPU faster)</b></td></tr>
     <tr><td>attention launches / layer</td><td>31</td><td>11</td></tr>
     <tr><td>correctness (<code>make verify</code>)</td><td>PASS</td><td>PASS (bit-identical)</td></tr>
   </table>
-
   <div class="callout">
-    <b>Result: the NPU backbone went from 400ms to 226ms (~1.8× speedup), and is now faster than the CPU.</b>
-    And the correctness numbers are <b>bit-identical</b> after the optimization — because "batching the launches"
-    only changes how the work is submitted, not the math being computed.
+    <b>Result: the NPU backbone went from 400ms to 226ms (~1.8× faster), now beating the CPU backbone.</b>
+    Correctness is bit-identical after the optimization — batching only changes how work is submitted, not the math.
   </div>
-
   <div class="callout warn">
-    <b>Headroom remaining (not yet done):</b> ~208 launches still remain. The next step (Route 3) would fuse a
-    layer's attention into an even larger NPU program block to cut overhead further. That's a future direction.
+    <b>Whole-model perspective (from Section 4):</b> the backbone is only 5.8% of the end-to-end CPU time, so
+    speeding it up moves a small slice of the total. A1 proves the <em>method</em> works; the biggest performance
+    prizes are <b>vision (73.6%, milestone A3)</b> and the <b>action expert (20.1%, A2)</b>. Vision was
+    deprioritized on engineering difficulty (4 new kernels + a 1024×1024 attention), but this profile shows it is
+    also the biggest performance opportunity — a trade-off worth revisiting. Remaining backbone headroom: fusing
+    the ~208 launches further (Route 3).
   </div>
 
   <!-- ============================================================ -->
@@ -768,27 +723,27 @@
 
   <h3>Done — Milestone A1</h3>
   <ul class="clean">
-    <li><span class="pill done">✅</span> SmolVLA's <b>language backbone (all 16 layers) runs on NPU2</b>, numerically checked against pure CPU</li>
-    <li><span class="pill done">✅</span> end-to-end hybrid pipeline works: CPU pre-processing → NPU backbone → CPU action generation</li>
+    <li><span class="pill done">✅</span> SmolVLA's <b>language backbone (all 16 layers) runs on NPU2</b>, verified against pure CPU</li>
+    <li><span class="pill done">✅</span> end-to-end hybrid pipeline: CPU pre-processing → NPU backbone → CPU action generation</li>
     <li><span class="pill done">✅</span> dual-track correctness (per-layer + end-to-end), <code>make verify</code> PASS on real hardware</li>
-    <li><span class="pill done">✅</span> performance optimization: backbone 1.8× faster, NPU now beats CPU</li>
+    <li><span class="pill done">✅</span> performance optimization: backbone 1.8× faster, NPU now beats the CPU backbone</li>
     <li><span class="pill done">✅</span> incidentally fixed a shared-code bug affecting all deployed models, verified no regression</li>
   </ul>
 
   <h3>Next milestones</h3>
   <table>
-    <tr><th>Milestone</th><th>Scope</th><th>Status</th></tr>
-    <tr><td><b>A2</b></td><td>Move the <b>action expert</b> onto the NPU too (cross-attention + 10-step denoise)</td><td><span class="pill future">planned</span></td></tr>
-    <tr><td><b>A3</b></td><td>Move the <b>vision encoder</b> onto the NPU (needs bidirectional attention, GELU, LayerNorm, pixel-shuffle, conv2d)</td><td><span class="pill future">longer-term</span></td></tr>
-    <tr><td><b>Route 3</b></td><td>Fuse attention further to cut the remaining ~208 launches</td><td><span class="pill future">optimization headroom</span></td></tr>
+    <tr><th>Milestone</th><th>Scope</th><th>Why / status</th></tr>
+    <tr><td><b>A2</b></td><td>Move the <b>action expert</b> onto the NPU (cross-attention + 10-step denoise)</td><td>20% of runtime; reuses backbone kernels → <span class="pill future">planned</span></td></tr>
+    <tr><td><b>A3</b></td><td>Move the <b>vision encoder</b> onto the NPU (needs LayerNorm, GELU, conv2d, pixel-shuffle, bidirectional attention)</td><td>74% of runtime = biggest prize, but 4 new kernels → <span class="pill future">longer-term</span></td></tr>
+    <tr><td><b>Route 3</b></td><td>Fuse backbone attention further to cut the remaining ~208 launches</td><td><span class="pill future">optimization headroom</span></td></tr>
   </table>
 
   <div class="card" style="margin-top:2rem;background:#f0f9ff;border-color:#7dd3fc">
     <p style="margin:0"><b>In one sentence:</b>
     SmolVLA's language brain (the 16-layer SmolLM2-360M) now runs entirely on the AMD NPU2, with action output
-    verified against a pure-CPU baseline (similarity 0.9971), and after optimization it is ~1.4× faster than CPU.
-    Vision and the action expert stay on CPU by design, as later milestones. This is the <b>first time a VLA
-    model's core runs on the AMD NPU2</b>.</p>
+    verified against a pure-CPU baseline (similarity 0.9971) and, after optimization, faster than the CPU backbone.
+    Vision and the action expert stay on CPU for now — and the CPU profiling shows vision is the next big
+    opportunity. This is the <b>first time a VLA model's core runs on the AMD NPU2</b>.</p>
   </div>
 
   <div class="meta" style="margin-top:3rem;border-bottom:none;border-top:1px solid var(--card-border);padding-top:1rem">
