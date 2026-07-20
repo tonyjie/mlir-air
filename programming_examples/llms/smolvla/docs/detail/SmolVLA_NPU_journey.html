@@ -77,6 +77,19 @@
   .toc a { color: var(--accent); text-decoration: none; }
   .toc a:hover { text-decoration: underline; }
   .toc ol { margin: 0.5rem 0; padding-left: 1.4rem; }
+  .shape { font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 0.82rem; background: #eef2ff; color: #3730a3; padding: 0.05rem 0.35rem; border-radius: 4px; white-space: nowrap; }
+  .knl { display:inline-block; font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 0.76rem; background:#ecfdf5; color:#065f46; border:1px solid #6ee7b7; border-radius:4px; padding:0.02rem 0.3rem; }
+  .knl.miss { background:#fef2f2; color:#991b1b; border-color:#fca5a5; }
+  table.arch { font-size: 0.85rem; }
+  table.arch td { vertical-align: top; }
+  table.arch th { background:#eff6ff; }
+  .stage-h { font-size:1.15rem; margin-top:2rem; padding:0.4rem 0.8rem; border-radius:6px; }
+  .stage-h.v { background:#fdf2f8; border-left:5px solid #be185d; color:#9d174d; }
+  .stage-h.b { background:#dbeafe; border-left:5px solid #2563eb; color:#1e40af; }
+  .stage-h.e { background:#f0fdf4; border-left:5px solid #15803d; color:#166534; }
+  details.k { margin:0.6rem 0; border:1px solid var(--card-border); border-radius:8px; padding:0.3rem 0.9rem; background:#fff; }
+  details.k summary { cursor:pointer; font-weight:600; padding:0.4rem 0; }
+  .legend { font-size:0.85rem; color:var(--muted); margin:0.6rem 0; }
 </style>
 </head>
 <body>
@@ -95,7 +108,9 @@
       <li><a href="#what">SmolVLA 是什么？</a>（面向非专家）</li>
       <li><a href="#three">模型的三个部分</a></li>
       <li><a href="#why">为什么要搬到 NPU？什么是 NPU？</a></li>
+      <li><a href="#arch">完整架构：从 input 到 output 的每一步</a>（shape / module / kernel）</li>
       <li><a href="#split">我们的方案：CPU / NPU 混合</a></li>
+      <li><a href="#mapping">当前 NPU 映射：哪个 kernel 替换了哪一步</a></li>
       <li><a href="#how">怎么把 backbone 映射到 NPU（分阶段）</a></li>
       <li><a href="#correct">正确性：怎么保证没算错</a></li>
       <li><a href="#perf">性能：优化前后</a></li>
@@ -196,7 +211,117 @@
   </p>
 
   <!-- ============================================================ -->
-  <h2 id="split">4. 我们的方案：CPU / NPU 混合</h2>
+  <h2 id="arch">4. 完整架构：从 input 到 output 的每一步</h2>
+
+  <p class="lead">
+    这一节把整条流水线拆开到<b>每个模块、每个 kernel、每个张量 shape</b>，
+    让你能判断「哪些能 / 已经映射到 NPU」。所有 shape 都是在真实 checkpoint 上
+    <b>实测</b>的（batch=1），不是从论文推的。
+  </p>
+
+  <div class="legend">
+    图例：<span class="shape">(张量 shape)</span> ·
+    <span class="knl">已在 NPU 有对应 kernel</span> ·
+    <span class="knl miss">尚无 NPU kernel（需新写）</span>
+  </div>
+
+  <div class="fig">
+  <svg viewBox="0 0 860 150" xmlns="http://www.w3.org/2000/svg" font-family="system-ui, sans-serif">
+    <defs><marker id="ara" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#6b7280"/></marker></defs>
+    <rect x="10" y="45" width="150" height="60" rx="8" fill="#f9fafb" stroke="#9ca3af"/>
+    <text x="85" y="70" text-anchor="middle" font-size="11" fill="#374151">3 相机 512×512</text>
+    <text x="85" y="88" text-anchor="middle" font-size="11" fill="#374151">+ 指令 + 状态</text>
+    <rect x="185" y="45" width="150" height="60" rx="8" fill="#fdf2f8" stroke="#be185d"/>
+    <text x="260" y="68" text-anchor="middle" font-size="12" font-weight="700" fill="#9d174d">① 视觉+连接器</text>
+    <text x="260" y="88" text-anchor="middle" font-size="10.5" fill="#9d174d">→ 视觉 token</text>
+    <rect x="360" y="45" width="150" height="60" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="2"/>
+    <text x="435" y="68" text-anchor="middle" font-size="12" font-weight="700" fill="#1e40af">② backbone</text>
+    <text x="435" y="88" text-anchor="middle" font-size="10.5" fill="#1e40af">→ 每层 K/V 缓存</text>
+    <rect x="535" y="45" width="150" height="60" rx="8" fill="#f0fdf4" stroke="#15803d"/>
+    <text x="610" y="68" text-anchor="middle" font-size="12" font-weight="700" fill="#166534">③ 动作专家</text>
+    <text x="610" y="88" text-anchor="middle" font-size="10.5" fill="#166534">×10 去噪</text>
+    <rect x="710" y="45" width="140" height="60" rx="8" fill="#f9fafb" stroke="#9ca3af"/>
+    <text x="780" y="78" text-anchor="middle" font-size="11" fill="#374151">动作 (50,6)</text>
+    <line x1="160" y1="75" x2="183" y2="75" stroke="#6b7280" stroke-width="2" marker-end="url(#ara)"/>
+    <line x1="335" y1="75" x2="358" y2="75" stroke="#6b7280" stroke-width="2" marker-end="url(#ara)"/>
+    <line x1="510" y1="75" x2="533" y2="75" stroke="#6b7280" stroke-width="2" marker-end="url(#ara)"/>
+    <line x1="685" y1="75" x2="708" y2="75" stroke="#6b7280" stroke-width="2" marker-end="url(#ara)"/>
+    <text x="30" y="30" font-size="12" font-weight="700" fill="#374151">端到端数据流（下面逐段展开）</text>
+  </svg>
+  </div>
+
+  <!-- ---------- STAGE 1 vision ---------- -->
+  <h3 class="stage-h v">① 视觉编码器 SigLIP + 连接器 &nbsp;<span class="pill cpu">CPU</span></h3>
+  <p>把每张相机图变成一小把「视觉 token」。核心是一个 12 层的 ViT（视觉 Transformer）。</p>
+  <table class="arch">
+    <tr><th>步骤 (module)</th><th>输入 → 输出 shape</th><th>用到的 kernel</th></tr>
+    <tr><td>patch embedding (Conv2d 16×16)</td><td><span class="shape">(1,3,512,512)</span> → <span class="shape">(1,768,32,32)</span></td><td><span class="knl miss">conv2d</span></td></tr>
+    <tr><td>flatten + 位置编码 → 1024 patch token</td><td>→ <span class="shape">(1,1024,768)</span></td><td><span class="knl">embedding</span></td></tr>
+    <tr><td>× 12 层 ViT block：LayerNorm</td><td><span class="shape">(1,1024,768)</span></td><td><span class="knl miss">LayerNorm</span></td></tr>
+    <tr><td>&nbsp;&nbsp;自注意力（<b>双向</b>，12 头）q/k/v/o</td><td>QKᵀ = <span class="shape">(12,1024,1024)</span></td><td><span class="knl">GEMM</span> + <span class="knl miss">双向 softmax</span></td></tr>
+    <tr><td>&nbsp;&nbsp;MLP：fc1 → GELU → fc2</td><td><span class="shape">768→3072→768</span></td><td><span class="knl">GEMM</span> + <span class="knl miss">GELU-tanh</span></td></tr>
+    <tr><td><b>连接器</b> pixel-shuffle（空间聚合 ×4）</td><td><span class="shape">(1,1024,768)</span> → <span class="shape">(1,64,12288)</span></td><td><span class="knl miss">pixel-shuffle</span></td></tr>
+    <tr><td>&nbsp;&nbsp;投影 Linear</td><td><span class="shape">(1,64,12288)</span> → <span class="shape">(1,64,960)</span></td><td><span class="knl">GEMM</span></td></tr>
+  </table>
+  <p class="legend">→ 每张图 <b>64 个视觉 token</b>（960 维）。3 相机 = 192 个。这一段有 4 类 NPU 尚无的 kernel（conv2d、LayerNorm、GELU-tanh、双向 softmax、pixel-shuffle），加上注意力矩阵大（1024×1024），是最难搬的 —— 故留 CPU（里程碑 A3）。</p>
+
+  <!-- ---------- prefix assembly ---------- -->
+  <h3 class="stage-h b" style="background:#eef2ff;border-color:#6366f1;color:#3730a3">拼装 prefix（喂给 backbone 的输入）&nbsp;<span class="pill cpu">CPU</span></h3>
+  <table class="arch">
+    <tr><th>来源</th><th>token 数 → shape</th></tr>
+    <tr><td>3 相机视觉 token</td><td>3 × 64 = 192 → <span class="shape">(192,960)</span></td></tr>
+    <tr><td>指令分词</td><td>48 → <span class="shape">(48,960)</span></td></tr>
+    <tr><td>机器人状态 state_proj</td><td><span class="shape">(1,32)→(1,960)</span> = 1 token</td></tr>
+    <tr><td><b>拼接 = prefix</b></td><td>192+48+1 = <b><span class="shape">(241,960)</span></b></td></tr>
+  </table>
+
+  <!-- ---------- STAGE 2 backbone ---------- -->
+  <h3 class="stage-h b">② 语言 backbone SmolLM2-360M（16 层）&nbsp;<span class="pill npu">NPU2 ★</span></h3>
+  <p>把 241 个 token 的 prefix「理解」一遍，产出每层的 K/V 记忆缓存。每层 7 个子步骤：</p>
+  <table class="arch">
+    <tr><th>子步骤 (每层)</th><th>输入 → 输出 shape</th><th>NPU kernel</th></tr>
+    <tr><td>1. 输入 RMSNorm（fp32 归约）</td><td><span class="shape">(241,960)</span></td><td><span class="knl">RMSNorm</span></td></tr>
+    <tr><td>2. Q 投影</td><td><span class="shape">(241,960)→(241,960)</span> 15 头</td><td><span class="knl">GEMM</span></td></tr>
+    <tr><td>&nbsp;&nbsp; K/V 投影（GQA 5 头）</td><td><span class="shape">(241,960)→(241,320)</span></td><td><span class="knl">GEMM</span></td></tr>
+    <tr><td>3. RoPE 位置编码（Q、K）</td><td>head_dim=64, θ=10000</td><td><span class="knl">RoPE</span></td></tr>
+    <tr><td>4. <b>非因果注意力</b>（241×241）</td><td>QKᵀ→softmax→PV</td><td><span class="knl">GEMM</span>+<span class="knl">masked-softmax</span>+<span class="knl">GEMM</span></td></tr>
+    <tr><td>5. O 投影</td><td><span class="shape">(241,960)→(241,960)</span></td><td><span class="knl">GEMM</span></td></tr>
+    <tr><td>6. 残差 + post RMSNorm</td><td><span class="shape">(241,960)</span></td><td><span class="knl">EltwiseAdd</span>+<span class="knl">RMSNorm</span></td></tr>
+    <tr><td>7. SwiGLU 前馈：gate/up → SiLU → down</td><td><span class="shape">960→2560→960</span></td><td><span class="knl">GEMM</span>+<span class="knl">SiLU-Mul</span>+<span class="knl">GEMM</span></td></tr>
+    <tr><td>（16 层后）final RMSNorm</td><td><span class="shape">(241,960)</span></td><td><span class="pill cpu">CPU</span> RMSNorm</td></tr>
+  </table>
+  <p class="legend">→ 产出 16 层的 K/V 缓存（每层 <span class="shape">(241,5,64)</span>）。<b>全部 kernel 都已在 NPU 上验证</b> —— 这就是我们能把整段搬上 NPU 的原因。注意力当初为避开复杂的因果 FlashAttention，用「GEMM + 带掩码 softmax」组合实现（见第 6 节）。</p>
+
+  <!-- ---------- STAGE 3 expert ---------- -->
+  <h3 class="stage-h e">③ 动作专家（16 层，×10 去噪循环）&nbsp;<span class="pill cpu">CPU</span></h3>
+  <p>
+    从随机噪声开始，每一步都跑一遍这个 16 层专家、逐渐「去噪」成动作。专家宽度 720（比 backbone 的 960 窄），
+    关键特点是<b>注意力按层交替</b>：
+  </p>
+  <table class="arch">
+    <tr><th>步骤</th><th>输入 → 输出 shape</th><th>kernel / 交互</th></tr>
+    <tr><td>动作输入 action_in_proj</td><td><span class="shape">(1,50,32)→(1,50,720)</span></td><td><span class="knl">GEMM</span></td></tr>
+    <tr><td>时间嵌入 action_time_mlp（拼 action+time）</td><td><span class="shape">(1,50,1440)→(1,50,720)</span></td><td><span class="knl">GEMM</span></td></tr>
+    <tr><td><b>偶数层：自注意力</b>（50 个动作 token 之间）</td><td>q<span class="shape">(50,960)</span> k,v<span class="shape">(50,320)</span></td><td><span class="knl">GEMM</span>+<span class="knl">softmax</span>（新 shape seq=50）</td></tr>
+    <tr><td><b>奇数层：交叉注意力</b>（动作 → backbone 缓存）</td><td>q<span class="shape">(50,960)</span> 但 k,v<span class="shape">(241,320)</span> 来自 backbone</td><td><span class="knl">GEMM</span>+<span class="knl">softmax</span> + <b>读 backbone K/V</b></td></tr>
+    <tr><td>每层 SwiGLU 前馈</td><td><span class="shape">720→2048→720</span></td><td><span class="knl">GEMM</span>+<span class="knl">SiLU-Mul</span></td></tr>
+    <tr><td>动作输出 action_out_proj</td><td><span class="shape">(1,50,720)→(1,50,32)</span></td><td><span class="knl">GEMM</span></td></tr>
+  </table>
+  <p class="legend">
+    → 最终动作块 <span class="shape">(1,50,6)</span>（只用前 6 维 = 动作维度）。专家复用 backbone 已有的 kernel 类型，
+    只是 shape 更小（seq=50），外加「交叉注意力读 backbone K/V」的接线 —— 而这个 K/V 注入机制我们在 A1 已经建好了。
+    <b>所以动作专家是最自然的下一步（A2）。</b> 注意：专家跑 <b>10 次</b>（每步去噪一次），backbone 只跑 <b>1 次</b>。
+  </p>
+
+  <div class="callout">
+    <b>看懂这张全图后，「能不能映射到 NPU」就清晰了：</b>
+    ② backbone 的 kernel 全部现成 → <b>已完成</b>；
+    ③ 专家复用同类 kernel + 已有的 K/V 注入 → <b>可行，A2</b>；
+    ① 视觉需要 4-5 个全新 kernel + 大注意力 → <b>最难，A3</b>。
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="split">5. 我们的方案：CPU / NPU 混合</h2>
 
   <p class="lead">
     我们没有把整个模型都搬上 NPU，而是做了一个<b>混合流水线</b>：
@@ -247,7 +372,55 @@
   </table>
 
   <!-- ============================================================ -->
-  <h2 id="how">5. 怎么把 backbone 映射到 NPU（分阶段）</h2>
+  <h2 id="mapping">6. 当前 NPU 映射：哪个 kernel 替换了哪一步</h2>
+
+  <p class="lead">
+    第 4 节讲了完整架构；这一节精确说明<b>当前实现到底调用了哪些 NPU kernel、替换了原模型 backbone 中的哪个算子</b>。
+    对每一步：原模型的 PyTorch 算子 → 我们调用的 NPU kernel。
+  </p>
+
+  <table class="arch">
+    <tr><th>backbone 里的原算子（PyTorch）</th><th>替换成的 NPU kernel</th><th>说明</th></tr>
+    <tr><td><code>LlamaRMSNorm</code>(input/post)</td><td><span class="knl">RMSNorm</span> ELF</td><td>fp32 归约，与 llama/qwen 同款；shape 241×960 已验证</td></tr>
+    <tr><td><code>q_proj / k_proj / v_proj</code></td><td><span class="knl">GEMM</span>（融合进 rms_gemms_rope ELF）</td><td>GQA：Q 960→960，K/V 960→320</td></tr>
+    <tr><td><code>apply_rotary_pos_emb</code>(RoPE)</td><td><span class="knl">RoPE</span>（同一融合 ELF）</td><td>half-split，θ=10000（实测值，非配置的 100000）</td></tr>
+    <tr><td><code>eager_attention_forward</code>（非因果）</td><td><span class="knl">qkt GEMM</span> + <span class="knl">masked_softmax</span> + <span class="knl">pv GEMM</span></td><td>自研组合，非 FlashAttention（见下方说明）</td></tr>
+    <tr><td><code>o_proj</code> + 残差</td><td><span class="knl">GEMM</span> + <span class="knl">EltwiseAdd</span>（融合进 o_ffn ELF）</td><td>—</td></tr>
+    <tr><td><code>LlamaMLP</code>（SwiGLU）</td><td><span class="knl">gate/up GEMM</span> + <span class="knl">SiLU-Mul</span> + <span class="knl">down GEMM</span>（o_ffn ELF）</td><td>960→2560→960</td></tr>
+  </table>
+
+  <div class="card">
+    <p style="margin-top:0"><b>关键设计：非因果注意力怎么实现的</b></p>
+    <p>
+      原模型的注意力是「非因果」的（prefix 里图像+文字互相都能看，不像 GPT 那样只能看前面）。
+      NPU 上现成的 FlashAttention 是「因果」写死的、内部结构复杂，改造它风险高。而 backbone 的注意力矩阵只有
+      <span class="shape">241×241</span>（很小，放得进片上内存），用不上 FlashAttention 的省内存技巧。
+    </p>
+    <p style="margin-bottom:0">
+      所以我们用<b>三个简单积木组合</b>出注意力：<span class="knl">GEMM</span> 算 Q×Kᵀ →
+      <span class="knl">masked_softmax</span>（新写的 kernel，一次性处理所有头 + 掩码）→
+      <span class="knl">GEMM</span> 算 概率×V。掩码是主机侧算好传进去的，想因果、想双向、想带 padding 都行 —— 灵活且可靠。
+    </p>
+  </div>
+
+  <div class="card">
+    <p style="margin-top:0"><b>三个融合 ELF：一层 = 3 大块，不是 33 个零碎调用</b></p>
+    <p style="margin-bottom:0">
+      为了减少「发任务」开销，backbone 每层的算子被打包成 3 个融合的 NPU 程序块（ELF）：
+      ① <code>rms_gemms_rope</code>（RMSNorm+QKV+RoPE）② 注意力（GEMM+softmax+GEMM）
+      ③ <code>o_ffn</code>（O+残差+RMSNorm+SwiGLU）。前两个是复用/改自已部署的 llama/qwen 模型，
+      注意力是本项目新增。第 8 节的性能优化，主要就是压缩②里注意力的调用次数。
+    </p>
+  </div>
+
+  <div class="callout warn">
+    <b>③ 动作专家 和 ① 视觉：目前仍全在 CPU</b> —— 尚未有任何 NPU kernel 替换它们。
+    第 4 节已列出它们各自需要什么（专家：复用 backbone kernel + 交叉注意力接线；视觉：conv2d / LayerNorm /
+    GELU-tanh / 双向 softmax / pixel-shuffle 等新 kernel）。这是 A2 / A3 的工作。
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="how">7. 怎么把 backbone 映射到 NPU（分阶段）</h2>
 
   <p>
     我们没有一步到位，而是像搭积木一样、每一步都<b>先验证正确再往上加</b>。整个过程分 4 个阶段：
@@ -296,7 +469,7 @@
   </div>
 
   <!-- ============================================================ -->
-  <h2 id="correct">6. 正确性：怎么保证没算错</h2>
+  <h2 id="correct">8. 正确性：怎么保证没算错</h2>
 
   <p>
     NPU 用 bf16（16 位）计算，比 CPU 的 32 位精度低，所以我们要证明「误差在可接受范围内」。
@@ -324,7 +497,7 @@
   </div>
 
   <!-- ============================================================ -->
-  <h2 id="perf">7. 性能：优化前后</h2>
+  <h2 id="perf">9. 性能：优化前后</h2>
 
   <p>
     这个项目<b>先保证正确，再优化速度</b>。第一次测速时，NPU 反而比 CPU <em>慢</em>一点 ——
@@ -362,7 +535,7 @@
   </div>
 
   <!-- ============================================================ -->
-  <h2 id="status">8. 当前进度与后续</h2>
+  <h2 id="status">10. 当前进度与后续</h2>
 
   <h3>已完成 —— 里程碑 A1</h3>
   <ul class="clean">
