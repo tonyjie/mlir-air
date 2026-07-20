@@ -663,26 +663,51 @@
     llama/qwen siblings).
   </p>
 
-  <h3>How one backbone layer actually runs on the NPU</h3>
+  <h3>Per-layer kernel sequence (what runs where, with shapes)</h3>
   <p>
-    The per-layer operations are packed into a small number of <b>fused ELFs</b> (one compiled NPU program that
-    chains several kernels, so it's one XRT dispatch instead of many). The two non-attention groups reuse the
-    <em>exact</em> fused ELFs built for the llama/qwen deployments; attention is host-orchestrated from 3 small
-    kernels. Concretely, per layer (this is the <code>make verify</code> path, attention on NPU):
+    Below is one backbone layer, top to bottom, in the same style as the llama/qwen deployment docs.
+    <span style="color:#1e40af;font-weight:600">[NPU elf:...]</span> = a fused ELF (one compiled program = one XRT
+    dispatch chaining several kernels); <b>(HOST)</b> = runs on CPU. All NPU shapes are at <b>seq padded 241→256</b>.
+    This is the <code>make verify</code> path (approach-B attention on NPU).
   </p>
-  <div class="card" style="font-family:'SF Mono',Menlo,Consolas,monospace;font-size:0.85rem;line-height:1.8">
-    <b>rms_gemms_rope.elf</b> &nbsp;— 1 dispatch &nbsp;<span style="color:#6b7280">(RMSNorm + Q/K/V GEMM + RoPE Q/K)</span> &nbsp;<span class="knl">reused from llama</span><br>
-    &nbsp;&nbsp;→ <b>attention</b> &nbsp;— 11 dispatches &nbsp;<span style="color:#6b7280">(5× <b>qkt</b> GEMM · 1× <b>masked_softmax</b> · 5× <b>pv</b> GEMM)</span><br>
-    &nbsp;&nbsp;→ <b>o_ffn.elf</b> &nbsp;— 1 dispatch &nbsp;<span style="color:#6b7280">(O proj + add + RMSNorm + Gate/Up + SwiGLU + Down + add)</span> &nbsp;<span class="knl">reused from llama</span><br>
-    <span style="color:#374151">= <b>13 XRT dispatches/layer × 16 layers = 208 total.</b> 5 distinct ELFs compiled once + cached:
-    <code>rms_gemms_rope</code>, <code>qkt</code>, <code>masked_softmax</code>, <code>pv</code>, <code>o_ffn</code>.</span>
+  <div class="card" style="font-family:'SF Mono',Menlo,Consolas,monospace;font-size:0.82rem;line-height:1.7;white-space:pre-wrap">
+<span style="color:#374151">x [256,960]</span>
+ ─<span style="color:#1e40af;font-weight:700">[NPU elf:rms_gemms_rope]</span>  <span class="knl">FUSED, 6 launches, 1 ELF</span> <span style="color:#6b7280">· reused from llama</span>
+     { RMSNorm + Q/K/V GEMM + RoPE-Q + RoPE-K }
+     GEMM Q [256,960]×[960,960]→[256,960] · K/V [256,960]×[960,320]→[256,320]
+     → q_roped[256,960]  k_roped[256,320]  v[256,320]
+ ─<b>attention</b>  <span class="knl miss">NOT fused — 11 dispatches</span> <span style="color:#6b7280">· new this project</span>
+     (HOST) reshape to heads, transpose Kᵀ, stack 3 q-heads/kv-group, fold mask
+     5× <span style="color:#1e40af;font-weight:700">[NPU elf:qkt]</span> GEMM  [768,64]×[64,256]→[768,256]  <span style="color:#6b7280">(3 heads batched, M=3·256)</span>
+     1× <span style="color:#1e40af;font-weight:700">[NPU elf:masked_softmax]</span>  scores[15,256,256], all heads at once
+     5× <span style="color:#1e40af;font-weight:700">[NPU elf:pv]</span> GEMM  [768,256]×[256,64]→[768,64]
+     → attn_out[256,960]
+ ─<span style="color:#1e40af;font-weight:700">[NPU elf:o_ffn]</span>  <span class="knl">FUSED, 8 launches, 1 ELF</span> <span style="color:#6b7280">· reused from llama</span>
+     { O GEMM + Add + RMSNorm + Gate + Up + SwiGLU + Down + Add }
+     O [256,960]×[960,960] · Gate/Up [256,960]×[960,2560] · Down [256,2560]×[2560,960]
+     → layer_out[256,960]
+
+once after 16 layers: (HOST) final RMSNorm [256,960]
   </div>
   <p class="legend">
-    <b>The attention 11 dispatches</b> = the batched per-head design (from GQA: 15 q-heads share 5 kv-heads, so
-    5 qkt + 5 pv, each batching 3 heads via a stacked matmul; plus 1 masked_softmax over all heads). Compare the
-    2 fused non-attention ELFs — the attention is the <em>un-fused</em> part, and cutting those 11 dispatches is
-    exactly what the Section 9 optimization and the future Route 3 target. (The final RMSNorm after layer 16 runs
-    on CPU, outside the per-layer loop — same choice as the llama/qwen siblings.)
+    <b>Totals per layer:</b> 2 fused ELFs (rms_gemms_rope=6 launches, o_ffn=8 launches) + 11 attention dispatches
+    = <b>13 XRT dispatches/layer × 16 = 208</b>. <b>5 distinct ELFs</b> compiled once &amp; cached:
+    <code>rms_gemms_rope</code>, <code>qkt</code>, <code>masked_softmax</code>, <code>pv</code>, <code>o_ffn</code>.
+  </p>
+  <p class="legend">
+    <b>On NPU:</b> every GEMM (Q/K/V/O/Gate/Up/Down), RMSNorm, RoPE, and the whole attention (QKᵀ, softmax, PV).
+    <b>On host (CPU):</b> (1) the per-layer attention glue — reshape to heads, the Kᵀ transpose, stacking q-heads
+    per GQA group, folding the additive prefix-LM mask into the score buffer (this is the un-fused part's
+    overhead); (2) the single final RMSNorm after layer 16 (outside the hot loop, sibling-consistent);
+    (3) the once-per-inference prefix assembly (vision/connector/tokenize) and the whole action expert — Sections 5-6.
+    <b>Other overhead:</b> the two-process npz bridge (lerobot venv ↔ NPU-python) and one-time kernel compile
+    (~68 s), both excluded from the ~217 ms figure.
+  </p>
+  <p class="legend">
+    <b>Why this shape of performance:</b> the 2 non-attention ELFs are already fused (1 dispatch each); the
+    attention's 11 dispatches are the un-fused remainder and the reason approach-B sits at ~217 ms. The FA
+    experiment (Section 9) collapses those 11 into 1 (→105 ms) but fails correctness; fusing attention into the
+    per-layer ELF while keeping the prefix-LM mask is the real ceiling (Route 3).
   </p>
 
   <div class="card">
