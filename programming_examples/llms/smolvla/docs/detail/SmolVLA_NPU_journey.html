@@ -966,6 +966,43 @@ once after 16 layers: (HOST) final RMSNorm [256,960]
     while keeping the 2.1× speedup. That would make FA a genuine win. It's the natural next experiment.
   </div>
 
+  <h3>Why is the NPU backbone slower than CPU? A single-kernel breakdown</h3>
+  <p>
+    Even the FA ceiling (~105 ms) is slower than the PyTorch backbone (56.8 ms). To find out why, we measured
+    <b>one kernel at a time</b> — the NPU kernel vs the same op in PyTorch on CPU, at SmolVLA's exact shapes
+    (median of 20, warm, one-time compile excluded; <code>bench_single_kernel.py</code>):
+  </p>
+  <table>
+    <tr><th>Op (SmolVLA shape)</th><th>NPU</th><th>CPU (PyTorch bf16)</th><th>Winner</th></tr>
+    <tr><td>GEMM 256×960×960 (Q/O proj)</td><td>~230 µs · <b>2049 GFLOPS</b></td><td>~340–590 µs · 800–1400 GFLOPS</td><td><b>NPU ~2.6×</b></td></tr>
+    <tr><td>FlashAttention 256×256, 15q/5kv, hd64</td><td>~900 µs · <b>280 GFLOPS</b></td><td>~500–780 µs · 320–500 GFLOPS</td><td><b>CPU</b></td></tr>
+  </table>
+  <div class="callout warn">
+    <b>The result overturns the simple "small shapes lose on NPU" story — it's more specific.</b>
+    <ul class="clean" style="margin:0.5rem 0 0">
+      <li><b>GEMM is NOT the problem.</b> Even at 256×960×960 (far smaller than llama's 2048-seq shapes), the NPU
+        GEMM beats CPU by ~2.6×. The matrix multiplies — the bulk of the FLOPs — are genuinely faster on NPU.</li>
+      <li><b>FlashAttention IS the weak kernel here.</b> SmolVLA's 15 heads force
+        <code>num_heads_per_unroll=1</code>, which uses only <b>4 of the 8 NPU columns</b> (half the array), and at
+        seq=256 the fixed cascade fill/drain isn't amortized — so NPU FA (280 GFLOPS) loses to CPU SDPA. This is
+        exactly why the FA-mode backbone (~105 ms) can't beat CPU.</li>
+      <li><b>approach-B (~217 ms) is dominated by per-dispatch overhead, not arithmetic.</b> Its GEMMs are fast in
+        isolation, but 11 attention dispatches/layer × 16 = 176 small launches each pay host↔device DMA + XRT
+        call-setup cost (the ~230 µs GEMM number excludes that; the real backbone pays it every dispatch).</li>
+    </ul>
+    <b>So the honest root cause is two-fold:</b> (1) attention is the one op that's slower on NPU at this
+    odd-15-head, short-seq shape, and (2) the un-fused per-dispatch overhead of the many small attention launches.
+    Neither is a wrong-kernel bug — the GEMMs use the registry's per-shape-optimal configs and win; it's small-shape
+    + odd-head-count physics plus dispatch overhead. It also points at the fix: fuse attention into the layer ELF
+    (kills the dispatch overhead) and/or a head-count that fills all 8 columns.
+  </div>
+  <div class="callout">
+    <b>The bigger picture (Section 4):</b> this is also why the backbone was never where NPU would shine — at
+    seq=241 it's the <em>smallest</em>-shape stage. The vision encoder (seq=1024, 1024×1024 attention) is both the
+    73.6% bottleneck <em>and</em> the shape where the NPU's GEMM advantage (shown above) would actually dominate.
+    That's the real performance opportunity (A3).
+  </div>
+
   <!-- ============================================================ -->
   <h2 id="status">10. Current status and next steps</h2>
 
