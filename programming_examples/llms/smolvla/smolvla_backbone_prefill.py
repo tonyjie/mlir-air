@@ -126,7 +126,120 @@ def _offn_scratch_specs(seq_len, emb_dim, hidden_dim):
     return arrays, inter
 
 
-def compile_all_kernels(cache, config, seq_len, cpu_attn=True):
+def _resolve_attn_mode(cpu_attn, attn_mode):
+    """Single source of truth mapping the legacy `cpu_attn` bool plus the new
+    `attn_mode` override to one of {"cpu", "gemm", "flash"}.
+
+    attn_mode, when given, wins outright ("cpu"/"gemm"/"flash"). When
+    attn_mode is None (the default, preserving every existing call site's
+    behavior), cpu_attn selects between the two pre-existing paths: "cpu"
+    (Step A, noncausal_attention_reference) or "gemm" (Step B / approach-B,
+    the batched qkt+masked_softmax+pv GEMMs -- the default NPU path)."""
+    if attn_mode is not None:
+        assert attn_mode in ("cpu", "gemm", "flash"), attn_mode
+        return attn_mode
+    return "cpu" if cpu_attn else "gemm"
+
+
+# ---------------------------------------------------------------------------
+# EXPERIMENT: non-causal FlashAttention attention path (attn_mode="flash").
+#
+# Alongside CPU reference (Step A) and approach-B's batched qkt/masked_softmax/
+# pv GEMMs (Step B, the default NPU path), this is a THIRD attention mode that
+# swaps in the kernel_registry's FlashAttention ELF
+# (flash_attention/kernel_fusion_based/attn_npu2_seqfirst.py), mirroring
+# llama32_1b_prefill.py's exact FA usage (same builder, same backend kwargs)
+# but with causal=False -- SmolVLA's attention is non-causal (prefix-LM), and
+# llama's is causal.
+#
+# IMPORTANT CAVEAT: FA's causal=False means FULLY non-causal (every token sees
+# every token, no mask at all). The real SmolVLA mask is prefix-LM: the first
+# 240 tokens must NOT see the state token (token 240), and the 15 pad tokens
+# (241->256) must not participate at all. FA-non-causal does not support an
+# arbitrary additive mask, so this path runs WITHOUT the prefix/padding mask --
+# it is deliberately an approximation, kept only to measure how much that
+# 0.41%-of-cells difference (plus pad-token leakage) costs in end-to-end
+# accuracy. See docs/detail/ (or the experiment report) for the measured
+# cosine/latency comparison against approach-B. NOT wired as the default;
+# approach-B (attn_mode="gemm"/cpu_attn=False) remains the production path.
+# ---------------------------------------------------------------------------
+
+_ATTN_BACKEND_KWARGS = {
+    "verbose": False,
+    "omit_while_true_loop": False,
+    "omit_pingpong": "all",
+    "runtime_loop_tiling_sizes": [1, 1],
+    "output_format": "elf",
+    "instance_name": "attention_bf16",
+}
+
+
+def _compile_flash_attention_kernel(cache, seq_len, head_dim, n_heads, n_kv_heads):
+    """Compile the FlashAttention ELF at SmolVLA's shape: seq=256, 15Q/5KV
+    heads, head_dim=64, NON-CAUSAL. Mirrors llama32_1b_prefill.py's FA compile
+    call exactly (same builder, same knobs) except causal=False."""
+    from flash_attention.kernel_fusion_based.attn_npu2_seqfirst import (
+        build_module as build_attn,
+    )
+
+    lkp = head_dim  # 64
+    # num_heads_per_unroll must divide num_heads (15) AND
+    # num_heads_per_unroll * num_q_tiles <= 8 (NPU2 physical-column limit).
+    # llama's num_heads=32 uses the builder default (2); SmolVLA's odd
+    # num_heads=15 forces num_heads_per_unroll=1 (its only divisor <= 2).
+    num_q_tiles = 4
+    num_heads_per_unroll = 1
+    assert n_heads % num_heads_per_unroll == 0
+    assert num_heads_per_unroll * num_q_tiles <= 8
+    print(
+        "  Compiling NPU FlashAttention kernel (EXPERIMENT: non-causal, "
+        f"seq={seq_len}, {n_heads}Q/{n_kv_heads}KV, head_dim={head_dim}, "
+        f"num_heads_per_unroll={num_heads_per_unroll})"
+    )
+    cache.compile_and_cache(
+        "flash_attn",
+        build_attn(
+            lk=seq_len,
+            lkp=lkp,
+            lq=seq_len,
+            lqp=256,
+            dk=head_dim,
+            dv=head_dim,
+            num_q_tiles=num_q_tiles,
+            num_cascade_stages=4,
+            num_heads=n_heads,
+            num_kv_heads=n_kv_heads,
+            causal=False,  # <-- NON-CAUSAL: the experiment.
+            num_heads_per_unroll=num_heads_per_unroll,
+        ),
+        {**_ATTN_BACKEND_KWARGS, "verbose": cache.verbose},
+    )
+
+
+def _npu_flash_attention(q_roped, k_roped, v, config, cache, seq_len):
+    """Run the FlashAttention ELF (seq-first, no mask -- see module docstring
+    caveat above). Mirrors llama32_1b_prefill.py's FA run call exactly.
+
+    Returns attn_out (seq_len, n_heads*head_dim) bf16.
+    """
+    n_heads = config.n_heads
+    head_dim = config.head_dim
+    q_attn = np.ascontiguousarray(np.asarray(q_roped, dtype=bfloat16))
+    k_attn = np.ascontiguousarray(np.asarray(k_roped, dtype=bfloat16))
+    v_attn = np.ascontiguousarray(np.asarray(v, dtype=bfloat16))
+    attn_output = np.zeros((seq_len, n_heads * head_dim), dtype=bfloat16)
+    results = cache.load_and_run(
+        "flash_attn",
+        _ATTN_BACKEND_KWARGS,
+        q_attn,
+        k_attn,
+        v_attn,
+        attn_output,
+    )
+    return results[-1].reshape(seq_len, n_heads * head_dim)
+
+
+def compile_all_kernels(cache, config, seq_len, cpu_attn=True, attn_mode=None):
     """Pre-compile all unique kernel configs to cache.
 
     Args:
@@ -134,7 +247,10 @@ def compile_all_kernels(cache, config, seq_len, cpu_attn=True):
         config: SmolVLABackboneConfig
         seq_len: Sequence length (padded, e.g. 256)
         cpu_attn: If True (Step A), no NPU attention kernel is compiled.
+        attn_mode: Optional override of {"cpu","gemm","flash"}; see
+            _resolve_attn_mode. Defaults (None) preserve cpu_attn's meaning.
     """
+    attn_mode = _resolve_attn_mode(cpu_attn, attn_mode)
     emb_dim = config.emb_dim
     n_heads = config.n_heads
     n_kv_heads = config.n_kv_heads
@@ -209,8 +325,10 @@ def compile_all_kernels(cache, config, seq_len, cpu_attn=True):
     _o_ffn_mod = build_o_ffn_module(seq_len, emb_dim, hidden_dim)
     cache.compile_and_cache("o_ffn", _o_ffn_mod, o_ffn_backend)
 
-    if not cpu_attn:
+    if attn_mode == "gemm":
         _compile_npu_attention_kernels(cache, seq_len, head_dim, n_heads, n_kv_heads)
+    elif attn_mode == "flash":
+        _compile_flash_attention_kernel(cache, seq_len, head_dim, n_heads, n_kv_heads)
     else:
         print("  Skipping NPU-attention compilation (Step A: CPU attention fallback)")
 
@@ -486,6 +604,7 @@ def run_transformer_block(
     positions,
     layer_idx=0,
     cpu_attn=True,
+    attn_mode=None,
     verbose=False,
 ):
     """Execute a single SmolVLA transformer block on NPU using cached kernels.
@@ -502,12 +621,18 @@ def run_transformer_block(
             smolvla_cpu_helpers.cpu_backbone_forward docstring)
         layer_idx: Layer index for logging / BO-cache keys
         cpu_attn: If True (Step A), run attention on CPU via
-            noncausal_attention_reference instead of an NPU kernel.
+            noncausal_attention_reference instead of an NPU kernel. Ignored
+            when attn_mode is given.
+        attn_mode: Optional override of {"cpu","gemm","flash"} -- see
+            _resolve_attn_mode. "flash" is the EXPERIMENT path (non-causal
+            FlashAttention ELF, no mask -- see module docstring near
+            _compile_flash_attention_kernel).
         verbose: If True, print per-step progress
 
     Returns:
         (output_bf16, npu_intermediates_dict)
     """
+    attn_mode = _resolve_attn_mode(cpu_attn, attn_mode)
     seq_len = x_bf16.shape[0]
     emb_dim = config.emb_dim
     n_heads = config.n_heads
@@ -573,12 +698,15 @@ def run_transformer_block(
 
     # 7. Attention (non-causal, GQA, prefix-mask + padding-frozen positions).
     # NOT llama32_1b's causal attention_reference -- this is the key SmolVLA
-    # divergence. Two paths:
-    #   Step A (cpu_attn=True): noncausal_attention_reference on CPU.
-    #   Step B (cpu_attn=False): _npu_attention -- per-head QKᵀ/PV GEMMs on NPU +
-    #     a batched masked_softmax on NPU (all matmuls + softmax run on NPU;
-    #     host only does layout glue).
-    if cpu_attn:
+    # divergence. Three modes (see _resolve_attn_mode):
+    #   "cpu"   (Step A): noncausal_attention_reference on CPU.
+    #   "gemm"  (Step B, default NPU path): _npu_attention -- per-head QKᵀ/PV
+    #     GEMMs on NPU + a batched masked_softmax on NPU (all matmuls + softmax
+    #     run on NPU; host only does layout glue).
+    #   "flash" (EXPERIMENT): _npu_flash_attention -- registry FlashAttention
+    #     ELF, non-causal, NO mask applied (see caveat near
+    #     _compile_flash_attention_kernel).
+    if attn_mode == "cpu":
         if verbose:
             print(
                 f"    Step 7: Attention GQA [CPU non-causal] "
@@ -594,6 +722,13 @@ def run_transformer_block(
             attn_out = attn_out_f32.reshape(seq_len, n_heads * head_dim).astype(
                 bfloat16
             )
+    elif attn_mode == "flash":
+        if verbose:
+            print(
+                f"    Step 7: Attention GQA [NPU: FlashAttention EXPERIMENT, "
+                f"non-causal, no mask] ({n_heads}Q/{n_kv_heads}KV heads)"
+            )
+        attn_out = _npu_flash_attention(q_roped, k_roped, v, config, cache, seq_len)
     else:
         if verbose:
             print(
@@ -684,6 +819,7 @@ def run_backbone_prefill(
     positions,
     rope_lut,
     cpu_attn=True,
+    attn_mode=None,
     verbose=False,
     return_kv=False,
 ):
@@ -754,6 +890,7 @@ def run_backbone_prefill(
             positions,
             layer_idx=layer_idx,
             cpu_attn=cpu_attn,
+            attn_mode=attn_mode,
             verbose=verbose,
         )
         per_layer_list.append(x)

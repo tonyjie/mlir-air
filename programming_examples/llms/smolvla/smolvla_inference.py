@@ -94,9 +94,14 @@ def build_oracle_batch(policy, prompt: str = DEFAULT_PROMPT):
     return b
 
 
-def _run_npu_backbone(prefix_embed, pad_mask, position_ids, workdir):
+def _run_npu_backbone(prefix_embed, pad_mask, position_ids, workdir, attn_mode="gemm"):
     """Bridge: write the prefix fixture, invoke run_npu_backbone.py in the
-    worktree python, read back per-layer K/V. Synchronous."""
+    worktree python, read back per-layer K/V. Synchronous.
+
+    attn_mode: "gemm" (default, approach-B, the production NPU attention
+    path) or "flash" (EXPERIMENT: registry FlashAttention, non-causal, no
+    mask -- see smolvla_backbone_prefill.py's attn_mode="flash" docstring)."""
+    assert attn_mode in ("gemm", "flash"), attn_mode
     in_path = str(Path(workdir) / "npu_in.npz")
     out_path = str(Path(workdir) / "npu_out.npz")
     np.savez(
@@ -105,16 +110,25 @@ def _run_npu_backbone(prefix_embed, pad_mask, position_ids, workdir):
         pad_mask=np.asarray(pad_mask, bool),
         position_ids=np.asarray(position_ids, np.int64),
     )
-    cmd = [WORKTREE_PYTHON, str(_HERE / "run_npu_backbone.py"), in_path, out_path]
+    cmd = [
+        WORKTREE_PYTHON,
+        str(_HERE / "run_npu_backbone.py"),
+        in_path,
+        out_path,
+        attn_mode,
+    ]
     print(f"[hybrid] NPU backbone subprocess: {' '.join(cmd)}", flush=True)
     subprocess.run(cmd, check=True)
     out = np.load(out_path)
     return out["k"], out["v"]  # (L, oracle_len, 5, 64) f32
 
 
-def run_hybrid_forward(batch, policy=None, noise=None, workdir=None):
+def run_hybrid_forward(batch, policy=None, noise=None, workdir=None, attn_mode="gemm"):
     """Run the full hybrid pipeline once; return the (1, chunk, action_dim)
-    action chunk (unpadded to the real action dim)."""
+    action chunk (unpadded to the real action dim).
+
+    attn_mode: forwarded to _run_npu_backbone -- "gemm" (default, approach-B,
+    production) or "flash" (EXPERIMENT: non-causal FlashAttention, no mask)."""
     if policy is None:
         policy = SmolVLAPolicy.from_pretrained(DEFAULT_MODEL).eval()
 
@@ -147,7 +161,11 @@ def run_hybrid_forward(batch, policy=None, noise=None, workdir=None):
             pkv = out[1]
             position_ids = kw["position_ids"].detach().numpy()[0].astype(np.int64)
             npu_k, npu_v = _run_npu_backbone(
-                captured["prefix_embed"], captured["pad_masks"], position_ids, workdir
+                captured["prefix_embed"],
+                captured["pad_masks"],
+                position_ids,
+                workdir,
+                attn_mode=attn_mode,
             )
             # Reassign whole contiguous tensors (recipe: don't mutate views).
             # Match each cached tensor's dtype/shape exactly: (1, L, 5, 64) bf16.

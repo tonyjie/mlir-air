@@ -11,17 +11,23 @@ raw V (5 kv-heads) -- exactly the quantities the SmolVLA action expert caches
 during its `fill_kv_cache=True` prefill.
 
 I/O contract (npz files, paths given as argv):
-  argv[1] = in_path  : prefix_embed (ORACLE_LEN, emb_dim) f32,
-                       pad_mask (ORACLE_LEN,) bool,
-                       position_ids (ORACLE_LEN,) int64  [lerobot's actual ids]
-  argv[2] = out_path : k (n_layers, ORACLE_LEN, n_kv_heads, head_dim) f32,
-                       v (n_layers, ORACLE_LEN, n_kv_heads, head_dim) f32,
-                       final_hidden (ORACLE_LEN, emb_dim) f32,
-                       per_layer (n_layers, ORACLE_LEN, emb_dim) f32
+  argv[1] = in_path   : prefix_embed (ORACLE_LEN, emb_dim) f32,
+                        pad_mask (ORACLE_LEN,) bool,
+                        position_ids (ORACLE_LEN,) int64  [lerobot's actual ids]
+  argv[2] = out_path  : k (n_layers, ORACLE_LEN, n_kv_heads, head_dim) f32,
+                        v (n_layers, ORACLE_LEN, n_kv_heads, head_dim) f32,
+                        final_hidden (ORACLE_LEN, emb_dim) f32,
+                        per_layer (n_layers, ORACLE_LEN, emb_dim) f32
+  argv[3] = attn_mode : OPTIONAL, one of {"gemm","flash"} (default "gemm" =
+                        approach-B, the production NPU attention path).
+                        "flash" is the EXPERIMENT path (registry
+                        FlashAttention, non-causal, no mask -- see
+                        smolvla_backbone_prefill.py's attn_mode="flash"
+                        docstring for the mask-difference caveat).
 
 Invoke under the NPU lock:
     flock -x -w 1800 /tmp/mlir-air-npu.lock \
-        python3 run_npu_backbone.py in.npz out.npz
+        python3 run_npu_backbone.py in.npz out.npz [attn_mode]
 """
 
 import sys
@@ -66,6 +72,8 @@ def build_padded_mask_and_positions(pad_mask, oracle_len):
 
 def main():
     in_path, out_path = sys.argv[1], sys.argv[2]
+    attn_mode = sys.argv[3] if len(sys.argv) > 3 else "gemm"
+    assert attn_mode in ("gemm", "flash"), attn_mode
     data = np.load(in_path)
     prefix_embed = data["prefix_embed"]  # (ORACLE_LEN, emb_dim) f32
     pad_mask = data["pad_mask"].astype(bool)  # (ORACLE_LEN,)
@@ -101,7 +109,7 @@ def main():
     cache = KernelCache(
         str(_HERE / "smolvla_block_kernel_cache"), verbose=False, profiler=Profiler()
     )
-    compile_all_kernels(cache, cfg, NPU_SEQ_LEN, cpu_attn=False)
+    compile_all_kernels(cache, cfg, NPU_SEQ_LEN, cpu_attn=False, attn_mode=attn_mode)
 
     final_hidden, per_layer, kv_list = run_backbone_prefill(
         x_bf16,
@@ -112,6 +120,7 @@ def main():
         positions_256,
         rope_lut_bf16,
         cpu_attn=False,
+        attn_mode=attn_mode,
         verbose=True,
         return_kv=True,
     )

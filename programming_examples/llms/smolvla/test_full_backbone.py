@@ -13,6 +13,10 @@ Two checks:
 Attention path is selectable:
     python3 test_full_backbone.py            # Step A (cpu_attn=True, GOAL 1)
     python3 test_full_backbone.py --npu-attn # Step B (cpu_attn=False, GOAL 2)
+    python3 test_full_backbone.py --flash    # EXPERIMENT: non-causal FlashAttention
+                                              # (see smolvla_backbone_prefill.py's
+                                              # attn_mode="flash" docstring for the
+                                              # mask-difference caveat)
 
 Run under the NPU lock:
     flock -x -w 1800 /tmp/mlir-air-npu.lock python3 test_full_backbone.py
@@ -74,8 +78,15 @@ def build_padded_mask_and_positions(pad_mask_241):
 
 
 def main():
-    cpu_attn = "--npu-attn" not in sys.argv
-    mode = "Step A (CPU attention)" if cpu_attn else "Step B (NPU attention)"
+    flash = "--flash" in sys.argv
+    cpu_attn = "--npu-attn" not in sys.argv and not flash
+    attn_mode = "flash" if flash else None
+    if flash:
+        mode = "EXPERIMENT (NPU FlashAttention, non-causal, no mask)"
+    elif cpu_attn:
+        mode = "Step A (CPU attention)"
+    else:
+        mode = "Step B (NPU attention)"
     print("=" * 70)
     print(f"SmolVLA Task 3.1: FULL 16-layer NPU backbone -- {mode}")
     print("=" * 70)
@@ -110,7 +121,7 @@ def main():
     cache = KernelCache(
         "smolvla_block_kernel_cache", verbose=False, profiler=Profiler()
     )
-    compile_all_kernels(cache, cfg, NPU_SEQ_LEN, cpu_attn=cpu_attn)
+    compile_all_kernels(cache, cfg, NPU_SEQ_LEN, cpu_attn=cpu_attn, attn_mode=attn_mode)
 
     final_hidden, per_layer = run_backbone_prefill(
         x_bf16,
@@ -121,6 +132,7 @@ def main():
         positions_256,
         rope_lut_bf16,
         cpu_attn=cpu_attn,
+        attn_mode=attn_mode,
         verbose=True,
     )
     assert len(per_layer) == cfg.n_layers, len(per_layer)

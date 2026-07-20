@@ -2,18 +2,23 @@
 
 Apples-to-apples INFERENCE latency for the SmolLM2-360M backbone at seq=256:
 - compiles NPU kernels ONCE (excluded from timing)
-- times N NPU run_backbone_prefill calls (cpu_attn=False, full NPU attention)
+- times N NPU run_backbone_prefill calls (--mode gemm: approach-B, the
+  default/production NPU attention; --mode flash: EXPERIMENT non-causal
+  FlashAttention, see smolvla_backbone_prefill.py's attn_mode="flash"
+  docstring for the mask-difference caveat)
 - times N cpu_backbone_forward calls (pure-numpy fp32, the verified reference)
 
 After the Phase-4 GQA-group batching optimization (commit f404998e), NPU
-attention issues ~11 XRT dispatches/layer (5 QKt + 1 softmax + 5 PV; was
-31/layer before batching) x 16 layers. Reports the split so remaining
+attention (--mode gemm) issues ~11 XRT dispatches/layer (5 QKt + 1 softmax +
+5 PV; was 31/layer before batching) x 16 layers. --mode flash issues 1
+dispatch/layer (the FlashAttention ELF). Reports the split so remaining
 fusion headroom (Route 3: fold attention into the per-layer fused ELF) is
 explicit. Does NOT include one-time kernel compile (~min) or the
 two-process npz bridge — those are deployment-harness costs, not inference cost.
 
 Run under the NPU lock, worktree python:
   flock -x -w 1800 /tmp/mlir-air-npu.lock python bench_backbone.py --iters 5
+  flock -x -w 1800 /tmp/mlir-air-npu.lock python bench_backbone.py --iters 5 --mode flash
 """
 
 import argparse
@@ -38,7 +43,15 @@ ORACLE_LEN = 241
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--iters", type=int, default=5)
+    ap.add_argument(
+        "--mode",
+        choices=["gemm", "flash"],
+        default="gemm",
+        help="gemm = approach-B (default, production); "
+        "flash = EXPERIMENT non-causal FlashAttention (no mask)",
+    )
     args = ap.parse_args()
+    attn_mode = args.mode
 
     cfg = SmolVLABackboneConfig()
     w = load_backbone_weights("lerobot/smolvla_base", config=cfg)
@@ -75,8 +88,11 @@ def main():
     # ---- NPU: compile ONCE (excluded from timing) ----
     print("[bench] compiling NPU kernels (one-time, excluded from timing)...")
     t_compile0 = time.perf_counter()
-    cache = KernelCache("bench_kernel_cache", verbose=False, profiler=Profiler())
-    compile_all_kernels(cache, cfg, NPU_SEQ, cpu_attn=False)
+    cache_dir = (
+        "bench_kernel_cache" if attn_mode == "gemm" else "bench_kernel_cache_flash"
+    )
+    cache = KernelCache(cache_dir, verbose=False, profiler=Profiler())
+    compile_all_kernels(cache, cfg, NPU_SEQ, cpu_attn=False, attn_mode=attn_mode)
     t_compile = time.perf_counter() - t_compile0
     print(f"[bench] compile took {t_compile:.1f}s (one-time)")
 
@@ -90,6 +106,7 @@ def main():
         positions,
         rope_lut,
         cpu_attn=False,
+        attn_mode=attn_mode,
         verbose=False,
         return_kv=False,
     )
@@ -106,6 +123,7 @@ def main():
             positions,
             rope_lut,
             cpu_attn=False,
+            attn_mode=attn_mode,
             verbose=False,
             return_kv=False,
         )
@@ -136,10 +154,12 @@ def main():
         cpu_times.append(time.perf_counter() - t0)
     cpu = np.array(cpu_times)
 
-    print("\n=== SmolVLA backbone inference latency (16 layers, seq=256/241) ===")
+    print(
+        f"\n=== SmolVLA backbone inference latency (16 layers, seq=256/241, mode={attn_mode}) ==="
+    )
     print(f"  iters = {args.iters}")
     print(
-        f"  NPU backbone (cpu_attn=False):  median {np.median(npu)*1e3:8.1f} ms  "
+        f"  NPU backbone (attn_mode={attn_mode}):  median {np.median(npu)*1e3:8.1f} ms  "
         f"[min {npu.min()*1e3:.1f}, max {npu.max()*1e3:.1f}]"
     )
     print(
@@ -153,12 +173,22 @@ def main():
     print(
         f"\n  one-time NPU compile = {t_compile:.1f}s (NOT in the per-inference numbers)"
     )
-    print(
-        "  NOTE: ~11 dispatches/layer x 16 = ~176 (after GQA-group batching; was 31/layer)."
-    )
-    print(
-        "  Route 3 (fuse attention into the per-layer fused ELF) is the remaining path to cut dispatch overhead further."
-    )
+    if attn_mode == "gemm":
+        print(
+            "  NOTE: ~11 dispatches/layer x 16 = ~176 (after GQA-group batching; was 31/layer)."
+        )
+        print(
+            "  Route 3 (fuse attention into the per-layer fused ELF) is the remaining path to cut dispatch overhead further."
+        )
+    else:
+        print(
+            "  NOTE (EXPERIMENT): FlashAttention issues 1 dispatch/layer for attention "
+            "(vs 11 for approach-B) x 16 layers; total attention dispatches 16 vs 176."
+        )
+        print(
+            "  CAVEAT: FA runs non-causal WITHOUT the prefix-LM mask or padding exclusion "
+            '-- see smolvla_backbone_prefill.py\'s attn_mode="flash" docstring.'
+        )
 
 
 if __name__ == "__main__":
