@@ -754,27 +754,92 @@
   <!-- ============================================================ -->
   <h2 id="correct">8. Correctness: how we verify it</h2>
 
+  <p class="lead">
+    "Correct" for a VLA can mean two different things, and it's worth separating them:
+  </p>
+  <table>
+    <tr><th>Question</th><th>Reference</th><th>Name</th></tr>
+    <tr><td>Did the NPU port introduce a bug / precision loss?</td><td>the real CPU model (lerobot PyTorch)</td><td><b>port fidelity</b></td></tr>
+    <tr><td>Does the model actually produce good robot actions?</td><td>ground-truth recorded trajectories</td><td><b>task fidelity</b></td></tr>
+  </table>
   <p>
-    The NPU computes in bf16 — the same precision as the CPU baseline (Section 4), so this is an apples-to-apples
-    comparison. We use two independent yardsticks:
+    These don't substitute for each other — the CPU model itself isn't a perfect policy, so matching it proves
+    "we didn't break it," not "the actions are good." For a <em>port</em>, the right primary reference is the CPU
+    model (our job is to move it to the NPU without damage). That is what we verify today.
+  </p>
+
+  <h3>What we verify now (port fidelity)</h3>
+  <p>
+    The NPU computes in bf16 — the <b>same precision as the real CPU model</b> (Section 4: its weights are already
+    bf16), so this is apples-to-apples. The reference is the unmodified lerobot
+    <code>predict_action_chunk</code> output (<b>not</b> the NumPy timing baseline from Section 9). Two tracks:
   </p>
   <div class="stat-row">
     <div class="stat">
       <div class="big-num">0.9962</div>
-      <div class="label">16-layer backbone output<br>vs answer key (cosine)</div>
+      <div class="label">16-layer backbone output<br>vs CPU model (cosine) — <i>diagnosis</i></div>
     </div>
     <div class="stat">
       <div class="big-num">0.9971</div>
-      <div class="label">final action chunk<br>vs pure CPU (cosine)</div>
+      <div class="label">final action chunk<br>vs CPU model (cosine) — <i>the gate</i></div>
     </div>
     <div class="stat">
       <div class="big-num">PASS</div>
-      <div class="label"><code>make verify</code><br>end-to-end automated gate</div>
+      <div class="label"><code>make verify</code><br>cosine ≥ 0.99 &amp; nmse ≤ 0.04</div>
     </div>
   </div>
+  <p>
+    <b>Metric:</b> median per-position cosine + a magnitude-invariant normalized MSE, on the (1,50,6) action chunk.
+    <b>Gate:</b> end-to-end only — per-layer cosine is a <em>diagnosis lens</em> (localizes which layer drifts),
+    never the gate, because per-layer can look fine while the end-to-end result fails (our FlashAttention
+    experiment in Section 9 showed exactly this: per-layer stayed ≥0.995 but the final chunk fell to 0.983).
+  </p>
+
   <div class="callout">
-    <b>Correctness is verified.</b> Cosine similarity 0.9971 (threshold 0.99); all the error is bf16 rounding,
-    within expectations. Measured on <b>real NPU2 hardware</b>, not simulated.
+    <b>Port fidelity is verified.</b> action-chunk cosine 0.9971 vs the real CPU model (gate 0.99); all error is
+    bf16 rounding, within expectations. Measured on <b>real NPU2 hardware</b>. A perturbation test (randomizing the
+    NPU K/V collapses the action) confirms the action is genuinely driven by the NPU compute.
+  </div>
+
+  <h3>Known limitations of the current metric</h3>
+  <ul class="clean">
+    <li><b>Cosine has blind spots for a physical output.</b> It is scale/shift-invariant, so a systematically
+      scaled action (e.g. gripper amplitude 20% low) can still score high — yet the robot would miss. A stronger
+      metric would be <b>per-dimension</b> (report the <em>worst</em> of the 6-7 action dims, not the global
+      median) with each dim normalized by its own magnitude.</li>
+    <li><b>Single input.</b> We gate on one synthetic batch. A distribution of prompts/observations (like the
+      token-set gate used for the LLM deployments) would be more robust.</li>
+    <li><b>Thresholds are pinned to a clean run, not to physics.</b> 0.99 was rounded down from the observed
+      0.9971 — it flags "worse than a clean bf16 run," not "the task fails." Giving it physical meaning requires
+      task fidelity (below).</li>
+  </ul>
+
+  <h3>Adding task fidelity (ground-truth) — what it would take</h3>
+  <p>
+    The gold standard is comparing predicted actions to <b>ground-truth recorded trajectories</b> — measuring
+    whether the NPU port <em>additionally</em> widens the action-vs-GT error the CPU model already has (the
+    playground's <code>eval_vs_groundtruth.py</code> is exactly this idea: on real LIBERO observations, feeding
+    true inputs cut action MSE by 85.9% vs zeros). But it <b>cannot be done on our A1 target</b>, and here's why:
+  </p>
+  <div class="callout warn">
+    <b>The base checkpoint has no usable ground truth.</b> <code>lerobot/smolvla_base</code> (what A1 deploys) is
+    pretrained on SO101 real-robot data and runs on synthetic inputs here — there is no matching GT trajectory.
+    Ground-truth validation needs the <b>LIBERO-finetuned checkpoint</b> <code>HuggingFaceVLA/smolvla_libero</code>,
+    whose I/O matches the <code>HuggingFaceVLA/libero</code> dataset. That checkpoint has a slightly different shape,
+    so it is a small (not free) re-port:
+    <table style="margin-top:0.6rem">
+      <tr><th></th><th>base (A1)</th><th>libero (for GT)</th><th>port impact</th></tr>
+      <tr><td>backbone hidden/heads/kv/head_dim/inter</td><td>960/15/5/64/2560</td><td><b>identical</b></td><td>✅ same kernels + fused ELFs reused</td></tr>
+      <tr><td>backbone layers</td><td>16</td><td>32</td><td>◐ loop 32×, same ELF</td></tr>
+      <tr><td>cameras → visual tokens</td><td>3 → 192</td><td>2 → 128</td><td>◐ host prefix assembly</td></tr>
+      <tr><td>state dim</td><td>6</td><td>8</td><td>✅ both pad to 32</td></tr>
+      <tr><td>prefix seq length</td><td>241</td><td>~177</td><td>◐ mask/pad (kernels unchanged if padded to 256)</td></tr>
+      <tr><td>action expert hidden/layers/inter</td><td>720/16/2048</td><td>480/32/1280</td><td>⚠️ matters for A2 (expert on NPU)</td></tr>
+    </table>
+    So migrating the <b>backbone</b> to libero is nearly free (identical core kernel shapes; only host-side prefix
+    assembly + the 16→32 loop change). The payoff: libero is the <em>only</em> way to measure task fidelity, since
+    it's the checkpoint with real GT. (Closed-loop task <em>success rate</em> — rollout in MuJoCo+LIBERO — is a
+    further step that needs a GPU sim and is out of scope here.)
   </div>
 
   <!-- ============================================================ -->
@@ -821,6 +886,35 @@
     (56.8 of 1044 ms), so speeding it up moves a small slice of the total. A1 proves the <em>method</em> works;
     the biggest performance prizes are <b>vision (73.6%, milestone A3)</b> and the <b>action expert (20.1%, A2)</b>.
     Remaining backbone headroom: fusing the 11 attention dispatches into the layer's ELF (Route 3).
+  </div>
+
+  <h3>Experiment: what if we used the registry FlashAttention instead?</h3>
+  <p>
+    Section 6 explains we didn't use the registry's FlashAttention because its mask is a boolean causal switch that
+    can't express our prefix-LM mask. We ran the experiment anyway — force <b>non-causal FA</b> (no mask at all) on
+    the backbone — to measure both sides of that trade-off. It <b>does</b> compile and run at our odd shape
+    (seq 256, 15q/5kv, head_dim 64, non-causal) once <code>num_heads_per_unroll</code> is set to 1 (15 isn't
+    divisible by 2).
+  </p>
+  <table>
+    <tr><th>Backbone attention path</th><th>NPU latency</th><th>attn dispatches/layer</th><th>action cosine vs CPU model</th><th>gate</th></tr>
+    <tr><td>approach-B (GEMM + masked_softmax)</td><td>~217 ms</td><td>11</td><td><b>0.9971</b></td><td>PASS</td></tr>
+    <tr><td>non-causal FlashAttention</td><td><b>~105 ms</b></td><td>1</td><td>0.9828</td><td><b>FAIL</b> (&lt; 0.99)</td></tr>
+  </table>
+  <div class="callout warn">
+    <b>Result: FA is 2.1× faster but fails correctness.</b> Dropping attention from 11 dispatches to 1 cut the NPU
+    backbone from ~217 ms to <b>~105 ms</b>. But with no mask, the first 240 prefix tokens wrongly see the state
+    token <em>and</em> the 15 padding tokens leak in — end-to-end action cosine falls to 0.983 (nmse 0.038, ~5×
+    approach-B's 0.008), below the 0.99 gate. Interestingly the per-layer cosine stayed high (≥0.995 through
+    layer 15) and only the final RMSNorm amplified the error — the reason per-layer cosine can't be the gate.
+    <br><br>
+    <b>Does FA beat the CPU baseline?</b> Even at 105 ms, <b>no</b> — the real PyTorch backbone is <b>56.8 ms</b>
+    (Section 4), so FA is still ~1.85× slower than CPU (it only beats our NumPy timing reference). So FA is faster
+    than approach-B but neither is yet faster than the optimized CPU backbone.
+    <br><br>
+    <b>The likely fix (not yet tried):</b> zero the padding K/V before the FA call — that removes the larger of the
+    two error sources (15/256 padding leakage vs the 1/241 state-column cells), and may bring FA back over the gate
+    while keeping the 2.1× speedup. That would make FA a genuine win. It's the natural next experiment.
   </div>
 
   <!-- ============================================================ -->
