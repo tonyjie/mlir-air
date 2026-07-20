@@ -60,19 +60,22 @@ multi-launch attention ELF is a correctness-first-then-optimize deferral
 
 ## Non-causal attention: approach B (GEMM + masked full-row softmax)
 
-The registry's FlashAttention kernel is **causal-pinned** and does not support
-SmolVLA's attention mask (`make_att_2d_masks`: image+language tokens attend
-**bidirectionally**, the state token starts a new causal block — this is
-prefix-LM masking, not autoregressive-causal). Two approaches were on the
-table:
+The registry's FlashAttention kernel supports both causal and non-causal
+attention (and GQA, head_dim 64), but its mask is a single **boolean** switch
+(`causal` on/off) — it cannot express SmolVLA's attention mask
+(`make_att_2d_masks`: image+language tokens attend **bidirectionally**, the
+state token starts a new causal block — this is prefix-LM masking, i.e. a
+mixed pattern that is neither fully causal nor fully bidirectional). Two
+approaches were on the table:
 
-- **Approach A (rejected):** fork FlashAttention's masking logic. Rejected
-  because SmolVLA's seq=241 (padded 256) is small enough that a single-head
-  QKᵀ score matrix (256x256xfp32 ~= 262 KB) comfortably fits L2 — flash's
-  online-softmax tiling exists to avoid materializing the full score matrix
-  for long sequences, which is not a constraint here. Forking a
-  flaky/causal-pinned kernel for no benefit at this shape was judged not
-  worth the risk.
+- **Approach A (rejected):** fork FlashAttention's masking logic to accept an
+  arbitrary mask. Rejected because SmolVLA's seq=241 (padded 256) is small
+  enough that a single-head QKᵀ score matrix (256x256xfp32 ~= 262 KB)
+  comfortably fits L2 — flash's online-softmax tiling exists to avoid
+  materializing the full score matrix for long sequences, which is not a
+  constraint here. FA's tile config is also a near-fixed point tuned for
+  seq≈2048–16384. Reworking the kernel's masking for no benefit at this shape
+  was judged not worth the risk.
 - **Approach B (built):** a dedicated **non-flash masked attention**, built as
   a first-class `kernel_registry` entry (reusable by A2's action-expert
   attention, which needs the same prefix-mask semantics) out of three

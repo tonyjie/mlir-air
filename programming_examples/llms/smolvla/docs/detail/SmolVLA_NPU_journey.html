@@ -554,27 +554,52 @@
 
   <p>
     A "kernel" is a low-level operation compiled to run on the NPU. From earlier NPU work (deploying Llama/Qwen
-    language models) we already have a <b>library of validated kernels</b>. The question for SmolVLA is: which of
-    its operations (from Part A) already have a kernel, and which would need new ones?
+    language models) we already have a <b>validated kernel library</b> — the
+    <code>programming_examples/kernel_registry</code>, which currently holds 8 verified kernels:
+    <b>GEMM</b> (bf16→fp32 and bf16→bf16), <b>GEMV</b>, <b>RMSNorm</b>, <b>FlashAttention</b> (GQA),
+    <b>Element-wise Add</b>, <b>SiLU-and-Mul</b>, and <b>RoPE</b>, each with a table of NPU2-tested shapes.
+    The question for SmolVLA is: which of its operations (from Part A) already have a kernel, at what shape, and
+    which would need new ones? The "shape SmolVLA needs" column below is what the backbone actually requires
+    (prefix seq = 241, padded to 256 on the NPU).
   </p>
   <table class="arch">
-    <tr><th>Operation in SmolVLA</th><th>NPU kernel?</th><th>Used by which stage</th></tr>
-    <tr><td>matmul / Linear (GEMM)</td><td><span class="knl">✓ have it</span></td><td>all three stages</td></tr>
-    <tr><td>RMSNorm</td><td><span class="knl">✓ have it</span></td><td>backbone, expert</td></tr>
-    <tr><td>RoPE (rotary position)</td><td><span class="knl">✓ have it</span></td><td>backbone</td></tr>
-    <tr><td>SiLU / SwiGLU activation</td><td><span class="knl">✓ have it</span></td><td>backbone, expert</td></tr>
-    <tr><td>element-wise add (residual)</td><td><span class="knl">✓ have it</span></td><td>backbone, expert</td></tr>
-    <tr><td>softmax (causal, for attention)</td><td><span class="knl">✓ have it</span></td><td>backbone, expert</td></tr>
-    <tr><td><b>non-causal masked softmax</b></td><td><span class="knl">✓ built new (this project)</span></td><td>backbone (prefix attention)</td></tr>
-    <tr><td>LayerNorm</td><td><span class="knl miss">✗ missing</span></td><td>vision</td></tr>
-    <tr><td>GELU-tanh</td><td><span class="knl miss">✗ missing</span></td><td>vision</td></tr>
-    <tr><td>conv2d</td><td><span class="knl miss">✗ missing</span></td><td>vision (patch embed)</td></tr>
-    <tr><td>pixel-shuffle</td><td><span class="knl miss">✗ missing</span></td><td>connector</td></tr>
-    <tr><td>sin/cos time embedding</td><td><span class="knl miss">✗ missing</span></td><td>action expert</td></tr>
+    <tr><th>Operation in SmolVLA</th><th>In the registry?</th><th>Shape SmolVLA needs (backbone)</th><th>Used by which stage</th></tr>
+    <tr><td>matmul / Linear (GEMM, prefill)</td><td><span class="knl">✓ have it</span></td><td><span class="shape">256×960×960</span> (Q/O), <span class="shape">256×960×320</span> (K/V), <span class="shape">256×960×2560</span> / <span class="shape">256×2560×960</span> (MLP)</td><td>all three stages</td></tr>
+    <tr><td>matmul / Linear (GEMV, decode, batch=1)</td><td><span class="knl">✓ have it</span></td><td>not used — SmolVLA backbone is prefill-only (no decode loop)</td><td>(n/a here)</td></tr>
+    <tr><td>RMSNorm</td><td><span class="knl">✓ have it</span></td><td><span class="shape">256×960</span></td><td>backbone, expert</td></tr>
+    <tr><td>RoPE (rotary position)</td><td><span class="knl">✓ have it</span></td><td>head_dim=64, θ=10000, seq 256</td><td>backbone</td></tr>
+    <tr><td>SiLU-and-Mul (SwiGLU)</td><td><span class="knl">✓ have it</span></td><td><span class="shape">256×2560</span></td><td>backbone, expert</td></tr>
+    <tr><td>element-wise add (residual)</td><td><span class="knl">✓ have it</span></td><td><span class="shape">256×960</span></td><td>backbone, expert</td></tr>
+    <tr><td><b>FlashAttention</b> (fused, GQA, causal/non-causal)</td><td><span class="knl">✓ have it</span> — <b>but mask model doesn't fit</b> (see below)</td><td>would be <span class="shape">241×241</span>, 15q/5kv, head_dim 64</td><td>backbone / expert attention</td></tr>
+    <tr><td><b>masked softmax</b> (arbitrary host mask)</td><td><span class="knl">✓ built new (this project)</span></td><td>scores <span class="shape">(15,256,256)</span>, batched over heads</td><td>backbone (prefix attention)</td></tr>
+    <tr><td>LayerNorm</td><td><span class="knl miss">✗ missing</span></td><td><span class="shape">(1,1024,768)</span> (vision)</td><td>vision</td></tr>
+    <tr><td>GELU-tanh</td><td><span class="knl miss">✗ missing</span></td><td><span class="shape">(1,1024,3072)</span> (vision)</td><td>vision</td></tr>
+    <tr><td>conv2d (patch embed)</td><td><span class="knl miss">✗ missing</span></td><td><span class="shape">(1,3,512,512)</span>→<span class="shape">(1,768,32,32)</span></td><td>vision</td></tr>
+    <tr><td>pixel-shuffle</td><td><span class="knl miss">✗ missing</span></td><td><span class="shape">(1,1024,768)</span>→<span class="shape">(1,64,12288)</span></td><td>connector</td></tr>
+    <tr><td>sin/cos time embedding</td><td><span class="knl miss">✗ missing</span></td><td><span class="shape">(1,50,720)</span></td><td>action expert</td></tr>
   </table>
+
+  <div class="callout warn">
+    <b>Why not use the existing FlashAttention kernel for the backbone?</b> The registry FA kernel <em>does</em>
+    support both causal and non-causal attention, GQA, and head_dim 64 — so this is a fair question. But two things
+    make it a poor fit for SmolVLA's backbone:
+    <ul class="clean" style="margin:0.5rem 0 0">
+      <li><b>Its mask is a single boolean switch (causal on/off), not an arbitrary mask.</b> SmolVLA's prefix
+        attention is neither fully causal nor fully bidirectional — it is a <b>prefix-LM mask</b> (240×240 visible
+        block + the state column masked, from Part A §3). FA can't express that mixed pattern; our
+        <code>masked_softmax</code> takes a host-supplied mask, so causal / bidirectional / padding-aware are all
+        possible.</li>
+      <li><b>FA's advantage doesn't apply at this size.</b> FA's whole point is avoiding a full score matrix for
+        <em>long</em> sequences via online-softmax; its tile config is a near-fixed point tuned for seq≈2048–16384.
+        SmolVLA's backbone is seq=241 — the full 256×256 score matrix (~262 KB) fits in on-chip L2, so a plain
+        matmul + masked-softmax + matmul is simpler and just as fast, with no flash machinery.</li>
+    </ul>
+    (FA also has a known head_dim=128 hang risk on some NPU2 setups; SmolVLA is head_dim=64, so that one doesn't apply.)
+  </div>
+
   <div class="callout">
     <b>This table decides the strategy.</b> The <b>backbone</b> uses only operations we already have (plus one
-    new non-causal softmax we built) → it can move to the NPU now. The <b>vision</b> stage needs 4 brand-new
+    new masked-softmax we built) → it can move to the NPU now. The <b>vision</b> stage needs 4 brand-new
     kernels (LayerNorm, GELU-tanh, conv2d, pixel-shuffle) → hardest. The <b>action expert</b> reuses the
     backbone's kernels at smaller shapes, plus a small sin/cos → feasible next.
   </div>
@@ -627,13 +652,15 @@
   <div class="card">
     <p style="margin-top:0"><b>Key design: how the non-causal attention was built</b></p>
     <p style="margin-bottom:0">
-      The backbone's attention is "non-causal" (image and text tokens see each other both ways). The NPU's
-      ready-made FlashAttention is hard-wired to be <em>causal</em> and complex to rework. And the attention
-      matrix is only <span class="shape">241×241</span> — small enough to fit on-chip, so FlashAttention's tricks
-      aren't needed. So we compose attention from three simple blocks: <span class="knl">GEMM</span> for Q×Kᵀ →
-      <span class="knl">masked_softmax</span> (a new kernel handling all heads + the mask at once) →
-      <span class="knl">GEMM</span> for probabilities×V. The mask is supplied by the host, so causal, bidirectional,
-      or padding-aware are all possible.
+      The backbone's attention is a <b>prefix-LM mask</b> (image + text see each other both ways; the state token
+      starts a new block). The registry FlashAttention kernel supports both causal and non-causal attention — but
+      its mask is a single <em>boolean</em> switch (causal on/off), which can't express this mixed prefix-LM
+      pattern (see the "Why not use FlashAttention" box in Section 5). And the score matrix is only
+      <span class="shape">241×241</span> — small enough to fit on-chip, so FlashAttention's long-sequence
+      online-softmax machinery buys nothing here. So we compose attention from three simple blocks:
+      <span class="knl">GEMM</span> for Q×Kᵀ → <span class="knl">masked_softmax</span> (a new kernel handling all
+      heads + an arbitrary host mask at once) → <span class="knl">GEMM</span> for probabilities×V. Because the mask
+      is host-supplied, causal, bidirectional, prefix-LM, and padding-aware are all possible.
     </p>
   </div>
 
