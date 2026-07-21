@@ -13,7 +13,7 @@ This is **documentation, not executable code** — it records results produced b
 
 **Status legend**: ✅ verified on real NPU2, accuracy in line with the bf16 standard · ⚠️ verified on real NPU2 but with a documented precision/coverage caveat · ❌ broken/missing
 
-> **Scope**: currently **GEMM**, **GEMV**, **RMSNorm**, **FlashAttention**, **Element-wise Add**, **SiLU-and-Mul**, and **RoPE** — the registry is built up one verified kernel at a time. The core LLM leaf kernels are now covered; see [`README.md`](README.md) for the roadmap.
+> **Scope**: currently **GEMM**, **GEMV**, **RMSNorm**, **LayerNorm**, **FlashAttention**, **Element-wise Add**, **SiLU-and-Mul**, and **RoPE** — the registry is built up one verified kernel at a time. The core LLM leaf kernels are now covered; see [`README.md`](README.md) for the roadmap.
 
 ---
 
@@ -25,6 +25,7 @@ This is **documentation, not executable code** — it records results produced b
 | GEMM (BF16 in, BF16 out) | [`details/GEMM_bf16_in_bf16_out.md`](details/GEMM_bf16_in_bf16_out.md) | **8898 GFLOP/s** (fused-cast incl. cast, 2048×8192×2048, full-chip 8×4) | ✅ |
 | GEMV (BF16) | [`details/GEMV_bf16.md`](details/GEMV_bf16.md) | **32.7 GFLOP/s** (memory-bound, 16384×3072, herd 8/8/8) | ✅ |
 | RMSNorm (BF16) | [`details/RMSNorm_bf16.md`](details/RMSNorm_bf16.md) | **24.9 GB/s** (memory-bound, 2048×3072, herd 8) | ✅ |
+| LayerNorm (BF16, affine) | [`details/LayerNorm_bf16.md`](details/LayerNorm_bf16.md) | **9.7 GB/s** (memory-bound, 1024×768, herd 8) | ✅ |
 | FlashAttention (BF16, GQA) | [`details/FlashAttention_bf16.md`](details/FlashAttention_bf16.md) | **1065–1131 GFLOP/s** (2048×2048, dk=64, 32q/8kv causal, full-chip 32 tiles) | ✅ |
 | Element-wise Add (BF16) | [`details/EltwiseAdd_bf16.md`](details/EltwiseAdd_bf16.md) | **57.7 GB/s** (memory-bound, N=4194304, herd 8×1) | ✅ |
 | SiLU-and-Mul (BF16) | [`details/SiLU_Mul_bf16.md`](details/SiLU_Mul_bf16.md) | **25.1 GB/s** (memory-bound, N=16777216, herd 8×1) | ✅ |
@@ -196,6 +197,18 @@ This is **documentation, not executable code** — it records results produced b
 > **Qwen3-0.6B QK-norm (2048×128)** is per-head RMSNorm over `head_dim=128` (Qwen3-specific q_norm/k_norm) — the same weighted-RMSNorm kernel with a small `N=128` reduction axis; verified PASS at 4.6e-3, confirming the kernel handles a 128-wide reduction. (Harness `eps = 1e-5`; Qwen3 `eps = 1e-6` — the difference is negligible vs the bf16 datapath error.)
 
 > Follows the **GPU / HuggingFace standard**: the `sum(x²)` reduction is accumulated in **FP32** (matching PyTorch `rms_norm_composite` / HF `LlamaRMSNorm`), giving `mean_rel_L1 = 4.2e-3` — in line with the GEMM tier and passing the canonical bf16 `rtol = 1.6e-2`. (`atol = 5e-2` covers a few large-magnitude bf16 *output*-rounding ULPs, not a reduction relaxation.) The FP32 reduction costs essentially nothing on this memory-bound kernel. See [`details/RMSNorm_bf16.md`](details/RMSNorm_bf16.md).
+
+---
+
+## LayerNorm — tested shapes
+
+`y = (x − mean) / sqrt(var + eps) · weight + bias`, per row; shapes written `M×N` (M = rows / patches, N = hidden = reduction axis). Unlike RMSNorm, LayerNorm **subtracts the mean** and has an **affine bias** (γ *and* β). The vision-encoder (SigLIP) norms of SmolVLA. **Memory-bound** (streams the whole matrix for an elementwise op), so throughput is reported as bandwidth; the fastest config is `herd_x=8` (all columns, near-linear scaling). Full data, the precision note, and reproduce commands are in [`details/LayerNorm_bf16.md`](details/LayerNorm_bf16.md).
+
+| (M×N) | herd_x | latency | bandwidth | mean_rel_L1 | abs_err max | Used by | Status |
+|---|---|---|---|---|---|---|---|
+| 1024×768 | 8 | 324 µs | 9.7 GB/s | 4.4e-3 | 1.9e-1 | SmolVLA vision (SigLIP) layer_norm1/2 + post_layernorm (hidden=768) | ✅ |
+
+> Follows the **GPU / HuggingFace standard** (PyTorch / HF `nn.LayerNorm`): **both** reductions — `sum(x)` for the mean *and* `sum((x−mean)²)` for the variance — are accumulated in **FP32**, giving `mean_rel_L1 = 4.4e-3`, in the same bf16 tier as RMSNorm (4.2e-3) and GEMM (~9e-3), and passing the canonical bf16 `rtol = 1.6e-2`. The `atol = 6e-2` (vs RMSNorm's 5e-2) covers LayerNorm's one extra bf16 *output*-rounding step — the bias add in `(x−mean)·rstd·weight + bias` — not a reduction relaxation. eps = 1e-5 (SigLIP uses 1e-6; the difference is negligible vs the bf16 datapath error). See [`details/LayerNorm_bf16.md`](details/LayerNorm_bf16.md).
 
 ---
 
