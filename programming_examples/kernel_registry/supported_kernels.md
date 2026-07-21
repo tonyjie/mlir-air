@@ -13,7 +13,7 @@ This is **documentation, not executable code** — it records results produced b
 
 **Status legend**: ✅ verified on real NPU2, accuracy in line with the bf16 standard · ⚠️ verified on real NPU2 but with a documented precision/coverage caveat · ❌ broken/missing
 
-> **Scope**: currently **GEMM**, **GEMV**, **RMSNorm**, **LayerNorm**, **FlashAttention**, **Element-wise Add**, **SiLU-and-Mul**, and **RoPE** — the registry is built up one verified kernel at a time. The core LLM leaf kernels are now covered; see [`README.md`](README.md) for the roadmap.
+> **Scope**: currently **GEMM**, **GEMV**, **RMSNorm**, **LayerNorm**, **FlashAttention**, **Element-wise Add**, **SiLU-and-Mul**, **RoPE**, and **GELU** — the registry is built up one verified kernel at a time. The core LLM leaf kernels are now covered; see [`README.md`](README.md) for the roadmap.
 
 ---
 
@@ -30,6 +30,7 @@ This is **documentation, not executable code** — it records results produced b
 | Element-wise Add (BF16) | [`details/EltwiseAdd_bf16.md`](details/EltwiseAdd_bf16.md) | **57.7 GB/s** (memory-bound, N=4194304, herd 8×1) | ✅ |
 | SiLU-and-Mul (BF16) | [`details/SiLU_Mul_bf16.md`](details/SiLU_Mul_bf16.md) | **25.1 GB/s** (memory-bound, N=16777216, herd 8×1) | ✅ |
 | RoPE (BF16, half-split) | [`details/RoPE_bf16.md`](details/RoPE_bf16.md) | **56.6 GB/s** (memory-bound, 49152×128, herd 8×1) | ✅ |
+| GELU (BF16, tanh approx) | [`details/GELU_bf16.md`](details/GELU_bf16.md) | **27.0 GB/s** (memory-bound, N=8388608, herd 8×2) | ✅ |
 
 ---
 
@@ -314,3 +315,21 @@ Rotary Position Embedding applied to Q/K, **half-split** convention (HuggingFace
 > **Qwen3-0.6B uses `head_dim = 128`** (vs llama's 64) — the two rows above are the first registry coverage of `head_dim = 128`; same half-split `rope_halfsplit.cc` kernel, verified PASS at 2.8e-3 (accuracy unchanged, set by the datapath not the head dim).
 
 > `mean_rel_L1 = 2.8e-3` is the second-cleanest in the registry (above Element-wise Add 1.9e-3, below RMSNorm 4.2e-3): a rotation is a few bf16 multiplies and one add/sub per element with **no accumulation** — nothing to amplify error, and `|out| ≈ |x|` so no near-zero blowup. Verified element-wise over the full output (no cosine) at `rtol = 1.6e-2, atol = 5e-2`; bit-identical across all herd configs and shapes (decode rows 8/32 read slightly lower from smaller rotation angles). Best config `herd_x=8, herd_y=1` for every shape: each tile uses 3 shim DMAs (input/LUT in, output out), so `herd_x·herd_y>8` exhausts the shim channels (the herd **cannot fill 32 tiles**, same limit as Element-wise Add / SiLU); within 8 tiles `herd_x` scales 7.4× (1→8). Small shapes are latency-bound by a ~80 µs launch floor. See [`details/RoPE_bf16.md`](details/RoPE_bf16.md).
+
+---
+
+## GELU-and-tanh — tested shapes
+
+`out = GELU(x)` in the **tanh approximation** (`out = 0.5·x·(1 + tanh(√(2/π)·(x + 0.044715·x³)))`), per-element, BF16. The SmolVLA SigLIP vision encoder MLP activation (applied to the `fc1` output, between `fc1` and `fc2`). **Memory-bound** (O(N) streaming, ~1.5 op/byte), so throughput is bandwidth. tanh is the hardware `__builtin_aie2p_tanh` (direct-codegen, no external `.o`); the precision is the "bf16 + one transcendental" tier. **Unlike SiLU-and-Mul / Element-wise Add, GELU is single-input (2 DMAs/tile), so `herd_y>1` places — the best config is `herd_x=8, herd_y=2` (16 tiles), twice the 8-tile ceiling of the 3-DMA elementwise kernels.** Full datapath, sweep, and reproduce commands in [`details/GELU_bf16.md`](details/GELU_bf16.md).
+
+| N | (as 2-D) | best config (hx/hy/tile_n) | latency | bandwidth | mean_rel_L1 | abs_err max | Used by | Status |
+|---|---|---|---|---|---|---|---|---|
+| 1048576 | — | 8/2/4096 | 235 µs | 17.8 GB/s | 8.4e-3 | 1.56e-2 | coverage | ✅ |
+| 2097152 | — | 8/2/4096 | 379 µs | 22.1 GB/s | 8.4e-3 | 1.56e-2 | coverage | ✅ |
+| 3145728 | 1024×3072 | 8/2/4096 | 522 µs | 24.1 GB/s | 8.4e-3 | 1.56e-2 | SmolVLA vision MLP GELU (seq 1024 · intermediate 3072) | ✅ |
+| 4194304 | 2048×2048 | 8/2/4096 | 672 µs | 25.0 GB/s | 8.4e-3 | 1.56e-2 | coverage | ✅ |
+| 8388608 | — | 8/2/4096 | 1244 µs | **27.0 GB/s** | 8.4e-3 | 1.56e-2 | coverage | ✅ |
+
+> The 3145728 row is SmolVLA's SigLIP vision MLP activation scale (seq 1024 · intermediate 3072); the `fc1` GEMM that produces its input is the `1024×768×3072` GEMM row. The reference is the **tanh** approximation (GELUTanh), matching SmolVLA / HF SigLIP — not the exact erf-GELU (which would add a ~1e-3 systematic bias). All shapes use the same best config.
+
+> `mean_rel_L1 = 8.4e-3` is the "bf16 + one transcendental" tier — below SiLU-and-Mul (1.0e-2), above RMSNorm (4.2e-3): the hardware `tanh` LUT approximation plus a chain of bf16 roundings. Slightly cleaner than SiLU because the tanh argument is scaled down and there is no `0.5·g·u` amplification (GELU's `abs_err max = 0.0156` vs SiLU's 0.125). Verified element-wise over the full output (no cosine) at `rtol = 1.6e-2, atol = 5e-2` (tighter than SiLU's 8e-2). **Best config `herd_x=8, herd_y=2, tile_n=4096` (16 tiles) for every shape**: GELU's single input (2 DMAs/tile) lets the herd use a second row where the 3-DMA elementwise kernels (Element-wise Add, SiLU) cannot; `herd_x·herd_y=32` (8×4) still does not place. `herd_x` scales 7.6× (1→8), plus ~1.8× for the second row. See [`details/GELU_bf16.md`](details/GELU_bf16.md).
