@@ -224,6 +224,7 @@ Fused scaled-dot-product attention (online-softmax FlashAttention) with grouped-
 | 512×512 | 64/64 | 2/2 | ✗ | 1 | 0.73 ms | 184 | 4.4e-2 | ✅ |
 | 512×512 | 64/64 | 12/6 | ✗ | 1 | 1.22 ms | 661 | 4.6e-2 | ✅ |
 | 512×512 | 64/64 | 64/8 | ✗ | 1 | 3.79 ms | 1135 | 4.6e-2 | ✅ |
+| 1024×1024 | 64/64 | 12/12 | ✗ | 1 | 2.36–2.61 ms | 1235–1366 | 4.8e-2 | ✅ SmolVLA vision self-attn (SigLIP) |
 | 512×512 | 128/128 | 32/8 | ✗ | 2 | 4.38 ms | 980 | 4.4e-2 | ✅ |
 | 512×512 | 128/128 | 28/4 | ✗ | 2 | 4.05 ms | 928 | 4.4e-2 | ✅ |
 | 16384×16384 | 64/64 | 2/2 | ✓ | 1 | 39.6 ms | 1734 | 4.5e-2 | ✅ |
@@ -239,6 +240,8 @@ Fused scaled-dot-product attention (online-softmax FlashAttention) with grouped-
 > **Qwen2.5-1.5B prefill attention** (`head_dim = 128`, 12q/2kv GQA, causal, lq=lk=2048): verified PASS at mean_rel_L1 = 3.83e-2 (full-output check, rtol 1.6e-2 / atol 1e-1) with the default full-chip config (`lqp=256, num_q_tiles=4, num_heads_per_unroll=2, num_cascade_stages=4`, `dv_chunks=2` for head_dim=128). head_dim=128 FA has been flaky (hang/NaN) on some NPU2 setups; this run completed cleanly, and prefill can fall back to CPU attention (`cpu_attn`) if a deployment hits the hang.
 
 > **Qwen2.5-0.5B prefill attention** (`head_dim = 64`, 14q/2kv GQA, causal, lq=lk=2048): verified PASS at mean_rel_L1 = 3.83e-2 with the default full-chip config (`lqp=256, lkp=64, num_q_tiles=4, num_heads_per_unroll=2, num_cascade_stages=4`, `dv_chunks=1` for head_dim=64). head_dim=64 has no hang risk. Prefill can also fall back to CPU attention (`cpu_attn`).
+
+> **SmolVLA vision encoder (SigLIP) self-attention** (`head_dim = 64`, 12q/12kv **MHA**, **non-causal / bidirectional**, lq=lk=1024): verified PASS at mean_rel_L1 = 4.8e-2 (full-output check, rtol 1.6e-2 / atol 1e-1) with the default full-chip config (`lqp=256, lkp=64, num_q_tiles=4, num_heads_per_unroll=2, num_cascade_stages=4`, `dv_chunks=1`). Being **12 heads (even)** lets `num_heads_per_unroll=2` fill the full 8×4 array; forcing `num_heads_per_unroll=1` (as the odd-15-head decoder backbone must) runs the identical numerics on the half array at **864 GFLOP/s vs 1235–1366** — a measured ~1.58× throughput from filling the chip. No mask (bidirectional), head_dim=64 → no hang risk.
 
 > All rows measured on NPU2 with the heads-first harness at the default tiling (`lqp=256, num_q_tiles=4, num_heads_per_unroll=2, num_cascade_stages=4` = 32 tiles, full 8×4 array). Accuracy `mean_rel_L1 ≈ 3.9e-2` is ~4× the GEMM tier: FA chains **two BFP16-emulated MMAs** plus a **bf16 online-softmax**, so it is looser than a single matmul (looser than GPU FA's `5e-2` only by the `atol`, not the standard `rtol = 1.6e-2`); accuracy is set by the datapath, not the shape. The **2048, 32q/8kv causal** row is llama-3.2-1B prefill's config (seq-first harness, bit-identical to heads-first — verified `max abs diff = 0`); its GFLOP/s range is run-to-run timing variation. `head_dim=128` rows use `dv_chunks=2`. A separate tunable sweep found only 2 of 8 candidate 32-tile configs place (constraints: columns `num_heads_per_unroll × num_q_tiles ≤ 8`, rows `num_cascade_stages ≤ 4`, `num_heads_per_unroll ≤ 2`). See [`details/FlashAttention_bf16.md`](details/FlashAttention_bf16.md).
 
