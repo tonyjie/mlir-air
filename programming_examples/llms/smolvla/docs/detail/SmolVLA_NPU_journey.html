@@ -555,8 +555,9 @@
 
   <p>
     A "kernel" is a low-level operation compiled to run on the NPU. Two sources matter here:
-    (1) the <b>kernel_registry</b> — 8 kernels <em>curated and shape-validated for LLM deployment</em>
-    (GEMM bf16→fp32 &amp; bf16→bf16, GEMV, RMSNorm, FlashAttention, Element-wise Add, SiLU-and-Mul, RoPE); and
+    (1) the <b>kernel_registry</b> — kernels <em>curated and shape-validated for LLM deployment</em>
+    (GEMM bf16→fp32 &amp; bf16→bf16, GEMV, RMSNorm, FlashAttention, Element-wise Add, SiLU-and-Mul, RoPE, and — added
+    during the A3 vision work below — <b>LayerNorm</b> and <b>GELU-tanh</b>, now 9 kernel families); and
     (2) the wider <code>programming_examples/</code> tree, which has <em>additional</em> kernels that exist but
     haven't been through the registry's LLM-deployment validation. So each SmolVLA operation falls into one of
     three tiers, not just "have / don't have":
@@ -577,11 +578,12 @@
     <tr><td>element-wise add (residual)</td><td><span class="knl">✓ in registry</span></td><td><span class="shape">256×960</span></td><td>backbone, expert</td></tr>
     <tr><td><b>FlashAttention</b> (fused, GQA, causal/non-causal)</td><td><span class="knl">✓ in registry</span> — <b>but mask model doesn't fit</b> (see below)</td><td>would be <span class="shape">241×241</span>, 15q/5kv, head_dim 64</td><td>backbone / expert attn</td></tr>
     <tr><td><b>masked softmax</b> (arbitrary host mask)</td><td><span class="knl">✓ built new (this project)</span></td><td>scores <span class="shape">(15,256,256)</span>, batched over heads</td><td>backbone attn</td></tr>
-    <tr><td>GELU-tanh</td><td><span class="knl adapt">◐ example exists</span> — <code>gelu/</code>, bf16, uses NPU2 <code>__builtin_aie2p_tanh</code></td><td><span class="shape">(1,1024,3072)</span></td><td>vision</td></tr>
-    <tr><td>LayerNorm</td><td><span class="knl adapt">◐ example exists</span> — <code>layer_norm/</code>, bf16</td><td><span class="shape">(1,1024,768)</span></td><td>vision</td></tr>
-    <tr><td>conv2d (patch embed)</td><td><span class="knl adapt">◐ example exists</span> — <code>conv2d/</code> (int32) &amp; <code>conv2d_14x14/</code> (bf16, NPU2); needs SmolVLA's dtype/shape</td><td><span class="shape">(1,3,512,512)</span>→<span class="shape">(1,768,32,32)</span></td><td>vision</td></tr>
+    <tr><td>GELU-tanh</td><td><span class="knl">✓ in registry</span> — <b>promoted (A3-2)</b> from <code>gelu/</code>; NPU2 <code>__builtin_aie2p_tanh</code></td><td><span class="shape">(1,1024,3072)</span> — verified, 24.1 GB/s</td><td>vision</td></tr>
+    <tr><td>LayerNorm (affine γ,β)</td><td><span class="knl">✓ in registry</span> — <b>promoted (A3-3)</b>; added affine + multi-tile to <code>layer_norm/</code></td><td><span class="shape">(1,1024,768)</span> — verified, 4.4e-3</td><td>vision</td></tr>
+    <tr><td>conv2d (patch embed)</td><td><span class="knl">✓ solved as im2col + GEMM</span> — stride=kernel=16 (non-overlapping) ⇒ reshape + existing GEMM; <b>no conv kernel needed</b></td><td><span class="shape">1024×768×768</span> (GEMM, A3-1)</td><td>vision</td></tr>
+    <tr><td><b>bidirectional attention (vision)</b></td><td><span class="knl">✓ in registry FA</span> — <b>verified (A3-4)</b> non-causal, fills full 8×4 array (even 12 heads)</td><td><span class="shape">1024×1024</span>, 12q/12kv, head_dim 64</td><td>vision</td></tr>
     <tr><td>sin/cos time embedding</td><td><span class="knl adapt">◐ example exists</span> — <code>sine_cosine/</code> (bf16, NPU1 lit) &amp; <code>rope_sincos/</code></td><td><span class="shape">(1,50,720)</span></td><td>action expert</td></tr>
-    <tr><td>pixel-shuffle (space-to-depth)</td><td><span class="knl miss">✗ truly new</span> — pure reshape; <code>data_transfer_transpose/dma_bf16</code> is a starting point</td><td><span class="shape">(1,1024,768)</span>→<span class="shape">(1,64,12288)</span></td><td>connector</td></tr>
+    <tr><td>pixel-shuffle (space-to-depth)</td><td><span class="knl">✓ solved as host reshape</span> — pure index remap, no kernel needed</td><td><span class="shape">(1,1024,768)</span>→<span class="shape">(1,64,12288)</span></td><td>connector</td></tr>
   </table>
 
   <div class="callout warn">
@@ -604,12 +606,14 @@
 
   <div class="callout">
     <b>This table decides the strategy.</b> The <b>backbone</b> is entirely tier-1 (registry) plus the one
-    masked-softmax we built → it can move to the NPU now. The <b>vision</b> stage is mostly tier-2: GELU-tanh,
-    LayerNorm and conv2d all have <code>programming_examples/</code> implementations that need validating/adapting
-    at SigLIP's shape/dtype — only <b>pixel-shuffle</b> is genuinely new (and it's just a reshape). Its remaining
-    difficulty is the large 1024×1024 attention, not a pile of from-scratch kernels. The <b>action expert</b>
-    reuses the backbone's kernels at smaller shapes; its sin/cos also already has an example. So "how much is truly
-    new" is small — the milestones are gated more by integration + validation effort than by missing kernels.
+    masked-softmax we built → it moved to the NPU (Milestone A1). For the <b>vision</b> stage, the A3 kernel work
+    below <em>closed the gap entirely</em>: GELU-tanh and LayerNorm were promoted into the registry, conv2d turned
+    out to be im2col + an existing GEMM (no conv kernel), pixel-shuffle is a host reshape, and the large 1024×1024
+    attention was verified on the registry FlashAttention (its <em>even</em> 12 heads even fill the full array).
+    So <b>every vision leaf kernel is now validated on real NPU2</b> — what remains is assembly (wiring the 12
+    layers + host reshape glue + oracle verification, Milestone A3-5). The <b>action expert</b> reuses the
+    backbone's kernels at smaller shapes; its sin/cos already has an example. Net: the milestones are gated by
+    integration + validation effort, not by missing kernels.
   </div>
 
   <!-- ============================================================ -->
@@ -1023,7 +1027,7 @@ once after 16 layers: (HOST) final RMSNorm [256,960]
   <!-- ============================================================ -->
   <h2 id="status">10. Current status and next steps</h2>
 
-  <h3>Done — Milestone A1</h3>
+  <h3>Done — Milestone A1 (language backbone)</h3>
   <ul class="clean">
     <li><span class="pill done">✅</span> SmolVLA's <b>language backbone (all 16 layers) runs on NPU2</b>, verified against pure CPU</li>
     <li><span class="pill done">✅</span> end-to-end hybrid pipeline: CPU pre-processing → NPU backbone → CPU action generation</li>
@@ -1032,20 +1036,39 @@ once after 16 layers: (HOST) final RMSNorm [256,960]
     <li><span class="pill done">✅</span> incidentally fixed a shared-code bug affecting all deployed models, verified no regression</li>
   </ul>
 
+  <h3>In progress — Milestone A3 (vision encoder, the 74% prize)</h3>
+  <p>Vision is the biggest performance lever (73.6% of end-to-end). We are mapping it correctness-first, one
+     verified kernel at a time (mirroring how A1 was built), then assembling the 12-layer encoder.</p>
+  <ul class="clean">
+    <li><span class="pill done">✅</span> <b>A3-1 GEMM shapes</b> — 5 SigLIP GEMM shapes validated on NPU2 (incl. the awkward connector <span class="shape">64×12288×960</span>: large K is fine, it's the tiny M=64 that half-fills the array)</li>
+    <li><span class="pill done">✅</span> <b>A3-2 GELU-tanh</b> — promoted to a registry kernel (<span class="shape">1024×3072</span>); found it's single-input so it fills <b>2×</b> the tiles of the 3-input elementwise kernels</li>
+    <li><span class="pill done">✅</span> <b>A3-3 LayerNorm</b> — added affine (γ,β) + multi-tile to the example, promoted to registry (<span class="shape">1024×768</span>)</li>
+    <li><span class="pill done">✅</span> <b>A3-4 FlashAttention 1024²</b> — verified the non-causal 12-head config; its <em>even</em> head count fills the full 8×4 array (1.58× the odd-15-head backbone)</li>
+    <li><span class="pill done">✅</span> <b>A3-5 Step 1</b> — CPU vision oracle + host-glue math (im2col, pixel-shuffle, biases) proven bit-faithful vs real lerobot (all 12 layers cos&gt;0.9997) <em>before</em> spending NPU time</li>
+    <li><span class="pill" style="background:#fef9c3;color:#854d0e">⏳</span> <b>A3-5 Step 2-5</b> — assembling the 12-layer ViT on NPU (per-layer cosine vs oracle) → splice into the hybrid → <code>make verify</code> still PASS <span class="pill future">in progress</span></li>
+  </ul>
+  <div class="callout">
+    <b>The A3 headline:</b> every vision leaf kernel is now validated on real NPU2 — there are <b>zero from-scratch
+    kernels</b> left for vision (conv became im2col+GEMM, pixel-shuffle became a host reshape). What remains is
+    integration + verification, not missing kernels.
+  </div>
+
   <h3>Next milestones</h3>
   <table>
     <tr><th>Milestone</th><th>Scope</th><th>Why / status</th></tr>
+    <tr><td><b>A3-5</b></td><td>Finish assembling the <b>vision encoder</b> on NPU + splice into the hybrid pipeline</td><td>74% of runtime; all kernels ready → <span class="pill" style="background:#fef9c3;color:#854d0e">in progress</span></td></tr>
+    <tr><td><b>A3-6</b></td><td>Vision <b>performance hill-climb</b> (fuse ELFs, buffer reuse, move bias/reshape on-device) to beat CPU vision's 719 ms</td><td>done after A3-5 correctness holds → <span class="pill future">planned</span></td></tr>
     <tr><td><b>A2</b></td><td>Move the <b>action expert</b> onto the NPU (cross-attention + 10-step denoise)</td><td>20% of runtime; reuses backbone kernels → <span class="pill future">planned</span></td></tr>
-    <tr><td><b>A3</b></td><td>Move the <b>vision encoder</b> onto the NPU (GELU/LayerNorm/conv2d have examples to adapt; only pixel-shuffle is new; plus a large 1024×1024 attention)</td><td>74% of runtime = biggest prize → <span class="pill future">longer-term</span></td></tr>
     <tr><td><b>Route 3</b></td><td>Fuse backbone attention further to cut the remaining ~208 launches</td><td><span class="pill future">optimization headroom</span></td></tr>
   </table>
 
   <div class="card" style="margin-top:2rem;background:#f0f9ff;border-color:#7dd3fc">
     <p style="margin:0"><b>In one sentence:</b>
-    SmolVLA's language brain (the 16-layer SmolLM2-360M) now runs entirely on the AMD NPU2, with action output
-    verified against a pure-CPU baseline (similarity 0.9971) and, after optimization, faster than the CPU backbone.
-    Vision and the action expert stay on CPU for now — and the CPU profiling shows vision is the next big
-    opportunity. This is the <b>first time a VLA model's core runs on the AMD NPU2</b>.</p>
+    SmolVLA's language brain (the 16-layer SmolLM2-360M) already runs entirely on the AMD NPU2 (action output
+    verified against a pure-CPU baseline, similarity 0.9971, faster than the CPU backbone) — and we are now
+    mapping the <b>vision encoder</b>, the 74% bottleneck: all of its NPU kernels are validated and the 12-layer
+    encoder is being assembled and verified. This is the <b>first time a VLA model's core runs on the AMD NPU2</b>,
+    and the biggest performance piece is next.</p>
   </div>
 
   <div class="meta" style="margin-top:3rem;border-bottom:none;border-top:1px solid var(--card-border);padding-top:1rem">
