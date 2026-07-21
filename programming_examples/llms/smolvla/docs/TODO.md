@@ -1,5 +1,70 @@
 # SmolVLA backbone — deployment TODO / execution notes
 
+## A3-5 Vision encoder (SigLIP ViT, 12 layers) — NPU integration (Step 2-3)
+
+Deliverables `vision_prefill.py` + `test_full_vit.py` are built and the full
+12-layer encoder runs **entirely on NPU** for all four heavy ops: projection/MLP
+GEMMs (gemm_qkvo/fc1/fc2 ELFs), affine LayerNorm (layer_norm ELF), GELU-tanh
+(gelu ELF), and non-causal bidirectional MHA (flash_attn ELF). Only the
+correctness-first host glue runs on CPU: per-Linear bias-adds, the two residual
+adds, and the im2col patch-embed (all A3-6 fusion candidates, NOT fallbacks).
+
+**NPU-execution: all 4 heavy ops on NPU (0 CPU fallback). NPU dispatches/layer =
+10** (LN1, q, k, v, FA, o, LN2, fc1, gelu, fc2), + 1 post_ln (once, end of stack).
+Correctness-first: NOT fused/optimized — A3-6 will merge these into multi-launch
+ELFs and move the bias/residual/im2col glue onto the device.
+
+### Correctness gate NOT met — precision-ceiling FAIL (root-caused, not a bug)
+
+Full-run vs the real-lerobot oracle: per-layer cosine 0.968–0.998 (layers 1–10
+below the 0.98 gate), **post_ln cosine 0.945** (< 0.99 gate). Per-token-median
+cosine is higher (post_ln 0.988) but still short.
+
+This is an HONEST precision ceiling of the current validated BF16/BFP16 NPU
+kernels on the SigLIP vision encoder, exhaustively root-caused (NOT a wiring bug):
+  1. Every leaf kernel is clean at registry tier: layer-0 block 0.9985, all
+     sub-ops cos > 0.9998 (LN 0.99997, qkvo GEMM 0.99999, FA 0.99979).
+  2. Teacher-forced per-layer (feed oracle input to each block independently) is
+     clean: L0=0.998, L2–L11 = 0.994–0.9998. Only L1 is anomalous at 0.981.
+  3. An EXACT numpy mirror of the pipeline (BFP16-input matmul + bf16-out cast +
+     host f32 bias + f32 residual) predicts post_ln 0.998 — so the failure is
+     NOT the wiring, NOT bf16-boundary rounding, NOT eps (1e-5 vs 1e-6 identical).
+  4. The excess error is SYSTEMATIC: **81% of FlashAttention's error is a shared
+     per-channel column-mean bias** (measured: total FA err L2 3.32, systematic
+     component 2.70). BFP16 block-float (shared 8-elem exponent) on the vision
+     encoder's outlier-heavy LayerNorm activations (max/mean-abs ~45) produces a
+     directional bias that survives LayerNorm centering and accumulates coherently.
+  5. Layer 1 has the strongest residual cancellation of any layer
+     (|input|=225.8, |attn_out|=182.8 → |x1|=143.0), which AMPLIFIES that
+     systematic bias — hence L1's 0.981. Random-noise models of the same rel
+     magnitude give x1 cos 0.9999 (cancellation averages out random error but
+     NOT systematic error). The per-layer errors compound in quadrature to the
+     observed 0.945.
+
+### NPU precision levers tried (all exhausted; none recovers the gate)
+
+  - **GEMM without BFP16** (`compile_gemm_mm(bfp16=False)`, native aie2p bf16
+    8x8x8 mmul): WRONG results (block-vs-oracle 0.28–0.90). The `mm_aie2p.cc`
+    non-BFP16 branch uses a different C_block accumulator layout that is not
+    correct at these tiles without a microkernel rewrite. Flag left in
+    external_kernels.py (default True = unchanged) to document.
+  - **Direct-codegen GEMM** (`build_module_lowered`, aievec lowering, no external
+    mm.o): WRONG at the cancellation layers (L1=0.23, L5=0.35).
+  - **FlashAttention without BFP16** (`compile_attn_npu2(bfp16=False)`): runtime
+    HANG (ERT_CMD_STATE_TIMEOUT). The FA kernel's L1 buffer tiling is sized for
+    the BFP16 mmul; the native mmul overflows/mismatches. Flag left (default
+    True) to document; would need an FA L1-tiling rewrite (A3-6 kernel work).
+  - **CPU attention** (mha_bidirectional on host): WORSE full-run (post_ln
+    0.905), so FA is NOT the dominant error and CPU is not a usable fallback.
+
+### Path forward (A3-6 / kernel work, out of this correctness task's scope)
+
+The gate needs a higher-precision matmul that stays on NPU: either (a) rewrite the
+FA kernel's L1 tiling so the native (non-BFP16) bf16 8x8x8 mmul places and runs
+(removes the 81%-systematic attention bias), or (b) an fp32-accumulate FA epilogue
+that doesn't quantize the attention output per block. Both are microkernel changes.
+Alternatively, revisit the gate metric (per-token-median 0.988 vs flattened 0.945).
+
 ## NPU-execution exceptions
 
 These are the operations that run on CPU rather than NPU, with the concrete
