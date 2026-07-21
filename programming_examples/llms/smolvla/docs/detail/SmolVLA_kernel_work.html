@@ -89,6 +89,15 @@
     <div class="stat"><div class="big">17</div><div class="label">(kernel, shape) rows<br>validated &amp; recorded</div></div>
   </div>
 
+  <div class="callout warn">
+    <b>One caveat, up front.</b> Every kernel in this document is <em>individually</em> clean at the accuracy tiers
+    shown. But when the 12 vision layers run <em>in sequence</em>, a tiny <em>systematic</em> bias from the NPU's
+    block-float (BFP16) matmul format accumulates and pulls the final vision-encoder output down to 0.945 similarity
+    (vs a 0.99 gate) — an honest precision ceiling, not a per-kernel defect. The per-kernel numbers below are all
+    real and PASS; the integration-level story is in the main journey artifact (Ch. 10) and
+    <code>docs/TODO.md</code>. The fix is a higher-precision attention micro-kernel (next milestone).
+  </div>
+
   <div class="toc">
     <b>Contents</b>
     <ol>

@@ -1045,19 +1045,41 @@ once after 16 layers: (HOST) final RMSNorm [256,960]
     <li><span class="pill done">✅</span> <b>A3-3 LayerNorm</b> — added affine (γ,β) + multi-tile to the example, promoted to registry (<span class="shape">1024×768</span>)</li>
     <li><span class="pill done">✅</span> <b>A3-4 FlashAttention 1024²</b> — verified the non-causal 12-head config; its <em>even</em> head count fills the full 8×4 array (1.58× the odd-15-head backbone)</li>
     <li><span class="pill done">✅</span> <b>A3-5 Step 1</b> — CPU vision oracle + host-glue math (im2col, pixel-shuffle, biases) proven bit-faithful vs real lerobot (all 12 layers cos&gt;0.9997) <em>before</em> spending NPU time</li>
-    <li><span class="pill" style="background:#fef9c3;color:#854d0e">⏳</span> <b>A3-5 Step 2-5</b> — assembling the 12-layer ViT on NPU (per-layer cosine vs oracle) → splice into the hybrid → <code>make verify</code> still PASS <span class="pill future">in progress</span></li>
+    <li><span class="pill done">✅</span> <b>A3-5 Step 2-3 — the 12-layer ViT runs entirely on NPU</b>: all four heavy ops (LayerNorm, 6 GEMMs, GELU, FlashAttention) on-chip, 0 CPU fallback, 10 dispatches/layer</li>
+    <li><span class="pill warn">⚠️</span> <b>A3-5 correctness gate NOT met yet</b> — a <b>BF16 precision ceiling</b> (not a wiring bug): the final vision-output similarity is <b>0.945</b> (gate 0.99). Root-caused; see the box below.</li>
+    <li><span class="pill future">◻</span> <b>A3-5 Step 4-5</b> — connector on NPU + splice into the hybrid + <code>make verify</code> — <span class="pill future">blocked on the precision fix</span></li>
   </ul>
   <div class="callout">
-    <b>The A3 headline:</b> every vision leaf kernel is now validated on real NPU2 — there are <b>zero from-scratch
-    kernels</b> left for vision (conv became im2col+GEMM, pixel-shuffle became a host reshape). What remains is
-    integration + verification, not missing kernels.
+    <b>The A3 headline:</b> every vision leaf kernel is validated on real NPU2 and the <b>whole 12-layer encoder
+    runs on-chip</b> — there are <b>zero from-scratch kernels</b> left (conv became im2col+GEMM, pixel-shuffle a
+    host reshape). But end-to-end accuracy hits a precision ceiling that the individual kernels don't show.
+  </div>
+  <div class="callout warn">
+    <b>Why the vision output is only 0.945 similar (and why it's honest, not a bug).</b> Each kernel is clean in
+    isolation (LayerNorm 0.99997, GEMM 0.99999, attention 0.99979), and feeding each of the 12 layers the correct
+    input independently ("teacher-forced") is also clean (0.994–0.9998) — so the wiring is correct. The gap appears
+    only when the 12 layers run <em>in sequence</em>:
+    <ul class="clean" style="margin:0.5rem 0 0">
+      <li>The NPU's fast matmul format (<b>BFP16</b> — a block of numbers sharing one exponent) introduces a tiny
+        <em>systematic</em> per-channel bias, not random noise. On the vision encoder's unusually spiky activations
+        (some values ~45× the average), this bias points in a consistent direction.</li>
+      <li>A systematic bias survives LayerNorm's centering and <b>accumulates coherently</b> across 12 layers,
+        whereas random error would average out. Layer 1 — which has the strongest residual cancellation
+        (|input| 226 → |output| 143) — amplifies it the most (drops to 0.981); the rest compound to 0.945.</li>
+      <li>The language backbone (A1) doesn't hit this: its activations are milder and it lacks this cancellation
+        pattern, so the same BF16 kernels pass there.</li>
+    </ul>
+    <b>Every on-NPU precision lever was tried</b> (non-BFP16 matmul → wrong tiles; direct-codegen → wrong;
+    non-BFP16 attention → hangs; CPU attention → worse at 0.905). The real fix is a <b>micro-kernel change</b> to the
+    attention kernel (a higher-precision accumulate) — that's the A3-6 work below. Performance, meanwhile, is
+    unaffected and healthy: the encoder is fully on-chip at registry-tier throughput.
   </div>
 
   <h3>Next milestones</h3>
   <table>
     <tr><th>Milestone</th><th>Scope</th><th>Why / status</th></tr>
-    <tr><td><b>A3-5</b></td><td>Finish assembling the <b>vision encoder</b> on NPU + splice into the hybrid pipeline</td><td>74% of runtime; all kernels ready → <span class="pill" style="background:#fef9c3;color:#854d0e">in progress</span></td></tr>
-    <tr><td><b>A3-6</b></td><td>Vision <b>performance hill-climb</b> (fuse ELFs, buffer reuse, move bias/reshape on-device) to beat CPU vision's 719 ms</td><td>done after A3-5 correctness holds → <span class="pill future">planned</span></td></tr>
+    <tr><td><b>A3-6a</b> (next)</td><td><b>Fix the vision precision ceiling</b> — a higher-precision attention micro-kernel (native-bf16 or fp32-accumulate epilogue), then finish the connector + hybrid splice + <code>make verify</code></td><td>unblocks A3-5's gate → <span class="pill" style="background:#fef9c3;color:#854d0e">next</span></td></tr>
+    <tr><td><b>A3-6b</b></td><td>Vision <b>performance hill-climb</b> (fuse ELFs, buffer reuse, move bias/reshape on-device) to beat CPU vision's 719 ms</td><td>after correctness holds → <span class="pill future">planned</span></td></tr>
     <tr><td><b>A2</b></td><td>Move the <b>action expert</b> onto the NPU (cross-attention + 10-step denoise)</td><td>20% of runtime; reuses backbone kernels → <span class="pill future">planned</span></td></tr>
     <tr><td><b>Route 3</b></td><td>Fuse backbone attention further to cut the remaining ~208 launches</td><td><span class="pill future">optimization headroom</span></td></tr>
   </table>
@@ -1065,10 +1087,11 @@ once after 16 layers: (HOST) final RMSNorm [256,960]
   <div class="card" style="margin-top:2rem;background:#f0f9ff;border-color:#7dd3fc">
     <p style="margin:0"><b>In one sentence:</b>
     SmolVLA's language brain (the 16-layer SmolLM2-360M) already runs entirely on the AMD NPU2 (action output
-    verified against a pure-CPU baseline, similarity 0.9971, faster than the CPU backbone) — and we are now
-    mapping the <b>vision encoder</b>, the 74% bottleneck: all of its NPU kernels are validated and the 12-layer
-    encoder is being assembled and verified. This is the <b>first time a VLA model's core runs on the AMD NPU2</b>,
-    and the biggest performance piece is next.</p>
+    verified against a pure-CPU baseline, similarity 0.9971, faster than the CPU backbone). The <b>vision
+    encoder</b> — the 74% bottleneck — now <b>also runs entirely on-chip</b> (all 12 layers, every kernel
+    validated), but its end-to-end accuracy currently sits at 0.945 against a 0.99 gate: an honest BF16
+    precision ceiling that a higher-precision attention micro-kernel (A3-6a) is expected to lift. This is the
+    <b>first time a VLA model's core runs on the AMD NPU2</b>, with the vision precision fix as the clear next step.</p>
   </div>
 
   <div class="meta" style="margin-top:3rem;border-bottom:none;border-top:1px solid var(--card-border);padding-top:1rem">
