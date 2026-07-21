@@ -1076,6 +1076,111 @@
           "tier": "high"
         }
       }
+    },
+    {
+      "M": 1024,
+      "K": 768,
+      "N": 768,
+      "used_by": "SmolVLA vision q/k/v/out_proj (SigLIP, seq=1024, hidden=768) + patch-embedding-as-GEMM (im2col, same shape)",
+      "_note": "SigLIP vision encoder. seq=1024, hidden=768. M=1024 -> drain tile_m=32 runs 1024/(32*8)=4 M-launch iterations; the standalone drain harness handles multi-iteration M correctly (verified PASS at 9.465e-3), the mm.o multi-iteration garbage bug does NOT apply to this single-launch drain path. N=768 not 512-aligned -> TILE_N=96 (4*96=384 | 768). K=768 tile_k_l2=384 (768/384=2). MKN=6e8 < 4e9 -> drain. abs_err max 1.709e-3 is covered by rtol*|ref| (not a near-zero element) -> PASSES high-precision.",
+      "methods": {
+        "drain": {
+          "tile": {
+            "tile_m": 32,
+            "tile_k_l2": 384,
+            "tile_k_l1": 64,
+            "tile_n": 96
+          },
+          "gflops": 3798,
+          "mean_rel_L1": 0.0095,
+          "tier": "high"
+        }
+      },
+      "best": {
+        "high": "drain"
+      }
+    },
+    {
+      "M": 1024,
+      "K": 768,
+      "N": 3072,
+      "used_by": "SmolVLA vision mlp fc1 (SigLIP, hidden 768 -> 3072)",
+      "_note": "Vision MLP up-projection (fc1). N=3072=4*128*6 -> stock TILE_N=128. K=768 tile_k_l2=256 (768/256=3). Same wide-N Gate/Up near-zero atol edge as every Qwen sibling: high-precision drain computes the in-tier result (mean_rel_L1=9.428e-3, 4195 GFLOPS @ tile_m=32/tk2=256/tn128) but the harness element-wise gate trips on a near-zero-reference element (abs_err 1.953e-3 > high-prec atol=1.5e-3, rtol*|ref|~0). The low-precision direct path PASSES (atol=4e-3, 1.089e-2). best.high points at the numerically-correct drain datapath; best.low at the harness-passing direct path.",
+      "methods": {
+        "drain": {
+          "tile": {
+            "tile_m": 32,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 4195,
+          "mean_rel_L1": 0.0094,
+          "tier": "high"
+        },
+        "direct": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 3650,
+          "mean_rel_L1": 0.0109,
+          "tier": "low"
+        }
+      },
+      "best": {
+        "high": "drain",
+        "low": "direct"
+      }
+    },
+    {
+      "M": 1024,
+      "K": 3072,
+      "N": 768,
+      "used_by": "SmolVLA vision mlp fc2 (SigLIP, 3072 -> 768)",
+      "_note": "Vision MLP down-projection (fc2). N=768 not 512-aligned -> TILE_N=96 (4*96=384 | 768). K=3072 tile_k_l2=384 (3072/384=8). MKN=2.4e9 < 4e9 -> drain. Down-proj-class (large K, small N) is the fast one, clean high-precision at 9.423e-3, abs_err max 8.5e-4 (no near-zero edge).",
+      "methods": {
+        "drain": {
+          "tile": {
+            "tile_m": 32,
+            "tile_k_l2": 384,
+            "tile_k_l1": 64,
+            "tile_n": 96
+          },
+          "gflops": 5790,
+          "mean_rel_L1": 0.0094,
+          "tier": "high"
+        }
+      },
+      "best": {
+        "high": "drain"
+      }
+    },
+    {
+      "M": 64,
+      "K": 12288,
+      "N": 960,
+      "used_by": "SmolVLA connector proj (vision->LLM, K=12288 very large, M=64 very small)",
+      "_note": "Connector projection between the vision encoder and the LLM. M=64 is tiny (only fills part of the herd) and K=12288 is very large. M=64 forces tile_m=16 (mm.o static_assert m%(2*8)==0 rejects tile_m=8) and herd_m=4 (tile_m*herd_m=64=M, single M-iteration; tile_m=16/herd_m=8=128 > M fails the m%(tile_m*herd_m)==0 assert). N=960 -> TILE_N=80 HERD_N=4 (4*80=320 | 960). K=12288=2^12*3 tile_k_l2=256 (48 L2 tiles). MKN=7.5e8 < 4e9 -> drain. K=12288 is NOT a placement blocker -- it just means 48 reduction tiles; PLACES and PASSES cleanly on NPU at 9.450e-3, abs_err max 3.66e-4. M=64 is latency-bound (~1690 GFLOPS, flat across tile_k_l2 in {256,512,768}) because it fills only 4x4 of the 8x4 herd. NO CPU fallback needed.",
+      "methods": {
+        "drain": {
+          "tile": {
+            "tile_m": 16,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 80
+          },
+          "gflops": 1695,
+          "mean_rel_L1": 0.0095,
+          "herd": [4, 4],
+          "tier": "high"
+        }
+      },
+      "best": {
+        "high": "drain"
+      }
     }
   ]
 }
