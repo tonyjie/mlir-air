@@ -65,6 +65,38 @@ FA kernel's L1 tiling so the native (non-BFP16) bf16 8x8x8 mmul places and runs
 that doesn't quantize the attention output per block. Both are microkernel changes.
 Alternatively, revisit the gate metric (per-token-median 0.988 vs flattened 0.945).
 
+### DECISION (2026-07-22): A3-6a precision fix DROPPED, proceed to A3-6b (perf)
+
+BFP16 is the format the NPU must use for good performance; forcing pure BF16 would
+be very slow. The 0.945 mismatch is an accepted BFP16 systematic-bias ceiling — the
+cause is NOT a controllable factor on our side (wiring/config/eps all ruled out,
+teacher-forced clean). So we do NOT pursue the higher-precision microkernel; we move
+to A3-6b performance hill-climb (ELF fusion, BO reuse, on-device glue).
+
+### Unfused reference preserved: tag `smolvla-vision-unfused-v1`
+
+Before A3-6b makes vision_prefill.py messier (merged ELFs), the clean
+kernel-by-kernel version is frozen at git tag **`smolvla-vision-unfused-v1`**
+(commit 65e0d3d5). To trace a precision/other issue against the simple version:
+    git checkout smolvla-vision-unfused-v1 -- programming_examples/llms/smolvla/vision_prefill.py
+That version = 10 dispatches/layer, one ELF per op, host bias/residual/im2col,
+measured NPU 281ms / 2.6x vs CPU, correctness 0.945.
+
+## A3-6b — vision performance hill-climb (IN PROGRESS)
+
+Baseline to beat: unfused NPU vision **281 ms** (median, compile excluded) vs CPU
+719 ms. Levers (each: apply → re-measure wall time → re-check per-layer cosine vs
+oracle stays ~0.945, i.e. fusion must not change the math):
+  - opt-merge-multi-launch-kernels: fuse the 10 per-layer dispatches into a few
+    multi-launch ELFs (mirror backbone's rms_gemms_rope / o_ffn), e.g. LN+QKV+attn
+    and O+residual+LN+FFN. Dominant win.
+  - opt-buffer-object-reuse: pre-load per-layer weight BOs once (static_input_indices)
+    across the 12 layers; reuse intermediate BOs.
+  - move host glue on-device: bias-adds into the GEMM epilogue, residual adds, and
+    ideally im2col — remove host round-trips.
+Gate: wall time strictly < 281 ms AND per-layer cosine unchanged (~0.945, fusion is
+math-equivalent — a cosine DROP means a fusion bug, not the BFP16 ceiling).
+
 ## NPU-execution exceptions
 
 These are the operations that run on CPU rather than NPU, with the concrete
