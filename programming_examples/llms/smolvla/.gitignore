@@ -1,3 +1,15 @@
 smolvla_oracle.npz
 vision_oracle.npz
 vision_kernel_cache/
+# kernel caches + compiled ELF/obj artifacts (rebuilt by compile_all_kernels)
+*_kernel_cache/
+bench_vision_cache/
+bench_vision_fused_cache/
+vit_fused_test_cache/
+air_project/
+*.elf
+*.o
+*.xclbin
+*.insts.bin
+air.mlir
+_prof_*.py

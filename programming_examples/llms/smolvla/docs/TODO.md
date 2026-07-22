@@ -9,10 +9,15 @@ GEMMs (gemm_qkvo/fc1/fc2 ELFs), affine LayerNorm (layer_norm ELF), GELU-tanh
 correctness-first host glue runs on CPU: per-Linear bias-adds, the two residual
 adds, and the im2col patch-embed (all A3-6 fusion candidates, NOT fallbacks).
 
-**NPU-execution: all 4 heavy ops on NPU (0 CPU fallback). NPU dispatches/layer =
-10** (LN1, q, k, v, FA, o, LN2, fc1, gelu, fc2), + 1 post_ln (once, end of stack).
-Correctness-first: NOT fused/optimized — A3-6 will merge these into multi-launch
-ELFs and move the bias/residual/im2col glue onto the device.
+**NPU-execution: all ops on NPU (0 CPU fallback).**
+- Unfused reference (`fused=False`, tag smolvla-vision-unfused-v1): 10
+  dispatches/layer (LN1, q, k, v, FA, o, LN2, fc1, gelu, fc2) + 1 post_ln.
+- **Fused production path (A3-6b, `fused=True`, default): 3 dispatches/layer**
+  (`vit_ln_qkv`, `flash_attn`, `vit_o_ffn`) + 1 post_ln `layer_norm` = 37 total.
+  All per-Linear bias-adds + both residual adds run ON-DEVICE inside the two
+  fused ELFs (no host f32 glue). Only im2col patch-embed stays on host (one-time,
+  pre-loop, not hot-loop work — see A3-6b Lever 3 remainder). See A3-6b section
+  above for the 368 ms → 141.6 ms result and the post_ln 0.945 → 0.990 rise.
 
 ### Correctness gate NOT met — precision-ceiling FAIL (root-caused, not a bug)
 
@@ -82,20 +87,88 @@ kernel-by-kernel version is frozen at git tag **`smolvla-vision-unfused-v1`**
 That version = 10 dispatches/layer, one ELF per op, host bias/residual/im2col,
 measured NPU 281ms / 2.6x vs CPU, correctness 0.945.
 
-## A3-6b — vision performance hill-climb (IN PROGRESS)
+## A3-6b — vision performance hill-climb (DONE — gate met)
 
 Baseline to beat: unfused NPU vision **281 ms** (median, compile excluded) vs CPU
-719 ms. Levers (each: apply → re-measure wall time → re-check per-layer cosine vs
-oracle stays ~0.945, i.e. fusion must not change the math):
-  - opt-merge-multi-launch-kernels: fuse the 10 per-layer dispatches into a few
-    multi-launch ELFs (mirror backbone's rms_gemms_rope / o_ffn), e.g. LN+QKV+attn
-    and O+residual+LN+FFN. Dominant win.
-  - opt-buffer-object-reuse: pre-load per-layer weight BOs once (static_input_indices)
-    across the 12 layers; reuse intermediate BOs.
-  - move host glue on-device: bias-adds into the GEMM epilogue, residual adds, and
-    ideally im2col — remove host round-trips.
-Gate: wall time strictly < 281 ms AND per-layer cosine unchanged (~0.945, fusion is
-math-equivalent — a cosine DROP means a fusion bug, not the BFP16 ceiling).
+719 ms. **Result: fused NPU vision 141.6 ms** (median of 10, this harness) — 2.0x
+faster than the 281 ms unfused baseline, gate (< 281 ms) cleared decisively.
+
+Measurement note: on the current machine this harness reproduces the *unfused*
+baseline at ~368 ms (not 281 ms — machine/contention variance; the 281 ms figure
+is from the original A3-6a run). The apples-to-apples delta on THIS machine is
+368 ms → 141.6 ms (2.6x). Either way the fused wall is far below the 281 ms gate.
+
+### Levers applied (each re-measured + re-verified against the oracle)
+
+| Lever | What | Wall (this harness) | Dispatches | post_ln cos |
+|---|---|---|---|---|
+| baseline (unfused) | 10 ELF/layer, host bias/residual | 368 ms | 121 | 0.9455 |
+| L1: BO intermediate reuse | mark kernel-overwritten output BOs `intermediate_indices` (skip host upload) | 368 ms | 121 | 0.9455 |
+| L2+L3: fuse ELFs + on-device glue | 2 fused ELFs (vit_ln_qkv, vit_o_ffn) + FA; bias-adds + residuals moved on-device | **141.6 ms** | **37** | **0.9906** |
+
+- **L1 (opt-buffer-object-reuse)**: applied. Weights were already static via
+  `static_input_indices`; the remaining redundant traffic was re-uploading the
+  zeroed output/scratch BOs every call. Marking them `intermediate_indices`
+  removed that. Small standalone effect (368→368 ms, within noise — the per-op
+  intermediate uploads were tiny vs the 1.75 ms/dispatch python/XRT overhead),
+  but it is retained and is inherited by the fused block runner. Cosine held at
+  0.9455.
+- **L2 (opt-merge-multi-launch-kernels)** + **L3 (host glue on-device)**: the
+  dominant win, applied together. Two fused ELFs built in `vit_fused_builders.py`
+  (mirroring the backbone's rms_gemms_rope / o_ffn), stitched via
+  `shared/infra/stitching.stitch_elf`:
+    - `vit_ln_qkv`  (7 launches): affine LN1 + Q/K/V drain GEMM + Q/K/V on-device
+      broadcast bias-add → q_b/k_b/v_b.
+    - `flash_attn`  (1 launch, unchanged registry ELF).
+    - `vit_o_ffn`  (10 launches): O GEMM + O bias + residual + affine LN2 + fc1
+      GEMM + fc1 bias + GELU-tanh + fc2 GEMM + fc2 bias + residual → output.
+  Per-layer weight/bias BOs pre-loaded once (`static_input_indices` +
+  `bo_key=f"...L{i}"`); every scratch/output BO is `intermediate_indices`. Result:
+  **121 → 37 dispatches** (3/layer + 1 post_ln), host-gap 212 ms → 4 ms, all
+  per-Linear bias-adds + both residuals on NPU (no host f32 glue).
+
+### Why post_ln cosine IMPROVED (0.945 → 0.990), not a masked bug
+
+The gate says a cosine DROP = fusion bug. This is a RISE, and it is expected, not
+suspicious: (1) each fused ELF was validated in isolation vs a faithful numpy
+mirror of its exact sub-graph (`test_vit_fused_elfs.py`: vit_ln_qkv q/k/v cos
+0.9999, vit_o_ffn out cos 0.9999) BEFORE end-to-end wiring, so the math is exactly
+as designed; (2) the improvement comes from doing the bias-adds + residuals
+on-device in bf16 vector lanes instead of the unfused path's host round-trip
+(bf16→f32 add→bf16 recast per op), which removed a layer of intermediate
+re-quantization that had been compounding the BFP16 systematic bias. The fused
+path is strictly the more-accurate arithmetic, so the accepted 0.945 BFP16 ceiling
+lifts. Correctness gate now PASSES outright (all per-layer > 0.98, post_ln > 0.99).
+
+### Fused-ELF gotcha (recorded for reuse)
+
+Both fused ELFs use DRAIN GEMMs, but at seq=1024 they resolve to two distinct
+tile_n (qkvo/o/fc2 → 96, fc1 → 128). `compile_gemm_mm` bakes DIM_N into the
+`mm.o` at compile time, and the plain `_m32` suffix is keyed only on method — so
+a GEMM built in isolation would link a stale generic `mm_m32.o` (wrong DIM_N) and
+produce garbage (first attempt: vit_ln_qkv cos ~0.07). Fix: force the
+tile_n-keyed suffix (`_m32_n96` / `mm_m32_n96.o`) via
+`vit_fused_builders._force_tile_n_suffix`, mirroring `disambiguate_by_tile_n`, so
+every ELF links the correctly-baked object. This is the same class as the
+backbone o_ffn's O/Down(80) vs Gate/Up(128) disambiguation.
+
+### Lever 3 remainder (NOT done — out of scope, no gate impact)
+
+im2col patch-embed stays on host: it is a ONE-TIME op before the layer loop (not
+per-layer hot-loop work), so it costs nothing in the per-inference number the gate
+measures. Moving it on-device would be a Conv/im2col kernel with no throughput
+benefit here. bias-adds + residuals (the per-layer host glue) ARE all on-device.
+
+### Deliverables
+
+- `vit_fused_builders.py` — the two fused-ELF builders (+ _build_gelu_2d,
+  _force_tile_n_suffix). Reuses shared bias-add (rms_qkv_bias_rope_multi) +
+  residual add (o_ffn_multi) + stitch_elf.
+- `vision_prefill.py` — `compile_all_kernels(..., fused=True)` (default) compiles
+  the 3-ELF fused path; `run_vit_block_fused` drives 3 dispatches/layer with
+  static weight BOs. `fused=False` keeps the frozen unfused path for A/B + diag.
+- `test_vit_fused_elfs.py` — standalone NPU correctness of each fused ELF vs numpy.
+- `bench_vision.py` — median-of-10 NPU vs CPU bench (mirrors bench_backbone.py).
 
 ## NPU-execution exceptions
 

@@ -92,6 +92,30 @@ _ATTN_BACKEND_KWARGS = {
 }
 
 
+# --- A3-6b fused-ELF backends (Lever 2 + Lever 3) ---
+# Both fused ViT ELFs (vit_ln_qkv, vit_o_ffn) are stitched from drain GEMMs +
+# affine LN + on-device bias-adds + residual adds + GELU. Drain herds need
+# runtime_loop_tiling_sizes=[2,2] for BD-ID recycling (same as the backbone o_ffn).
+
+
+def _vit_ln_qkv_backend():
+    return {
+        "omit_while_true_loop": False,
+        "output_format": "elf",
+        "instance_name": "vit_ln_qkv",
+        "runtime_loop_tiling_sizes": [2, 2],
+    }
+
+
+def _vit_o_ffn_backend():
+    return {
+        "omit_while_true_loop": False,
+        "output_format": "elf",
+        "instance_name": "vit_o_ffn",
+        "runtime_loop_tiling_sizes": [2, 2],
+    }
+
+
 # Vision GEMM tiles (registry, precision="high" → drain). All three resolve to
 # tile_m=32 drain; kept as explicit constants so compile-time mm.o bakes match
 # the build_module tile args (registry-validated in A3-1, commit 3fc1bb12).
@@ -116,8 +140,137 @@ _GEMM_SHAPES = {
 # ---------------------------------------------------------------------------
 
 
-def compile_all_kernels(cache, config, seq_len=1024, fa_bfp16=True):
+def _compile_flash_attn(cache, config, seq_len, fa_bfp16):
+    """Compile the non-causal FlashAttention ELF (shared by fused + unfused)."""
+    from flash_attention.kernel_fusion_based.attn_npu2_seqfirst import (
+        build_module as build_attn,
+    )
+    from shared.infra.external_kernels import compile_attn_npu2
+
+    n_heads = config.n_heads
+    n_kv_heads = config.n_heads  # MHA
+    head_dim = config.head_dim
+    num_heads_per_unroll = 2
+    num_q_tiles = 4
+    assert n_heads % num_heads_per_unroll == 0
+    assert num_heads_per_unroll * num_q_tiles <= 8
+    print(
+        f"  Compiling flash_attn: non-causal, seq={seq_len}, {n_heads}Q/{n_kv_heads}KV, "
+        f"head_dim={head_dim}, hpu={num_heads_per_unroll}"
+    )
+    attn_mod = build_attn(
+        lk=seq_len,
+        lkp=head_dim,
+        lq=seq_len,
+        lqp=256,
+        dk=head_dim,
+        dv=head_dim,
+        num_q_tiles=num_q_tiles,
+        num_cascade_stages=4,
+        num_heads=n_heads,
+        num_kv_heads=n_kv_heads,
+        causal=False,
+        num_heads_per_unroll=num_heads_per_unroll,
+    )
+    compile_attn_npu2(head_dim=head_dim, bfp16=fa_bfp16, force=True)
+    print(f"    (FA microkernel BFP16={fa_bfp16})")
+    cache.compile_and_cache(
+        "flash_attn", attn_mod, {**_ATTN_BACKEND_KWARGS, "verbose": cache.verbose}
+    )
+
+
+def _compile_fused_kernels(cache, config, seq_len, fa_bfp16):
+    """A3-6b Lever 2+3: compile the two fused ViT multi-launch ELFs + FA.
+
+    vit_ln_qkv  : LN1 + Q/K/V GEMM + Q/K/V bias-add       (7 launches, 1 ELF)
+    flash_attn  : non-causal MHA                          (1 launch,  registry ELF)
+    vit_o_ffn   : O GEMM + O bias + residual + LN2 + fc1 + fc1 bias + GELU
+                  + fc2 + fc2 bias + residual             (10 launches, 1 ELF)
+
+    All the per-Linear bias-adds and both residual adds — host f32 glue in the
+    unfused driver — run on-device inside these two ELFs. => 3 NPU dispatches per
+    layer (was 10) and NO host bias/residual round-trips.
+
+    Order matters: compile_gemm_mm bakes DIM_N into each mm_*.o at compile time,
+    then compile_and_cache -> prepare_air_project stages the current CWD .o's into
+    air_project/. Both ELFs use tile_n-keyed drain objects (mm_m32_n96 for
+    qkvo/o/fc2, mm_m32_n128 for fc1); compile every distinct one first so both
+    ELFs link the correctly-baked objects (see vit_fused_builders._force_tile_n_suffix).
+    """
+    from shared.infra.external_kernels import compile_gemm_mm
+    from shared.builders.gemm_builder import (
+        gemm_registry_config,
+        disambiguate_by_tile_n,
+    )
+    from vit_fused_builders import build_vit_ln_qkv_module, build_vit_o_ffn_module
+
+    emb_dim = config.emb_dim
+    hidden_dim = config.hidden_dim
+    n_heads = config.n_heads
+    head_dim = config.head_dim
+
+    # Compile every distinct tile_n-keyed drain mm.o the two ELFs link.
+    o_spec = gemm_registry_config(seq_len, emb_dim, emb_dim, "bf16", "high")
+    g_spec = gemm_registry_config(seq_len, emb_dim, hidden_dim, "bf16", "high")
+    d_spec = gemm_registry_config(seq_len, hidden_dim, emb_dim, "bf16", "high")
+    o_spec, g_spec, d_spec = disambiguate_by_tile_n([o_spec, g_spec, d_spec])
+    _needed = {}
+    for s in (o_spec, g_spec, d_spec):
+        _needed[s["sym_suffix"]] = s
+    for s in _needed.values():
+        print(
+            f"  Compiling {s['obj']} (drain tile_m={s['tile_m']} tile_n={s['tile_n']})"
+        )
+        compile_gemm_mm(
+            tile_m=s["tile_m"],
+            tile_n=s["tile_n"],
+            tile_k_l1=s["tile_k_l1"],
+            sym_suffix=s["sym_suffix"],
+            out_name=s["obj"],
+        )
+
+    print("  Compiling vit_ln_qkv (7-launch fused ELF)...")
+    cache.compile_and_cache(
+        "vit_ln_qkv",
+        build_vit_ln_qkv_module(seq_len, emb_dim, n_heads, head_dim),
+        {"verbose": cache.verbose, **_vit_ln_qkv_backend()},
+    )
+
+    print("  Compiling vit_o_ffn (10-launch fused ELF)...")
+    cache.compile_and_cache(
+        "vit_o_ffn",
+        build_vit_o_ffn_module(seq_len, emb_dim, hidden_dim),
+        {"verbose": cache.verbose, **_vit_o_ffn_backend()},
+    )
+
+    # Standalone affine LayerNorm ELF — used ONCE at the end of the stack for
+    # post_layernorm (kept on NPU, identical to the unfused path so post_ln
+    # cosine vs oracle is unchanged). Not in the per-layer hot loop.
+    from layer_norm.layer_norm import build_module as build_layer_norm
+
+    print(f"  Compiling layer_norm: {seq_len}x{emb_dim} affine (post_ln, herd_x=8)")
+    cache.compile_and_cache(
+        "layer_norm",
+        build_layer_norm(seq_len, emb_dim, bfloat16, herd_x=8),
+        {"verbose": cache.verbose, **_ln_backend()},
+    )
+
+    _compile_flash_attn(cache, config, seq_len, fa_bfp16)
+
+    cache._save_manifest()
+    print(f"\nAll {len(cache.artifacts)} vision kernels compiled to {cache.cache_dir}/")
+    if cache.profiler.enabled:
+        total = sum(cache.profiler.compile_times.values())
+        print(f"Total compilation time: {total:.1f}s")
+
+
+def compile_all_kernels(cache, config, seq_len=1024, fa_bfp16=True, fused=True):
     """Pre-compile every unique vision-encoder kernel config to the cache.
+
+    fused: if True (A3-6b default), compile the two fused multi-launch ELFs
+        (vit_ln_qkv + vit_o_ffn) plus flash_attn — 3 ELFs, 3 dispatches/layer.
+        If False, compile the 6 unfused per-op ELFs (10 dispatches/layer, the
+        frozen smolvla-vision-unfused-v1 path) for A/B comparison + diagnosis.
 
     fa_bfp16: FlashAttention microkernel (attn_npu2.o) block-float mode.
         BFP16=True (default) is the only WORKING FA build at this shape: BFP16=False
@@ -150,8 +303,15 @@ def compile_all_kernels(cache, config, seq_len=1024, fa_bfp16=True):
     head_dim = config.head_dim
 
     print(f"\n{'='*60}")
-    print(f"Compiling vision-encoder kernels (seq_len={seq_len})...")
+    print(
+        f"Compiling vision-encoder kernels (seq_len={seq_len}, "
+        f"{'FUSED 3-ELF' if fused else 'UNFUSED 6-ELF'})..."
+    )
     print(f"{'='*60}\n")
+
+    if fused:
+        _compile_fused_kernels(cache, config, seq_len, fa_bfp16)
+        return
 
     # --- 1. Projection / MLP GEMMs (one ELF per distinct shape) ---
     for name, s in _GEMM_SHAPES.items():
@@ -264,6 +424,7 @@ def _run_gemm(cache, name, A, B, M, N, bo_key):
         C,
         output_indices=[2],
         static_input_indices={1},
+        intermediate_indices={2},  # C is kernel-overwritten; skip host upload
         bo_key=bo_key,
     )
     return res[2].reshape(M, N)
@@ -285,6 +446,7 @@ def _run_layer_norm(cache, x, weight, bias, M, N, bo_key):
         out,
         output_indices=[2],
         static_input_indices={1},
+        intermediate_indices={2},  # out is kernel-overwritten; skip host upload
         bo_key=bo_key,
     )
     return res[2].reshape(M, N)
@@ -300,6 +462,7 @@ def _run_gelu(cache, x, M, N, bo_key):
         x,
         out,
         output_indices=[1],
+        intermediate_indices={1},  # out is kernel-overwritten; skip host upload
         bo_key=bo_key,
     )
     return res[1].reshape(M, N)
@@ -322,13 +485,140 @@ def _run_flash_attention(cache, q, k, v, config, seq_len):
         v_attn,
         out,
         output_indices=[3],
+        intermediate_indices={3},  # out is kernel-overwritten; skip host upload
         bo_key="flash_attn",
     )
     return res[3].reshape(seq_len, n_heads * head_dim)
 
 
 # ---------------------------------------------------------------------------
-# One SigLIP encoder block (pre-norm)
+# A3-6b fused block runner (Lever 1+2+3): 3 dispatches/layer, static weight BOs
+# ---------------------------------------------------------------------------
+
+
+def run_vit_block_fused(
+    x_bf16, lw, config, cache, layer_idx=0, verbose=False, attn_mode="flash"
+):
+    """Execute one SigLIP encoder layer via the two fused ELFs + FA (A3-6b).
+
+    3 NPU dispatches: vit_ln_qkv -> flash_attn -> vit_o_ffn. Per-layer weight
+    BOs (LN params, wq/wk/wv/wo, biases, fc1/fc2) are pre-loaded once via
+    static_input_indices + bo_key=f"...L{layer_idx}" and skipped on re-upload;
+    every scratch/output buffer is intermediate (kernel-overwritten, no host
+    upload). ALL bias-adds + both residuals run on-device inside the ELFs — no
+    host f32 glue. Mirrors smolvla_backbone_prefill.run_transformer_block.
+
+    attn_mode: "flash" (default) = FlashAttention ELF. "cpu" = host MHA (diag).
+    """
+    seq_len = x_bf16.shape[0]
+    emb = config.emb_dim
+    hidden = config.hidden_dim
+    n_heads = config.n_heads
+    head_dim = config.head_dim
+
+    _cache = getattr(run_vit_block_fused, "_arg_cache", {})
+    run_vit_block_fused._arg_cache = _cache
+
+    def _pack(w, b):
+        return np.concatenate(
+            [np.asarray(w, dtype=bfloat16), np.asarray(b, dtype=bfloat16)]
+        ).astype(bfloat16)
+
+    def z2(cols):
+        return np.zeros((seq_len, cols), dtype=bfloat16)
+
+    # ---- 1. vit_ln_qkv: LN1 + Q/K/V GEMM + Q/K/V bias -> q_b, k_b, v_b ----
+    ln_key = f"vit_ln_qkv_L{layer_idx}"
+    if ln_key not in _cache:
+        _cache[ln_key] = [
+            None,  # arg0 x_in (dynamic)
+            _pack(lw.ln1_w, lw.ln1_b),  # arg1 LN1 param
+            z2(emb),  # arg2 normed
+            np.asarray(lw.wq, dtype=bfloat16).reshape(emb, emb),  # arg3
+            z2(emb),  # arg4 q_raw
+            np.asarray(lw.wk, dtype=bfloat16).reshape(emb, emb),  # arg5
+            z2(emb),  # arg6 k_raw
+            np.asarray(lw.wv, dtype=bfloat16).reshape(emb, emb),  # arg7
+            z2(emb),  # arg8 v_raw
+            np.asarray(lw.bq, dtype=bfloat16).reshape(emb),  # arg9
+            np.asarray(lw.bk, dtype=bfloat16).reshape(emb),  # arg10
+            np.asarray(lw.bv, dtype=bfloat16).reshape(emb),  # arg11
+            z2(emb),  # arg12 q_b (out)
+            z2(emb),  # arg13 k_b (out)
+            z2(emb),  # arg14 v_b (out)
+        ]
+    ln_args = _cache[ln_key]
+    ln_args[0] = np.ascontiguousarray(np.asarray(x_bf16, dtype=bfloat16)).reshape(-1)
+    res = cache.load_and_run(
+        "vit_ln_qkv",
+        _vit_ln_qkv_backend(),
+        *ln_args,
+        output_indices=[12, 13, 14],
+        static_input_indices={1, 3, 5, 7, 9, 10, 11},  # LN param + weights + biases
+        intermediate_indices={2, 4, 6, 8, 12, 13, 14},  # scratch + outputs
+        bo_key=ln_key,
+    )
+    q = res[12].reshape(seq_len, emb)
+    k = res[13].reshape(seq_len, emb)
+    v = res[14].reshape(seq_len, emb)
+
+    # ---- 2. Attention ----
+    if attn_mode == "cpu":
+        from vision_cpu_helpers import mha_bidirectional
+
+        attn = mha_bidirectional(
+            q.astype(np.float32),
+            k.astype(np.float32),
+            v.astype(np.float32),
+            n_heads,
+            head_dim,
+            config.attn_scale,
+        ).astype(bfloat16)
+    else:
+        attn = _run_flash_attention(cache, q, k, v, config, seq_len)
+
+    # ---- 3. vit_o_ffn: O + bias + residual + LN2 + fc1 + bias + GELU + fc2
+    #        + bias + residual -> output ----
+    offn_key = f"vit_o_ffn_L{layer_idx}"
+    if offn_key not in _cache:
+        _cache[offn_key] = [
+            None,  # arg0 attn (dynamic)
+            np.asarray(lw.wo, dtype=bfloat16).reshape(emb, emb),  # arg1
+            z2(emb),  # arg2 o_raw
+            np.asarray(lw.bo, dtype=bfloat16).reshape(emb),  # arg3 bo
+            z2(emb),  # arg4 o_b
+            None,  # arg5 x_res (dynamic = block input)
+            z2(emb),  # arg6 res1
+            _pack(lw.ln2_w, lw.ln2_b),  # arg7 LN2 param
+            z2(emb),  # arg8 normed2
+            np.asarray(lw.w_fc1, dtype=bfloat16).reshape(emb, hidden),  # arg9
+            z2(hidden),  # arg10 fc1_raw
+            np.asarray(lw.b_fc1, dtype=bfloat16).reshape(hidden),  # arg11
+            z2(hidden),  # arg12 fc1_b
+            z2(hidden),  # arg13 gelu_out
+            np.asarray(lw.w_fc2, dtype=bfloat16).reshape(hidden, emb),  # arg14
+            z2(emb),  # arg15 fc2_raw
+            np.asarray(lw.b_fc2, dtype=bfloat16).reshape(emb),  # arg16
+            z2(emb),  # arg17 fc2_b
+            z2(emb),  # arg18 output
+        ]
+    offn_args = _cache[offn_key]
+    offn_args[0] = np.ascontiguousarray(np.asarray(attn, dtype=bfloat16)).reshape(-1)
+    offn_args[5] = np.ascontiguousarray(np.asarray(x_bf16, dtype=bfloat16)).reshape(-1)
+    res = cache.load_and_run(
+        "vit_o_ffn",
+        _vit_o_ffn_backend(),
+        *offn_args,
+        output_indices=[18],
+        static_input_indices={1, 3, 7, 9, 11, 14, 16},  # wo,bo,LN2,fc1,bfc1,fc2,bfc2
+        intermediate_indices={2, 4, 6, 8, 10, 12, 13, 15, 17, 18},  # scratch+out
+        bo_key=offn_key,
+    )
+    return res[18].reshape(seq_len, emb)
+
+
+# ---------------------------------------------------------------------------
+# One SigLIP encoder block (pre-norm) — UNFUSED reference (10 dispatches/layer)
 # ---------------------------------------------------------------------------
 
 
@@ -426,6 +716,7 @@ def run_vit_encoder(
     do_connector=False,
     verbose=False,
     attn_mode="flash",
+    fused=True,
 ):
     """Run the full 12-layer SigLIP ViT encoder on NPU.
 
@@ -463,11 +754,12 @@ def run_vit_encoder(
     x_bf16 = x.astype(bfloat16)
     seq_len, emb = x_bf16.shape
 
+    _block = run_vit_block_fused if fused else run_vit_block
     per_layer = []
     for layer_idx, lw in enumerate(weights.layers):
         if verbose:
             print(f"\n--- ViT layer {layer_idx}/{len(weights.layers) - 1} ---")
-        x_bf16 = run_vit_block(
+        x_bf16 = _block(
             x_bf16,
             lw,
             config,
