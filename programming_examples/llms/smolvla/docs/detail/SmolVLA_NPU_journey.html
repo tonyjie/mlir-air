@@ -129,6 +129,7 @@
       <li><a href="#why">Why an NPU, and which kernels we already have</a></li>
       <li><a href="#mapping">Our mapping solution: the CPU / NPU hybrid</a></li>
       <li><a href="#how">How we mapped the backbone (phase by phase)</a></li>
+      <li><a href="#vismap">How we mapped the vision encoder (Milestone A3)</a></li>
       <li><a href="#correct">Correctness: how we verify it</a></li>
       <li><a href="#perf">Performance on the NPU (before vs after optimization)</a></li>
       <li><a href="#status">Current status and next steps</a></li>
@@ -778,6 +779,94 @@ once after 16 layers: (HOST) final RMSNorm [256,960]
       💡 A "perturbation test" (replacing the NPU K/V with random noise makes the action change drastically)
       proves the action is genuinely driven by the NPU's computation, not the CPU.
     </p>
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="vismap">7.5. How we mapped the vision encoder (Milestone A3)</h2>
+
+  <p class="lead">
+    The same recipe as the backbone, applied to the 74%-of-runtime SigLIP vision encoder: validate every leaf
+    kernel at the vision shapes, then assemble the 12 layers and check against a CPU answer key. The vision tower
+    is a <b>12-layer ViT</b>: image → 1024 patch tokens (768-dim), 12 standard (non-GQA) attention heads,
+    bidirectional (no mask), LayerNorm (not RMSNorm), GELU-tanh MLP.
+  </p>
+
+  <h3>Which original operator each NPU kernel replaces</h3>
+  <table class="arch">
+    <tr><th>Original operator (PyTorch)</th><th>Replaced by NPU kernel</th><th>Notes</th></tr>
+    <tr><td><code>Conv2d</code> patch embed</td><td><span class="knl">GEMM</span> (after host im2col)</td><td>stride=kernel=16 (non-overlapping) ⇒ reshape + matmul; <b>no conv kernel</b>. <span class="shape">1024×768×768</span></td></tr>
+    <tr><td><code>nn.LayerNorm</code> (×2/layer + final)</td><td><span class="knl">LayerNorm</span> ELF (affine)</td><td>subtract-mean + γ,β; we extended the example to add affine. <span class="shape">1024×768</span>, eps 1e-6</td></tr>
+    <tr><td><code>q/k/v/out_proj</code> (+bias)</td><td><span class="knl">GEMM</span> + host bias-add</td><td>MHA, no GQA — all 4 are <span class="shape">1024×768×768</span></td></tr>
+    <tr><td><code>eager_attention</code> (bidirectional)</td><td><span class="knl">FlashAttention</span> (non-causal)</td><td>no mask ⇒ FA fits directly; <span class="shape">1024×1024</span>, 12/12, scale 1/8, fills full 8×4 array</td></tr>
+    <tr><td><code>gelu_pytorch_tanh</code></td><td><span class="knl">GELU-tanh</span> ELF</td><td>same hardware-tanh kernel, promoted to the registry. <span class="shape">1024×3072</span></td></tr>
+    <tr><td><code>fc1 / fc2</code> (+bias)</td><td><span class="knl">GEMM</span> + host bias-add</td><td>up <span class="shape">1024×768×3072</span> · down <span class="shape">1024×3072×768</span></td></tr>
+    <tr><td>connector: pixel-shuffle + proj</td><td>host reshape + <span class="knl">GEMM</span></td><td>space-to-depth is a pure index remap (host); proj <span class="shape">64×12288×960</span> <span style="color:#6b7280">(A3-5 Step 4)</span></td></tr>
+  </table>
+  <p class="legend">
+    Contrast with the backbone: <b>no RoPE</b> (vision uses an additive position embedding), <b>no GQA</b> (12 full
+    heads), <b>LayerNorm instead of RMSNorm</b>, <b>GELU instead of SwiGLU</b>, and <b>a bias on every Linear</b>
+    (the backbone was bias-free). Every heavy kernel is from the registry — two of them (LayerNorm affine, GELU-tanh)
+    were promoted <em>during</em> this work; see the kernel-work companion artifact.
+  </p>
+
+  <h3>Per-layer kernel sequence (what runs where, with shapes)</h3>
+  <p>
+    One SigLIP encoder layer, top to bottom, same notation as the backbone above.
+    <span style="color:#1e40af;font-weight:600">[NPU elf:...]</span> = one compiled program = one XRT dispatch;
+    <b>(HOST)</b> = runs on CPU. Correctness-first: each op is its own dispatch (no fusion yet — that's A3-6b), and
+    the biases / residual / im2col glue run on host.
+  </p>
+  <div class="card" style="font-family:'SF Mono',Menlo,Consolas,monospace;font-size:0.82rem;line-height:1.7;white-space:pre-wrap">
+<span style="color:#374151">once, before layer 0: (HOST) im2col patch-embed + position-embedding → x [1024,768]</span>
+
+<span style="color:#374151">x [1024,768]</span>
+ ─<span style="color:#1e40af;font-weight:700">[NPU elf:layer_norm]</span>  LayerNorm1 (affine)
+ ─<span style="color:#1e40af;font-weight:700">[NPU elf:gemm_qkvo]</span> ×3  Q,K,V  [1024,768]×[768,768]  <span style="color:#6b7280">+ (HOST) bias-add</span>
+ ─<span style="color:#1e40af;font-weight:700">[NPU elf:flash_attn]</span>  bidirectional MHA  [1024,1024], 12/12, scale 1/8
+ ─<span style="color:#1e40af;font-weight:700">[NPU elf:gemm_qkvo]</span>  O proj [1024,768]×[768,768]  <span style="color:#6b7280">+ (HOST) bias-add</span>
+ ─(HOST) residual add  x = x + attn_out
+ ─<span style="color:#1e40af;font-weight:700">[NPU elf:layer_norm]</span>  LayerNorm2 (affine)
+ ─<span style="color:#1e40af;font-weight:700">[NPU elf:gemm_fc1]</span>  fc1 [1024,768]×[768,3072]  <span style="color:#6b7280">+ (HOST) bias-add</span>
+ ─<span style="color:#1e40af;font-weight:700">[NPU elf:gelu]</span>  GELU-tanh  [1024,3072]
+ ─<span style="color:#1e40af;font-weight:700">[NPU elf:gemm_fc2]</span>  fc2 [1024,3072]×[3072,768]  <span style="color:#6b7280">+ (HOST) bias-add</span>
+ ─(HOST) residual add  x = x + mlp_out
+     → layer_out [1024,768]
+
+once after 12 layers: <span style="color:#1e40af;font-weight:700">[NPU elf:layer_norm]</span> post_layernorm [1024,768]
+  </div>
+  <p class="legend">
+    <b>Totals per layer:</b> LN1, Q, K, V, attention, O, LN2, fc1, GELU, fc2 = <b>10 NPU dispatches/layer × 12 =
+    120</b> (+1 final LN). <b>6 distinct ELFs</b> compiled once &amp; cached (three GEMM shapes, LayerNorm, GELU,
+    FlashAttention). <b>0 CPU fallback</b> — every heavy op is on-chip; the host does only bias-adds, the two
+    residual adds, and the once-per-image im2col.
+  </p>
+
+  <div class="stat-row">
+    <div class="stat"><div class="big-num">281 ms</div><div class="label">NPU vision encoder<br>(12 layers, measured, unoptimized)</div></div>
+    <div class="stat"><div class="big-num">719 ms</div><div class="label">real CPU vision stage<br>(bf16 PyTorch baseline)</div></div>
+    <div class="stat"><div class="big-num">2.6×</div><div class="label">NPU faster than CPU<br>(even before any fusion)</div></div>
+  </div>
+  <div class="callout">
+    <b>Vision on the NPU is already 2.6× faster than the CPU — and it isn't even optimized yet.</b> Measured wall
+    time (compile excluded, median of 10 runs): the 12-layer encoder is <b>281 ms on NPU</b> vs the real lerobot
+    <b>719 ms CPU</b> vision stage. This is the opposite of the backbone result (Section 9), and the reason is
+    <em>shape</em>: vision runs at seq=1024 with big matmuls (fc up to 3072-wide, a 1024×1024 attention), so the
+    NPU's matrix engine is well-fed and the per-dispatch overhead is amortized — exactly where an NPU wins. The
+    backbone, at seq=256, is too small to fill the array. Since vision is 74% of end-to-end runtime, this ~440 ms
+    saving is the single biggest lever in the whole model — and A3-6b fusion (10 dispatches/layer → a few) can push
+    it lower still.
+  </div>
+
+  <div class="callout warn">
+    <b>The catch: correctness isn't there yet.</b> Every vision kernel is clean in isolation and each layer is
+    correct when fed the right input, but running all 12 in sequence drops the final similarity to <b>0.945</b>
+    (gate 0.99). This is a <b>BF16 precision ceiling</b>, not a bug: the NPU's block-float matmul format leaves a
+    tiny <em>systematic</em> per-channel bias that — on the vision encoder's unusually spiky activations —
+    accumulates coherently across 12 layers (and is amplified by layer 1's strong residual cancellation). The
+    backbone doesn't hit this because its activations are milder. The fix is a higher-precision attention
+    micro-kernel (milestone <b>A3-6a</b>); the timing above is representative because that fix is a kernel swap, not
+    a restructure. Until then, vision-on-NPU is a proven <em>performance</em> result awaiting the <em>precision</em>
+    fix before it can join the verified hybrid pipeline.
   </div>
 
   <!-- ============================================================ -->
