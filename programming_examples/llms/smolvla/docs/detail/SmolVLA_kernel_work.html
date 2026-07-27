@@ -304,7 +304,7 @@
     <tr><td>Q / K / V / Out projection</td><td>GEMM bf16-out</td><td><span class="shape">1024×768×768</span></td><td><span class="tiles full">8×4 = 32</span></td><td>3798 GFLOP/s</td><td>9.5e-3</td><td><span class="tag reuse">reuse</span></td></tr>
     <tr><td>MLP fc1 (up)</td><td>GEMM bf16-out</td><td><span class="shape">1024×768×3072</span></td><td><span class="tiles full">8×4 = 32</span></td><td>4195 GFLOP/s</td><td>9.4e-3</td><td><span class="tag reuse">reuse</span></td></tr>
     <tr><td>MLP fc2 (down)</td><td>GEMM bf16-out</td><td><span class="shape">1024×3072×768</span></td><td><span class="tiles full">8×4 = 32</span></td><td>5790 GFLOP/s</td><td>9.4e-3</td><td><span class="tag reuse">reuse</span></td></tr>
-    <tr><td>connector projection</td><td>GEMM bf16-out</td><td><span class="shape">64×12288×960</span></td><td><span class="tiles half">4×4 = 16</span></td><td>1695 GFLOP/s</td><td>9.5e-3</td><td><span class="tag reuse">reuse</span></td></tr>
+    <tr><td>connector projection</td><td>GEMM bf16-out</td><td><span class="shape">64×12288×960</span></td><td><span class="tiles half">4×4 = 16</span></td><td>2246 GFLOP/s<br><span style="color:var(--muted);font-size:0.8rem">weight-DMA-bound (~28 GB/s)</span></td><td>9.5e-3</td><td><span class="tag reuse">reuse</span></td></tr>
     <tr><td>LayerNorm (×2/layer + final)</td><td><b>LayerNorm bf16 (affine)</b></td><td><span class="shape">1024×768</span></td><td><span class="tiles row">8×1 = 8</span></td><td>9.7 GB/s</td><td>4.4e-3</td><td><span class="tag mod">EXTEND</span></td></tr>
     <tr><td>MLP activation</td><td><b>GELU-tanh</b></td><td><span class="shape">1024×3072</span> (N=3.1M)</td><td><span class="tiles half">8×2 = 16</span></td><td>24.1 GB/s</td><td>8.4e-3</td><td><span class="tag reuse">reuse→registry</span></td></tr>
     <tr><td>self-attention (bidirectional)</td><td>FlashAttention (non-causal)</td><td><span class="shape">1024×1024</span>, 12/12</td><td><span class="tiles full">8×4 = 32</span></td><td>1235–1366 GFLOP/s</td><td>4.8e-2</td><td><span class="tag reuse">reuse</span></td></tr>
@@ -408,8 +408,11 @@
     </tr>
     <tr>
       <td>GEMM connector <span class="shape">64×12288×960</span></td>
-      <td>Feared the huge K=12288 would fail to place (→ CPU fallback).</td>
-      <td>K is <em>not</em> the blocker (just more reduction tiles); the tiny M=64 is — it half-fills the array. Places &amp; PASSes, no fallback.</td>
+      <td>Feared the huge K=12288 would fail to place (→ CPU fallback). Then the idle half-array looked like a
+          missed 2×. <b>Both instincts were wrong.</b></td>
+      <td>K is <em>not</em> the blocker (just more reduction tiles) — places &amp; PASSes, no fallback. And the idle
+          half is not the cost: the op is <b>weight-DMA-bound</b>, so filling it is measurably slower. The real win
+          was the <em>tile width</em>: <code>tile_n</code> 80 → <b>240</b> = <b>1.33×</b> at identical accuracy (§7).</td>
     </tr>
     <tr>
       <td>GEMM fc1 <span class="shape">1024×768×3072</span></td>
@@ -461,10 +464,11 @@
       <td>GEMM connector <span class="shape">64×12288×960</span></td>
       <td><span class="tiles half">4×4 = 16</span></td>
       <td><span class="bar" style="width:48px"></span>50%</td>
-      <td><span class="pill warn">capped by the shape</span> <b>M = 64 is the limit, not the tuning.</b> The
-          microkernel's smallest legal <code>tile_m</code> is 16, so <code>tile_m·herd_m = 64 = M</code> allows at
-          most 4 M-columns. Throughput is flat (~1690 GFLOP/s) across every <code>tile_k_l2</code> — it is
-          latency-bound, so the idle half would not help.</td>
+      <td><span class="pill ok">ceiling proven, and correct</span> <b>M = 64 caps it at 16 tiles — and 32 tiles
+          would be <em>slower</em>.</b> The microkernel needs <code>tile_m % 16 == 0</code>, so
+          <code>tile_m·herd_m = 64 = M</code> allows at most 4 M-columns; the full grid was enumerated and 4×4 is the
+          maximum reachable. Padding M to 128 to fill 8×4 was measured and is slower in wall-clock. The kernel is
+          <b>weight-DMA-bound</b>, not tile-bound — see the box below.</td>
     </tr>
     <tr>
       <td>GELU-tanh</td>
@@ -494,6 +498,30 @@
           builder cannot express. See below.</td>
     </tr>
   </table>
+
+  <div class="callout">
+    <b>Case study — "can we fill 8×4?" answered properly for the connector GEMM.</b> This is the one row where the
+    idle half looked like a missed opportunity, so it was measured rather than argued:
+    <ul class="clean" style="margin:0.5rem 0">
+      <li><b>32 tiles is unreachable.</b> Enumerating the whole <code>(tile_m, herd_m, tile_n, herd_n)</code> grid
+        under the microkernel's <code>tile_m%16==0</code> / <code>tile_n%16==0</code> and the divisibility asserts
+        gives <b>4×4 = 16 as the maximum</b>. (<code>tile_n=120</code> would allow <code>herd_n=8</code> since
+        960 = 120·8, but violates <code>n%16</code> — confirmed by compile failure.)</li>
+      <li><b>Forcing it is counter-productive.</b> Padding M 64→128 to genuinely fill 8×4 runs
+        <b>734 µs vs 667–713 µs</b> — <em>slower</em>. The GFLOP/s doubles, but half of it is padding arithmetic.</li>
+      <li><b>Because the bottleneck is bandwidth, not tiles.</b> The weight matrix is
+        <b>23.6 MB — 93% of all traffic, and independent of M</b>. 25.3 MB in ~890 µs ≈ <b>28 GB/s</b>, at the DMA
+        ceiling. Halving K halves the latency (892→518 µs), and the tile sweep 4/8/16 (7358/1668/888 µs) is
+        near-linear then <b>saturates</b>. Idle tiles have no bandwidth left to consume.</li>
+      <li><b>The sweep did find a real 1.33×</b> — just not from tiles. The registry's <code>tile_n</code> was
+        <b>80</b>; the sweep is strongly non-flat (16:3352 µs, 48:1347, 80:890, <b>240:667–713</b>) and
+        <code>tile_n=240</code> is <b>1.33× faster at bit-identical accuracy</b>. The 80 came from the generic
+        "N is not 512-aligned → shrink TILE_N" habit, which is the wrong instinct for tiny-M/huge-K: fewer, larger
+        N-tiles amortize the weight stream better. Registry and the deployment path are now both on 240.</li>
+    </ul>
+    <b>The transferable lesson:</b> "fill the array" is a proxy, not the goal. For a memory-bound op, occupancy stops
+    mattering the moment the DMA saturates — check the arithmetic intensity before treating idle tiles as a bug.
+  </div>
 
   <div class="callout warn">
     <b>The one honest gap: masked-softmax uses 4 of 32 tiles.</b> Every other kernel on this branch is either at 100%
