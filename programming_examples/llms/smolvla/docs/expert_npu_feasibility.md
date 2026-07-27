@@ -15,7 +15,8 @@ that ~480 fused dispatches × ~1.75 ms would bury the expert in ~840 ms of
 overhead. That premise is **wrong by ~50×**: the measured per-dispatch cost of
 the deployed driver path is **24–36 µs**, not 1.75 ms (§5). The real reason is
 that **seq=50 is far too small to feed the array** — every kernel runs at
-200–1100 GFLOP/s against the vision tower's 3798 — and that **every NPU launch
+200–1100 GFLOP/s against the 2046–3366 measured this session for the same
+kernels at the *backbone's* seq=256 (§2) — and that **every NPU launch
 costs ~85 µs no matter how little work it does**, which for a 239-launch denoise
 step is 20 ms/step of pure floor.
 
@@ -92,8 +93,8 @@ Full sweep in `results/expert_gemm.csv`, logs in `results/logs/`.
 | backbone down (seq 256) | 256×2560×960 | **3366** |
 | SmolVLA vision (registry, seq 1024) | 1024×3072×768 | 5790 |
 
-The expert's best GEMM (1122) is **3× below the backbone's down-proj** and
-**5× below the vision tower's**. The expert's *typical* GEMM (559) is
+The expert's best GEMM (1122) is **3× below the backbone's down-proj** (measured
+this session) and **5× below the vision tower's** (registry figure, not re-measured here). The expert's *typical* GEMM (559) is
 **3.7× below the backbone's equivalent projection**.
 
 ### Why: M is the whole story
