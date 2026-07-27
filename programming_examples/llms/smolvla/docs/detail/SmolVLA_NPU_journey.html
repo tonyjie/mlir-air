@@ -127,11 +127,10 @@
     <div class="grp">Part B — Running it on the NPU</div>
     <ol start="5">
       <li><a href="#why">Why an NPU, and which kernels we already have</a></li>
-      <li><a href="#mapping">Our mapping solution: the CPU / NPU hybrid</a></li>
-      <li><a href="#how">How we mapped the backbone (phase by phase)</a></li>
-      <li><a href="#vismap">How we mapped the vision encoder (Milestone A3)</a></li>
-      <li><a href="#correct">Correctness: how we verify it</a></li>
-      <li><a href="#perf">Performance on the NPU (before vs after optimization)</a></li>
+      <li><a href="#mapping"><b>What runs on the NPU today</b></a> — the mapping, both stages</li>
+      <li><a href="#correct"><b>Correctness</b></a> — does it still produce the right actions?</li>
+      <li><a href="#perf"><b>Performance</b></a> — the measured numbers</li>
+      <li><a href="#whyperf"><b>Why the performance looks like this</b></a></li>
       <li><a href="#status">Current status and next steps</a></li>
     </ol>
   </div>
@@ -606,616 +605,402 @@
   </div>
 
   <div class="callout">
-    <b>This table decides the strategy.</b> The <b>backbone</b> is entirely tier-1 (registry) plus the one
-    masked-softmax we built → it moved to the NPU (Milestone A1). For the <b>vision</b> stage, the A3 kernel work
-    below <em>closed the gap entirely</em>: GELU-tanh and LayerNorm were promoted into the registry, conv2d turned
-    out to be im2col + an existing GEMM (no conv kernel), pixel-shuffle is a host reshape, and the large 1024×1024
-    attention was verified on the registry FlashAttention (its <em>even</em> 12 heads even fill the full array).
-    So <b>every vision leaf kernel is now validated on real NPU2</b> — what remains is assembly (wiring the 12
-    layers + host reshape glue + oracle verification, Milestone A3-5). The <b>action expert</b> reuses the
-    backbone's kernels at smaller shapes; its sin/cos already has an example. Net: the milestones are gated by
-    integration + validation effort, not by missing kernels.
+    <b>This table decided the strategy — and the gap has since been closed.</b> The <b>backbone</b> was entirely
+    tier-1 (registry) plus the one masked-softmax we wrote, so it moved to the NPU first. The <b>vision</b> stage
+    then needed no from-scratch kernels either: GELU-tanh and LayerNorm were validated and promoted into the
+    registry, conv2d turned out to be im2col + an existing GEMM, pixel-shuffle is a host reshape, and the large
+    1024×1024 attention ran on the registry FlashAttention (its <em>even</em> 12 heads even fill the whole array).
+    So <b>every kernel both stages need is now validated on real NPU2</b>, and both stages run there — the next
+    section shows exactly how. The <b>action expert</b>, still on the CPU, reuses the backbone's kernels at smaller
+    shapes; its sin/cos already has an example too. Net: progress is gated by integration and validation effort,
+    not by missing kernels.
   </div>
 
   <!-- ============================================================ -->
-  <h2 id="mapping">6. Our mapping solution: the CPU / NPU hybrid</h2>
+  <h2 id="mapping">6. What runs on the NPU today</h2>
 
   <p class="lead">
-    Given the kernel availability above, we built a <b>hybrid pipeline</b>: the NPU runs the language backbone
-    (all its kernels exist); the CPU runs the rest. This is milestone <b>A1</b>.
+    Both heavy stages of SmolVLA now run on the NPU — <b>the vision encoder and the language backbone</b>. Only the
+    action expert is still on the CPU. This section is the single picture of what sits where; the two sections after
+    it give the accuracy and the speed.
+  </p>
+
+  <table>
+    <tr><th>Stage</th><th>What it is</th><th>Share of CPU runtime</th><th>On the NPU?</th></tr>
+    <tr><td><b>① Vision</b> (SigLIP)</td><td>12-layer ViT, run once per camera (<b>×3</b>)</td><td>~69%</td><td><span class="pill npu">✅ fully on NPU</span></td></tr>
+    <tr><td><b>①b Connector</b></td><td>pixel-shuffle + projection into the language space</td><td>~0.5%</td><td><span class="pill npu">✅ on NPU</span> (the projection; the shuffle is a host reshape)</td></tr>
+    <tr><td><b>② Backbone</b> (SmolLM2-360M)</td><td>16-layer transformer prefill</td><td>~9%</td><td><span class="pill npu">✅ fully on NPU</span></td></tr>
+    <tr><td><b>③ Action expert</b></td><td>16 layers × 10 denoising steps</td><td>~32%</td><td><span class="pill cpu">CPU</span> — not started</td></tr>
+  </table>
+  <p class="legend">
+    Percentages are of the measured pure-CPU <code>predict_action_chunk</code> (Section 8's harness). Everything
+    inside stages ① / ①b / ② — every matmul, norm, attention and activation — executes on the NPU; there is
+    <b>no CPU fallback</b> inside them. The host only does data-shuffling glue (see below).
   </p>
 
   <div class="fig">
-  <svg viewBox="0 0 860 340" xmlns="http://www.w3.org/2000/svg" font-family="system-ui, sans-serif">
+  <svg viewBox="0 0 860 360" xmlns="http://www.w3.org/2000/svg" font-family="system-ui, sans-serif">
     <defs><marker id="ar2" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#6b7280"/></marker></defs>
-    <rect x="20" y="20" width="820" height="70" rx="8" fill="#fef3c7" stroke="#d97706" stroke-width="1.5" stroke-dasharray="4 3"/>
-    <text x="32" y="40" font-size="12" font-weight="700" fill="#92400e">CPU</text>
-    <text x="140" y="42" font-size="12" fill="#78350f">3 cameras → SigLIP vision encoder → connector → 192 vision tokens</text>
-    <text x="140" y="60" font-size="12" fill="#78350f">instruction → tokenize → 48 language tokens</text>
-    <text x="140" y="78" font-size="12" fill="#78350f">state → 1 token &nbsp;&nbsp;→&nbsp;&nbsp;concatenate into a prefix (241 tokens, 960-dim each)</text>
-    <line x1="430" y1="90" x2="430" y2="115" stroke="#6b7280" stroke-width="2" marker-end="url(#ar2)"/>
-    <rect x="120" y="118" width="620" height="92" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="3"/>
-    <text x="132" y="138" font-size="12" font-weight="700" fill="#1e40af">NPU2 ★</text>
-    <text x="430" y="140" text-anchor="middle" font-size="13" font-weight="700" fill="#1e3a8a">SmolLM2-360M backbone · 16-layer prefill</text>
-    <text x="430" y="162" text-anchor="middle" font-size="11" fill="#1e3a8a">per layer: RMSNorm → Q/K/V proj → RoPE → non-causal attention → O proj → residual → SwiGLU MLP</text>
-    <text x="430" y="184" text-anchor="middle" font-size="11" fill="#6b7280">all matrix mults / norms / attention / activations run on the NPU</text>
-    <text x="430" y="201" text-anchor="middle" font-size="10.5" fill="#1e40af">produces: each layer's K/V "memory cache"</text>
-    <line x1="430" y1="210" x2="430" y2="235" stroke="#6b7280" stroke-width="2" marker-end="url(#ar2)"/>
-    <text x="445" y="228" font-size="10.5" fill="#6b7280">inject the NPU-computed K/V back into the CPU</text>
-    <rect x="20" y="238" width="820" height="80" rx="8" fill="#fef3c7" stroke="#d97706" stroke-width="1.5" stroke-dasharray="4 3"/>
-    <text x="32" y="258" font-size="12" font-weight="700" fill="#92400e">CPU</text>
-    <text x="140" y="262" font-size="12" fill="#78350f">action expert reads the backbone's K/V cache</text>
-    <text x="140" y="282" font-size="12" fill="#78350f">10-step flow-matching denoise loop</text>
-    <text x="140" y="302" font-size="12" font-weight="700" fill="#78350f">→ outputs a (50, 6) action chunk</text>
+
+    <rect x="20" y="14" width="820" height="44" rx="8" fill="#fef3c7" stroke="#d97706" stroke-width="1.5" stroke-dasharray="4 3"/>
+    <text x="32" y="32" font-size="12" font-weight="700" fill="#92400e">CPU</text>
+    <text x="140" y="32" font-size="12" fill="#78350f">3 camera images · instruction text · robot state</text>
+    <text x="140" y="50" font-size="11.5" fill="#92400e">(image resize/pad, tokenize — cheap preprocessing)</text>
+    <line x1="430" y1="58" x2="430" y2="80" stroke="#6b7280" stroke-width="2" marker-end="url(#ar2)"/>
+
+    <rect x="60" y="83" width="740" height="86" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="3"/>
+    <text x="72" y="101" font-size="12" font-weight="700" fill="#1e40af">NPU2 ★</text>
+    <text x="430" y="103" text-anchor="middle" font-size="13" font-weight="700" fill="#1e3a8a">① Vision encoder — SigLIP, 12 layers, ×3 cameras</text>
+    <text x="430" y="124" text-anchor="middle" font-size="11" fill="#1e3a8a">per layer: LayerNorm → Q/K/V → bidirectional attention → O → residual → LayerNorm → GELU MLP</text>
+    <text x="430" y="142" text-anchor="middle" font-size="11" fill="#1e3a8a">then ①b connector: pixel-shuffle → projection → 64 tokens per image</text>
+    <text x="430" y="160" text-anchor="middle" font-size="10.5" fill="#6b7280">3 dispatches per layer · 38 per image</text>
+    <line x1="430" y1="169" x2="430" y2="189" stroke="#6b7280" stroke-width="2" marker-end="url(#ar2)"/>
+
+    <rect x="20" y="192" width="820" height="34" rx="8" fill="#fef3c7" stroke="#d97706" stroke-width="1.5" stroke-dasharray="4 3"/>
+    <text x="32" y="213" font-size="12" font-weight="700" fill="#92400e">CPU</text>
+    <text x="430" y="213" text-anchor="middle" font-size="12" fill="#78350f">assemble the prefix: 192 vision + 48 language + 1 state = 241 tokens</text>
+    <line x1="430" y1="226" x2="430" y2="246" stroke="#6b7280" stroke-width="2" marker-end="url(#ar2)"/>
+
+    <rect x="60" y="249" width="740" height="62" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="3"/>
+    <text x="72" y="267" font-size="12" font-weight="700" fill="#1e40af">NPU2 ★</text>
+    <text x="430" y="269" text-anchor="middle" font-size="13" font-weight="700" fill="#1e3a8a">② Language backbone — SmolLM2-360M, 16 layers</text>
+    <text x="430" y="289" text-anchor="middle" font-size="11" fill="#1e3a8a">per layer: RMSNorm → Q/K/V → RoPE → masked attention → O → residual → SwiGLU MLP</text>
+    <text x="430" y="305" text-anchor="middle" font-size="10.5" fill="#6b7280">13 dispatches per layer · 208 total — produces the K/V cache</text>
+    <line x1="430" y1="311" x2="430" y2="331" stroke="#6b7280" stroke-width="2" marker-end="url(#ar2)"/>
+
+    <rect x="20" y="334" width="820" height="24" rx="8" fill="#fef3c7" stroke="#d97706" stroke-width="1.5" stroke-dasharray="4 3"/>
+    <text x="32" y="351" font-size="12" font-weight="700" fill="#92400e">CPU</text>
+    <text x="430" y="351" text-anchor="middle" font-size="12" fill="#78350f">③ action expert · 10-step denoise → (50, 6) action chunk</text>
   </svg>
-  <figcaption>The hybrid pipeline: CPU handles pre-processing and action generation; the NPU runs the core 16-layer backbone.</figcaption>
+  <figcaption>Both compute-heavy stages run on the NPU; the CPU keeps the cheap glue and the action expert.</figcaption>
   </div>
 
   <h3>Which original operator each NPU kernel replaces</h3>
+  <p>
+    Two tables, one per stage. They use different operators — that is why the vision work needed two kernels the
+    backbone never did (LayerNorm with affine, GELU-tanh).
+  </p>
+
+  <p style="margin-bottom:0.3rem"><b>① Vision (SigLIP)</b> — seq = 1024 patch tokens, hidden 768, 12 heads (plain MHA), <b>no</b> mask</p>
   <table class="arch">
-    <tr><th>Original operator (PyTorch)</th><th>Replaced by NPU kernel</th><th>Notes</th></tr>
-    <tr><td><code>LlamaRMSNorm</code> (input / post)</td><td><span class="knl">RMSNorm</span> ELF</td><td>fp32 reduction, same as llama/qwen; shape 241×960 validated</td></tr>
-    <tr><td><code>q_proj / k_proj / v_proj</code></td><td><span class="knl">GEMM</span> (fused into the rms_gemms_rope ELF)</td><td>GQA: Q (1,241,960)→(1,241,960), K/V →(1,241,320)</td></tr>
-    <tr><td><code>apply_rotary_pos_emb</code> (RoPE)</td><td><span class="knl">RoPE</span> (same fused ELF)</td><td>half-split, θ=10000 (measured value, not the config's 100000)</td></tr>
-    <tr><td><code>eager_attention_forward</code> (non-causal)</td><td><span class="knl">qkt GEMM</span> + <span class="knl">masked_softmax</span> + <span class="knl">pv GEMM</span></td><td>custom composition, not FlashAttention (see below)</td></tr>
-    <tr><td><code>o_proj</code> + residual</td><td><span class="knl">GEMM</span> + <span class="knl">EltwiseAdd</span> (fused into the o_ffn ELF)</td><td>—</td></tr>
-    <tr><td><code>LlamaMLP</code> (SwiGLU)</td><td><span class="knl">gate/up GEMM</span> + <span class="knl">SiLU-Mul</span> + <span class="knl">down GEMM</span> (o_ffn ELF)</td><td>(1,241,960)→(1,241,2560)→(1,241,960)</td></tr>
+    <tr><th>Original operator</th><th>NPU kernel</th><th>Shape</th></tr>
+    <tr><td><code>Conv2d</code> patch embed</td><td><span class="knl">GEMM</span> (after a host im2col reshape)</td><td><span class="shape">1024×768×768</span></td></tr>
+    <tr><td><code>nn.LayerNorm</code> ×2/layer + final</td><td><span class="knl">LayerNorm</span> (affine γ,β)</td><td><span class="shape">1024×768</span></td></tr>
+    <tr><td><code>q/k/v/out_proj</code> (+bias)</td><td><span class="knl">GEMM</span> (bias folded in)</td><td><span class="shape">1024×768×768</span></td></tr>
+    <tr><td><code>eager_attention</code> (bidirectional)</td><td><span class="knl">FlashAttention</span> (non-causal)</td><td><span class="shape">1024×1024</span>, 12/12</td></tr>
+    <tr><td><code>gelu_pytorch_tanh</code></td><td><span class="knl">GELU-tanh</span></td><td><span class="shape">1024×3072</span></td></tr>
+    <tr><td><code>fc1 / fc2</code> (+bias)</td><td><span class="knl">GEMM</span></td><td><span class="shape">1024×768×3072</span> / <span class="shape">1024×3072×768</span></td></tr>
+    <tr><td>connector projection</td><td><span class="knl">GEMM</span></td><td><span class="shape">64×12288×960</span></td></tr>
+  </table>
+
+  <p style="margin-bottom:0.3rem"><b>② Backbone (SmolLM2)</b> — seq = 241 (padded 256), hidden 960, GQA 15 Q / 5 KV heads, prefix-LM mask</p>
+  <table class="arch">
+    <tr><th>Original operator</th><th>NPU kernel</th><th>Shape</th></tr>
+    <tr><td><code>LlamaRMSNorm</code> ×2/layer</td><td><span class="knl">RMSNorm</span></td><td><span class="shape">256×960</span></td></tr>
+    <tr><td><code>q/k/v_proj</code></td><td><span class="knl">GEMM</span></td><td><span class="shape">256×960×960</span> / <span class="shape">256×960×320</span></td></tr>
+    <tr><td><code>apply_rotary_pos_emb</code></td><td><span class="knl">RoPE</span> (half-split)</td><td>head_dim 64</td></tr>
+    <tr><td><code>eager_attention</code> (prefix-LM mask)</td><td><span class="knl">GEMM</span> + <span class="knl">masked-softmax</span> + <span class="knl">GEMM</span></td><td>scores <span class="shape">15×256×256</span></td></tr>
+    <tr><td><code>o_proj</code> + residual</td><td><span class="knl">GEMM</span> + <span class="knl">EltwiseAdd</span></td><td><span class="shape">256×960×960</span></td></tr>
+    <tr><td><code>LlamaMLP</code> (SwiGLU)</td><td><span class="knl">GEMM</span> + <span class="knl">SiLU-Mul</span> + <span class="knl">GEMM</span></td><td><span class="shape">256×960×2560</span> / <span class="shape">256×2560×960</span></td></tr>
   </table>
   <p class="legend">
-    Every kernel above is from the <b>registry</b> (the 6 tier-1 kernels), reused at SmolVLA's shapes — except
-    <code>masked_softmax</code>, which we built new. The backbone runs seq=241 padded to <b>256</b>; the GEMMs pick
-    fused-cast vs drain per shape via <code>gemm_registry_config</code> (registry-driven, same mechanism as the
-    llama/qwen siblings).
+    Every kernel above comes from the shared <b>kernel_registry</b>, reused at SmolVLA's shapes — except
+    <code>masked-softmax</code>, which we wrote (the backbone's prefix-LM mask can't be expressed by
+    FlashAttention's causal on/off switch — see Section 5), and <b>LayerNorm</b> / <b>GELU-tanh</b>, which we
+    extended and promoted into the registry for the vision work. Full kernel-level detail lives in the companion
+    <em>kernel-work</em> artifact.
   </p>
 
-  <h3>Per-layer kernel sequence (what runs where, with shapes)</h3>
+  <h3>What one layer actually dispatches</h3>
   <p>
-    Below is one backbone layer, top to bottom, in the same style as the llama/qwen deployment docs.
-    <span style="color:#1e40af;font-weight:600">[NPU elf:...]</span> = a fused ELF (one compiled program = one XRT
-    dispatch chaining several kernels); <b>(HOST)</b> = runs on CPU. All NPU shapes are at <b>seq padded 241→256</b>.
-    This is the <code>make verify</code> path (approach-B attention on NPU).
+    <span style="color:#1e40af;font-weight:600">[NPU elf:…]</span> = one compiled program = one dispatch to the
+    chip; <b>FUSED</b> means several operations were merged into that single program. <b>(HOST)</b> = runs on CPU.
+    The contrast between the two stages is the key to Section 9's performance story.
   </p>
   <div class="card" style="font-family:'SF Mono',Menlo,Consolas,monospace;font-size:0.82rem;line-height:1.7;white-space:pre-wrap">
-<span style="color:#374151">x [256,960]</span>
- ─<span style="color:#1e40af;font-weight:700">[NPU elf:rms_gemms_rope]</span>  <span class="knl">FUSED, 6 launches, 1 ELF</span> <span style="color:#6b7280">· reused from llama</span>
-     { RMSNorm + Q/K/V GEMM + RoPE-Q + RoPE-K }
-     GEMM Q [256,960]×[960,960]→[256,960] · K/V [256,960]×[960,320]→[256,320]
-     → q_roped[256,960]  k_roped[256,320]  v[256,320]
- ─<b>attention</b>  <span class="knl miss">NOT fused — 11 dispatches</span> <span style="color:#6b7280">· new this project</span>
-     (HOST) reshape to heads, transpose Kᵀ, stack 3 q-heads/kv-group, fold mask
-     5× <span style="color:#1e40af;font-weight:700">[NPU elf:qkt]</span> GEMM  [768,64]×[64,256]→[768,256]  <span style="color:#6b7280">(3 heads batched, M=3·256)</span>
-     1× <span style="color:#1e40af;font-weight:700">[NPU elf:masked_softmax]</span>  scores[15,256,256], all heads at once
-     5× <span style="color:#1e40af;font-weight:700">[NPU elf:pv]</span> GEMM  [768,256]×[256,64]→[768,64]
-     → attn_out[256,960]
- ─<span style="color:#1e40af;font-weight:700">[NPU elf:o_ffn]</span>  <span class="knl">FUSED, 8 launches, 1 ELF</span> <span style="color:#6b7280">· reused from llama</span>
-     { O GEMM + Add + RMSNorm + Gate + Up + SwiGLU + Down + Add }
-     O [256,960]×[960,960] · Gate/Up [256,960]×[960,2560] · Down [256,2560]×[2560,960]
-     → layer_out[256,960]
-
-once after 16 layers: (HOST) final RMSNorm [256,960]
-  </div>
-  <p class="legend">
-    <b>Totals per layer:</b> 2 fused ELFs (rms_gemms_rope=6 launches, o_ffn=8 launches) + 11 attention dispatches
-    = <b>13 XRT dispatches/layer × 16 = 208</b>. <b>5 distinct ELFs</b> compiled once &amp; cached:
-    <code>rms_gemms_rope</code>, <code>qkt</code>, <code>masked_softmax</code>, <code>pv</code>, <code>o_ffn</code>.
-  </p>
-  <p class="legend">
-    <b>On NPU:</b> every GEMM (Q/K/V/O/Gate/Up/Down), RMSNorm, RoPE, and the whole attention (QKᵀ, softmax, PV).
-    <b>On host (CPU):</b> (1) the per-layer attention glue — reshape to heads, the Kᵀ transpose, stacking q-heads
-    per GQA group, folding the additive prefix-LM mask into the score buffer (this is the un-fused part's
-    overhead); (2) the single final RMSNorm after layer 16 (outside the hot loop, sibling-consistent);
-    (3) the once-per-inference prefix assembly (vision/connector/tokenize) and the whole action expert — Sections 5-6.
-    <b>Other overhead:</b> the two-process npz bridge (lerobot venv ↔ NPU-python) and one-time kernel compile
-    (~68 s), both excluded from the ~217 ms figure.
-  </p>
-  <p class="legend">
-    <b>Why this shape of performance:</b> the 2 non-attention ELFs are already fused (1 dispatch each); the
-    attention's 11 dispatches are the un-fused remainder and the reason approach-B sits at ~217 ms. The FA
-    experiment (Section 9) collapses those 11 into 1 (→105 ms) but fails correctness; fusing attention into the
-    per-layer ELF while keeping the prefix-LM mask is the real ceiling (Route 3).
-  </p>
-
-  <div class="card">
-    <p style="margin-top:0"><b>Key design: how the non-causal attention was built</b></p>
-    <p style="margin-bottom:0">
-      The backbone's attention is a <b>prefix-LM mask</b> (image + text see each other both ways; the state token
-      starts a new block). The registry FlashAttention kernel supports both causal and non-causal attention — but
-      its mask is a single <em>boolean</em> switch (causal on/off), which can't express this mixed prefix-LM
-      pattern (see the "Why not use FlashAttention" box in Section 5). And the score matrix is only
-      <span class="shape">241×241</span> — small enough to fit on-chip, so FlashAttention's long-sequence
-      online-softmax machinery buys nothing here. So we compose attention from three simple blocks:
-      <span class="knl">GEMM</span> for Q×Kᵀ → <span class="knl">masked_softmax</span> (a new kernel handling all
-      heads + an arbitrary host mask at once) → <span class="knl">GEMM</span> for probabilities×V. Because the mask
-      is host-supplied, causal, bidirectional, prefix-LM, and padding-aware are all possible.
-    </p>
-  </div>
-
-  <div class="callout warn">
-    <b>Is the whole backbone on the NPU? Yes — but only the backbone.</b> All 16 backbone layers' compute
-    (RMSNorm, every GEMM projection, RoPE, attention, SwiGLU) runs on NPU; only the single post-layer-16 RMSNorm
-    stays on CPU (outside the hot loop, sibling-consistent). What is <em>not</em> on the NPU at all: ① the vision
-    encoder + connector and ③ the action expert + 10-step denoise loop — these remain fully on CPU (see Section 5
-    for what each would need; the expert is the natural next milestone since its cross-attention already reads the
-    backbone K/V cache the hybrid pipeline produces).
-  </div>
-
-  <!-- ============================================================ -->
-  <h2 id="how">7. How we mapped the backbone (phase by phase)</h2>
-
-  <p>Like stacking bricks, <b>every step was verified correct before adding the next</b>. Four phases:</p>
-
-  <div class="card">
-    <p><span class="step-num">0</span><b>Build a CPU reference (the "answer key")</b></p>
-    <p style="margin-left:2.2rem">
-      Run the real SmolVLA on CPU and record every layer's output as the oracle. Everything the NPU computes is
-      checked against it. <span class="pill done">✅ done</span>
-    </p>
-    <p style="margin-left:2.2rem;color:var(--muted);font-size:0.9rem">
-      💡 This caught a trap: the config says the RoPE parameter is 100000, but the code uses 10000 at runtime —
-      found only by comparing against the answer key. The wrong value would silently corrupt the backbone.
-    </p>
-  </div>
-  <div class="card">
-    <p><span class="step-num">1</span><b>Validate each kernel</b></p>
-    <p style="margin-left:2.2rem">
-      Re-test the 7 existing kernels at SmolVLA's sizes, and build the one new kernel (non-causal masked softmax)
-      from "matmul + masked softmax." <span class="pill done">✅ done</span>
-    </p>
-  </div>
-  <div class="card">
-    <p><span class="step-num">2</span><b>Assemble ONE layer</b></p>
-    <p style="margin-left:2.2rem">
-      Run the backbone's first layer on the NPU, compare with the answer key: similarity <b>0.99998</b>
-      (1.0 = identical). <span class="pill done">✅ done</span>
-    </p>
-  </div>
-  <div class="card">
-    <p><span class="step-num">3</span><b>Scale to 16 layers, run end to end</b></p>
-    <p style="margin-left:2.2rem">
-      Run all 16 layers, inject the NPU K/V into the CPU action expert, produce the action chunk, compare with the
-      pure-CPU chunk. <span class="pill done">✅ done</span>
-    </p>
-    <p style="margin-left:2.2rem;color:var(--muted);font-size:0.9rem">
-      💡 A "perturbation test" (replacing the NPU K/V with random noise makes the action change drastically)
-      proves the action is genuinely driven by the NPU's computation, not the CPU.
-    </p>
-  </div>
-
-  <!-- ============================================================ -->
-  <h2 id="vismap">7.5. How we mapped the vision encoder (Milestone A3)</h2>
-
-  <p class="lead">
-    The same recipe as the backbone, applied to the 74%-of-runtime SigLIP vision encoder: validate every leaf
-    kernel at the vision shapes, then assemble the 12 layers and check against a CPU answer key. The vision tower
-    is a <b>12-layer ViT</b>: image → 1024 patch tokens (768-dim), 12 standard (non-GQA) attention heads,
-    bidirectional (no mask), LayerNorm (not RMSNorm), GELU-tanh MLP.
-  </p>
-
-  <h3>Which original operator each NPU kernel replaces</h3>
-  <table class="arch">
-    <tr><th>Original operator (PyTorch)</th><th>Replaced by NPU kernel</th><th>Notes</th></tr>
-    <tr><td><code>Conv2d</code> patch embed</td><td><span class="knl">GEMM</span> (after host im2col)</td><td>stride=kernel=16 (non-overlapping) ⇒ reshape + matmul; <b>no conv kernel</b>. <span class="shape">1024×768×768</span></td></tr>
-    <tr><td><code>nn.LayerNorm</code> (×2/layer + final)</td><td><span class="knl">LayerNorm</span> ELF (affine)</td><td>subtract-mean + γ,β; we extended the example to add affine. <span class="shape">1024×768</span>, eps 1e-6</td></tr>
-    <tr><td><code>q/k/v/out_proj</code> (+bias)</td><td><span class="knl">GEMM</span> + host bias-add</td><td>MHA, no GQA — all 4 are <span class="shape">1024×768×768</span></td></tr>
-    <tr><td><code>eager_attention</code> (bidirectional)</td><td><span class="knl">FlashAttention</span> (non-causal)</td><td>no mask ⇒ FA fits directly; <span class="shape">1024×1024</span>, 12/12, scale 1/8, fills full 8×4 array</td></tr>
-    <tr><td><code>gelu_pytorch_tanh</code></td><td><span class="knl">GELU-tanh</span> ELF</td><td>same hardware-tanh kernel, promoted to the registry. <span class="shape">1024×3072</span></td></tr>
-    <tr><td><code>fc1 / fc2</code> (+bias)</td><td><span class="knl">GEMM</span> + host bias-add</td><td>up <span class="shape">1024×768×3072</span> · down <span class="shape">1024×3072×768</span></td></tr>
-    <tr><td>connector: pixel-shuffle + proj</td><td>host reshape + <span class="knl">GEMM</span></td><td>space-to-depth is a pure index remap (host); proj <span class="shape">64×12288×960</span> <span style="color:#6b7280">(A3-5 Step 4)</span></td></tr>
-  </table>
-  <p class="legend">
-    Contrast with the backbone: <b>no RoPE</b> (vision uses an additive position embedding), <b>no GQA</b> (12 full
-    heads), <b>LayerNorm instead of RMSNorm</b>, <b>GELU instead of SwiGLU</b>, and <b>a bias on every Linear</b>
-    (the backbone was bias-free). Every heavy kernel is from the registry — two of them (LayerNorm affine, GELU-tanh)
-    were promoted <em>during</em> this work; see the kernel-work companion artifact.
-  </p>
-
-  <h3>Per-layer kernel sequence (what runs where, with shapes)</h3>
-  <p>
-    One SigLIP encoder layer, top to bottom, same notation as the backbone above.
-    <span style="color:#1e40af;font-weight:600">[NPU elf:...]</span> = one compiled program = one XRT dispatch;
-    <b>(HOST)</b> = runs on CPU. This shows the <em>first, correctness-first</em> build — each op as its own
-    dispatch, with biases / residuals / im2col on the host. The optimization that follows keeps this exact math but
-    fuses the ops and moves the glue on-device.
-  </p>
-  <div class="card" style="font-family:'SF Mono',Menlo,Consolas,monospace;font-size:0.82rem;line-height:1.7;white-space:pre-wrap">
-<span style="color:#374151">once, before layer 0: (HOST) im2col patch-embed + position-embedding → x [1024,768]</span>
-
-<span style="color:#374151">x [1024,768]</span>
- ─<span style="color:#1e40af;font-weight:700">[NPU elf:layer_norm]</span>  LayerNorm1 (affine)
- ─<span style="color:#1e40af;font-weight:700">[NPU elf:gemm_qkvo]</span> ×3  Q,K,V  [1024,768]×[768,768]  <span style="color:#6b7280">+ (HOST) bias-add</span>
- ─<span style="color:#1e40af;font-weight:700">[NPU elf:flash_attn]</span>  bidirectional MHA  [1024,1024], 12/12, scale 1/8
- ─<span style="color:#1e40af;font-weight:700">[NPU elf:gemm_qkvo]</span>  O proj [1024,768]×[768,768]  <span style="color:#6b7280">+ (HOST) bias-add</span>
- ─(HOST) residual add  x = x + attn_out
- ─<span style="color:#1e40af;font-weight:700">[NPU elf:layer_norm]</span>  LayerNorm2 (affine)
- ─<span style="color:#1e40af;font-weight:700">[NPU elf:gemm_fc1]</span>  fc1 [1024,768]×[768,3072]  <span style="color:#6b7280">+ (HOST) bias-add</span>
- ─<span style="color:#1e40af;font-weight:700">[NPU elf:gelu]</span>  GELU-tanh  [1024,3072]
- ─<span style="color:#1e40af;font-weight:700">[NPU elf:gemm_fc2]</span>  fc2 [1024,3072]×[3072,768]  <span style="color:#6b7280">+ (HOST) bias-add</span>
- ─(HOST) residual add  x = x + mlp_out
+<b style="font-family:inherit">① VISION — one of 12 layers</b>   <span class="knl">3 dispatches/layer</span>
+<span style="color:#6b7280">once per image, before layer 0: (HOST) im2col patch-embed + position-embedding → x [1024,768]</span>
+ ─<span style="color:#1e40af;font-weight:700">[NPU elf:vit_ln_qkv]</span>  <span class="knl">FUSED, 7 launches</span>  { LayerNorm1 + Q + K + V GEMM + biases }
+ ─<span style="color:#1e40af;font-weight:700">[NPU elf:flash_attn]</span>  bidirectional MHA  [1024,1024], 12 heads, scale 1/8
+ ─<span style="color:#1e40af;font-weight:700">[NPU elf:vit_o_ffn]</span>   <span class="knl">FUSED, 10 launches</span> { O + residual + LayerNorm2 + fc1 + GELU + fc2 + residual }
      → layer_out [1024,768]
+<span style="color:#6b7280">once after 12 layers: [NPU elf:layer_norm] post_layernorm
+once per image:       (HOST) pixel-shuffle → [NPU elf:gemm_connector] 64×12288×960</span>
+<b style="font-family:inherit">→ 38 dispatches per image · 114 for all 3 cameras</b>
 
-once after 12 layers: <span style="color:#1e40af;font-weight:700">[NPU elf:layer_norm]</span> post_layernorm [1024,768]
-  </div>
-  <p class="legend">
-    <b>That was the first (correctness-first) version:</b> 10 separate NPU dispatches/layer × 12 = <b>120</b>, with
-    bias-adds and residuals on the host. <b>It has since been fused</b> — see the optimization below, which keeps
-    exactly the same math but collapses those into <b>3 dispatches/layer</b> and moves the bias/residual on-device.
-  </p>
-
-  <h3>Optimizing it: the bottleneck was not the NPU</h3>
-  <p>
-    Before tuning anything, we profiled where the 12-layer encoder's time actually went. The result was decisive:
-    of the total, only ~141 ms was real NPU compute — the rest was <b>host gap</b>, ~1.75 ms of Python + driver
-    overhead per dispatch × 121 dispatches. The encoder was <b>host-bound, not compute-bound</b>, so the lever was
-    <em>fewer dispatches</em>, not faster kernels.
-  </p>
-  <table>
-    <tr><th></th><th>Before (one ELF per op)</th><th>After (fused)</th></tr>
-    <tr><td>NPU dispatches</td><td>121</td><td><b>37</b> (3/layer + final LN)</td></tr>
-    <tr><td>host gap (overhead)</td><td>212 ms</td><td><b>4 ms</b></td></tr>
-    <tr><td>bias-adds &amp; residuals</td><td>on host (f32)</td><td><b>on device</b> (bf16)</td></tr>
-    <tr><td>wall time</td><td>368 ms</td><td><b>141.6 ms</b></td></tr>
-    <tr><td>accuracy vs CPU answer key</td><td>0.945 (below gate)</td><td><b>0.990 — PASS</b></td></tr>
-  </table>
-  <p class="legend">
-    The fusion builds two multi-launch ELFs — <code>vit_ln_qkv</code> (LayerNorm + Q/K/V + biases) and
-    <code>vit_o_ffn</code> (O-proj + residual + LayerNorm + fc1 + GELU + fc2 + residual) — using the same stitching
-    machinery the language backbone uses, plus FlashAttention as the third dispatch.
-  </p>
-
-  <div class="stat-row">
-    <div class="stat"><div class="big-num">138 ms</div><div class="label">NPU vision encoder<br>(per image, fused, measured)</div></div>
-    <div class="stat"><div class="big-num">237 ms</div><div class="label">CPU vision encoder<br>(per image, bf16 PyTorch)</div></div>
-    <div class="stat"><div class="big-num">1.72×</div><div class="label">NPU faster than CPU<br>(and passes the 0.99 gate)</div></div>
+<b style="font-family:inherit">② BACKBONE — one of 16 layers</b>   <span class="knl miss">13 dispatches/layer</span>
+<span style="color:#374151">x [256,960]</span>
+ ─<span style="color:#1e40af;font-weight:700">[NPU elf:rms_gemms_rope]</span>  <span class="knl">FUSED, 6 launches</span> { RMSNorm + Q/K/V GEMM + RoPE-Q + RoPE-K }
+ ─<b style="font-family:inherit">attention</b>  <span class="knl miss">NOT fused — 11 dispatches</span>
+     (HOST) reshape to heads, transpose Kᵀ, fold in the prefix-LM mask
+     5× <span style="color:#1e40af;font-weight:700">[NPU elf:qkt]</span> · 1× <span style="color:#1e40af;font-weight:700">[NPU elf:masked_softmax]</span> · 5× <span style="color:#1e40af;font-weight:700">[NPU elf:pv]</span>
+ ─<span style="color:#1e40af;font-weight:700">[NPU elf:o_ffn]</span>  <span class="knl">FUSED, 8 launches</span> { O + Add + RMSNorm + Gate + Up + SwiGLU + Down + Add }
+     → layer_out [256,960]
+<span style="color:#6b7280">once after 16 layers: (HOST) final RMSNorm</span>
+<b style="font-family:inherit">→ 208 dispatches per inference</b>
   </div>
   <div class="callout">
-    <b>Vision on the NPU is 1.72× faster than the CPU, and it passes the accuracy gate.</b> Measured wall time
-    (compile excluded, median of 10 runs): <b>138 ms per image on NPU</b> vs <b>237 ms on CPU</b>.
-    <b>Careful with the units:</b> SmolVLA has <b>three cameras</b>, and the encoder runs once per image — so a
-    full inference is <b>3 × 138 = 413 ms on NPU</b> vs the <b>711–719 ms</b> CPU vision stage quoted in Section 4.
-    (Comparing one NPU image against the three-image CPU stage would wrongly suggest ~5×.)
-    The win's direction is still the opposite of the backbone result (Section 9), and the reason is <em>shape</em>:
-    vision runs at seq=1024 with big matmuls (fc up to 3072-wide, a 1024×1024 attention), so the NPU's matrix engine
-    is well-fed and per-dispatch overhead is amortized. The backbone, at seq=256, is too small to fill the array.
-  </div>
-  <div class="callout">
-    <b>Why three cameras cost 3× (and why batching them barely helps).</b> The encoder does <em>independent</em>
-    work per image: each 512×512 frame becomes 1024 patch tokens that flow through all 12 layers, and attention is
-    within-image (1024×1024), never across images. So three cameras are inherently 3× the FLOPs — that's the
-    algorithm, not the scheduling. lerobot reflects this literally: <code>embed_prefix</code> <em>loops</em> over
-    the images and calls <code>embed_image()</code> once per camera.
-    Feeding all three as one batch is possible, but measured on CPU it saves only <b>9%</b>
-    (608 ms → 554 ms) — it removes per-call overhead, not arithmetic. On the NPU the equivalent headroom is smaller
-    still: after fusion the host overhead is already down to ~4 ms per image (~3%), so batching would recover a few
-    percent at best. Real vision headroom lies elsewhere (e.g. the memory-bound norm/activation ops inside the
-    137 ms), not in batching the cameras.
+    <b>Read this comparison — it explains almost everything in Section 9.</b> Vision was <em>fused</em>: 12 layers
+    cost only 38 dispatches. The backbone's attention was <em>not</em>: its 11 unfused dispatches per layer make
+    208 in total, on a stage that is 8× smaller than vision. Since each dispatch costs roughly the same fixed
+    overhead regardless of how much work it carries, the backbone pays that toll ~5× more often for far less
+    compute.
   </div>
 
-  <div class="callout">
-    <b>A surprise: fusing for speed also fixed the accuracy.</b> In the unfused version, running all 12 layers in
-    sequence had dropped the final similarity to <b>0.945</b> (below the 0.99 gate) — a <em>systematic</em> bias
-    from the NPU's block-float (BFP16) matmul accumulating across layers. We had accepted that as a precision
-    ceiling (BFP16 is the format the NPU needs for speed; forcing plain BF16 would be far slower). Fusion removed it
-    as a side effect: doing the bias-adds and residuals <b>on-device in bf16</b> eliminated a host
-    <code>bf16→f32→bf16</code> round-trip that had been <em>amplifying</em> that bias each layer. Result:
-    <b>0.945 → 0.990, PASS</b>, with all 12 per-layer similarities above 0.996. This was verified independently on
-    real hardware, and each fused ELF was checked against a numeric mirror of its own sub-graph first, so the gain
-    is real rather than a masked error.
-  </div>
+  <h3>What stays on the host, and why it isn't a fallback</h3>
+  <ul class="clean">
+    <li><b>im2col</b> (once per image) and <b>pixel-shuffle</b> (once per image) — pure index reshuffles with
+      <em>zero arithmetic</em>; running them on the NPU would cost more in data movement than it saves.</li>
+    <li><b>The backbone's attention glue</b> — reshaping to heads, transposing Kᵀ, folding the mask into the score
+      buffer. This is a consequence of attention not being fused, and disappears if it is.</li>
+    <li><b>One final RMSNorm</b> after layer 16 (outside the hot loop, consistent with the sibling deployments).</li>
+    <li><b>The whole action expert</b> — by design, not yet started.</li>
+  </ul>
 
   <!-- ============================================================ -->
-  <h2 id="correct">8. Correctness: how we verify it</h2>
+  <h2 id="correct">7. Correctness: does it still produce the right actions?</h2>
 
   <p class="lead">
-    "Correct" for a VLA can mean two different things, and it's worth separating them:
+    "Correct" for a robot policy can mean two different things, and they are not interchangeable:
   </p>
   <table>
     <tr><th>Question</th><th>Reference</th><th>Name</th></tr>
-    <tr><td>Did the NPU port introduce a bug / precision loss?</td><td>the real CPU model (lerobot PyTorch)</td><td><b>port fidelity</b></td></tr>
-    <tr><td>Does the model actually produce good robot actions?</td><td>ground-truth recorded trajectories</td><td><b>task fidelity</b></td></tr>
+    <tr><td>Did moving to the NPU introduce a bug or precision loss?</td><td>the real CPU model (lerobot PyTorch)</td><td><b>port fidelity</b></td></tr>
+    <tr><td>Does the model produce <em>good robot actions</em>?</td><td>ground-truth recorded trajectories</td><td><b>task fidelity</b></td></tr>
   </table>
   <p>
-    These don't substitute for each other — the CPU model itself isn't a perfect policy, so matching it proves
-    "we didn't break it," not "the actions are good." For a <em>port</em>, the right primary reference is the CPU
-    model (our job is to move it to the NPU without damage). That is what we verify today.
+    Our job is a <b>port</b>: move the computation to the NPU without damaging it. So the reference that matters is
+    the real CPU model — matching it proves "we didn't break it." (The CPU model itself isn't a perfect policy;
+    task fidelity would need the LIBERO-finetuned checkpoint, discussed at the end of this section.)
   </p>
 
-  <h3>What we verify now (port fidelity)</h3>
+  <h3>How it was built: every step verified before the next</h3>
   <p>
-    The NPU computes in bf16 — the <b>same precision as the real CPU model</b> (Section 4: its weights are already
-    bf16), so this is apples-to-apples. The reference is the unmodified lerobot
-    <code>predict_action_chunk</code> output (<b>not</b> the NumPy timing baseline from Section 9). Two tracks:
+    Both stages were brought up the same way, and the ordering is the reason the port is trustworthy:
+    ① dump a CPU "answer key" from the real model → ② validate each kernel alone at SmolVLA's exact shapes →
+    ③ assemble <em>one</em> layer and compare → ④ scale to all layers → ⑤ run end-to-end and compare the action
+    chunk. A mismatch at any step is localized to what was just added.
   </p>
-  <div class="stat-row">
-    <div class="stat">
-      <div class="big-num">0.9962</div>
-      <div class="label">16-layer backbone output<br>vs CPU model (cosine) — <i>diagnosis</i></div>
-    </div>
-    <div class="stat">
-      <div class="big-num">0.9971</div>
-      <div class="label">final action chunk<br>vs CPU model (cosine) — <i>the gate</i></div>
-    </div>
-    <div class="stat">
-      <div class="big-num">PASS</div>
-      <div class="label"><code>make verify</code><br>cosine ≥ 0.99 &amp; nmse ≤ 0.04</div>
-    </div>
-  </div>
-  <p>
-    <b>Metric:</b> median per-position cosine + a magnitude-invariant normalized MSE, on the (1,50,6) action chunk.
-    <b>Gate:</b> end-to-end only — per-layer cosine is a <em>diagnosis lens</em> (localizes which layer drifts),
-    never the gate, because per-layer can look fine while the end-to-end result fails (our FlashAttention
-    experiment in Section 9 showed exactly this: per-layer stayed ≥0.995 but the final chunk fell to 0.983).
+  <p class="legend">
+    This caught things a final end-to-end check never would have. Example: the model's config says the RoPE
+    parameter is 100000, but the code actually uses 10000 at runtime — visible only by comparing a single layer
+    against the answer key. Silently wrong, and it would have corrupted the whole backbone.
+  </p>
+
+  <h3>The gates, and what they currently report</h3>
+  <table>
+    <tr><th>What is compared</th><th>Against</th><th>Result</th></tr>
+    <tr><td>Vision encoder output (12 layers)</td><td>real lerobot vision output</td><td>similarity <b>0.9906</b> <span class="pill done">PASS</span></td></tr>
+    <tr><td>Connector output</td><td>real lerobot connector output</td><td>similarity <b>0.99999</b> (kernel alone) <span class="pill done">PASS</span></td></tr>
+    <tr><td>Backbone: each of 16 layers</td><td>real lerobot per-layer output</td><td>all <b>&gt; 0.98</b> <span class="pill done">PASS</span></td></tr>
+    <tr><td><b>Final action chunk</b> — NPU backbone only</td><td>pure-CPU lerobot action chunk</td><td>cosine <b>0.9971</b>, nMSE 0.0078 <span class="pill done">PASS</span></td></tr>
+    <tr><td><b>Final action chunk</b> — NPU vision <em>and</em> backbone</td><td>pure-CPU lerobot action chunk</td><td>cosine <b>0.9940</b>, nMSE 0.0122 <span class="pill done">PASS</span></td></tr>
+  </table>
+  <p class="legend">
+    Gate thresholds: cosine ≥ 0.99 and normalized MSE ≤ 0.04, on the full (50, 6) action chunk with fixed noise so
+    the comparison is deterministic. Adding the NPU vision costs only ~0.003 cosine — comfortable margin.
+    The per-layer checks are <em>diagnosis</em>, never the gate: an earlier experiment passed every layer yet failed
+    end-to-end, so only the action chunk decides.
   </p>
 
   <div class="callout">
-    <b>Port fidelity is verified.</b> action-chunk cosine 0.9971 vs the real CPU model (gate 0.99); all error is
-    bf16 rounding, within expectations. Measured on <b>real NPU2 hardware</b>. A perturbation test (randomizing the
-    NPU K/V collapses the action) confirms the action is genuinely driven by the NPU compute.
+    <b>The port is verified end-to-end against the real model.</b> With both the vision encoder and the language
+    backbone on the NPU, the produced action chunk still matches the pure-CPU lerobot output at 0.994 similarity —
+    inside the gate with room to spare.
   </div>
 
-  <h3>Known limitations of the current metric</h3>
+  <h3>What this metric does <em>not</em> tell us</h3>
   <ul class="clean">
-    <li><b>Cosine has blind spots for a physical output.</b> It is scale/shift-invariant, so a systematically
-      scaled action (e.g. gripper amplitude 20% low) can still score high — yet the robot would miss. A stronger
-      metric would be <b>per-dimension</b> (report the <em>worst</em> of the 6-7 action dims, not the global
-      median) with each dim normalized by its own magnitude.</li>
-    <li><b>Single input.</b> We gate on one synthetic batch. A distribution of prompts/observations (like the
-      token-set gate used for the LLM deployments) would be more robust.</li>
-    <li><b>Thresholds are pinned to a clean run, not to physics.</b> 0.99 was rounded down from the observed
-      0.9971 — it flags "worse than a clean bf16 run," not "the task fails." Giving it physical meaning requires
-      task fidelity (below).</li>
+    <li><b>Cosine is scale-blind</b>, and these are physical outputs. A systematically scaled action would still
+      score well. We also report normalized MSE for that reason, but per-dimension error would be stricter.</li>
+    <li><b>One input.</b> The gate uses a single synthetic observation, so it cannot catch input-dependent effects.</li>
+    <li><b>Thresholds are engineering, not physics.</b> 0.99 was set from what a clean run achieves, not from
+      "the robot still completes the task."</li>
+    <li><b>No ground truth.</b> The base checkpoint has no recorded trajectories to score against. Getting true
+      task fidelity means porting to the LIBERO-finetuned checkpoint — mechanically cheap (the backbone dimensions
+      are identical, so the kernels and fused programs carry over unchanged; it is 32 layers instead of 16 and
+      2 cameras instead of 3).</li>
   </ul>
 
-  <h3>Adding task fidelity (ground-truth) — what it would take</h3>
-  <p>
-    The gold standard is comparing predicted actions to <b>ground-truth recorded trajectories</b> — measuring
-    whether the NPU port <em>additionally</em> widens the action-vs-GT error the CPU model already has (the
-    playground's <code>eval_vs_groundtruth.py</code> is exactly this idea: on real LIBERO observations, feeding
-    true inputs cut action MSE by 85.9% vs zeros). But it <b>cannot be done on our A1 target</b>, and here's why:
-  </p>
-  <div class="callout warn">
-    <b>The base checkpoint has no usable ground truth.</b> <code>lerobot/smolvla_base</code> (what A1 deploys) is
-    pretrained on SO101 real-robot data and runs on synthetic inputs here — there is no matching GT trajectory.
-    Ground-truth validation needs the <b>LIBERO-finetuned checkpoint</b> <code>HuggingFaceVLA/smolvla_libero</code>,
-    whose I/O matches the <code>HuggingFaceVLA/libero</code> dataset. That checkpoint has a slightly different shape,
-    so it is a small (not free) re-port:
-    <table style="margin-top:0.6rem">
-      <tr><th></th><th>base (A1)</th><th>libero (for GT)</th><th>port impact</th></tr>
-      <tr><td>backbone hidden/heads/kv/head_dim/inter</td><td>960/15/5/64/2560</td><td><b>identical</b></td><td>✅ same kernels + fused ELFs reused</td></tr>
-      <tr><td>backbone layers</td><td>16</td><td>32</td><td>◐ loop 32×, same ELF</td></tr>
-      <tr><td>cameras → visual tokens</td><td>3 → 192</td><td>2 → 128</td><td>◐ host prefix assembly</td></tr>
-      <tr><td>state dim</td><td>6</td><td>8</td><td>✅ both pad to 32</td></tr>
-      <tr><td>prefix seq length</td><td>241</td><td>~177</td><td>◐ mask/pad (kernels unchanged if padded to 256)</td></tr>
-      <tr><td>action expert hidden/layers/inter</td><td>720/16/2048</td><td>480/32/1280</td><td>⚠️ matters for A2 (expert on NPU)</td></tr>
-    </table>
-    So migrating the <b>backbone</b> to libero is nearly free (identical core kernel shapes; only host-side prefix
-    assembly + the 16→32 loop change). The payoff: libero is the <em>only</em> way to measure task fidelity, since
-    it's the checkpoint with real GT. (Closed-loop task <em>success rate</em> — rollout in MuJoCo+LIBERO — is a
-    further step that needs a GPU sim and is out of scope here.)
-  </div>
-
   <!-- ============================================================ -->
-  <h2 id="perf">9. Performance on the NPU (before vs after optimization)</h2>
+  <h2 id="perf">8. Performance: the measured numbers</h2>
 
-  <p>
-    This project was <b>correctness-first, then optimize speed</b>. On the first measurement the NPU backbone was
-    slower than it needed to be — because the attention part split the 15 heads into many small jobs, so each layer
-    issued <b>31 attention dispatches</b> (15 QKᵀ + 1 softmax + 15 PV) on top of the 2 fused ELFs = 33/layer, and
-    the <b>job-launch overhead</b> added up (~528 across 16 layers).
+  <p class="lead">
+    All numbers below are wall-clock on real hardware, median of repeated runs, one-time compilation excluded.
+    The reference is the <b>real lerobot CPU model</b> — not a simplified re-implementation.
   </p>
-  <div class="analogy">
-    <b>Analogy:</b> like 15 small files each making a separate trip to the printer — the walking takes longer than
-    the printing. The fix is to <b>batch what can be batched into one print job</b>.
-  </div>
-  <p>
-    <b>Optimization (Route 1):</b> every 3 attention heads share the same data, so they stack into one larger
-    matrix multiplication — cutting per-layer launches from 31 to 11 (total ~528 → ~208).
-  </p>
-  <table>
-    <tr><th>Metric (backbone only, 16 layers)</th><th>Before opt</th><th>After opt</th></tr>
-    <tr><td>NPU backbone latency</td><td>~400 ms</td><td><b>~226 ms</b></td></tr>
-    <tr><td>CPU-NumPy reference latency (same math, fp32)</td><td>~344 ms</td><td>~340 ms</td></tr>
-    <tr><td>NPU / CPU-NumPy ratio</td><td>1.16× (NPU slower)</td><td><b>0.71× (NPU faster)</b></td></tr>
-    <tr><td>XRT dispatches / layer</td><td>33 (31 attention)</td><td>13 (11 attention)</td></tr>
-    <tr><td>correctness (<code>make verify</code>)</td><td>PASS</td><td>PASS (bit-identical)</td></tr>
-  </table>
-  <div class="callout">
-    <b>Result: the NPU backbone went from 400ms to 226ms (~1.8× faster).</b> After the optimization it beats the
-    NumPy reference (0.71×). Correctness is bit-identical — batching only changes how the work is submitted, not
-    the math.
-  </div>
-  <div class="callout warn">
-    <b>Two different "CPU backbone" numbers — don't confuse them.</b> Section 4's profiling says the backbone is
-    <b>56.8 ms</b>; the table above says <b>~340 ms</b>. Both are correct — they are <em>different CPU
-    implementations</em>: Section 4 is the real LeRobot model (<b>PyTorch</b>, heavily-optimized MKL matmuls),
-    while the table's reference is our own <b>plain NumPy fp32</b> backbone (<code>cpu_backbone_forward</code>),
-    used only as a like-for-like yardstick for the NPU bench (compile + bridge excluded). So the fair headline is
-    "NPU backbone ≈ 226 ms." Versus the optimized <b>PyTorch</b> backbone (56.8 ms) the NPU is currently
-    <em>slower</em> — expected for an un-fused, first-pass port whose attention still costs 11 dispatches/layer.
-  </div>
-  <div class="callout warn">
-    <b>Whole-model perspective (from Section 4):</b> the backbone is only 5.8% of the end-to-end CPU time
-    (56.8 of 1044 ms), so speeding it up moves a small slice of the total. A1 proves the <em>method</em> works;
-    the biggest performance prizes are <b>vision (73.6%, milestone A3)</b> and the <b>action expert (20.1%, A2)</b>.
-    Remaining backbone headroom: fusing the 11 attention dispatches into the layer's ELF (Route 3).
-  </div>
 
-  <h3>Experiment: what if we used the registry FlashAttention instead?</h3>
-  <p>
-    Section 6 explains we didn't use the registry's FlashAttention because its mask is a boolean causal switch that
-    can't express our prefix-LM mask. We ran the experiment anyway — force <b>non-causal FA</b> (no mask at all) on
-    the backbone — to measure both sides of that trade-off. It <b>does</b> compile and run at our odd shape
-    (seq 256, 15q/5kv, head_dim 64, non-causal) once <code>num_heads_per_unroll</code> is set to 1 (15 isn't
-    divisible by 2).
-  </p>
+  <h3>Per stage</h3>
   <table>
-    <tr><th>Backbone attention path</th><th>NPU latency</th><th>attn dispatches/layer</th><th>action cosine vs CPU model</th><th>gate</th></tr>
-    <tr><td>approach-B (GEMM + masked_softmax)</td><td>~217 ms</td><td>11</td><td><b>0.9971</b></td><td>PASS</td></tr>
-    <tr><td>non-causal FlashAttention</td><td><b>~105 ms</b></td><td>1</td><td>0.9828</td><td><b>FAIL</b> (&lt; 0.99)</td></tr>
-  </table>
-  <p>
-    Same per-layer diagram as Section 6, but with the attention block swapped for FlashAttention — note how much
-    simpler the host glue and dispatch count become (this is where the speed comes from):
-  </p>
-  <div class="card" style="font-family:'SF Mono',Menlo,Consolas,monospace;font-size:0.82rem;line-height:1.7;white-space:pre-wrap">
-<span style="color:#374151">x [256,960]</span>
- ─<span style="color:#1e40af;font-weight:700">[NPU elf:rms_gemms_rope]</span>  <span class="knl">FUSED, 6 launches, 1 ELF</span>  <span style="color:#6b7280">(unchanged from approach-B)</span>
-     → q_roped[256,960]  k_roped[256,320]  v[256,320]
- ─<b>attention</b>  <span class="knl">1 dispatch</span> <span style="color:#6b7280">· vs approach-B's 11</span>
-     (HOST) just make Q/K/V contiguous — <b>no transpose, no per-head stacking, no mask fold</b>
-     1× <span style="color:#1e40af;font-weight:700">[NPU elf:flash_attn]</span>  seq-first, non-causal, 15q/5kv, hd=64, <b>no mask</b>
-        Q[256,960] K[256,320] V[256,320] → attn_out[256,960]   <span style="color:#991b1b">(⚠ state col + 15 pad leak in)</span>
- ─<span style="color:#1e40af;font-weight:700">[NPU elf:o_ffn]</span>  <span class="knl">FUSED, 8 launches, 1 ELF</span>  <span style="color:#6b7280">(unchanged from approach-B)</span>
-     → layer_out[256,960]
-
-once after 16 layers: (HOST) final RMSNorm [256,960]
-  </div>
-  <p class="legend">
-    <b>Totals per layer:</b> 2 fused ELFs + 1 attention dispatch = <b>3 XRT dispatches/layer × 16 = 48</b>
-    (vs approach-B's 13/layer = 208). The whole attention host-glue block (reshape-to-heads, Kᵀ transpose,
-    per-group stacking, mask folding) <em>disappears</em> — FA takes seq-first Q/K/V directly and does everything
-    on-device in one shot. That's the 2.1× win. The cost is in the ⚠ line: <code>causal=False</code> has no mask
-    input, so the state column and the 15 padding tokens are not excluded.
-  </p>
-  <div class="callout warn">
-    <b>Result: FA is 2.1× faster but fails correctness.</b> Dropping attention from 11 dispatches to 1 cut the NPU
-    backbone from ~217 ms to <b>~105 ms</b>. But with no mask, the first 240 prefix tokens wrongly see the state
-    token <em>and</em> the 15 padding tokens leak in — end-to-end action cosine falls to 0.983 (nmse 0.038, ~5×
-    approach-B's 0.008), below the 0.99 gate. Interestingly the per-layer cosine stayed high (≥0.995 through
-    layer 15) and only the final RMSNorm amplified the error — the reason per-layer cosine can't be the gate.
-    <br><br>
-    <b>Does FA beat the CPU baseline?</b> Even at 105 ms, <b>no</b> — the real PyTorch backbone is <b>56.8 ms</b>
-    (Section 4), so FA is still ~1.85× slower than CPU (it only beats our NumPy timing reference). So FA is faster
-    than approach-B but neither is yet faster than the optimized CPU backbone.
-    <br><br>
-    <b>The likely fix (not yet tried):</b> zero the padding K/V before the FA call — that removes the larger of the
-    two error sources (15/256 padding leakage vs the 1/241 state-column cells), and may bring FA back over the gate
-    while keeping the 2.1× speedup. That would make FA a genuine win. It's the natural next experiment.
-  </div>
-
-  <h3>Why is the NPU backbone slower than CPU? A single-kernel breakdown</h3>
-  <p>
-    Even the FA ceiling (~105 ms) is slower than the PyTorch backbone (56.8 ms). To find out why, we measured
-    <b>one kernel at a time</b> — the NPU kernel vs the same op in PyTorch on CPU, at SmolVLA's exact shapes
-    (median of 20, warm, one-time compile excluded; <code>bench_single_kernel.py</code>):
-  </p>
-  <table>
-    <tr><th>Op (SmolVLA shape)</th><th>NPU @ SmolVLA shape</th><th>CPU (PyTorch bf16)</th><th>Winner</th></tr>
-    <tr><td>GEMM 256×960×960 (Q/O proj)</td><td>~230 µs · <b>2049 GFLOPS</b></td><td>~340–590 µs · 800–1400 GFLOPS</td><td><b>NPU ~2.6×</b></td></tr>
-    <tr><td>FlashAttention 256×256, 15q/5kv, hd64</td><td>~900 µs · <b>280 GFLOPS</b></td><td>~500–780 µs · 320–500 GFLOPS</td><td><b>CPU</b></td></tr>
-  </table>
-  <p>
-    …and the <b>same NPU kernels at the large shapes they were tuned for</b> (from the kernel_registry), to show
-    how far below peak SmolVLA's small shapes run — this is the core of the "under-fed array" effect:
-  </p>
-  <table>
-    <tr><th>NPU kernel</th><th>SmolVLA small shape</th><th>Large shape (registry peak)</th><th>Utilization</th></tr>
-    <tr><td>GEMM (bf16-out)</td><td>256×960×960 → <b>2049</b> GFLOPS</td><td>2048×8192×2048 → <b>8898</b> GFLOPS</td><td>~23% of peak</td></tr>
-    <tr><td>&nbsp;&nbsp;(mid shape for reference)</td><td colspan="2">2048×2048×2048 → 6215 · 2048×2048×1024 → 5392</td><td>—</td></tr>
-    <tr><td>FlashAttention</td><td>256×256, 15q/5kv → <b>280</b> GFLOPS</td><td>2048×2048, 32q/8kv → <b>1065</b> GFLOPS (peak 2031 at 32q/32kv)</td><td>~13–26% of peak</td></tr>
-    <tr><td>&nbsp;&nbsp;(mid shape for reference)</td><td colspan="2">512×512, 12q/6kv → 661 · 512×512, 64q/8kv → 1135</td><td>—</td></tr>
+    <tr><th>Stage</th><th>CPU (lerobot)</th><th>NPU (ours)</th><th>Result</th></tr>
+    <tr><td>Vision — <b>per image</b></td><td>222 ms</td><td><b>148 ms</b></td><td><span class="pill done">1.5× faster</span></td></tr>
+    <tr><td>Vision — per inference (3 cameras)</td><td>666 ms</td><td><b>444 ms</b></td><td><span class="pill done">1.5× faster</span></td></tr>
+    <tr><td>Connector (×3)</td><td>5.3 ms</td><td>~4.8 ms</td><td>≈ parity</td></tr>
+    <tr><td><b>Backbone</b></td><td><b>91 ms</b></td><td><b>229 ms</b></td><td><span class="pill" style="background:#fee2e2;color:#991b1b;border:1px solid #fca5a5">2.5× slower</span></td></tr>
+    <tr><td>Action expert + remainder</td><td>307 ms</td><td>— (still CPU)</td><td>—</td></tr>
   </table>
   <p class="legend">
-    The NPU's 8×4 MMA array only approaches peak when M/N/K are large enough to keep every tile busy and amortize
-    DMA. At SmolVLA's seq=256 both kernels run at ~15–25% of their large-shape throughput. GEMM still wins vs CPU
-    (its peak is so high that even 23% beats CPU BLAS); FA doesn't (its absolute peak is ~8× lower than GEMM's, so
-    at 13–26% it falls below CPU). This is the quantitative face of "the backbone is the smallest-shape stage."
+    Vision is a genuine win. The backbone is a genuine loss — and it is large enough to cancel most of the vision
+    gain. Section 9 explains both.
   </p>
+
+  <h3>End to end</h3>
+  <table>
+    <tr><th>Configuration</th><th>As measured</th><th>Of which: process bridge</th><th>Compute only</th><th>vs CPU</th></tr>
+    <tr><td>Pure CPU (lerobot)</td><td><b>967 ms</b></td><td>—</td><td>967 ms</td><td>1.00×</td></tr>
+    <tr><td>NPU backbone only</td><td>2158 ms</td><td>596 ms</td><td>1562 ms</td><td>0.62× <span style="color:#991b1b">(slower)</span></td></tr>
+    <tr><td><b>NPU vision + backbone</b></td><td>2589 ms</td><td>1163 ms</td><td><b>1425 ms</b></td><td>0.68× <span style="color:#991b1b">(slower)</span></td></tr>
+  </table>
   <div class="callout warn">
-    <b>The result overturns the simple "small shapes lose on NPU" story — it's more specific.</b>
-    <ul class="clean" style="margin:0.5rem 0 0">
-      <li><b>GEMM is NOT the problem.</b> Even at 256×960×960 (far smaller than llama's 2048-seq shapes), the NPU
-        GEMM beats CPU by ~2.6×. The matrix multiplies — the bulk of the FLOPs — are genuinely faster on NPU.</li>
-      <li><b>FlashAttention IS the weak kernel here.</b> SmolVLA's 15 heads force
-        <code>num_heads_per_unroll=1</code>, which uses only <b>4 of the 8 NPU columns</b> (half the array), and at
-        seq=256 the fixed cascade fill/drain isn't amortized — so NPU FA (280 GFLOPS) loses to CPU SDPA. This is
-        exactly why the FA-mode backbone (~105 ms) can't beat CPU.</li>
-      <li><b>approach-B (~217 ms) is dominated by per-dispatch overhead, not arithmetic.</b> Its GEMMs are fast in
-        isolation, but 11 attention dispatches/layer × 16 = 176 small launches each pay host↔device DMA + XRT
-        call-setup cost (the ~230 µs GEMM number excludes that; the real backbone pays it every dispatch).</li>
-    </ul>
-    <b>So the honest root cause is two-fold:</b> (1) attention is the one op that's slower on NPU at this
-    odd-15-head, short-seq shape, and (2) the un-fused per-dispatch overhead of the many small attention launches.
-    Neither is a wrong-kernel bug — the GEMMs use the registry's per-shape-optimal configs and win; it's small-shape
-    + odd-head-count physics plus dispatch overhead. It also points at the fix: fuse attention into the layer ELF
-    (kills the dispatch overhead) and/or a head-count that fills all 8 columns.
+    <b>The honest headline: end-to-end we are still slower than the CPU.</b> Even with the process-bridge overhead
+    removed, the full pipeline is ~0.68× the pure-CPU speed. The vision win is real, but three things eat it — and
+    two of them are fixable engineering, not hardware limits. That is exactly what the next section is about.
   </div>
-  <div class="callout">
-    <b>The bigger picture (Section 4):</b> this is also why the backbone was never where NPU would shine — at
-    seq=241 it's the <em>smallest</em>-shape stage. The vision encoder (seq=1024, 1024×1024 attention) is both the
-    73.6% bottleneck <em>and</em> the shape where the NPU's GEMM advantage (shown above) would actually dominate.
-    That's the real performance opportunity (A3).
-  </div>
+  <p class="legend">
+    <b>What the "process bridge" is:</b> our CPU and NPU code live in two separate Python environments (one has
+    PyTorch, the other has the NPU runtime), so every NPU stage is launched as a fresh subprocess — paying process
+    startup, weight loading and device-context setup <em>every time</em>. It is an artifact of this development
+    setup, not of NPU deployment, which is why the "compute only" column is the fairer comparison.
+  </p>
 
   <!-- ============================================================ -->
+  <h2 id="whyperf">9. Why the performance looks like this</h2>
+
+  <p class="lead">
+    Three effects explain the whole picture. The first is a property of the hardware; the other two are things we
+    have not finished doing.
+  </p>
+
+  <h3>① Big shapes win, small shapes lose — this is the hardware's nature</h3>
+  <p>
+    An NPU is a large grid of compute tiles. Efficiency depends on whether a given operation has enough work to
+    fill that grid. Vision and the backbone sit on opposite sides of that line:
+  </p>
+  <table>
+    <tr><th>Kernel, at the shape we actually use</th><th>NPU</th><th>CPU</th><th></th></tr>
+    <tr><td>Matmul at <b>vision</b> size (<span class="shape">1024×768×768</span>)</td><td>3798 GFLOP/s</td><td>—</td><td>array well fed</td></tr>
+    <tr><td>Matmul at <b>backbone</b> size (<span class="shape">256×960×960</span>)</td><td>1896 GFLOP/s</td><td>—</td><td>half the efficiency</td></tr>
+    <tr><td>Attention at <b>vision</b> size (1024², 12 heads)</td><td>1292 GFLOP/s</td><td>—</td><td>fills the full grid</td></tr>
+    <tr><td>Attention at <b>backbone</b> size (256², 15 heads)</td><td>280 GFLOP/s</td><td>~500 GFLOP/s</td><td><b>NPU loses to CPU</b></td></tr>
+  </table>
+  <p class="legend">
+    The backbone's attention is the worst case: its sequence is short <em>and</em> its 15 heads are an odd number,
+    which forces the kernel onto half the grid (an even head count, like vision's 12, packs two per unit and fills
+    it — measured 1.58× just from that). For reference the same matmul kernel reaches 8898 GFLOP/s at large sizes,
+    so the backbone shapes run at roughly a fifth of the chip's capability.
+  </p>
+
+  <h3>② The backbone's attention was never fused — 208 dispatches</h3>
+  <p>
+    Every dispatch to the chip carries a fixed cost (~1.75 ms of driver and Python overhead) regardless of how much
+    work it does. We measured this directly on the vision encoder before it was optimized: of its total time, only
+    141 ms was real NPU compute and <b>212 ms was pure dispatch overhead</b> across 121 dispatches. It was
+    <em>host-bound, not compute-bound</em>.
+  </p>
+  <p>Fusing vision's operations into merged programs fixed exactly that:</p>
+  <table>
+    <tr><th>Vision encoder</th><th>Before fusion</th><th>After fusion</th></tr>
+    <tr><td>dispatches</td><td>121</td><td><b>37</b></td></tr>
+    <tr><td>dispatch overhead</td><td>212 ms</td><td><b>4 ms</b></td></tr>
+    <tr><td>wall time</td><td>368 ms</td><td><b>141.6 ms</b></td></tr>
+    <tr><td>accuracy</td><td>0.945</td><td><b>0.990</b></td></tr>
+  </table>
+  <div class="callout">
+    <b>A surprise worth recording: fusing for speed also fixed accuracy.</b> Before fusion the 12 layers in sequence
+    only reached 0.945 similarity, and we had accepted that as a hardware precision ceiling — the NPU's fast matmul
+    format (a block of numbers sharing one exponent) leaves a small <em>systematic</em> bias, and unlike random
+    noise, systematic bias accumulates coherently across layers. Fusion removed it as a side effect: doing the small
+    additions on-chip eliminated a host round-trip that had been <em>amplifying</em> that bias each layer. Accuracy
+    went to 0.990 and passed. An apparent hardware limit turned out to be an artifact of how the pipeline was
+    assembled.
+  </div>
+  <p>
+    <b>The backbone has not had this treatment.</b> Its attention is still 11 separate dispatches per layer — 208
+    in total, versus vision's 38 per image — on a stage with far less compute to amortize them. That is the single
+    clearest explanation for why our backbone is 2.5× slower than the CPU's, and the most promising thing left to
+    fix.
+  </p>
+
+  <h3>③ The two-process bridge, and one redundant computation</h3>
+  <ul class="clean">
+    <li><b>Bridge (596–1163 ms).</b> Each NPU stage is a fresh subprocess: process start, model weights loaded from
+      disk, device context and compiled programs loaded — every inference. A single-process deployment pays this
+      once at startup, not per call.</li>
+    <li><b>A redundant CPU backbone (~91 ms).</b> To reuse lerobot's exact cache structures, the CPU still runs its
+      own backbone and we then overwrite the result with the NPU's. Correct, but wasted work.</li>
+    <li><b>A subtle one we found and fixed:</b> the numerical library's worker threads kept spinning after the one
+      host matmul, stealing CPU from the thread issuing NPU dispatches — inflating the encoder from 135 ms to
+      178 ms per image. Capping those threads recovered ~120 ms per inference. The symptom looked like an NPU
+      problem; the cause was CPU-side thread contention.</li>
+  </ul>
+
+  <h3>What this adds up to</h3>
+  <p>
+    Vision on the NPU saves ~222 ms per inference. The backbone on the NPU <em>costs</em> ~138 ms. The bridge costs
+    another ~1163 ms in the current two-process setup, and the action expert (307 ms) has not been touched. Fix the
+    backbone's dispatch count and remove the bridge, and the same silicon and the same kernels move from 0.68× to
+    roughly parity or better — without any new hardware capability.
+  </p>
+
   <h2 id="status">10. Current status and next steps</h2>
 
-  <h3>Done — Milestone A1 (language backbone)</h3>
+  <h3>Where we are</h3>
   <ul class="clean">
-    <li><span class="pill done">✅</span> SmolVLA's <b>language backbone (all 16 layers) runs on NPU2</b>, verified against pure CPU</li>
-    <li><span class="pill done">✅</span> end-to-end hybrid pipeline: CPU pre-processing → NPU backbone → CPU action generation</li>
-    <li><span class="pill done">✅</span> dual-track correctness (per-layer + end-to-end), <code>make verify</code> PASS on real hardware</li>
-    <li><span class="pill done">✅</span> performance optimization: backbone 1.8× faster, NPU now beats the CPU backbone</li>
-    <li><span class="pill done">✅</span> incidentally fixed a shared-code bug affecting all deployed models, verified no regression</li>
+    <li><span class="pill done">✅</span> <b>Both heavy stages run on the NPU</b> — the 12-layer vision encoder
+      (×3 cameras) and the 16-layer language backbone, with no CPU fallback inside either. Only the action expert
+      remains on the CPU.</li>
+    <li><span class="pill done">✅</span> <b>Correctness holds end-to-end</b> — the produced action chunk matches the
+      pure-CPU lerobot output at cosine <b>0.994</b> (gate 0.99), verified on real hardware.</li>
+    <li><span class="pill done">✅</span> <b>Vision is 1.5× faster than the CPU</b> (148 ms vs 222 ms per image),
+      after fusion cut it from 121 dispatches to 37.</li>
+    <li><span class="pill warn">⚠️</span> <b>End-to-end we are still ~0.68× the CPU speed</b> — the backbone on the
+      NPU is 2.5× slower than the CPU's, and the two-process bridge adds ~1.2 s. Both are addressable (Section 9).</li>
+    <li><span class="pill done">✅</span> Along the way: 2 kernels promoted into the shared registry (affine
+      LayerNorm, GELU-tanh), 1 written from scratch (masked-softmax), 17 (kernel, shape) rows validated on real
+      NPU2, and a shared-code bug fixed with no regression to the sibling models.</li>
   </ul>
 
-  <h3>In progress — Milestone A3 (vision encoder, the 74% prize)</h3>
-  <p>Vision is the biggest performance lever (73.6% of end-to-end). We are mapping it correctness-first, one
-     verified kernel at a time (mirroring how A1 was built), then assembling the 12-layer encoder.</p>
-  <ul class="clean">
-    <li><span class="pill done">✅</span> <b>A3-1 GEMM shapes</b> — 5 SigLIP GEMM shapes validated on NPU2 (incl. the awkward connector <span class="shape">64×12288×960</span>: large K is fine, it's the tiny M=64 that half-fills the array)</li>
-    <li><span class="pill done">✅</span> <b>A3-2 GELU-tanh</b> — promoted to a registry kernel (<span class="shape">1024×3072</span>); found it's single-input so it fills <b>2×</b> the tiles of the 3-input elementwise kernels</li>
-    <li><span class="pill done">✅</span> <b>A3-3 LayerNorm</b> — added affine (γ,β) + multi-tile to the example, promoted to registry (<span class="shape">1024×768</span>)</li>
-    <li><span class="pill done">✅</span> <b>A3-4 FlashAttention 1024²</b> — verified the non-causal 12-head config; its <em>even</em> head count fills the full 8×4 array (1.58× the odd-15-head backbone)</li>
-    <li><span class="pill done">✅</span> <b>A3-5 Step 1</b> — CPU vision oracle + host-glue math (im2col, pixel-shuffle, biases) proven bit-faithful vs real lerobot (all 12 layers cos&gt;0.9997) <em>before</em> spending NPU time</li>
-    <li><span class="pill done">✅</span> <b>A3-5 Step 2-3 — the 12-layer ViT runs entirely on NPU</b>: all four heavy ops (LayerNorm, 6 GEMMs, GELU, FlashAttention) on-chip, 0 CPU fallback, 10 dispatches/layer</li>
-    <li><span class="pill done">✅</span> <b>A3-6b optimization — 2.6× faster AND it now passes the gate</b>: fused the per-layer ops into 2 multi-launch ELFs + moved bias/residual on-device → <b>121 → 37 dispatches</b>, <b>368 → 141.6 ms</b>, accuracy <b>0.945 → 0.990 (PASS)</b></li>
-    <li><span class="pill future">◻</span> <b>A3-5 Step 4-5</b> — connector on NPU + splice into the hybrid pipeline + <code>make verify</code> end-to-end <span class="pill future">next</span></li>
-  </ul>
-  <div class="callout">
-    <b>The A3 headline:</b> every vision leaf kernel is validated on real NPU2, the <b>whole 12-layer encoder runs
-    on-chip</b> with <b>zero from-scratch kernels</b> (conv became im2col+GEMM, pixel-shuffle a host reshape), and
-    after fusion it is <b>1.72× faster than the CPU encoder while passing the accuracy gate</b> (0.990 vs 0.99;
-    138 ms vs 237 ms per image — and the model runs it 3×, once per camera).
-    What remains is wiring it into the end-to-end pipeline.
-  </div>
-  <div class="callout">
-    <b>The most interesting finding: a precision ceiling that fusion dissolved.</b> Before fusion, the 12 layers in
-    sequence produced only 0.945 similarity — each kernel was clean in isolation (LayerNorm 0.99997, GEMM 0.99999,
-    attention 0.99979) and each layer was clean when fed the correct input, so it wasn't a wiring bug. The cause was
-    a <em>systematic</em> per-channel bias from <b>BFP16</b> (the NPU's fast block-float matmul, where a block of
-    numbers shares one exponent). Unlike random noise, a systematic bias survives LayerNorm's centering and
-    accumulates coherently across layers.
-    <ul class="clean" style="margin:0.5rem 0 0">
-      <li>We first accepted this as a real ceiling: BFP16 is the format the NPU needs for speed, and every
-        alternative was worse (plain-BF16 matmul → wrong results; direct-codegen → wrong; plain-BF16 attention →
-        hangs; CPU attention → worse still at 0.905).</li>
-      <li>Then <b>fusion removed it as a side effect</b>. Doing the bias-adds and residuals on-device in bf16
-        eliminated a host <code>bf16→f32→bf16</code> round-trip that had been <em>amplifying</em> the bias every
-        layer. Accuracy went <b>0.945 → 0.990</b>, with all 12 layers above 0.996.</li>
-      <li>The language backbone (A1) never hit this: its activations are milder and it lacks the strong residual
-        cancellation that amplified the bias in vision's layer 1.</li>
-    </ul>
-    <b>Lesson:</b> an accuracy problem that looks like a hardware-format limit can actually be an artifact of how
-    the pipeline is assembled — fewer host round-trips meant both faster <em>and</em> more accurate.
-  </div>
-
-  <h3>Next milestones</h3>
+  <h3>What to do next, in order of expected payoff</h3>
   <table>
-    <tr><th>Milestone</th><th>Scope</th><th>Why / status</th></tr>
-    <tr><td><b>A3-5 Step 4-5</b> (next)</td><td>Connector on NPU + splice NPU vision into the hybrid pipeline + <code>make verify</code> end-to-end</td><td>gives the first true end-to-end NPU-vs-CPU number → <span class="pill" style="background:#fef9c3;color:#854d0e">next</span></td></tr>
-    <tr><td><b>A2</b></td><td>Move the <b>action expert</b> onto the NPU (cross-attention + 10-step denoise)</td><td>20% of runtime; reuses backbone kernels → <span class="pill future">planned</span></td></tr>
-    <tr><td><b>Route 3</b></td><td>Fuse backbone attention further to cut the remaining ~208 launches</td><td><span class="pill future">optimization headroom</span></td></tr>
+    <tr><th>#</th><th>Work</th><th>Why it matters</th></tr>
+    <tr>
+      <td><b>1</b></td>
+      <td><b>Fuse the backbone's attention</b> (11 dispatches/layer → ~1)</td>
+      <td>The backbone is host-bound exactly as vision was before fusion — 208 dispatches on a small stage. Vision's
+          identical fix gave 2.6×. This is what turns the backbone from a 138 ms <em>loss</em> into a win.</td>
+    </tr>
+    <tr>
+      <td><b>2</b></td>
+      <td><b>Single-process deployment</b> (remove the two-venv bridge)</td>
+      <td>Removes ~1.2 s of per-inference process startup, weight loading and device setup — pure overhead that a
+          real deployment would pay once, not every call.</td>
+    </tr>
+    <tr>
+      <td><b>3</b></td>
+      <td>Stop the redundant CPU backbone</td>
+      <td>~91 ms currently computed on CPU and then overwritten by the NPU result.</td>
+    </tr>
+    <tr>
+      <td><b>4</b></td>
+      <td>Move the <b>action expert</b> to the NPU</td>
+      <td>The last 32% still on CPU. Reuses the backbone's kernels at smaller shapes, and its cross-attention already
+          reads the K/V cache the NPU backbone produces.</td>
+    </tr>
+    <tr>
+      <td><b>5</b></td>
+      <td>Batch the 3 cameras into one set of dispatches</td>
+      <td>Measured ~17–20% on the vision matmuls (bigger shapes use the array better); a smaller but cheap win —
+          no kernel changes, only re-validation.</td>
+    </tr>
   </table>
 
   <div class="card" style="margin-top:2rem;background:#f0f9ff;border-color:#7dd3fc">
     <p style="margin:0"><b>In one sentence:</b>
-    SmolVLA's language brain (the 16-layer SmolLM2-360M) already runs entirely on the AMD NPU2 (action output
-    verified against a pure-CPU baseline, similarity 0.9971, faster than the CPU backbone). The <b>vision
-    encoder</b> — the 74% bottleneck — now <b>also runs entirely on-chip</b>, and after fusion it is
-    <b>1.72× faster than the CPU encoder (138 ms vs 237 ms per image, ×3 cameras) while passing the accuracy gate
-    at 0.990</b>. This is the
-    <b>first time a VLA model's core runs on the AMD NPU2</b>; the remaining step is wiring the NPU vision into the
-    end-to-end pipeline to measure the full model, then moving the action expert across.</p>
+    Both compute-heavy stages of SmolVLA — the vision encoder and the language backbone — now run entirely on the
+    AMD NPU2 and still produce the right actions (0.994 vs the real CPU model). The vision encoder is genuinely
+    1.5× faster than the CPU; the full pipeline is not yet, because the backbone's attention has not been fused and
+    a development-time process bridge dominates the measurement. Both are known, measured, and fixable — which is
+    the useful state to be in.</p>
   </div>
 
   <div class="meta" style="margin-top:3rem;border-bottom:none;border-top:1px solid var(--card-border);padding-top:1rem">
