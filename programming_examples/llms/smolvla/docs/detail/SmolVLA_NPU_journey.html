@@ -813,8 +813,9 @@ once after 16 layers: (HOST) final RMSNorm [256,960]
   <p>
     One SigLIP encoder layer, top to bottom, same notation as the backbone above.
     <span style="color:#1e40af;font-weight:600">[NPU elf:...]</span> = one compiled program = one XRT dispatch;
-    <b>(HOST)</b> = runs on CPU. Correctness-first: each op is its own dispatch (no fusion yet — that's A3-6b), and
-    the biases / residual / im2col glue run on host.
+    <b>(HOST)</b> = runs on CPU. This shows the <em>first, correctness-first</em> build — each op as its own
+    dispatch, with biases / residuals / im2col on the host. The optimization that follows keeps this exact math but
+    fuses the ops and moves the glue on-device.
   </p>
   <div class="card" style="font-family:'SF Mono',Menlo,Consolas,monospace;font-size:0.82rem;line-height:1.7;white-space:pre-wrap">
 <span style="color:#374151">once, before layer 0: (HOST) im2col patch-embed + position-embedding → x [1024,768]</span>
@@ -835,38 +836,57 @@ once after 16 layers: (HOST) final RMSNorm [256,960]
 once after 12 layers: <span style="color:#1e40af;font-weight:700">[NPU elf:layer_norm]</span> post_layernorm [1024,768]
   </div>
   <p class="legend">
-    <b>Totals per layer:</b> LN1, Q, K, V, attention, O, LN2, fc1, GELU, fc2 = <b>10 NPU dispatches/layer × 12 =
-    120</b> (+1 final LN). <b>6 distinct ELFs</b> compiled once &amp; cached (three GEMM shapes, LayerNorm, GELU,
-    FlashAttention). <b>0 CPU fallback</b> — every heavy op is on-chip; the host does only bias-adds, the two
-    residual adds, and the once-per-image im2col.
+    <b>That was the first (correctness-first) version:</b> 10 separate NPU dispatches/layer × 12 = <b>120</b>, with
+    bias-adds and residuals on the host. <b>It has since been fused</b> — see the optimization below, which keeps
+    exactly the same math but collapses those into <b>3 dispatches/layer</b> and moves the bias/residual on-device.
+  </p>
+
+  <h3>Optimizing it: the bottleneck was not the NPU</h3>
+  <p>
+    Before tuning anything, we profiled where the 12-layer encoder's time actually went. The result was decisive:
+    of the total, only ~141 ms was real NPU compute — the rest was <b>host gap</b>, ~1.75 ms of Python + driver
+    overhead per dispatch × 121 dispatches. The encoder was <b>host-bound, not compute-bound</b>, so the lever was
+    <em>fewer dispatches</em>, not faster kernels.
+  </p>
+  <table>
+    <tr><th></th><th>Before (one ELF per op)</th><th>After (fused)</th></tr>
+    <tr><td>NPU dispatches</td><td>121</td><td><b>37</b> (3/layer + final LN)</td></tr>
+    <tr><td>host gap (overhead)</td><td>212 ms</td><td><b>4 ms</b></td></tr>
+    <tr><td>bias-adds &amp; residuals</td><td>on host (f32)</td><td><b>on device</b> (bf16)</td></tr>
+    <tr><td>wall time</td><td>368 ms</td><td><b>141.6 ms</b></td></tr>
+    <tr><td>accuracy vs CPU answer key</td><td>0.945 (below gate)</td><td><b>0.990 — PASS</b></td></tr>
+  </table>
+  <p class="legend">
+    The fusion builds two multi-launch ELFs — <code>vit_ln_qkv</code> (LayerNorm + Q/K/V + biases) and
+    <code>vit_o_ffn</code> (O-proj + residual + LayerNorm + fc1 + GELU + fc2 + residual) — using the same stitching
+    machinery the language backbone uses, plus FlashAttention as the third dispatch.
   </p>
 
   <div class="stat-row">
-    <div class="stat"><div class="big-num">281 ms</div><div class="label">NPU vision encoder<br>(12 layers, measured, unoptimized)</div></div>
+    <div class="stat"><div class="big-num">141.6 ms</div><div class="label">NPU vision encoder<br>(12 layers, fused, measured)</div></div>
     <div class="stat"><div class="big-num">719 ms</div><div class="label">real CPU vision stage<br>(bf16 PyTorch baseline)</div></div>
-    <div class="stat"><div class="big-num">2.6×</div><div class="label">NPU faster than CPU<br>(even before any fusion)</div></div>
+    <div class="stat"><div class="big-num">0.990</div><div class="label">accuracy vs CPU answer key<br>(gate 0.99 — PASS)</div></div>
   </div>
   <div class="callout">
-    <b>Vision on the NPU is already 2.6× faster than the CPU — and it isn't even optimized yet.</b> Measured wall
-    time (compile excluded, median of 10 runs): the 12-layer encoder is <b>281 ms on NPU</b> vs the real lerobot
+    <b>Vision on the NPU is ~5× faster than the CPU, and it passes the accuracy gate.</b> Measured wall time
+    (compile excluded, median of 10 runs): the 12-layer encoder is <b>141.6 ms on NPU</b> vs the real lerobot
     <b>719 ms CPU</b> vision stage. This is the opposite of the backbone result (Section 9), and the reason is
     <em>shape</em>: vision runs at seq=1024 with big matmuls (fc up to 3072-wide, a 1024×1024 attention), so the
     NPU's matrix engine is well-fed and the per-dispatch overhead is amortized — exactly where an NPU wins. The
-    backbone, at seq=256, is too small to fill the array. Since vision is 74% of end-to-end runtime, this ~440 ms
-    saving is the single biggest lever in the whole model — and A3-6b fusion (10 dispatches/layer → a few) can push
-    it lower still.
+    backbone, at seq=256, is too small to fill the array. Since vision is 74% of end-to-end runtime, this is the
+    single biggest lever in the whole model.
   </div>
 
-  <div class="callout warn">
-    <b>The catch: correctness isn't there yet.</b> Every vision kernel is clean in isolation and each layer is
-    correct when fed the right input, but running all 12 in sequence drops the final similarity to <b>0.945</b>
-    (gate 0.99). This is a <b>BF16 precision ceiling</b>, not a bug: the NPU's block-float matmul format leaves a
-    tiny <em>systematic</em> per-channel bias that — on the vision encoder's unusually spiky activations —
-    accumulates coherently across 12 layers (and is amplified by layer 1's strong residual cancellation). The
-    backbone doesn't hit this because its activations are milder. The fix is a higher-precision attention
-    micro-kernel (milestone <b>A3-6a</b>); the timing above is representative because that fix is a kernel swap, not
-    a restructure. Until then, vision-on-NPU is a proven <em>performance</em> result awaiting the <em>precision</em>
-    fix before it can join the verified hybrid pipeline.
+  <div class="callout">
+    <b>A surprise: fusing for speed also fixed the accuracy.</b> In the unfused version, running all 12 layers in
+    sequence had dropped the final similarity to <b>0.945</b> (below the 0.99 gate) — a <em>systematic</em> bias
+    from the NPU's block-float (BFP16) matmul accumulating across layers. We had accepted that as a precision
+    ceiling (BFP16 is the format the NPU needs for speed; forcing plain BF16 would be far slower). Fusion removed it
+    as a side effect: doing the bias-adds and residuals <b>on-device in bf16</b> eliminated a host
+    <code>bf16→f32→bf16</code> round-trip that had been <em>amplifying</em> that bias each layer. Result:
+    <b>0.945 → 0.990, PASS</b>, with all 12 per-layer similarities above 0.996. This was verified independently on
+    real hardware, and each fused ELF was checked against a numeric mirror of its own sub-graph first, so the gain
+    is real rather than a masked error.
   </div>
 
   <!-- ============================================================ -->
@@ -1135,40 +1155,40 @@ once after 16 layers: (HOST) final RMSNorm [256,960]
     <li><span class="pill done">✅</span> <b>A3-4 FlashAttention 1024²</b> — verified the non-causal 12-head config; its <em>even</em> head count fills the full 8×4 array (1.58× the odd-15-head backbone)</li>
     <li><span class="pill done">✅</span> <b>A3-5 Step 1</b> — CPU vision oracle + host-glue math (im2col, pixel-shuffle, biases) proven bit-faithful vs real lerobot (all 12 layers cos&gt;0.9997) <em>before</em> spending NPU time</li>
     <li><span class="pill done">✅</span> <b>A3-5 Step 2-3 — the 12-layer ViT runs entirely on NPU</b>: all four heavy ops (LayerNorm, 6 GEMMs, GELU, FlashAttention) on-chip, 0 CPU fallback, 10 dispatches/layer</li>
-    <li><span class="pill warn">⚠️</span> <b>A3-5 correctness gate NOT met yet</b> — a <b>BF16 precision ceiling</b> (not a wiring bug): the final vision-output similarity is <b>0.945</b> (gate 0.99). Root-caused; see the box below.</li>
-    <li><span class="pill future">◻</span> <b>A3-5 Step 4-5</b> — connector on NPU + splice into the hybrid + <code>make verify</code> — <span class="pill future">blocked on the precision fix</span></li>
+    <li><span class="pill done">✅</span> <b>A3-6b optimization — 2.6× faster AND it now passes the gate</b>: fused the per-layer ops into 2 multi-launch ELFs + moved bias/residual on-device → <b>121 → 37 dispatches</b>, <b>368 → 141.6 ms</b>, accuracy <b>0.945 → 0.990 (PASS)</b></li>
+    <li><span class="pill future">◻</span> <b>A3-5 Step 4-5</b> — connector on NPU + splice into the hybrid pipeline + <code>make verify</code> end-to-end <span class="pill future">next</span></li>
   </ul>
   <div class="callout">
-    <b>The A3 headline:</b> every vision leaf kernel is validated on real NPU2 and the <b>whole 12-layer encoder
-    runs on-chip</b> — there are <b>zero from-scratch kernels</b> left (conv became im2col+GEMM, pixel-shuffle a
-    host reshape). But end-to-end accuracy hits a precision ceiling that the individual kernels don't show.
+    <b>The A3 headline:</b> every vision leaf kernel is validated on real NPU2, the <b>whole 12-layer encoder runs
+    on-chip</b> with <b>zero from-scratch kernels</b> (conv became im2col+GEMM, pixel-shuffle a host reshape), and
+    after fusion it is <b>~5× faster than the CPU vision stage while passing the accuracy gate</b> (0.990 vs 0.99).
+    What remains is wiring it into the end-to-end pipeline.
   </div>
-  <div class="callout warn">
-    <b>Why the vision output is only 0.945 similar (and why it's honest, not a bug).</b> Each kernel is clean in
-    isolation (LayerNorm 0.99997, GEMM 0.99999, attention 0.99979), and feeding each of the 12 layers the correct
-    input independently ("teacher-forced") is also clean (0.994–0.9998) — so the wiring is correct. The gap appears
-    only when the 12 layers run <em>in sequence</em>:
+  <div class="callout">
+    <b>The most interesting finding: a precision ceiling that fusion dissolved.</b> Before fusion, the 12 layers in
+    sequence produced only 0.945 similarity — each kernel was clean in isolation (LayerNorm 0.99997, GEMM 0.99999,
+    attention 0.99979) and each layer was clean when fed the correct input, so it wasn't a wiring bug. The cause was
+    a <em>systematic</em> per-channel bias from <b>BFP16</b> (the NPU's fast block-float matmul, where a block of
+    numbers shares one exponent). Unlike random noise, a systematic bias survives LayerNorm's centering and
+    accumulates coherently across layers.
     <ul class="clean" style="margin:0.5rem 0 0">
-      <li>The NPU's fast matmul format (<b>BFP16</b> — a block of numbers sharing one exponent) introduces a tiny
-        <em>systematic</em> per-channel bias, not random noise. On the vision encoder's unusually spiky activations
-        (some values ~45× the average), this bias points in a consistent direction.</li>
-      <li>A systematic bias survives LayerNorm's centering and <b>accumulates coherently</b> across 12 layers,
-        whereas random error would average out. Layer 1 — which has the strongest residual cancellation
-        (|input| 226 → |output| 143) — amplifies it the most (drops to 0.981); the rest compound to 0.945.</li>
-      <li>The language backbone (A1) doesn't hit this: its activations are milder and it lacks this cancellation
-        pattern, so the same BF16 kernels pass there.</li>
+      <li>We first accepted this as a real ceiling: BFP16 is the format the NPU needs for speed, and every
+        alternative was worse (plain-BF16 matmul → wrong results; direct-codegen → wrong; plain-BF16 attention →
+        hangs; CPU attention → worse still at 0.905).</li>
+      <li>Then <b>fusion removed it as a side effect</b>. Doing the bias-adds and residuals on-device in bf16
+        eliminated a host <code>bf16→f32→bf16</code> round-trip that had been <em>amplifying</em> the bias every
+        layer. Accuracy went <b>0.945 → 0.990</b>, with all 12 layers above 0.996.</li>
+      <li>The language backbone (A1) never hit this: its activations are milder and it lacks the strong residual
+        cancellation that amplified the bias in vision's layer 1.</li>
     </ul>
-    <b>Every on-NPU precision lever was tried</b> (non-BFP16 matmul → wrong tiles; direct-codegen → wrong;
-    non-BFP16 attention → hangs; CPU attention → worse at 0.905). The real fix is a <b>micro-kernel change</b> to the
-    attention kernel (a higher-precision accumulate) — that's the A3-6 work below. Performance, meanwhile, is
-    unaffected and healthy: the encoder is fully on-chip at registry-tier throughput.
+    <b>Lesson:</b> an accuracy problem that looks like a hardware-format limit can actually be an artifact of how
+    the pipeline is assembled — fewer host round-trips meant both faster <em>and</em> more accurate.
   </div>
 
   <h3>Next milestones</h3>
   <table>
     <tr><th>Milestone</th><th>Scope</th><th>Why / status</th></tr>
-    <tr><td><b>A3-6a</b> (next)</td><td><b>Fix the vision precision ceiling</b> — a higher-precision attention micro-kernel (native-bf16 or fp32-accumulate epilogue), then finish the connector + hybrid splice + <code>make verify</code></td><td>unblocks A3-5's gate → <span class="pill" style="background:#fef9c3;color:#854d0e">next</span></td></tr>
-    <tr><td><b>A3-6b</b></td><td>Vision <b>performance hill-climb</b> (fuse ELFs, buffer reuse, move bias/reshape on-device) to beat CPU vision's 719 ms</td><td>after correctness holds → <span class="pill future">planned</span></td></tr>
+    <tr><td><b>A3-5 Step 4-5</b> (next)</td><td>Connector on NPU + splice NPU vision into the hybrid pipeline + <code>make verify</code> end-to-end</td><td>gives the first true end-to-end NPU-vs-CPU number → <span class="pill" style="background:#fef9c3;color:#854d0e">next</span></td></tr>
     <tr><td><b>A2</b></td><td>Move the <b>action expert</b> onto the NPU (cross-attention + 10-step denoise)</td><td>20% of runtime; reuses backbone kernels → <span class="pill future">planned</span></td></tr>
     <tr><td><b>Route 3</b></td><td>Fuse backbone attention further to cut the remaining ~208 launches</td><td><span class="pill future">optimization headroom</span></td></tr>
   </table>
@@ -1177,10 +1197,10 @@ once after 16 layers: (HOST) final RMSNorm [256,960]
     <p style="margin:0"><b>In one sentence:</b>
     SmolVLA's language brain (the 16-layer SmolLM2-360M) already runs entirely on the AMD NPU2 (action output
     verified against a pure-CPU baseline, similarity 0.9971, faster than the CPU backbone). The <b>vision
-    encoder</b> — the 74% bottleneck — now <b>also runs entirely on-chip</b> (all 12 layers, every kernel
-    validated), but its end-to-end accuracy currently sits at 0.945 against a 0.99 gate: an honest BF16
-    precision ceiling that a higher-precision attention micro-kernel (A3-6a) is expected to lift. This is the
-    <b>first time a VLA model's core runs on the AMD NPU2</b>, with the vision precision fix as the clear next step.</p>
+    encoder</b> — the 74% bottleneck — now <b>also runs entirely on-chip</b>, and after fusion it is
+    <b>141.6 ms vs the CPU's 719 ms (~5×) while passing the accuracy gate at 0.990</b>. This is the
+    <b>first time a VLA model's core runs on the AMD NPU2</b>; the remaining step is wiring the NPU vision into the
+    end-to-end pipeline to measure the full model, then moving the action expert across.</p>
   </div>
 
   <div class="meta" style="margin-top:3rem;border-bottom:none;border-top:1px solid var(--card-border);padding-top:1rem">

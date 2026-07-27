@@ -89,13 +89,14 @@
     <div class="stat"><div class="big">17</div><div class="label">(kernel, shape) rows<br>validated &amp; recorded</div></div>
   </div>
 
-  <div class="callout warn">
-    <b>One caveat, up front.</b> Every kernel in this document is <em>individually</em> clean at the accuracy tiers
-    shown. But when the 12 vision layers run <em>in sequence</em>, a tiny <em>systematic</em> bias from the NPU's
-    block-float (BFP16) matmul format accumulates and pulls the final vision-encoder output down to 0.945 similarity
-    (vs a 0.99 gate) — an honest precision ceiling, not a per-kernel defect. The per-kernel numbers below are all
-    real and PASS; the integration-level story is in the main journey artifact (Ch. 10) and
-    <code>docs/TODO.md</code>. The fix is a higher-precision attention micro-kernel (next milestone).
+  <div class="callout">
+    <b>A note on per-kernel vs integrated accuracy.</b> Every kernel here is <em>individually</em> clean at the tiers
+    shown. When the 12 vision layers were first run <em>in sequence</em> as separate dispatches, a tiny
+    <em>systematic</em> bias from the NPU's block-float (BFP16) matmul accumulated and pulled the final encoder
+    output to 0.945 (vs a 0.99 gate). <b>Fusing the per-layer ops into two multi-launch ELFs fixed this</b> — doing
+    the bias-adds and residuals on-device in bf16 removed a host <code>bf16→f32→bf16</code> round-trip that had been
+    amplifying that bias, lifting the encoder to <b>0.990 (PASS)</b> while also cutting wall time 2.6×. The
+    integration story is in the main journey artifact (Ch. 7.5 &amp; 10).
   </div>
 
   <div class="toc">
@@ -243,6 +244,22 @@
     limit — a free ~1.8× bandwidth headroom that the "copy the sibling's config" habit would have missed.</p>
   </div>
 
+  <h3><span class="tag mod">COMPOSE</span> &nbsp;Two fused vision ELFs — many kernels, one dispatch</h3>
+  <div class="card">
+    <p style="margin-top:0"><b>Why it was needed.</b> Running each vision op as its own NPU dispatch made the
+    encoder <em>host-bound</em>, not compute-bound: 141 ms of actual NPU work was buried under 212 ms of host gap
+    across 121 dispatches (~1.75 ms each of Python + driver overhead). The fix isn't a faster kernel — it's
+    <em>fewer dispatches</em>.</p>
+    <p><b>What was built.</b> Two multi-launch ELFs (<span class="src"><code>vit_fused_builders.py</code></span>,
+    stitched with the same <code>stitch_elf</code> machinery the language backbone uses):
+    <code>vit_ln_qkv</code> (7 launches: LayerNorm + Q/K/V GEMMs + biases) and <code>vit_o_ffn</code> (10 launches:
+    O-proj + residual + LayerNorm + fc1 + GELU + fc2 + residual). Every bias-add and both residuals moved
+    <em>on-device</em>. Result: <b>121 → 37 dispatches</b>, host gap 212 ms → 4 ms, wall time <b>2.6× faster</b>.</p>
+    <p style="margin-bottom:0"><b>The bonus.</b> Doing bias/residual on-device in bf16 also removed a host
+    <code>bf16→f32→bf16</code> round-trip that had been amplifying BFP16's systematic bias — which is what lifted
+    end-to-end accuracy from 0.945 to <b>0.990 (PASS)</b>. A rare case where fusing for speed also bought accuracy.</p>
+  </div>
+
   <!-- ============================================================ -->
   <h2 id="gotchas">5. Gotchas found (silent-wrong-answer traps)</h2>
   <p>
@@ -281,6 +298,13 @@
       <td>any kernel, wrong target</td>
       <td>Building for the default <code>aie2</code> (NPU1) target silently outputs all-zeros on NPU2.</td>
       <td>Always build with <code>AIE_TARGET=aie2p</code> for NPU2.</td>
+    </tr>
+    <tr>
+      <td>two fused ELFs, different <code>tile_n</code></td>
+      <td>Two ELFs whose GEMMs use different tile widths (96 vs 128) both resolved to the same generic
+          <code>mm_m32.o</code> object → the second reused the first's stale baked-in width → garbage
+          (similarity 0.07).</td>
+      <td>Key the compiled object name by <code>tile_n</code> so each width gets its own object.</td>
     </tr>
   </table>
 
