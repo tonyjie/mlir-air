@@ -920,14 +920,17 @@ once per image:       (HOST) pixel-shuffle → [NPU elf:gemm_connector] 64×1228
     <tr>
       <td><b>③ Action expert</b><br>per inference</td>
       <td>seq <b>50</b>, hidden 720<br>× <b>10</b> sequential denoise steps</td>
-      <td colspan="2" style="text-align:center"><em>feasibility study in progress</em></td>
-      <td>Expected to lose badly: the smallest shape in the model <em>and</em> a 10× sequential multiplier on the dispatch count. Being measured rather than assumed.</td>
+      <td><b>387–526 ms</b><br><span style="font-size:0.8em;color:#6b7280">projected</span></td>
+      <td><b>324 ms</b></td>
+      <td><span class="pill" style="background:#fee2e2;color:#991b1b;border:1px solid #fca5a5">NPU loses 1.2–1.6×</span> seq=50 is the smallest shape in the model: its kernels run at 200–1100 GFLOP/s versus 2046–3366 for the <em>same</em> kernels at the backbone's seq=256. On top of that every launch costs ~85 µs however little work it carries, and a denoise step needs 239 of them.</td>
     </tr>
   </table>
   <p class="legend">
-    "Best NPU" means the best we have actually measured, not a theoretical peak. For the backbone in particular it is
-    <b>not</b> its ceiling: it has never received the fusion treatment that took vision from 368 ms to 141 ms, so a
-    fused backbone would be meaningfully faster than 229 ms — we simply have not built it yet.
+    "Best NPU" means the best we have <em>measured</em> — except the action expert, which was <b>never ported</b>:
+    its figure is a projection built by measuring every one of its kernels individually on real NPU2 at its own
+    shapes and summing them. That projection is the weaker part of the study; the robust part is that the NPU loses
+    <em>head-to-head on every single kernel the expert runs</em>, by 1.1× (gate/up) to 6.6× (attention). We stopped
+    before writing the port, which is what a feasibility study is for.
   </p>
 
   <div class="callout">
@@ -992,12 +995,11 @@ once per image:       (HOST) pixel-shuffle → [NPU elf:gemm_connector] 64×1228
     so the backbone shapes run at roughly a fifth of the chip's capability.
   </p>
 
-  <h3>② The backbone's attention was never fused — 208 dispatches</h3>
+  <h3>② The backbone's kernels are genuinely slower at its size</h3>
   <p>
-    Every dispatch to the chip carries a fixed cost (~1.75 ms of driver and Python overhead) regardless of how much
-    work it does. We measured this directly on the vision encoder before it was optimized: of its total time, only
-    141 ms was real NPU compute and <b>212 ms was pure dispatch overhead</b> across 121 dispatches. It was
-    <em>host-bound, not compute-bound</em>.
+    Before it was optimized, the vision encoder spent only 141 ms of its total on real NPU compute; the other
+    <b>212 ms sat between dispatches</b>, on the host. It was <em>host-bound, not compute-bound</em>, and fusing its
+    operations into merged programs removed that gap:
   </p>
   <p>Fusing vision's operations into merged programs fixed exactly that:</p>
   <table>
@@ -1016,12 +1018,20 @@ once per image:       (HOST) pixel-shuffle → [NPU elf:gemm_connector] 64×1228
     went to 0.990 and passed. An apparent hardware limit turned out to be an artifact of how the pipeline was
     assembled.
   </div>
-  <p>
-    <b>The backbone has not had this treatment.</b> Its attention is still 11 separate dispatches per layer — 208
-    in total, versus vision's 38 per image — on a stage with far less compute to amortize them. That is the single
-    clearest explanation for why our backbone is 2.5× slower than the CPU's, and the most promising thing left to
-    fix.
-  </p>
+  <div class="callout warn">
+    <b>But the backbone is a different problem — and we got this wrong at first.</b> The obvious inference was that
+    the backbone suffers the same disease: its attention is still 11 separate dispatches per layer, 208 in total,
+    so fusing it should give the same win. <b>Direct measurement says otherwise.</b> Profiling the real 16-layer
+    backbone (832 dispatches over 4 inferences) breaks its time down as:
+    <table style="margin:0.6rem 0">
+      <tr><th>Moving data to the chip</th><th><b>The NPU actually computing</b></th><th>Reading results back</th></tr>
+      <tr><td>10%</td><td><b>90%</b></td><td>1%</td></tr>
+    </table>
+    A separate microbenchmark puts the host cost of one dispatch at <b>24–36 µs</b>, not milliseconds. So the
+    backbone is <em>compute</em>-bound, not host-bound: its 229 ms is ~206 ms of the NPU genuinely working. Even
+    driving the host overhead to zero would leave it far above the CPU's 77 ms. <b>Fusion cannot rescue the
+    backbone</b> — the kernels themselves are slower at seq=256, which is effect ① above, not effect ②.
+  </div>
 
   <h3>③ Two overheads that were not the hardware's fault (both now fixed)</h3>
   <ul class="clean">
@@ -1083,28 +1093,29 @@ once per image:       (HOST) pixel-shuffle → [NPU elf:gemm_connector] 64×1228
     <tr><th>#</th><th>Work</th><th>Expected payoff</th></tr>
     <tr>
       <td><b>1</b></td>
-      <td><b>Fuse the backbone's attention</b> (11 dispatches/layer → ~1)</td>
-      <td>The backbone is host-bound exactly as vision was — 208 dispatches on a small stage. Vision's identical fix
-          gave 2.6×. If it lands, the backbone becomes worth moving to the NPU as well, adding to the win instead of
-          subtracting from it.</td>
+      <td>Split the 3 cameras across CPU and NPU in parallel</td>
+      <td>The largest remaining measured headroom: vision 470 ms → ~360 ms, end to end ≈ 1.35×. Deliberately
+          deferred so far — it introduces concurrency into a control loop that a correctness gate has to protect.</td>
     </tr>
     <tr>
       <td><b>2</b></td>
-      <td>Split the 3 cameras across CPU and NPU in parallel</td>
-      <td>Measured headroom: vision 470 ms → ~360 ms, end to end ≈ 1.35×. Deliberately deferred — it introduces
-          concurrency into a control loop that a correctness gate has to protect.</td>
+      <td>Attack what is left <em>inside</em> the vision encoder</td>
+      <td>Turbo mode showed the encoder is not compute-clock-bound (Section 8), so the remaining time is in
+          memory-bound norms/activations, attention, and ~35 ms per inference of host-side patch reshaping that
+          could move onto the device.</td>
     </tr>
     <tr>
       <td><b>3</b></td>
-      <td><b>Action expert</b> — decide from the feasibility study, not from its 32% share</td>
-      <td>It is the largest remaining CPU block, but also the <em>worst</em> shape in the model (seq 50, ×10
-          sequential steps). Being measured before any porting effort is committed.</td>
+      <td>Batch the 3 cameras into one encoder pass</td>
+      <td>~17–20% on the vision matmuls, a few percent end to end. Cheap in kernels (no code changes), but needs
+          re-validation at the new size.</td>
     </tr>
     <tr>
-      <td><b>4</b></td>
-      <td>Batch the 3 cameras into one encoder pass</td>
-      <td>~17–20% on the vision matmuls, but only a few percent end to end now that dispatch overhead is down to
-          ~4 ms per image. Cheap in kernels (no code changes), but needs re-validation at the new size.</td>
+      <td style="color:#991b1b"><b>✗</b></td>
+      <td><s>Fuse the backbone's attention</s> · <s>port the action expert</s></td>
+      <td><b>Both measured and dropped.</b> The backbone is compute-bound, not dispatch-bound, so fusion cannot
+          close a 229 vs 77 ms gap. The expert loses head-to-head on every kernel at seq=50. Knowing which doors are
+          closed is as useful as knowing which are open.</td>
     </tr>
   </table>
 
