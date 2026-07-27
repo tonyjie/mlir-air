@@ -877,11 +877,17 @@ once after 12 layers: <span style="color:#1e40af;font-weight:700">[NPU elf:layer
     vision runs at seq=1024 with big matmuls (fc up to 3072-wide, a 1024×1024 attention), so the NPU's matrix engine
     is well-fed and per-dispatch overhead is amortized. The backbone, at seq=256, is too small to fill the array.
   </div>
-  <div class="callout warn">
-    <b>Headroom not yet taken: batch the three cameras.</b> Today each image is a separate 37-dispatch run. Since
-    the per-image work is identical and independent, the three could share one set of dispatches (GEMMs at M=3072
-    instead of 1024), amortizing the launch overhead ~3×. Given that dispatch overhead is what dominated before
-    fusion, this is the obvious next optimization for vision.
+  <div class="callout">
+    <b>Why three cameras cost 3× (and why batching them barely helps).</b> The encoder does <em>independent</em>
+    work per image: each 512×512 frame becomes 1024 patch tokens that flow through all 12 layers, and attention is
+    within-image (1024×1024), never across images. So three cameras are inherently 3× the FLOPs — that's the
+    algorithm, not the scheduling. lerobot reflects this literally: <code>embed_prefix</code> <em>loops</em> over
+    the images and calls <code>embed_image()</code> once per camera.
+    Feeding all three as one batch is possible, but measured on CPU it saves only <b>9%</b>
+    (608 ms → 554 ms) — it removes per-call overhead, not arithmetic. On the NPU the equivalent headroom is smaller
+    still: after fusion the host overhead is already down to ~4 ms per image (~3%), so batching would recover a few
+    percent at best. Real vision headroom lies elsewhere (e.g. the memory-bound norm/activation ops inside the
+    137 ms), not in batching the cameras.
   </div>
 
   <div class="callout">
