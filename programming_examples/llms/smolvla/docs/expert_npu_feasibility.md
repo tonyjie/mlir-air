@@ -68,9 +68,9 @@ Full sweep in `results/expert_gemm.csv`, logs in `results/logs/`.
 
 | expert op | shape (M=50→64) | tiling (tm/tk2/tk1/tn, herd) | latency | **GFLOP/s** | mean_rel_L1 |
 |---|---|---|---|---|---|
-| q_proj | 64×720×960 | 16/144/48/80, 4×4 | 159.1 µs | **556** | 9.39e-3 |
+| q_proj | 64×720×960 | 16/144/48/80, 4×4 | 158.2 µs | **559** | 9.39e-3 |
 | k/v_proj (even layers) | 64×720×320 | 16/144/48/80, 4×4 | 95.2 µs | **310** | 9.43e-3 |
-| o_proj (N 720→768) | 64×960×768 | 16/320/32/96, 4×4 | 133.4 µs | **696** | 9.46e-3 |
+| o_proj (N 720→768) | 64×960×768 | 16/320/32/96, 4×4 | 135.6 µs | **685** | 9.46e-3 |
 | o_proj (native N=720) | 64×960×720 | 16/320/32/80, 4×**3** | 165.9 µs | 533 | 9.47e-3 |
 | gate/up | 64×720×2048 | 16/144/48/128, 4×4 | 185.0 µs | **1020** | 9.43e-3 |
 | down (N 720→768) | 64×2048×768 | 16/256/32/96, 4×4 | 179.5 µs | **1122** | 9.28e-3 |
@@ -93,7 +93,7 @@ Full sweep in `results/expert_gemm.csv`, logs in `results/logs/`.
 | SmolVLA vision (registry, seq 1024) | 1024×3072×768 | 5790 |
 
 The expert's best GEMM (1122) is **3× below the backbone's down-proj** and
-**5× below the vision tower's**. The expert's *typical* GEMM (556) is
+**5× below the vision tower's**. The expert's *typical* GEMM (559) is
 **3.7× below the backbone's equivalent projection**.
 
 ### Why: M is the whole story
@@ -102,7 +102,7 @@ Same K/N, only M changes — this is the cleanest single measurement in the stud
 
 | M | shape | latency | GFLOP/s |
 |---|---|---|---|
-| **64** (the expert) | 64×720×960 | 159.1 µs | **556** |
+| **64** (the expert) | 64×720×960 | 158.2 µs | **559** |
 | 128 | 128×720×960 | 173.8 µs | **1018** |
 | 256 (the backbone) | 256×720×960 | 198.9 µs | **1780** |
 
@@ -229,19 +229,19 @@ in any port we would write, so that lever is already spent.)*
 
 | scenario | dispatches | device | overhead | **TOTAL** | effective |
 |---|---|---|---|---|---|
-| **A** — one dispatch per op, today's kernels | 2390 | 440.0 ms | 86.0 ms | **526.0 ms** | 214 GFLOP/s |
-| **B** — A + concat q‖k‖v and gate‖up weights, hoist the cross-attn K/V out of the denoise loop | 1926 | 405.1 ms | 68.8 ms | **473.9 ms** | 238 GFLOP/s |
-| **C** — B + a *hypothetical fixed* small-Q FlashAttention (§4) | 1926 | 317.7 ms | 68.8 ms | **386.5 ms** | 291 GFLOP/s |
-| **D** — "fuse like vision", 3 ELFs/layer × 16 × 10 | **490** | 563–725 ms | 17.6 ms | **581–743 ms** | 152–194 GFLOP/s |
+| **A** — one dispatch per op, today's kernels | 2390 | 440.2 ms | 86.0 ms | **526.3 ms** | 214 GFLOP/s |
+| **B** — A + concat q‖k‖v and gate‖up weights, hoist the cross-attn K/V out of the denoise loop | 1926 | 405.4 ms | 68.8 ms | **474.2 ms** | 238 GFLOP/s |
+| **C** — B + a *hypothetical fixed* small-Q FlashAttention (§4) | 1926 | 318.0 ms | 68.8 ms | **386.7 ms** | 291 GFLOP/s |
+| **D** — "fuse like vision", 3 ELFs/layer × 16 × 10 | **490** | 563–726 ms | 17.6 ms | **581–743 ms** | 152–194 GFLOP/s |
 
 Scenario D is the one the original premise expected to win. It removes 52 ms of
 dispatch cost and adds 158–320 ms of device cost (§5). **It is the worst option.**
 
-Where scenario A's 440 ms of device time goes:
+Where scenario A's 440.2 ms of device time goes:
 
 | bucket | ms | share |
 |---|---|---|
-| GEMM (projections + FFN) | 168.0 | 38.2% |
+| GEMM (projections + FFN) | 168.2 | 38.2% |
 | attention | 144.9 | 32.9% |
 | RMSNorm | 48.4 | 11.0% |
 | eltwise add (residuals) | 27.7 | 6.3% |
@@ -283,9 +283,9 @@ NPU: from §2/§3/§4, at the **padded** M=64/256 it is forced to use.
 
 | op | shape | CPU bf16 | CPU GFLOP/s | NPU | NPU GFLOP/s | **CPU faster by** |
 |---|---|---|---|---|---|---|
-| q_proj | 50×720×960 | **89.9 µs** | 769 | 159.1 µs | 556 | **1.8×** |
+| q_proj | 50×720×960 | **89.9 µs** | 769 | 158.2 µs | 559 | **1.8×** |
 | k/v_proj (even) | 50×720×320 | **41.6 µs** | 554 | 95.2 µs | 310 | **2.3×** |
-| o_proj | 50×960×720 | **62.3 µs** | 1109 | 133.4 µs | 696 | **2.1×** |
+| o_proj | 50×960×720 | **62.3 µs** | 1109 | 135.6 µs | 685 | **2.2×** |
 | gate/up | 50×720×2048 | **169.2 µs** | 871 | 185.0 µs | 1020 | **1.1×** |
 | down | 50×2048×720 | **112.3 µs** | 1313 | 179.5 µs | 1122 | **1.6×** |
 | k/v_proj (cross) | 241×320×320 | **55.5 µs** | 890 | 112.6 µs | 466 | **2.0×** |
@@ -304,9 +304,9 @@ exactly the shape that best fills the herd.
 | | latency per inference | vs CPU |
 |---|---|---|
 | **CPU (measured)** | **323.9 ms** | 1.00× |
-| NPU scenario A (today's kernels, unfused) | 526.0 ms | **1.62× slower** |
-| NPU scenario B (cheap structural wins) | 473.9 ms | **1.46× slower** |
-| NPU scenario C (+ fixed small-Q FlashAttention) | 386.5 ms | **1.19× slower** |
+| NPU scenario A (today's kernels, unfused) | 526.3 ms | **1.62× slower** |
+| NPU scenario B (cheap structural wins) | 474.2 ms | **1.46× slower** |
+| NPU scenario C (+ fixed small-Q FlashAttention) | 386.7 ms | **1.19× slower** |
 | NPU scenario D ("fuse like vision") | 581–743 ms | **1.79–2.29× slower** |
 
 **The expert should stay on CPU.** It is the mirror image of the vision tower:
@@ -314,7 +314,7 @@ vision wins 1.5× because seq=1024 and 768/3072-wide matmuls saturate the array;
 the expert loses because seq=50 leaves half the herd unused, attention on 1
 column of 8, and 46% of the device time in per-launch floor.
 
-Note also the *lower bound*: scenario C's **device time alone is 317.7 ms**,
+Note also the *lower bound*: scenario C's **device time alone is 318.0 ms**,
 already a dead heat with the CPU's 323.9 ms. **No amount of dispatch-overhead
 reduction, driver work, or fusion can produce a win** — the compute itself is
 not fast enough at these shapes.
@@ -323,7 +323,7 @@ not fast enough at these shapes.
 
 ## 9. What would have to change to flip it
 
-Target: ≤ 324 ms. Best modelled today is 386.5 ms (scenario C). The gap is 1.19×,
+Target: ≤ 324 ms. Best modelled today is 386.7 ms (scenario C). The gap is 1.19×,
 and it is **not** in the host.
 
 | lever | effect | feasible? |
@@ -331,7 +331,7 @@ and it is **not** in the host.
 | **1. Cut the per-launch device floor from ~85 µs to ~30 µs.** 46% of device time is launch floor (herd start/stop, DMA BD programming, lock setup). At 30 µs, scenario C → **~193 ms device / ~262 ms total = a 1.24× WIN.** | **−105 ms** | Compiler/runtime work, not kernel tuning. Unquantified difficulty, but it is the only lever big enough on its own. |
 | **2. Fix FlashAttention below lq=256** (§4). Removes a 5.1× Q-padding waste and 550 µs × 160 attentions. | **−87 ms** | Real bug (inf/NaN at lq≤128 in *both* variants). Bounded, well-defined kernel work. Necessary but not sufficient. |
 | **3. Concat q‖k‖v and gate‖up weights; hoist the cross-attn K/V GEMMs out of the 10-step loop.** Pure host-side restructuring; the fused-weight GEMMs are already measured (§2). | **−52 ms** | Easy and safe. Nowhere near enough alone. |
-| **4. Batch > 1** (multiple environments / action chunks per call). M goes 64 → 128 → 256, and measured GFLOP/s goes 556 → 1018 → **1780** (3.2×). | converts the workload from latency-bound to compute-bound | The single biggest structural lever — but it buys **throughput, not single-chunk latency**. Only useful if the deployment can batch. |
+| **4. Batch > 1** (multiple environments / action chunks per call). M goes 64 → 128 → 256, and measured GFLOP/s goes 559 → 1018 → **1780** (3.2×). | converts the workload from latency-bound to compute-bound | The single biggest structural lever — but it buys **throughput, not single-chunk latency**. Only useful if the deployment can batch. |
 | ~~5. Fuse into 3 ELFs/layer like vision~~ | **+158 to +320 ms** | **Counterproductive** — measured 1.39–1.79× device penalty for 24 µs/dispatch of savings (§5). |
 | ~~6. Reduce per-dispatch host overhead~~ | ≤ **−86 ms**, and it is already only 16% | Even at zero, 440 ms > 324 ms. Cannot flip it. |
 
@@ -409,5 +409,5 @@ artifact: `gate_up` and `kv_cross` report FAIL on 1–52 of 10⁵ elements with
 
 Also: **N=720 cannot use `herd_n=4`** (`720 % (4·tile_n) == 0` has no solution
 with `tile_n % 16 == 0`). Either drop to `herd_n=3` or pad N 720→768 — padding
-is *faster* despite +6.7% FLOPs (o_proj 133.4 µs padded vs 165.9 µs native;
+is *faster* despite +6.7% FLOPs (o_proj 135.6 µs padded vs 165.9 µs native;
 down 179.5 vs 212.3).

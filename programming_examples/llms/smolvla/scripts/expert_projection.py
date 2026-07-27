@@ -33,9 +33,9 @@ N_ODD = N_LAYERS // 2  # cross-attn layers
 # ---------------------------------------------------------------------------
 US = {
     # --- GEMM, M=50 padded to 64 --------------------------------------------
-    "q_proj": 159.1,  # 64x720x960   tm16/tk2 144/tk1 48/tn80  herd 4x4
+    "q_proj": 158.2,  # 64x720x960   tm16/tk2 144/tk1 48/tn80  herd 4x4 (median of 4)
     "kv_even": 95.2,  # 64x720x320   same tiling
-    "o_proj": 133.4,  # 64x960x768   (N 720->768) tn96 herd 4x4
+    "o_proj": 135.6,  # 64x960x768   (N 720->768) tn96 herd 4x4 (median of 3)
     "gate_or_up": 185.0,  # 64x720x2048  tn128 herd 4x4
     "down": 179.5,  # 64x2048x768  (N 720->768) tn96 herd 4x4
     "kv_cross": 112.6,  # 256x320x320  tm32/tk2 320/tn80 herd 8x4 (M=241->256)
