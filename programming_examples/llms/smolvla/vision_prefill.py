@@ -137,25 +137,35 @@ _GEMM_SHAPES = {
 }
 
 # A3-5 Step 4: the connector (modality projection) GEMM, 64x12288x960.
-# Registry row (drain, precision="high"): tile_m=16, tile_k_l2=256, tile_k_l1=32,
-# tile_n=80, with a per-shape HERD OVERRIDE of 4x4 — M=64 is only 4 tile_m rows,
+# Registry row (drain, precision="high"): tile_m=16, tile_k_l2=384, tile_k_l1=32,
+# tile_n=240, with a per-shape HERD OVERRIDE of 4x4 — M=64 is only 4 tile_m rows,
 # so the usual 8-row herd cannot be filled (build_module asserts
 # m % (tile_m*herd_m) == 0). tile_m=16 also differs from the _m32 drain default,
-# so this ELF links its OWN symbol-suffixed microkernel (mm_m16_n80.o) and can
+# so this ELF links its OWN symbol-suffixed microkernel (mm_m16_n240.o) and can
 # never collide with the encoder's mm_m32_n{96,128}.o (see the fused-ELF mm.o
 # gotcha in vit_fused_builders._force_tile_n_suffix).
+#
+# tile_n=240 (was 80): measured on NPU2 2026-07-27, the tile_n sweep at herd 4x4
+# is strongly non-flat — 16:3352us, 48:1347us, 80:890us, 240:667-713us. 240 is
+# 1.33x faster at BIT-IDENTICAL accuracy (both mean_rel_L1=9.450e-3, abs_err max
+# 3.662e-4). The old 80 came from the generic "N not 512-aligned -> shrink
+# TILE_N" habit, which is the wrong instinct here: this GEMM is WEIGHT-DMA-BOUND
+# (B = 23.6 MB = 93% of traffic, independent of M), so fewer/larger N-tiles
+# amortize the weight stream better. 16 tiles is the hard ceiling AND the right
+# choice — padding M 64->128 to fill the full 8x4 herd was measured SLOWER in
+# wall-clock (734us vs 667-713us). See kernel_registry GEMM detail page.
 _CONNECTOR_GEMM = dict(
     m=64,
     k=12288,
     n=960,
     tile_m=16,
-    tile_k_l2=256,
+    tile_k_l2=384,
     tile_k_l1=32,
-    tile_n=80,
+    tile_n=240,
     herd_m=4,
     herd_n=4,
-    sym_suffix="_m16_n80",
-    obj="mm_m16_n80.o",
+    sym_suffix="_m16_n240",
+    obj="mm_m16_n240.o",
 )
 _PIXEL_SHUFFLE_FACTOR = 4
 

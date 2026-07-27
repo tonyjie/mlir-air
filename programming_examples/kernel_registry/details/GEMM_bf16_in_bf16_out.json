@@ -453,7 +453,7 @@
       "K": 896,
       "N": 896,
       "used_by": "Qwen2.5-0.5B Q/O proj",
-      "_note": "Non-512-aligned N=896=128*7. HERD_N=1 (TILE_N=128) fails at runtime (qds_device::wait unexpected command state) \u2014 fused-cast/drain paths assume the 8x4 array. Working config keeps HERD_N=4 with TILE_N=32 (4*32=128 | 896); drain (tile_m=32) places, fused-cast tile_m=64 over-allocates L1.",
+      "_note": "Non-512-aligned N=896=128*7. HERD_N=1 (TILE_N=128) fails at runtime (qds_device::wait unexpected command state) — fused-cast/drain paths assume the 8x4 array. Working config keeps HERD_N=4 with TILE_N=32 (4*32=128 | 896); drain (tile_m=32) places, fused-cast tile_m=64 over-allocates L1.",
       "methods": {
         "drain": {
           "tile": {
@@ -975,7 +975,7 @@
       "M": 256,
       "K": 960,
       "N": 320,
-      "used_by": "SmolVLA K/V proj (kv_dim=320=4\u00b780; K=960 tile_k_l2=320)",
+      "used_by": "SmolVLA K/V proj (kv_dim=320=4·80; K=960 tile_k_l2=320)",
       "methods": {
         "drain": {
           "tile": {
@@ -997,7 +997,7 @@
       "M": 256,
       "K": 960,
       "N": 2560,
-      "used_by": "SmolVLA Gate/Up proj (N=2560=4\u00b7128\u00b75; K=960 tile_k_l2=320)",
+      "used_by": "SmolVLA Gate/Up proj (N=2560=4·128·5; K=960 tile_k_l2=320)",
       "methods": {
         "drain": {
           "tile": {
@@ -1019,7 +1019,7 @@
       "M": 256,
       "K": 2560,
       "N": 960,
-      "used_by": "SmolVLA Down proj (K=2560 tile_k_l2=320; N=960\u2192TILE_N=80)",
+      "used_by": "SmolVLA Down proj (K=2560 tile_k_l2=320; N=960→TILE_N=80)",
       "methods": {
         "drain": {
           "tile": {
@@ -1163,18 +1163,21 @@
       "K": 12288,
       "N": 960,
       "used_by": "SmolVLA connector proj (vision->LLM, K=12288 very large, M=64 very small)",
-      "_note": "Connector projection between the vision encoder and the LLM. M=64 is tiny (only fills part of the herd) and K=12288 is very large. M=64 forces tile_m=16 (mm.o static_assert m%(2*8)==0 rejects tile_m=8) and herd_m=4 (tile_m*herd_m=64=M, single M-iteration; tile_m=16/herd_m=8=128 > M fails the m%(tile_m*herd_m)==0 assert). N=960 -> TILE_N=80 HERD_N=4 (4*80=320 | 960). K=12288=2^12*3 tile_k_l2=256 (48 L2 tiles). MKN=7.5e8 < 4e9 -> drain. K=12288 is NOT a placement blocker -- it just means 48 reduction tiles; PLACES and PASSES cleanly on NPU at 9.450e-3, abs_err max 3.66e-4. M=64 is latency-bound (~1690 GFLOPS, flat across tile_k_l2 in {256,512,768}) because it fills only 4x4 of the 8x4 herd. NO CPU fallback needed.",
+      "_note": "Connector projection between the vision encoder and the LLM. M=64 is tiny and K=12288 is very large. M=64 forces tile_m=16 (mm.o static_assert m%(2*8)==0 rejects tile_m=8) and herd_m=4 (tile_m*herd_m=64=M; tile_m=16/herd_m=8=128 > M fails the m%(tile_m*herd_m)==0 assert). MKN=7.5e8 < 4e9 -> drain. K=12288 is NOT a placement blocker -- just 48 reduction tiles at tile_k_l2=256; PLACES and PASSES cleanly at 9.450e-3, abs_err max 3.662e-4. NO CPU fallback needed. TILE_N=240: N=960=4*240 and 240 satisfies the mmul t=8 constraint (n%(2*t)==0). WHY 240 AND NOT 80: the measured tile_n sweep at herd 4x4 (2026-07-27) is strongly non-flat -- 16:3352us, 48:1347us, 80:890us, 240:667-713us. tile_n=240 is 1.33x FASTER than the tile_n=80 this row originally carried, at BIT-IDENTICAL accuracy (both 9.450e-3, abs_err max 3.662e-4). The old 80 came from the generic 'N not 512-aligned -> shrink TILE_N' habit (4*80=320 | 960), which is the wrong instinct for this tiny-M/huge-K shape: fewer, larger N-tiles amortize the weight DMA far better. tile_k_l2 is nearly inert across {128,256,384} (686/689/672us; 384 marginally best); tile_k_l2 >= 512 FAILS TO COMPILE (L1 over-allocation) -- an earlier revision of this note claimed 512/768 were flat-but-working, which was wrong. 16 TILES IS THE HARD CEILING, and it is NOT costing performance. The full (tile_m,herd_m,tile_n,herd_n) grid was enumerated under tile_m%16==0, tile_n%16==0, M%(tile_m*herd_m)==0, N%(tile_n*herd_n)==0, herd_m<=8, herd_n<=4: 4x4 is the maximum reachable (tile_n=120 would allow herd_n=8 but violates n%16, verified by compile failure). Padding M 64->128 to fill the full 8x4 herd was MEASURED and is SLOWER in wall-clock (975us vs 892us at tile_n=80; 734us vs 667-713us at tile_n=240) -- the doubled GFLOPS is pure padding waste. ROOT CAUSE: this GEMM is WEIGHT-DMA-BOUND, not tile-bound. B is 12288*960*2 = 23.6 MB vs A 1.57 MB + C 0.12 MB, i.e. 93% of traffic and independent of M; 25.3 MB in ~890us ~= 28 GB/s, at the DMA ceiling. Confirmed two ways: halving K halves latency (892->518us), and the herd_m sweep at 4/8/16 tiles (7358/1668/888us) is near-linear then saturates. Extra tiles have no extra bandwidth to consume.",
       "methods": {
         "drain": {
           "tile": {
             "tile_m": 16,
-            "tile_k_l2": 256,
+            "tile_k_l2": 384,
             "tile_k_l1": 32,
-            "tile_n": 80
+            "tile_n": 240
           },
-          "gflops": 1695,
+          "gflops": 2246,
           "mean_rel_L1": 0.0095,
-          "herd": [4, 4],
+          "herd": [
+            4,
+            4
+          ],
           "tier": "high"
         }
       },
