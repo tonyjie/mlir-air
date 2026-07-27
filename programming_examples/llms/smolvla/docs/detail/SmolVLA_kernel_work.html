@@ -50,6 +50,16 @@
   .toc ol { margin:0.4rem 0; padding-left:1.4rem; }
   .src { font-family:"SF Mono",Menlo,Consolas,monospace; font-size:0.8rem; color:#374151; }
   .num { font-variant-numeric:tabular-nums; }
+  .path { font-family:"SF Mono",Menlo,Consolas,monospace; font-size:0.78rem; background:#f8fafc;
+          color:#0f172a; border:1px solid #e2e8f0; border-radius:4px; padding:0.05rem 0.35rem; }
+  .tiles { display:inline-block; font-family:"SF Mono",Menlo,Consolas,monospace; font-size:0.76rem;
+           font-weight:600; border-radius:4px; padding:0.05rem 0.4rem; white-space:nowrap; }
+  .tiles.full { background:#dcfce7; color:#14532d; border:1px solid #86efac; }   /* 32 tiles */
+  .tiles.half { background:#e0f2fe; color:#075985; border:1px solid #7dd3fc; }   /* 16 tiles */
+  .tiles.row  { background:#fef9c3; color:#713f12; border:1px solid #fde047; }   /* 8 tiles  */
+  .tiles.low  { background:#fee2e2; color:#7f1d1d; border:1px solid #fca5a5; }   /* <8 tiles */
+  .bar { display:inline-block; height:0.55rem; border-radius:3px; background:var(--accent);
+         vertical-align:middle; margin-right:0.35rem; }
 </style>
 </head>
 <body>
@@ -79,6 +89,12 @@
         <span class="num">~4e-2</span> attention (it chains more rounding).</li>
       <li><b>GFLOP/s</b> = compute throughput (higher better, for compute-bound ops like matmul/attention).
         <b>GB/s</b> = memory bandwidth (higher better, for memory-bound ops like norms/activations/residuals).</li>
+      <li><b>tiles</b> = how much of the NPU2 compute array the kernel occupies. The chip is an
+        <b>8&nbsp;columns × 4&nbsp;rows = 32-tile</b> array. <span class="tiles full">8×4 = 32</span> is full-chip;
+        <span class="tiles half">8×2 = 16</span> half; <span class="tiles row">8×1 = 8</span> one row;
+        <span class="tiles low">&lt; 8</span> is under-filled. <b>More tiles is not automatically better</b> —
+        several kernels are physically capped below 32 by a hardware limit, not by a missed tuning
+        opportunity (see §7).</li>
     </ul>
   </div>
 
@@ -86,8 +102,14 @@
     <div class="stat"><div class="big">1</div><div class="label">brand-new kernel written<br>(masked-softmax)</div></div>
     <div class="stat"><div class="big">1</div><div class="label">kernel extended<br>(LayerNorm + affine)</div></div>
     <div class="stat"><div class="big">2</div><div class="label">promoted into the registry<br>(LayerNorm, GELU-tanh)</div></div>
-    <div class="stat"><div class="big">17</div><div class="label">(kernel, shape) rows<br>validated &amp; recorded</div></div>
+    <div class="stat"><div class="big">21</div><div class="label">(kernel, shape) rows<br>validated &amp; recorded</div></div>
+    <div class="stat"><div class="big">28</div><div class="label">files changed<br>vs upstream main</div></div>
   </div>
+  <p style="color:var(--muted);font-size:0.88rem;margin-top:-0.6rem">
+    21 registry rows = 10 GEMM shapes + 5 GELU + 1 each of RMSNorm / LayerNorm / RoPE / SiLU-and-Mul /
+    Element-wise Add / FlashAttention. Of the 14 rows SmolVLA actually deploys, <b>all 14 were independently re-run
+    on NPU2 and reproduced</b> (2026-07-27) — see §2 for the file-by-file diff.
+  </p>
 
   <div class="callout">
     <b>A note on per-kernel vs integrated accuracy.</b> Every kernel here is <em>individually</em> clean at the tiers
@@ -103,10 +125,12 @@
     <b>Contents</b>
     <ol>
       <li><a href="#big">The big picture — three kinds of kernel work</a></li>
+      <li><a href="#diff">Exactly what changed vs upstream — the file manifest</a></li>
       <li><a href="#backbone">Backbone kernels (language model, Milestone A1)</a></li>
       <li><a href="#vision">Vision kernels (SigLIP encoder, Milestone A3)</a></li>
       <li><a href="#new">The kernels we actually wrote or changed</a></li>
       <li><a href="#gotchas">Gotchas found (silent-wrong-answer traps)</a></li>
+      <li><a href="#tiles">Array occupancy — how many tiles each kernel uses, and why</a></li>
       <li><a href="#reuse">Where each implementation comes from</a></li>
     </ol>
   </div>
@@ -147,34 +171,127 @@
   </div>
 
   <!-- ============================================================ -->
-  <h2 id="backbone">2. Backbone kernels (language model — Milestone A1)</h2>
+  <h2 id="diff">2. Exactly what changed vs upstream — the file manifest</h2>
+  <p class="lead">
+    Everything below is the diff of this branch against the upstream merge-base
+    (<code>b55c3734</code>, <code>Xilinx/mlir-air</code> main). Paths are relative to the repo root, so each row is
+    directly checkable with <code>git diff b55c3734..HEAD -- &lt;path&gt;</code>. Kernel-related changes total
+    <b>28 files, +2211 / −244 lines</b>.
+  </p>
+
+  <h3>A. Brand-new directory <span class="tag new">NEW</span></h3>
+  <table>
+    <tr><th>Path</th><th>+/−</th><th>What it is</th></tr>
+    <tr><td><span class="path">programming_examples/masked_softmax/masked_softmax.cc</span></td><td class="num">+231</td>
+        <td>The compute kernel. Forked from <span class="path">softmax/softmax.cc</span>; the genuinely new code is the
+            <code>masked_softmax_bf16(in, pos, mask, out)</code> entry point and the
+            <code>kExpDiffFloor = −120</code> clamp inside <code>exp_bf16</code>.</td></tr>
+    <tr><td><span class="path">programming_examples/masked_softmax/masked_softmax.py</span></td><td class="num">+295</td>
+        <td>Builder + host harness. Adds a second L3 <code>mask</code> input DMA'd alongside the scores.</td></tr>
+    <tr><td><span class="path">programming_examples/masked_softmax/lut_based_ops.h</span></td><td class="num">+424</td>
+        <td><b>Byte-identical copy</b> of <span class="path">softmax/lut_based_ops.h</span> (verified). Carried along
+            so the example is self-contained — <em>not</em> new logic.</td></tr>
+    <tr><td><span class="path">programming_examples/masked_softmax/zero.cc</span></td><td class="num">+37</td>
+        <td><b>Byte-identical copy</b> of <span class="path">softmax/zero.cc</span> (verified).</td></tr>
+    <tr><td><span class="path">programming_examples/masked_softmax/Makefile</span></td><td class="num">+62</td><td>Build/run targets.</td></tr>
+    <tr><td><span class="path">programming_examples/masked_softmax/run_npu2_makefile_peano.lit</span></td><td class="num">+10</td>
+        <td>Lit test (<code>REQUIRES: ryzen_ai_npu2, peano</code>, checks <code>PASS!</code>). Re-run on NPU2 — passes.</td></tr>
+  </table>
+  <div class="callout">
+    <b>Honest accounting:</b> of masked-softmax's 1059 added lines, <b>461 are byte-identical copies</b> of the
+    upstream <code>softmax/</code> support files. The real new work is the masked entry point + the LUT clamp inside
+    <code>masked_softmax.cc</code>, plus the second-input plumbing in the builder.
+  </div>
+
+  <h3>B. Modified existing kernels <span class="tag mod">EXTEND</span></h3>
+  <table>
+    <tr><th>Path</th><th>+/−</th><th>What changed</th></tr>
+    <tr><td><span class="path">programming_examples/layer_norm/layer_norm.py</span></td><td class="num">+272 / −145</td>
+        <td>Added the affine epilogue (γ, β), the multi-tile <code>herd_x</code> path, and the packed
+            <code>weight‖bias</code> single-DMA param buffer. This is the <b>only real kernel-code change</b> of the three.</td></tr>
+    <tr><td><span class="path">programming_examples/layer_norm/Makefile</span></td><td class="num">+22 / −1</td>
+        <td><code>AIE_TARGET</code>/<code>HERD_X</code>/<code>M</code>/<code>N</code> knobs; default now <code>aie2p</code> + <code>HERD_X=8</code>.</td></tr>
+    <tr><td><span class="path">programming_examples/gelu/gelu.py</span></td><td class="num">+90 / −45</td>
+        <td><b>No math change.</b> Exposed the hardcoded 1×2 herd as <code>--herd-x/--herd-y</code>, added
+            <code>--perf-iters</code>, and replaced a weak 100-sample random check (<code>rtol 1e-1</code>) with a
+            full-output FP32 element-wise gate.</td></tr>
+    <tr><td><span class="path">programming_examples/gelu/Makefile</span></td><td class="num">+17 / −2</td>
+        <td><code>N</code>/<code>TILE_N</code>/<code>HERD_X</code>/<code>HERD_Y</code> + a <code>profile</code> target.</td></tr>
+  </table>
+
+  <h3>C. kernel_registry — the catalogue <span class="tag reuse">RECORD</span></h3>
+  <table>
+    <tr><th>Path</th><th>+/−</th><th>What changed</th></tr>
+    <tr><td><span class="path">kernel_registry/details/GELU_bf16.md</span></td><td class="num">+264</td>
+        <td><b>New kernel page.</b> Datapath, herd/tile sweeps, tolerances, 5 shapes, reproduce commands.</td></tr>
+    <tr><td><span class="path">kernel_registry/details/LayerNorm_bf16.md</span></td><td class="num">+169</td>
+        <td><b>New kernel page.</b> Registry grows 8 → 9 kernel families.</td></tr>
+    <tr><td><span class="path">kernel_registry/details/GEMM_bf16_in_bf16_out.json</span></td><td class="num">+233</td>
+        <td>10 new SmolVLA shape entries (machine-readable — this is what model code reads).</td></tr>
+    <tr><td><span class="path">kernel_registry/details/GEMM_bf16_in_bf16_out.md</span></td><td class="num">+13</td>
+        <td>The same 10 shapes as human tables + two explanatory notes.</td></tr>
+    <tr><td><span class="path">kernel_registry/supported_kernels.md</span></td><td class="num">+52 / −1</td>
+        <td>Index rows, a new "LayerNorm — tested shapes" section, a new "GELU-and-tanh" section, and one appended row
+            each for RMSNorm / RoPE / SiLU-Mul / EltwiseAdd / FlashAttention.</td></tr>
+    <tr><td><span class="path">kernel_registry/details/{RMSNorm,RoPE,SiLU_Mul,EltwiseAdd,FlashAttention}_bf16.md</span></td>
+        <td class="num">+13 total</td><td>One SmolVLA row appended to each (+ the EltwiseAdd <code>tile_n</code> and RoPE θ notes).</td></tr>
+    <tr><td><span class="path">kernel_registry/registry_lookup.py</span></td><td class="num">+8 / −1</td>
+        <td>Surfaces a per-method <code>herd</code> override (only the connector shape has one). <b>Verified
+            behaviour-preserving:</b> all 33 pre-existing shapes × both precision tiers (42 combinations) return
+            byte-identical dicts, and no pre-existing JSON entry was touched.</td></tr>
+    <tr><td><span class="path">kernel_registry/README.md</span></td><td class="num">+4 / −2</td>
+        <td>Scope/roadmap updated for GELU + a methodology note (the DMA-per-tile herd ceiling, see §7).</td></tr>
+  </table>
+
+  <h3>D. Model-side plumbing this kernel work required</h3>
+  <table>
+    <tr><th>Path</th><th>+/−</th><th>What changed</th></tr>
+    <tr><td><span class="path">llms/shared/builders/gemm_builder.py</span></td><td class="num">+49</td>
+        <td><code>disambiguate_by_tile_n()</code> — SmolVLA is the first model where two <code>drain</code> GEMMs in
+            the <em>same</em> fused ELF resolve to different <code>tile_n</code> (80 vs 128), which silently collided
+            on one shared <code>mm_m32.o</code>. See the gotcha table.</td></tr>
+    <tr><td><span class="path">llms/shared/builders/o_ffn_multi.py</span></td><td class="num">+66 / −28</td><td>Uses the disambiguated specs.</td></tr>
+    <tr><td><span class="path">llms/shared/infra/external_kernels.py</span></td><td class="num">+45 / −19</td>
+        <td>Compiles/stages <code>masked_softmax.o</code>; per-<code>tile_n</code> <code>mm.o</code> names.</td></tr>
+    <tr><td><span class="path">llms/shared/infra/cache.py</span></td><td class="num">+4</td><td>Kernel-cache staging for the new object.</td></tr>
+    <tr><td><span class="path">llms/verify/comparators.py</span>, <span class="path">llms/verify/test_regression_gate.py</span></td>
+        <td class="num">+28</td><td>Verification helpers for the new shapes.</td></tr>
+  </table>
+  <p style="color:var(--muted);font-size:0.9rem">
+    (The SmolVLA model directory itself — <span class="path">programming_examples/llms/smolvla/</span> — is entirely
+    new but is <em>model integration</em>, not kernel work; it is covered by the main journey artifact.)
+  </p>
+
+  <!-- ============================================================ -->
+  <h2 id="backbone">3. Backbone kernels (language model — Milestone A1)</h2>
   <p>
     The 16-layer SmolLM2-360M backbone runs entirely on the NPU. Its per-layer math decomposes into these kernels,
     each validated at the backbone's padded prefix length <b>seq = 256</b> (real length 241, padded to a friendly
     tile boundary), <b>emb = 960</b>, GQA 15 query / 5 key-value heads, head_dim 64.
   </p>
   <table>
-    <tr><th>Op in the model</th><th>Kernel</th><th>Shape</th><th>Performance</th><th>Accuracy<br>(mean_rel_L1)</th><th>Kind</th></tr>
-    <tr><td>RMSNorm (×2/layer)</td><td>RMSNorm bf16</td><td><span class="shape">256×960</span></td><td>6.7 GB/s</td><td>4.2e-3</td><td><span class="tag reuse">reuse</span></td></tr>
-    <tr><td>Q / O projection</td><td>GEMM bf16-out</td><td><span class="shape">256×960×960</span></td><td>1896 GFLOP/s</td><td>9.5e-3</td><td><span class="tag reuse">reuse</span></td></tr>
-    <tr><td>K / V projection</td><td>GEMM bf16-out</td><td><span class="shape">256×960×320</span></td><td>1228 GFLOP/s</td><td>9.4e-3</td><td><span class="tag reuse">reuse</span></td></tr>
-    <tr><td>Gate / Up projection</td><td>GEMM bf16-out</td><td><span class="shape">256×960×2560</span></td><td>2838 GFLOP/s</td><td>9.4e-3</td><td><span class="tag reuse">reuse</span></td></tr>
-    <tr><td>Down projection</td><td>GEMM bf16-out</td><td><span class="shape">256×2560×960</span></td><td>3425 GFLOP/s</td><td>9.4e-3</td><td><span class="tag reuse">reuse</span></td></tr>
-    <tr><td>RoPE (rotary pos, Q &amp; K)</td><td>RoPE half-split</td><td><span class="shape">256×64</span></td><td>latency-bound (80 µs)</td><td>2.8e-3</td><td><span class="tag reuse">reuse</span></td></tr>
-    <tr><td>attention — scores <code>Q·Kᵀ</code></td><td>GEMM (per head)</td><td><span class="shape">256×64×256</span></td><td>—</td><td>9.6e-3</td><td><span class="tag reuse">reuse</span></td></tr>
-    <tr><td>attention — softmax(+mask)</td><td><b>masked-softmax</b></td><td><span class="shape">(15,256,256)</span> batched</td><td>—</td><td>bf16 tier</td><td><span class="tag new">NEW</span></td></tr>
-    <tr><td>attention — <code>P·V</code></td><td>GEMM (per head)</td><td><span class="shape">256×256×64</span></td><td>—</td><td>9.6e-3</td><td><span class="tag reuse">reuse</span></td></tr>
-    <tr><td>SiLU-and-Mul (SwiGLU)</td><td>SiLU-and-Mul bf16</td><td><span class="shape">256×2560</span> (N=655360)</td><td>15.9 GB/s</td><td>1.0e-2</td><td><span class="tag reuse">reuse</span></td></tr>
-    <tr><td>residual add</td><td>Element-wise Add</td><td><span class="shape">256×960</span> (N=245760)</td><td>13.2 GB/s</td><td>1.9e-3</td><td><span class="tag reuse">reuse</span></td></tr>
+    <tr><th>Op in the model</th><th>Kernel</th><th>Shape</th><th>Tiles used</th><th>Performance</th><th>Accuracy<br>(mean_rel_L1)</th><th>Kind</th></tr>
+    <tr><td>RMSNorm (×2/layer)</td><td>RMSNorm bf16</td><td><span class="shape">256×960</span></td><td><span class="tiles row">8×1 = 8</span></td><td>6.7 GB/s</td><td>4.2e-3</td><td><span class="tag reuse">reuse</span></td></tr>
+    <tr><td>Q / O projection</td><td>GEMM bf16-out</td><td><span class="shape">256×960×960</span></td><td><span class="tiles full">8×4 = 32</span></td><td>1896 GFLOP/s</td><td>9.5e-3</td><td><span class="tag reuse">reuse</span></td></tr>
+    <tr><td>K / V projection</td><td>GEMM bf16-out</td><td><span class="shape">256×960×320</span></td><td><span class="tiles full">8×4 = 32</span></td><td>1228 GFLOP/s</td><td>9.4e-3</td><td><span class="tag reuse">reuse</span></td></tr>
+    <tr><td>Gate / Up projection</td><td>GEMM bf16-out</td><td><span class="shape">256×960×2560</span></td><td><span class="tiles full">8×4 = 32</span></td><td>2838 GFLOP/s</td><td>9.4e-3</td><td><span class="tag reuse">reuse</span></td></tr>
+    <tr><td>Down projection</td><td>GEMM bf16-out</td><td><span class="shape">256×2560×960</span></td><td><span class="tiles full">8×4 = 32</span></td><td>3425 GFLOP/s</td><td>9.4e-3</td><td><span class="tag reuse">reuse</span></td></tr>
+    <tr><td>RoPE (rotary pos, Q &amp; K)</td><td>RoPE half-split</td><td><span class="shape">256×64</span></td><td><span class="tiles row">8×1 = 8</span></td><td>latency-bound (80 µs)</td><td>2.8e-3</td><td><span class="tag reuse">reuse</span></td></tr>
+    <tr><td>attention — scores <code>Q·Kᵀ</code></td><td>GEMM (per head)</td><td><span class="shape">256×64×256</span></td><td><span class="tiles full">8×4 = 32</span></td><td>—</td><td>9.6e-3</td><td><span class="tag reuse">reuse</span></td></tr>
+    <tr><td>attention — softmax(+mask)</td><td><b>masked-softmax</b></td><td><span class="shape">(15,256,256)</span> batched</td><td><span class="tiles low">1×4 = 4</span></td><td>—</td><td>bf16 tier</td><td><span class="tag new">NEW</span></td></tr>
+    <tr><td>attention — <code>P·V</code></td><td>GEMM (per head)</td><td><span class="shape">256×256×64</span></td><td><span class="tiles full">8×4 = 32</span></td><td>—</td><td>9.6e-3</td><td><span class="tag reuse">reuse</span></td></tr>
+    <tr><td>SiLU-and-Mul (SwiGLU)</td><td>SiLU-and-Mul bf16</td><td><span class="shape">256×2560</span> (N=655360)</td><td><span class="tiles row">8×1 = 8</span></td><td>15.9 GB/s</td><td>1.0e-2</td><td><span class="tag reuse">reuse</span></td></tr>
+    <tr><td>residual add</td><td>Element-wise Add</td><td><span class="shape">256×960</span> (N=245760)</td><td><span class="tiles row">8×1 = 8</span></td><td>13.2 GB/s</td><td>1.9e-3</td><td><span class="tag reuse">reuse</span></td></tr>
   </table>
   <p style="color:var(--muted);font-size:0.9rem">
     The attention sub-GEMMs (<span class="shape">256×64×256</span> / <span class="shape">256×256×64</span>) are
     thin-K/thin-N shapes measured for accuracy but latency-bound, so no GFLOP/s headline. Everything here PASSes at
-    the standard bf16 tiers.
+    the standard bf16 tiers. The <span class="tiles low">4-tile</span> masked-softmax is the one genuine
+    under-fill on this branch — see §7.
   </p>
 
   <!-- ============================================================ -->
-  <h2 id="vision">3. Vision kernels (SigLIP encoder — Milestone A3)</h2>
+  <h2 id="vision">4. Vision kernels (SigLIP encoder — Milestone A3)</h2>
   <p>
     The vision encoder is the biggest performance target (≈74% of end-to-end runtime). Every one of its leaf
     kernels is now validated on real NPU2 at the SigLIP shape — <b>seq = 1024</b> (a 512×512 image = 1024 patch
@@ -182,16 +299,16 @@
     backbone.
   </p>
   <table>
-    <tr><th>Op in the model</th><th>Kernel</th><th>Shape</th><th>Performance</th><th>Accuracy</th><th>Kind</th></tr>
-    <tr><td>patch embed (Conv2d→im2col)</td><td>GEMM bf16-out</td><td><span class="shape">1024×768×768</span></td><td>3798 GFLOP/s</td><td>9.5e-3</td><td><span class="tag reuse">reuse</span></td></tr>
-    <tr><td>Q / K / V / Out projection</td><td>GEMM bf16-out</td><td><span class="shape">1024×768×768</span></td><td>3798 GFLOP/s</td><td>9.5e-3</td><td><span class="tag reuse">reuse</span></td></tr>
-    <tr><td>MLP fc1 (up)</td><td>GEMM bf16-out</td><td><span class="shape">1024×768×3072</span></td><td>4195 GFLOP/s</td><td>9.4e-3</td><td><span class="tag reuse">reuse</span></td></tr>
-    <tr><td>MLP fc2 (down)</td><td>GEMM bf16-out</td><td><span class="shape">1024×3072×768</span></td><td>5790 GFLOP/s</td><td>9.4e-3</td><td><span class="tag reuse">reuse</span></td></tr>
-    <tr><td>connector projection</td><td>GEMM bf16-out</td><td><span class="shape">64×12288×960</span></td><td>1695 GFLOP/s</td><td>9.5e-3</td><td><span class="tag reuse">reuse</span></td></tr>
-    <tr><td>LayerNorm (×2/layer + final)</td><td><b>LayerNorm bf16 (affine)</b></td><td><span class="shape">1024×768</span></td><td>9.7 GB/s</td><td>4.4e-3</td><td><span class="tag mod">EXTEND</span></td></tr>
-    <tr><td>MLP activation</td><td><b>GELU-tanh</b></td><td><span class="shape">1024×3072</span> (N=3.1M)</td><td>24.1 GB/s</td><td>8.4e-3</td><td><span class="tag reuse">reuse→registry</span></td></tr>
-    <tr><td>self-attention (bidirectional)</td><td>FlashAttention (non-causal)</td><td><span class="shape">1024×1024</span>, 12/12</td><td>1235–1366 GFLOP/s</td><td>4.8e-2</td><td><span class="tag reuse">reuse</span></td></tr>
-    <tr><td>pixel-shuffle (connector)</td><td>host reshape</td><td><span class="shape">(1024,768)→(64,12288)</span></td><td>host-side</td><td>exact</td><td><span class="tag reuse">no kernel</span></td></tr>
+    <tr><th>Op in the model</th><th>Kernel</th><th>Shape</th><th>Tiles used</th><th>Performance</th><th>Accuracy</th><th>Kind</th></tr>
+    <tr><td>patch embed (Conv2d→im2col)</td><td>GEMM bf16-out</td><td><span class="shape">1024×768×768</span></td><td><span class="tiles full">8×4 = 32</span></td><td>3798 GFLOP/s</td><td>9.5e-3</td><td><span class="tag reuse">reuse</span></td></tr>
+    <tr><td>Q / K / V / Out projection</td><td>GEMM bf16-out</td><td><span class="shape">1024×768×768</span></td><td><span class="tiles full">8×4 = 32</span></td><td>3798 GFLOP/s</td><td>9.5e-3</td><td><span class="tag reuse">reuse</span></td></tr>
+    <tr><td>MLP fc1 (up)</td><td>GEMM bf16-out</td><td><span class="shape">1024×768×3072</span></td><td><span class="tiles full">8×4 = 32</span></td><td>4195 GFLOP/s</td><td>9.4e-3</td><td><span class="tag reuse">reuse</span></td></tr>
+    <tr><td>MLP fc2 (down)</td><td>GEMM bf16-out</td><td><span class="shape">1024×3072×768</span></td><td><span class="tiles full">8×4 = 32</span></td><td>5790 GFLOP/s</td><td>9.4e-3</td><td><span class="tag reuse">reuse</span></td></tr>
+    <tr><td>connector projection</td><td>GEMM bf16-out</td><td><span class="shape">64×12288×960</span></td><td><span class="tiles half">4×4 = 16</span></td><td>1695 GFLOP/s</td><td>9.5e-3</td><td><span class="tag reuse">reuse</span></td></tr>
+    <tr><td>LayerNorm (×2/layer + final)</td><td><b>LayerNorm bf16 (affine)</b></td><td><span class="shape">1024×768</span></td><td><span class="tiles row">8×1 = 8</span></td><td>9.7 GB/s</td><td>4.4e-3</td><td><span class="tag mod">EXTEND</span></td></tr>
+    <tr><td>MLP activation</td><td><b>GELU-tanh</b></td><td><span class="shape">1024×3072</span> (N=3.1M)</td><td><span class="tiles half">8×2 = 16</span></td><td>24.1 GB/s</td><td>8.4e-3</td><td><span class="tag reuse">reuse→registry</span></td></tr>
+    <tr><td>self-attention (bidirectional)</td><td>FlashAttention (non-causal)</td><td><span class="shape">1024×1024</span>, 12/12</td><td><span class="tiles full">8×4 = 32</span></td><td>1235–1366 GFLOP/s</td><td>4.8e-2</td><td><span class="tag reuse">reuse</span></td></tr>
+    <tr><td>pixel-shuffle (connector)</td><td>host reshape</td><td><span class="shape">(1024,768)→(64,12288)</span></td><td>—</td><td>host-side</td><td>exact</td><td><span class="tag reuse">no kernel</span></td></tr>
   </table>
   <div class="callout">
     <b>A nice result on the vision attention.</b> The registry FlashAttention runs the <span class="shape">1024×1024</span>
@@ -202,7 +319,7 @@
   </div>
 
   <!-- ============================================================ -->
-  <h2 id="new">4. The kernels we actually wrote or changed</h2>
+  <h2 id="new">5. The kernels we actually wrote or changed</h2>
 
   <h3><span class="tag new">NEW</span> &nbsp;masked-softmax — the one from-scratch kernel</h3>
   <div class="card">
@@ -220,6 +337,11 @@
     quantizer, so a floor clamp (<code>kExpDiffFloor = −120</code>) was added inside the exp routine. Runs on NPU2,
     verified PASS.</p>
   </div>
+
+  <h3 style="color:var(--muted);font-size:1rem;margin-top:0.6rem">
+    Source: <span class="path">programming_examples/masked_softmax/</span> ·
+    forked from <span class="path">programming_examples/softmax/</span>
+  </h3>
 
   <h3><span class="tag mod">EXTEND</span> &nbsp;LayerNorm — added affine + multi-tile</h3>
   <div class="card">
@@ -261,7 +383,7 @@
   </div>
 
   <!-- ============================================================ -->
-  <h2 id="gotchas">5. Gotchas found (silent-wrong-answer traps)</h2>
+  <h2 id="gotchas">6. Gotchas found (silent-wrong-answer traps)</h2>
   <p>
     Several configs <em>compile and pass their size asserts</em> but produce silently wrong output on the device.
     These are the most valuable findings — they're invisible without a numeric check against a reference, and they
@@ -291,8 +413,11 @@
     </tr>
     <tr>
       <td>GEMM fc1 <span class="shape">1024×768×3072</span></td>
-      <td>The standalone test reports FAIL — but only on <em>one</em> near-zero output element (a tolerance-edge artifact, same as every Qwen wide-N shape).</td>
-      <td>The high-precision path is numerically correct (9.4e-3) <em>and</em> faster (4195 GFLOP/s) — deploy it; the "failing" element is cosmetic.</td>
+      <td>The standalone test reports FAIL — on <b>4 of 3,145,728</b> output elements (0.0001%), all with tiny
+          reference magnitudes (|ref| ≈ 3e-3…9e-6) where the strict high-precision <code>atol = 1.5e-3</code> bites.
+          Same tolerance-edge class as every Qwen wide-N shape.</td>
+      <td>The high-precision path is numerically correct (mean error 9.4e-3, squarely in tier) <em>and</em> faster
+          (4195 GFLOP/s vs 3650) — deploy it; the 4 elements are a tolerance artifact, not a datapath error.</td>
     </tr>
     <tr>
       <td>any kernel, wrong target</td>
@@ -309,35 +434,128 @@
   </table>
 
   <!-- ============================================================ -->
-  <h2 id="reuse">6. Where each implementation comes from</h2>
+  <h2 id="tiles">7. Array occupancy — how many tiles each kernel uses, and why</h2>
+  <p class="lead">
+    NPU2 is an <b>8 columns × 4 rows = 32-tile</b> compute array. A kernel that leaves tiles idle leaves performance
+    on the table — but only if those tiles were <em>reachable</em>. On this branch three different ceilings are in
+    play, and it matters which one a kernel hit: a <b>physics</b> ceiling is fine, a <b>tuning</b> ceiling is a bug.
+  </p>
+
+  <table>
+    <tr><th>Kernel</th><th>Tiles</th><th>Fill</th><th>Ceiling — and is it real?</th></tr>
+    <tr>
+      <td>GEMM (all 8 projection/attention shapes)</td>
+      <td><span class="tiles full">8×4 = 32</span></td>
+      <td><span class="bar" style="width:96px"></span>100%</td>
+      <td><span class="pill ok">optimal</span> Full chip. GEMM tiles over both M and N, so it always fills the array
+          when <code>M ≥ tile_m·8</code>.</td>
+    </tr>
+    <tr>
+      <td>FlashAttention <span class="shape">1024²</span> 12/12</td>
+      <td><span class="tiles full">8×4 = 32</span></td>
+      <td><span class="bar" style="width:96px"></span>100%</td>
+      <td><span class="pill ok">optimal</span> 12 heads is <b>even</b> → <code>heads_per_unroll = 2</code> fills all
+          8 columns. Measured <b>1.58×</b> vs the half-array config the odd-15-head backbone is forced onto.</td>
+    </tr>
+    <tr>
+      <td>GEMM connector <span class="shape">64×12288×960</span></td>
+      <td><span class="tiles half">4×4 = 16</span></td>
+      <td><span class="bar" style="width:48px"></span>50%</td>
+      <td><span class="pill warn">capped by the shape</span> <b>M = 64 is the limit, not the tuning.</b> The
+          microkernel's smallest legal <code>tile_m</code> is 16, so <code>tile_m·herd_m = 64 = M</code> allows at
+          most 4 M-columns. Throughput is flat (~1690 GFLOP/s) across every <code>tile_k_l2</code> — it is
+          latency-bound, so the idle half would not help.</td>
+    </tr>
+    <tr>
+      <td>GELU-tanh</td>
+      <td><span class="tiles half">8×2 = 16</span></td>
+      <td><span class="bar" style="width:48px"></span>50%</td>
+      <td><span class="pill ok">at its hardware ceiling</span> Single-input op = <b>2 DMAs/tile</b>, so a second row
+          places where the 3-DMA kernels can't. 8×4 was <b>tried and fails to place</b>. Getting to 16 was worth
+          <b>1.8×</b> over the 8-tile config a "copy the sibling" habit would have chosen.</td>
+    </tr>
+    <tr>
+      <td>RMSNorm · LayerNorm · SiLU-and-Mul · Element-wise Add · RoPE</td>
+      <td><span class="tiles row">8×1 = 8</span></td>
+      <td><span class="bar" style="width:24px"></span>25%</td>
+      <td><span class="pill ok">at their hardware ceiling</span> All are <b>3-DMA/tile</b> streaming ops (two inputs
+          + one output, or row + params + output). The shim-DMA channel budget hard-caps them at one 8-column row —
+          <code>herd_y &gt; 1</code> does not place. Within the row, scaling is near-linear
+          (<b>6.1–7.6×</b> from 1→8 columns), so the 8 tiles they can use are used well.</td>
+    </tr>
+    <tr>
+      <td><b>masked-softmax</b></td>
+      <td><span class="tiles low">1×4 = 4</span></td>
+      <td><span class="bar" style="width:12px"></span>12.5%</td>
+      <td><span class="pill warn">a real tuning gap</span> <b>The one kernel not at its ceiling.</b> It inherited the
+          upstream <code>softmax/</code> herd layout <code>sizes=[1, herd_n]</code> — a single <em>column</em>, 4 rows.
+          Raising <code>herd_n</code> to 8 fails to compile (<em>"row index (6) must be less than the number of rows
+          (6)"</em>) because rows max out at 4; the fix is to spread across <b>columns</b> instead, which the current
+          builder cannot express. See below.</td>
+    </tr>
+  </table>
+
+  <div class="callout warn">
+    <b>The one honest gap: masked-softmax uses 4 of 32 tiles.</b> Every other kernel on this branch is either at 100%
+    or provably at a hardware ceiling. masked-softmax is at <b>12.5%</b> purely because it inherited the upstream
+    <code>softmax</code> example's one-column herd (<code>sizes=[1, herd_n]</code>) and that layout was never
+    revisited. The sibling elementwise kernels all use <code>sizes=[herd_x, herd_y]</code> and reach 8–16 tiles.
+    <br><br>
+    <b>Verified on hardware, not assumed:</b> the deployment-scale run (<code>N = 15·256·256 = 983040</code>, all 15
+    heads batched into one dispatch) PASSes at <code>herd_n = 4</code>; <code>herd_n = 8</code> fails to place because
+    the array only has 4 rows. Because it is a 3-DMA/tile op (scores + mask in, probabilities out), its realistic
+    ceiling is the same <b>8×1 = 8 tiles</b> the other 3-DMA kernels hit — so the available headroom is roughly
+    <b>2×</b>, not 8×. That is a builder change (swap the herd axis), and it is <b>not yet done</b>.
+  </div>
+
+  <div class="callout">
+    <b>The reusable rule this produced</b> (now written into the registry's methodology notes): <b>the tile ceiling is
+    set by DMA streams per tile, not by a fixed number.</b> 3 streams → one 8-tile row; 2 streams → 16 tiles. Never
+    inherit a herd config from the nearest-looking kernel — count its DMAs and sweep <code>herd_y</code> yourself.
+    GELU is the proof: assuming SiLU's 8-tile cap would have silently cost 1.8× bandwidth.
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="reuse">8. Where each implementation comes from</h2>
   <p>
     Almost every kernel is an existing implementation reused — this table names the source directory so you can see
     exactly how much is inherited vs. new.
   </p>
   <table>
-    <tr><th>Kernel</th><th>Implementation source</th><th>Status on this branch</th></tr>
-    <tr><td>GEMM (bf16-out)</td><td class="src">matrix_multiplication/bf16_in_bf16_out/ (external <code>mm.o</code>)</td><td>reused; 9 new SmolVLA shapes recorded</td></tr>
-    <tr><td>RMSNorm</td><td class="src">weighted RMSNorm (shared LLM toolkit)</td><td>reused; 1 shape recorded</td></tr>
-    <tr><td>RoPE (half-split)</td><td class="src">rope_halfsplit.cc (shared)</td><td>reused; 1 shape recorded</td></tr>
-    <tr><td>SiLU-and-Mul</td><td class="src">silu_and_mul/ (shared)</td><td>reused; 1 shape recorded</td></tr>
-    <tr><td>Element-wise Add</td><td class="src">eltwise_add/ (shared)</td><td>reused; 1 shape recorded (+tile_n gotcha)</td></tr>
-    <tr><td>FlashAttention</td><td class="src">flash_attention/kernel_fusion_based/ (<code>attn_npu2.o</code>)</td><td>reused; vision 1024² non-causal row added</td></tr>
-    <tr><td>GELU-tanh</td><td class="src">gelu/ (hardware tanh intrinsic)</td><td>validated &amp; <b>promoted to registry</b></td></tr>
-    <tr><td>LayerNorm (affine)</td><td class="src">layer_norm/ (was affine-less, single-tile)</td><td><b>extended</b> (affine+multi-tile) &amp; promoted</td></tr>
-    <tr><td>masked-softmax</td><td class="src">softmax/ → masked_softmax/</td><td><b>newly written</b></td></tr>
+    <tr><th>Kernel</th><th>Implementation directory (repo-relative)</th><th>Status on this branch</th></tr>
+    <tr><td>GEMM (bf16-out)</td><td><span class="path">programming_examples/matrix_multiplication/bf16_in_bf16_out/</span><br><span style="color:var(--muted);font-size:0.8rem">external <code>mm.o</code> from <code>mm_aie2p.cc</code></span></td><td>reused unchanged; <b>10 new SmolVLA shapes</b> recorded</td></tr>
+    <tr><td>RMSNorm</td><td><span class="path">programming_examples/weighted_rms_norm/</span></td><td>reused unchanged; 1 shape recorded</td></tr>
+    <tr><td>RoPE (half-split)</td><td><span class="path">programming_examples/rope_halfsplit/</span></td><td>reused unchanged; 1 shape recorded</td></tr>
+    <tr><td>SiLU-and-Mul</td><td><span class="path">programming_examples/silu_and_mul/</span></td><td>reused unchanged; 1 shape recorded</td></tr>
+    <tr><td>Element-wise Add</td><td><span class="path">programming_examples/eltwise_add/</span></td><td>reused unchanged; 1 shape recorded (+ the <code>tile_n</code> gotcha)</td></tr>
+    <tr><td>FlashAttention</td><td><span class="path">programming_examples/flash_attention/kernel_fusion_based/</span><br><span style="color:var(--muted);font-size:0.8rem">external <code>attn_npu2.o</code></span></td><td>reused unchanged; vision 1024² non-causal row added</td></tr>
+    <tr><td>GELU-tanh</td><td><span class="path">programming_examples/gelu/</span></td><td>harness improved (herd knobs + real precision gate), <b>math unchanged</b>; <b>promoted to registry</b></td></tr>
+    <tr><td>LayerNorm (affine)</td><td><span class="path">programming_examples/layer_norm/</span></td><td><b>kernel extended</b> (affine γ/β + multi-tile) &amp; <b>promoted to registry</b></td></tr>
+    <tr><td>masked-softmax</td><td><span class="path">programming_examples/masked_softmax/</span><br><span style="color:var(--muted);font-size:0.8rem">forked from <span class="path">programming_examples/softmax/</span></span></td><td><b>newly written</b>; <em>not</em> a registry kernel (yet)</td></tr>
   </table>
+
+  <div class="callout warn">
+    <b>Worth stating plainly:</b> masked-softmax — the one kernel written from scratch — is the one thing here that is
+    <em>not</em> in the <code>kernel_registry</code>. It runs, it has a lit test, and it was re-verified PASS on NPU2,
+    but it carries no registry page: no per-shape performance number, no documented tolerance, and no precision report
+    in its harness (it prints only <code>PASS!</code>). Promoting it would require adding a
+    <code>mean_rel_L1</code> report, a herd/tile sweep, and a detail page — the same bar the other 9 kernels meet.</div>
 
   <div class="callout" style="margin-top:2rem">
     <b>In one sentence:</b> on this branch the NPU-kernel effort was overwhelmingly <em>reuse-and-validate</em> —
-    9 GEMM shapes, plus RMSNorm/RoPE/SiLU/Add/FlashAttention/GELU shapes measured and recorded — with exactly
-    <b>one new kernel written</b> (masked-softmax) and <b>one extended</b> (LayerNorm gaining affine), which is why
-    the registry grew from 8 to 9 kernel families and now carries every shape SmolVLA's backbone and vision need.
+    10 GEMM shapes, plus RMSNorm/RoPE/SiLU/Add/FlashAttention/GELU/LayerNorm shapes measured and recorded — with
+    exactly <b>one new kernel written</b> (masked-softmax) and <b>one extended</b> (LayerNorm gaining affine), which
+    is why the registry grew from 8 to 9 kernel families and now carries every shape SmolVLA's backbone and vision
+    need. On array occupancy, every kernel is at 100% fill or at a demonstrated hardware ceiling — with the single
+    exception of masked-softmax at 4/32 tiles, which is an inherited-layout gap, not a physical limit.
   </div>
 
   <div class="meta" style="margin-top:3rem;border-bottom:none;border-top:1px solid var(--card-border);padding-top:1rem">
-    Kernel details live in <code>programming_examples/kernel_registry/</code>
+    Kernel details live in <span class="path">programming_examples/kernel_registry/</span>
     (<code>supported_kernels.md</code> + <code>details/*.md</code>) on the <code>smolvla</code> branch ·
-    all performance/accuracy numbers measured on real NPU2 (Strix, AIE2P).
+    diff base = upstream <code>b55c3734</code> (<code>Xilinx/mlir-air</code> main) ·
+    all performance/accuracy numbers measured on real NPU2 (Strix, AIE2P), <b>every registry row independently
+    re-run and reproduced 2026-07-27</b>.
   </div>
 
 </div>
