@@ -35,6 +35,32 @@ def build_prefix_mask(n_prefix, n_state=1, pad_mask=None):
     return mask
 
 
+def build_padded_mask_and_positions(pad_mask, oracle_len, npu_seq_len=256):
+    """Extend the prefix mask + RoPE positions from the real prefix length to
+    the NPU kernels' padded sequence length.
+
+    The registry kernels are validated at M=256 while lerobot's prefix is 241
+    tokens, so both the additive attention mask and the RoPE position array are
+    built at the oracle length and then padded. Padding rows/columns stay -inf
+    (fully masked) and padding positions freeze at the last real position via
+    `cumsum(pad_mask) - 1`, exactly like SmolVLA's own position_ids.
+
+    Single source of truth shared by the subprocess bridge
+    (`run_npu_backbone.py`) and the single-process runtime
+    (`smolvla_npu_runtime.BackboneRuntime`)."""
+    pad_mask = np.asarray(pad_mask, dtype=bool)
+    n_prefix = oracle_len - 1  # 240 visual+language, 1 state token
+    mask_o = build_prefix_mask(n_prefix, 1, pad_mask=pad_mask)
+    mask_p = np.full((npu_seq_len, npu_seq_len), -np.inf, dtype=np.float32)
+    mask_p[:oracle_len, :oracle_len] = mask_o
+
+    pad_mask_p = np.zeros((npu_seq_len,), dtype=bool)
+    pad_mask_p[:oracle_len] = pad_mask
+    positions_p = np.cumsum(pad_mask_p.astype(np.int64)) - 1
+    positions_p = np.clip(positions_p, 0, None)
+    return mask_p, positions_p
+
+
 def _softmax(x, axis=-1):
     """Softmax with HF-eager-attention semantics for fully-masked rows.
     Real SmolVLA masking (smolvlm_with_expert.py eager_attention_forward) uses

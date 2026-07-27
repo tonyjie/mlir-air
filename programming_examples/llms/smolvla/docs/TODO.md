@@ -270,12 +270,167 @@ backbone prefill (91 ms) and then OVERWRITES the resulting KV cache with the NPU
 K/V. That redundant work is the price of reusing lerobot's exact cache
 structure; removing it is a follow-up, not a correctness issue.
 
+## A3-7 — single-process runner + NPU-vision/CPU-backbone config (DONE, beats CPU)
+
+Two changes, both aimed at the end-to-end number:
+
+**(A) The subprocess bridge is gone.** The premise of the bridged design — that
+the lerobot venv cannot see `air`/`pyxrt` — is FALSE on this machine. With the
+mlir-air env sourced (PYTHONPATH/LD_LIBRARY_PATH), `~/Projects/
+smolvla_playground/.venv/bin/python` imports `torch`, `lerobot`, `air`,
+`aircc` AND `pyxrt`, and opens the device (`pyxrt.device(0)` -> RyzenAI-npu4).
+New module **`smolvla_npu_runtime.py`** (`VisionRuntime` / `BackboneRuntime` +
+process-wide singletons) loads weights, ELFs, the XRT context and the device
+BOs ONCE and reuses them for every inference.
+`run_hybrid_forward(bridge=False)` is now the default; `bridge=True` keeps the
+old two-process path as a fallback (gated by `make verify-bridge`, identical
+numerics).
+
+Per-inference cost removed, measured by the bridges' own phase timers:
+
+| bridge phase (per inference, per stage) | vision | backbone |
+|---|---|---|
+| process spawn + interpreter/imports | 194 ms | 166 ms |
+| safetensors weight (re)load | 353 ms | 368 ms |
+| ELF/manifest load (XRT ctx) | 32 ms | 32 ms |
+| npz round-trip | 6 ms | 2 ms |
+| **total non-compute** | **585 ms** | **568 ms** |
+
+Plus a cold-start penalty the bridge could never amortize (first image 347 ms
+vs 147 ms warm; backbone 387 ms vs 245 ms warm).
+
+**(B) The production config drops the NPU backbone.** The NPU backbone is
+measurably SLOWER than lerobot's torch CPU backbone at seq=256 (238-252 ms vs
+76-93 ms), and the old hybrid additionally ran the CPU prefill and then threw it
+away. With `npu_backbone=False` nothing is hooked, nothing is overwritten and
+that redundancy disappears. See "NPU-execution exceptions" below — this is a
+*measured-slower* exception, logged with both numbers, not a broken NPU path.
+
+### End-to-end result (`make bench-e2e`, interleaved, fixed zero noise)
+
+Configs are timed ROUND-ROBIN (`bench_e2e.py` `--interleave`, default) because
+this machine is shared and drifts on a minutes timescale; measuring config A
+entirely before config B lets that drift masquerade as a difference. Three
+independent runs, different machine load:
+
+| config | run 1 | run 2 | run 3 | vs CPU |
+|---|---|---|---|---|
+| pure CPU lerobot | 985 ms | 1127 ms | 1005 ms | 1.00x |
+| **NPU vision + CPU backbone (production)** | **888 ms** | **874 ms** | **856 ms** | **1.11x / 1.29x / 1.17x** |
+| NPU vision + NPU backbone | — | 1163 ms | 1114 ms | 0.97x / 0.90x |
+| bridge: NPU vision + NPU backbone (legacy) | — | 2678 ms | — | 0.42x |
+
+The production config is the stable one: **856-888 ms across all three runs**,
+because the NPU vision stage barely moves (440-475 ms for 3 cameras, i.e.
+140-160 ms/image) regardless of host load. The *CPU baseline* is what swings
+(985-1127 ms, i.e. 187-223 ms/image for its vision tower), so the ratio ranges
+1.11x-1.29x. Against the previously recorded 967 ms CPU figure it is 1.13x.
+
+Per stage (median of the run-3 iterations):
+
+| stage | pure CPU | NPU vision + CPU backbone |
+|---|---|---|
+| vision + connector (3 cameras) | 655 ms | **470 ms** (147 ms/image) |
+| backbone prefill | 76 ms | 93 ms (CPU both; +17 ms, see below) |
+| action expert + rest | 286 ms | 305 ms |
+| TOTAL | 1005 ms | **856 ms** |
+
+Honest accounting of why it is ~856 ms and not the ~745 ms a naive
+"967 - 222" projection suggests:
+  1. The NPU vision stage costs 470 ms end-to-end, not 444 ms: 440 ms of
+     encoder+connector plus ~25 ms of host im2col patch-embed + tensor
+     marshalling for 3 images.
+  2. lerobot's CPU vision tower re-measures at 187-223 ms/image depending on
+     machine load, not a fixed 222 ms — so the saving is 180-200 ms, not 222.
+  3. There is a small but repeatable +17-19 ms penalty on the CPU work that
+     FOLLOWS the NPU stage (backbone prefill 76 -> 93 ms). Probed directly: a
+     fixed multithreaded torch matmul run after a 0.6 s gap costs ~5 ms more
+     than back-to-back, whether the gap is `sleep`, a single-threaded spin, or
+     the NPU encode — i.e. it is generic thread-pool/turbo re-entry after the
+     CPU idles, not something the NPU path does wrong.
+  Sum: 1005 - 185 + 18 + 25 ~= 863, which matches the measured 856 ms.
+
+### BLAS-thread trade-off (measured both ways, `make bench-e2e-all`)
+
+The old bridge could pin BLAS globally (`bridge_common.limit_blas_threads`, env
+vars before `import numpy`) because the NPU process did nothing else. In ONE
+process that is wrong: the CPU action expert IS BLAS-bound and wants all cores.
+`smolvla_npu_runtime.npu_thread_limits()` therefore clamps at RUNTIME and only
+around the NPU dispatch loop — `openblas_set_num_threads` (found by symbol
+lookup through ctypes on the already-mapped `libscipy_openblas64_*.so`;
+`threadpoolctl` is not installed in the lerobot venv) plus
+`torch.set_num_threads` — and restores afterwards. `SMOLVLA_NPU_BLAS_LIMIT=0`
+disables it; `bench_e2e.py --blas-ab` runs both arms interleaved.
+
+| arm | NPU vision stage | e2e | verdict |
+|---|---|---|---|
+| clamp ON (default) | 440 ms | **874 ms** | best |
+| clamp OFF | 466 ms | 962 ms | +88 ms |
+| (quieter machine) clamp ON / OFF | 462 / 531 ms | 888 / 905 ms | +17 ms |
+
+The clamp is worth 25-69 ms on the NPU stage and never lost overall. Restoring
+in-process DOES work (no env-var re-import needed), so the trade-off the task
+worried about — "limit for NPU vs keep threads for the expert" — does not have
+to be paid: `expert + rest` is 305 ms with the clamp vs 394 ms without in the
+same interleaved run, i.e. the clamp does not hurt the expert at all.
+
+Related micro-fix: the im2col patch-embed now runs BEFORE the clamp (it is a
+one-time host matmul per image, not part of the dispatch loop): 4.6 ms
+multithreaded vs 9.6 ms at one thread, ~15 ms/inference.
+
+### Correctness (`make verify`)
+
+| config | median per-position cosine | nmse | gate |
+|---|---|---|---|
+| **NPU vision + CPU backbone (production)** | **0.998996** | **0.003023** | **PASS** |
+| NPU vision + NPU backbone (single process) | 0.993906 | 0.012201 | PASS |
+| NPU vision + NPU backbone (legacy bridge) | 0.993906 | 0.012201 | PASS |
+
+Dropping the NPU backbone leaves the vision encoder as the ONLY NPU-induced
+deviation, so cosine improves from 0.9939 to 0.9990 (nmse 0.0122 -> 0.0030) as
+expected. The single-process and bridged NPU-backbone runs agree to every
+printed digit, which is the check that the refactor changed no math.
+
+### Not done / follow-ups (quantified, not hand-waved)
+
+- **Concurrent camera split** (CPU encodes 1 of 3 images while the NPU encodes
+  the other 2): with NPU 147 ms/image and CPU ~217 ms/image the wall for the
+  vision stage would drop from ~470 ms to ~max(2x147..180, ~230) ~= 360 ms,
+  i.e. another ~100 ms (~1.35x e2e). NOT implemented: it re-introduces a CPU
+  execution path for part of the vision stage, the process-global thread clamp
+  cannot be scoped to one thread (`openblas_set_num_threads_local` exists but
+  `torch.set_num_threads` is global), and it adds concurrency to a
+  correctness-gated robot control loop. Recorded as headroom, measured inputs
+  above.
+- **Batching the 3 cameras into one M=3072 encoder pass**: would cut 111
+  dispatches to 37, but the post-A3-6b host gap is already only ~4 ms/image, so
+  the win is small and it costs a full ELF re-compile + re-validation at a new M.
+- **NPU backbone speed** (238 ms vs 76-93 ms CPU): the 31 attention
+  dispatches/layer are still unfused (A3-6b did vision only). Fusing them is the
+  prerequisite for the backbone to be worth putting back on NPU.
+
 ## NPU-execution exceptions
 
 These are the operations that run on CPU rather than NPU, with the concrete
 reason for each. Everything else in the per-layer hot loop (RMSNorm, Q/K/V
 GEMMs, RoPE, O-proj, residual, SwiGLU FFN) runs on NPU via the fused
 `rms_gemms_rope` and `o_ffn` ELFs.
+
+- **Backbone prefill in the PRODUCTION config (A3-7)**: CPU (lerobot's own torch
+  path). Reason: **CPU is measured faster**, which is the only kind of
+  performance-based exception allowed here, and both numbers are recorded.
+  NPU 16-layer prefill (seq=256, `attn_mode="gemm"`, warm, in-process, no bridge
+  overhead) = **238-252 ms**; lerobot's torch CPU prefill on the same batch in
+  the same process = **76-93 ms**. That is a 2.6-3.1x CPU win, reproduced in
+  every bench run (see the A3-7 table). The NPU path is NOT broken — it is
+  fully wired, gated and still exercised by `make verify-npu-backbone` /
+  `make run --npu-backbone` (cosine 0.993906 PASS) — it is simply slower at
+  these shapes because attention is still 31 unfused dispatches/layer
+  (33 ELF dispatches/layer, 528 per inference) at only seq=256, where per
+  dispatch python+XRT overhead dominates the tiny GEMMs. Fusing the per-head
+  attention into one multi-launch ELF is the prerequisite for revisiting this.
+  The NPU vision tower, by contrast, IS faster than CPU (147 vs 187-223
+  ms/image) and stays on NPU.
 
 - **Connector `pixel_shuffle`** (A3-5 Step 4): host. NOT a fallback — it is a
   pure space-to-depth RESHAPE/transpose with zero arithmetic (`reshape` +
@@ -330,7 +485,8 @@ GEMMs, RoPE, O-proj, residual, SwiGLU FFN) runs on NPU via the fused
 - Vision (A3-6b fused, `fused=True`): **3 ELF dispatches/layer** (`vit_ln_qkv`,
   `flash_attn`, `vit_o_ffn`) x 12 layers + 1 `layer_norm` (post_ln) + 1
   `gemm_connector` = **38 dispatches per image**, 5 distinct ELFs. With 3
-  cameras that is 114 dispatches per inference, all in one bridge invocation.
+  cameras that is 114 dispatches per inference, all in one in-process
+  `VisionRuntime.encode(...)` call (A3-7; previously one bridge invocation).
 
 ## NPU-attention GEMM shapes (not in the large-shape registry sweep)
 

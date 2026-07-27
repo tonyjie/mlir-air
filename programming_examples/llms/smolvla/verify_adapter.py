@@ -6,15 +6,20 @@
 SmolVLA is a continuous-output (flow-matching action-chunk) model, NOT a
 token-generation model, so it does NOT use the shared verify subsystem's
 token-set gate (`compute_topk_set_check` / verify_runner.py's HfRunner harness
-are for autoregressive LLMs). Instead this adapter drives the end-to-end hybrid
-pipeline (`smolvla_inference.run_hybrid_forward`: CPU prefix -> NPU backbone ->
-CPU expert 10-step denoise) and applies the continuous-output
-`regression_gate` from `verify.comparators` to the (1,50,6) action chunk vs the
-pure-CPU baseline (`smolvla_oracle.npz['action_chunk']`, fixed zero noise).
+are for autoregressive LLMs). Instead this adapter drives the end-to-end
+pipeline (`smolvla_inference.run_hybrid_forward`) and applies the
+continuous-output `regression_gate` from `verify.comparators` to the (1,50,6)
+action chunk vs the pure-CPU baseline (`smolvla_oracle.npz['action_chunk']`,
+fixed zero noise).
 
-Must run in the LEROBOT venv (`~/Projects/smolvla_playground/.venv/bin/python`);
-the NPU backbone runs in the worktree python via the subprocess bridge inside
-run_hybrid_forward. `make verify` wraps this under the NPU lock.
+`make verify` gates the PRODUCTION config: NPU SigLIP vision + connector,
+lerobot's CPU backbone, SINGLE PROCESS. The vision encoder is then the only
+NPU-induced deviation from the baseline. `make verify-npu-backbone` adds the
+NPU 16-layer prefill (the fuller error budget, kept for the record).
+
+Runs in the LEROBOT venv (`~/Projects/smolvla_playground/.venv/bin/python`),
+which — with the mlir-air env sourced — also has air/pyxrt, so no subprocess is
+involved. `make verify` wraps this under the NPU lock.
 
 Entry points (structural parity with sibling verify_adapter.py, adapted to
 regression):
@@ -40,6 +45,7 @@ if str(_LLMS_DIR) not in sys.path:
 
 from smolvla_inference import (  # noqa: E402
     run_hybrid_forward,
+    warmup_npu,
     build_oracle_batch,
     normalized_mse,
     _fixed_noise,
@@ -59,8 +65,10 @@ COS_MIN = 0.99
 NMSE_MAX = 0.04
 
 
-def build_config(npu_vision: bool = False) -> dict:
-    cfg = _inference_config(npu_vision)
+def build_config(
+    npu_vision: bool = True, npu_backbone: bool = False, bridge: bool = False
+) -> dict:
+    cfg = _inference_config(npu_vision, npu_backbone, bridge)
     cfg.update({"gate": "regression", "cos_min": COS_MIN, "nmse_max": NMSE_MAX})
     return cfg
 
@@ -68,15 +76,17 @@ def build_config(npu_vision: bool = False) -> dict:
 def run_gate(
     cos_min: float = COS_MIN,
     nmse_max: float = NMSE_MAX,
-    npu_vision: bool = False,
+    npu_vision: bool = True,
+    npu_backbone: bool = False,
+    bridge: bool = False,
 ) -> dict:
-    """Run the hybrid pipeline once and return the gate dict. Gates on cosine
+    """Run the pipeline once and return the gate dict. Gates on cosine
     (primary) AND magnitude-invariant normalized MSE; raw MSE kept for report.
 
-    npu_vision: also run the SigLIP vision tower + connector on NPU (the
-    `make verify-npu-vision` gate). The baseline is the SAME pure-CPU lerobot
-    action chunk either way, so this measures the FULL NPU error budget
-    (vision + backbone), not just the backbone's."""
+    The baseline is the SAME pure-CPU lerobot action chunk for every config, so
+    the gate always measures the FULL NPU error budget of whatever stages are
+    enabled. Defaults = the production config (NPU vision + CPU backbone,
+    single process), whose only NPU-induced deviation is the vision encoder."""
     from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 
     o = np.load(_HERE / "smolvla_oracle.npz")
@@ -84,8 +94,15 @@ def run_gate(
 
     policy = SmolVLAPolicy.from_pretrained(DEFAULT_MODEL).eval()
     batch = build_oracle_batch(policy)
+    if not bridge:
+        warmup_npu(npu_vision=npu_vision, npu_backbone=npu_backbone)
     chunk = run_hybrid_forward(
-        batch, policy=policy, noise=_fixed_noise(policy), npu_vision=npu_vision
+        batch,
+        policy=policy,
+        noise=_fixed_noise(policy),
+        npu_vision=npu_vision,
+        npu_backbone=npu_backbone,
+        bridge=bridge,
     )
     assert chunk.shape == ref.shape, (chunk.shape, ref.shape)
 
@@ -98,11 +115,20 @@ def run_gate(
 
 
 def main() -> int:
-    npu_vision = "--npu-vision" in sys.argv
-    g = run_gate(npu_vision=npu_vision)
-    stages = "NPU vision + NPU backbone" if npu_vision else "NPU backbone"
+    """Default gate = the production config (NPU vision, CPU backbone, single
+    process). Flags select the other configs:
+      --npu-backbone  also run the 16-layer prefill on NPU
+      --cpu-vision    keep lerobot's CPU vision tower
+      --bridge        drive the NPU stages through the legacy subprocesses"""
+    npu_vision = "--cpu-vision" not in sys.argv
+    npu_backbone = "--npu-backbone" in sys.argv
+    bridge = "--bridge" in sys.argv
+    g = run_gate(npu_vision=npu_vision, npu_backbone=npu_backbone, bridge=bridge)
+    cfg = build_config(npu_vision, npu_backbone, bridge)
     print("=" * 60)
-    print(f"SmolVLA verify: e2e action-chunk regression gate [{stages}]")
+    print("SmolVLA verify: e2e action-chunk regression gate")
+    print(f"  NPU stages     : {cfg['npu_stages']}")
+    print(f"  execution model: {cfg['execution_model']}")
     print("=" * 60)
     for k in ("cosine", "cos_min", "mse", "nmse", "nmse_max", "max_abs", "passed"):
         print(f"  {k:8s} = {g[k]}")

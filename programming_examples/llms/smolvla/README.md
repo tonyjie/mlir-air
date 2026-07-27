@@ -51,15 +51,20 @@ action expert is the natural **A2** follow-on (see [Future work](#future-work-a2
 
 ## How to run
 
-Two Python environments are involved (the two are bridged automatically by
-`smolvla_inference.run_hybrid_forward`, which drives from the lerobot venv and
-spawns the NPU backbone as a subprocess in the worktree python):
+Everything runs in **ONE process** under `LEROBOT_PYTHON` (default
+`~/Projects/smolvla_playground/.venv/bin/python`). With the mlir-air
+environment sourced (`utils/env_setup.sh`, i.e. PYTHONPATH + LD_LIBRARY_PATH),
+that interpreter has `torch` + `lerobot` **and** `air` + `aircc` + `pyxrt`, so
+`smolvla_npu_runtime` drives the NPU directly: weights, ELFs, the XRT context
+and the device buffer objects are loaded once per process and reused by every
+inference (see [A3-7 in `docs/TODO.md`](docs/TODO.md)).
 
-- `LEROBOT_PYTHON` (default `~/Projects/smolvla_playground/.venv/bin/python`) —
-  has `torch` + `lerobot`; drives the CPU prefix assembly + action expert +
-  the correctness gates.
-- `NPU_PYTHON` (default the worktree `sandbox/bin/python3`) — has `air` +
-  `pyxrt`; runs the NPU backbone prefill.
+- `LEROBOT_PYTHON` — the driver for every `make` target above.
+- `NPU_PYTHON` (default the worktree `sandbox/bin/python3`) — only needed by
+  the worktree-only NPU unit tests (`make export-kv`, `make vision-connector`,
+  `make diagnosis`) and by the legacy subprocess bridge, which is retained as a
+  fallback for environments where the lerobot venv really cannot see `air`
+  (`run_hybrid_forward(bridge=True)`, gated by `make verify-bridge`).
 
 All NPU-touching targets are wrapped with `flock -x -w 1800 /tmp/mlir-air-npu.lock`
 **inside** the Makefile itself (this machine has one NPU shared across
@@ -76,8 +81,11 @@ make help        # target list
 make oracle      # (re)generate smolvla_oracle.npz: pure-CPU fixture (prefix,
                   # per-layer hidden states, action chunk) — no NPU, lerobot venv only
 make export-kv   # Step-1 gate: NPU-exported per-layer post-RoPE K/V vs the CPU KV cache
-make run         # one hybrid forward end to end; prints the action chunk
+make run         # one forward end to end (NPU vision + CPU backbone); prints the chunk
 make verify      # the production PASS/FAIL gate: e2e action-chunk regression vs CPU baseline
+make verify-npu-backbone  # same gate with the 16-layer prefill ALSO on NPU
+make verify-bridge        # same gate through the legacy two-process subprocess path
+make bench-e2e   # end-to-end wall-time table: CPU vs NPU-vision vs +NPU-backbone
 make diagnosis   # informational: full 16-layer per-layer backbone cosine vs oracle (NPU attention)
 make clean       # remove kernel cache + build artifacts
 ```
@@ -104,7 +112,35 @@ Two independent tracks, both required to call a phase done — see
 
 Both numbers are measured on real NPU2 hardware, not simulated.
 
-## Performance (measured)
+## End-to-end performance (A3-7, measured)
+
+The deployable number is the wall time of one `predict_action_chunk`
+(vision -> connector -> prefix -> backbone prefill -> 10-step action-expert
+denoise), single process, warm, `make bench-e2e` (configs interleaved
+round-robin so the shared machine's drift cannot masquerade as a difference):
+
+| config | wall (3 runs) | vs pure CPU |
+|---|---|---|
+| pure CPU lerobot | 985 / 1127 / 1005 ms | 1.00x |
+| **NPU vision + CPU backbone (production)** | **888 / 874 / 856 ms** | **1.11x / 1.29x / 1.17x** |
+| NPU vision + NPU backbone | 1163 / 1114 ms | 0.97x / 0.90x |
+| legacy subprocess bridge (vision+backbone) | 2678 ms | 0.42x |
+
+The NPU-vision configuration is the stable one (856-888 ms in every run, the
+vision stage costing 440-475 ms for 3 cameras); the CPU baseline is what swings
+with machine load. The 16-layer backbone stays on **CPU** in the production
+config because lerobot's torch prefill (76-93 ms) is measurably faster than our
+NPU prefill (238-252 ms) at seq=256 — logged under
+[NPU-execution exceptions](docs/TODO.md#npu-execution-exceptions). The NPU
+backbone remains fully wired and gated (`make verify-npu-backbone`).
+
+Correctness in the production config: median per-position action-chunk cosine
+**0.998996**, normalized MSE **0.003023** (gate: cosine >= 0.99, nmse <= 0.04)
+— **PASS**. Dropping the NPU backbone leaves the vision encoder as the only
+NPU-induced deviation, so this is better than the 0.9939 of the
+vision+backbone configuration.
+
+## Backbone kernel performance (measured)
 
 This port was **correctness-first**, then went through a Phase-4 optimization
 pass. Both states are measured on real NPU2 hardware with `bench_backbone.py`

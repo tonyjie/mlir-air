@@ -1,18 +1,22 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
 #
-# SmolVLA backbone hybrid inference on NPU2 (MLIR-AIR).
+# SmolVLA hybrid inference on NPU2 (MLIR-AIR).
 #
-# Hybrid CPU/NPU pipeline: CPU vision+prefix -> NPU 16-layer backbone prefill
-# -> CPU action expert 10-step denoise. Correctness = a continuous-output
-# REGRESSION gate on the (1,50,6) action chunk vs the pure-CPU baseline (NOT the
-# token-set gate used by autoregressive LLM siblings).
+# PRODUCTION pipeline: NPU SigLIP vision tower + connector -> CPU prefix
+# assembly -> CPU backbone prefill -> CPU action expert 10-step denoise, all in
+# ONE process. Correctness = a continuous-output REGRESSION gate on the
+# (1,50,6) action chunk vs the pure-CPU baseline (NOT the token-set gate used
+# by the autoregressive LLM siblings).
 #
-# Two Python envs (BRIDGED execution):
-#   LEROBOT_PYTHON  - has torch+lerobot, drives CPU prefix/expert + the gate.
-#   NPU_PYTHON      - has air+pyxrt, runs the NPU backbone (spawned as a
-#                     subprocess by smolvla_inference.run_hybrid_forward).
-# make targets run the LEROBOT_PYTHON driver; the NPU subprocess is internal.
+# SINGLE PROCESS: with the mlir-air env sourced, LEROBOT_PYTHON has torch +
+# lerobot AND air + pyxrt, so the NPU stages run in-process via
+# smolvla_npu_runtime (weights/ELFs/XRT loaded once). NPU_PYTHON is only used
+# by the worktree-only NPU tests and by the legacy `*-bridge` targets, which
+# keep the old two-process subprocess path alive as a fallback reference.
+#
+# NOTE: every recipe below already self-locks the NPU (NPU_LOCK). Do NOT wrap
+# `make ...` in an outer flock on the same file — it self-deadlocks.
 
 srcdir := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
 
@@ -21,26 +25,30 @@ NPU_PYTHON     ?= /home/jiajli/apps/mlir-air/sandbox/bin/python3
 NPU_LOCK       := flock -x -w 1800 /tmp/mlir-air-npu.lock
 export SMOLVLA_NPU_PYTHON = $(NPU_PYTHON)
 
-.PHONY: help oracle export-kv run verify verify-npu-vision vision-connector \
-        bench-e2e diagnosis clean
+.PHONY: help oracle export-kv run verify verify-npu-backbone verify-bridge \
+        vision-connector bench-e2e bench-e2e-all diagnosis clean
 
 help:
 	@echo "============================================================"
-	@echo " SmolVLA backbone hybrid inference on NPU2 (MLIR-AIR)"
+	@echo " SmolVLA hybrid inference on NPU2 (MLIR-AIR), single process"
 	@echo "============================================================"
 	@echo "  make oracle      Regenerate smolvla_oracle.npz (lerobot venv, CPU)"
 	@echo "  make export-kv   Verify NPU-exported per-layer K/V vs CPU cache"
-	@echo "  make run         Run one hybrid forward, print the action chunk"
-	@echo "  make verify      E2E action-chunk regression gate, NPU backbone (PASS/FAIL)"
-	@echo "  make verify-npu-vision"
-	@echo "                   Same gate with NPU vision + NPU backbone (PASS/FAIL)"
+	@echo "  make run         Run one forward (NPU vision + CPU backbone), print the chunk"
+	@echo "  make verify      PRODUCTION gate: NPU vision + CPU backbone (PASS/FAIL)"
+	@echo "  make verify-npu-backbone"
+	@echo "                   Same gate with the 16-layer prefill ALSO on NPU"
+	@echo "  make verify-bridge"
+	@echo "                   Same gate through the legacy two-process bridge"
 	@echo "  make vision-connector"
 	@echo "                   A3-5 Step 4 gate: connector on NPU vs vision oracle"
-	@echo "  make bench-e2e   3-config end-to-end wall-time table (CPU / +backbone / +vision)"
+	@echo "  make bench-e2e   End-to-end wall-time table: CPU / NPU-vision / +NPU-backbone"
+	@echo "  make bench-e2e-all"
+	@echo "                   ... plus the BLAS-clamp A/B and the legacy bridge rows"
 	@echo "  make diagnosis   Full 16-layer per-layer backbone cosine vs oracle"
 	@echo "  make clean       Remove kernel cache + build artifacts"
 	@echo ""
-	@echo "  LEROBOT_PYTHON=$(LEROBOT_PYTHON)"
+	@echo "  LEROBOT_PYTHON=$(LEROBOT_PYTHON)   (also has air/pyxrt -> single process)"
 	@echo "  NPU_PYTHON=$(NPU_PYTHON)"
 
 ## Regenerate the pure-CPU oracle fixture (no NPU; lerobot venv only).
@@ -51,28 +59,40 @@ oracle:
 export-kv:
 	cd $(srcdir) && $(NPU_LOCK) $(NPU_PYTHON) test_export_kv.py
 
-## Run one hybrid forward end to end.
+## Run one forward end to end in the production config.
 run:
 	cd $(srcdir) && $(NPU_LOCK) $(LEROBOT_PYTHON) smolvla_inference.py
 
-## The production gate: e2e action-chunk regression vs the pure-CPU baseline.
-## NPU backbone only; lerobot's CPU vision tower feeds the prefix.
+## THE production gate: e2e action-chunk regression vs the pure-CPU baseline,
+## NPU vision + connector, CPU backbone, single process.
 verify:
 	cd $(srcdir) && $(NPU_LOCK) $(LEROBOT_PYTHON) verify_adapter.py
 
-## Same gate with the SigLIP vision tower + connector ALSO on NPU (A3-5 Step 5).
-## Same pure-CPU baseline, so this gates the full vision+backbone error budget.
-verify-npu-vision:
-	cd $(srcdir) && $(NPU_LOCK) $(LEROBOT_PYTHON) verify_adapter.py --npu-vision
+## Same gate with the 16-layer backbone prefill ALSO on NPU: the full
+## vision+backbone error budget (slower, kept for the record).
+verify-npu-backbone:
+	cd $(srcdir) && $(NPU_LOCK) $(LEROBOT_PYTHON) verify_adapter.py --npu-backbone
+
+## Same gate driven through the legacy two-process subprocess bridge, to prove
+## that fallback path still works when air/pyxrt are absent from the venv.
+verify-bridge:
+	cd $(srcdir) && $(NPU_LOCK) $(LEROBOT_PYTHON) verify_adapter.py \
+	    --npu-backbone --bridge
 
 ## A3-5 Step 4 gate: connector ELF (64x12288x960) vs the vision oracle.
 vision-connector:
 	cd $(srcdir) && $(NPU_LOCK) $(NPU_PYTHON) test_vit_connector.py
 
-## The A3-5 Step 5 deliverable: true end-to-end predict_action_chunk wall time
-## for pure-CPU / NPU-backbone / NPU-vision+backbone, bridge overhead broken out.
+## The A3-7 deliverable: true end-to-end predict_action_chunk wall time for
+## pure-CPU / NPU-vision / NPU-vision+backbone, single process, interleaved.
 bench-e2e:
-	cd $(srcdir) && $(NPU_LOCK) $(LEROBOT_PYTHON) bench_e2e.py --iters 5
+	cd $(srcdir) && $(NPU_LOCK) $(LEROBOT_PYTHON) bench_e2e.py --iters 5 \
+	    --configs cpu,vision,vision+backbone
+
+## ... plus the scoped-BLAS-clamp A/B and the legacy bridge rows (slow).
+bench-e2e-all:
+	cd $(srcdir) && $(NPU_LOCK) $(LEROBOT_PYTHON) bench_e2e.py --iters 5 --blas-ab \
+	    --configs cpu,vision,vision+backbone,bridge:vision+backbone
 
 ## Informational: full 16-layer per-layer backbone cosine vs oracle (NPU attn).
 diagnosis:

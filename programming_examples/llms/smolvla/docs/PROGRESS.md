@@ -126,3 +126,43 @@ lerobot's torch CPU backbone (91 ms), each NPU stage is a fresh subprocess so it
 always pays cold-start, and the 307 ms CPU action expert is untouched. Full
 numbers, per-stage split and the reusable BLAS-thread-contention finding are in
 `docs/TODO.md`, section "A3-5 Step 4-5".
+
+## A3-7: single-process runner + NPU-vision/CPU-backbone config (DONE — beats CPU)
+
+Two changes turned the pipeline from 0.42-0.68x of the CPU baseline into a win:
+
+1. **The subprocess bridge is gone.** The lerobot venv can import `air`,
+   `aircc` and `pyxrt` (with the mlir-air env sourced) as well as
+   torch/lerobot, so the two-process design was never necessary. New
+   `smolvla_npu_runtime.py` (`VisionRuntime`/`BackboneRuntime` + singletons)
+   loads weights, ELFs, the XRT context and device BOs ONCE per process.
+   That removes ~585 ms (vision) / ~568 ms (backbone) of spawn + safetensors
+   reload + ELF load + npz I/O paid on EVERY inference, plus the cold-start
+   penalty a fresh process could never amortize.
+   `run_hybrid_forward(bridge=True)` keeps the old path as a fallback
+   (`make verify-bridge`, bit-identical gate numbers).
+2. **The production config keeps the backbone on CPU** (`npu_backbone=False`),
+   because lerobot's torch prefill (76-93 ms) is measurably faster than our NPU
+   prefill (238-252 ms) at seq=256. This also deletes the old redundancy of
+   computing the CPU prefill and then overwriting its KV cache.
+
+| config | wall (3 interleaved runs) | vs pure CPU |
+|---|---|---|
+| pure CPU lerobot | 985 / 1127 / 1005 ms | 1.00x |
+| **NPU vision + CPU backbone** | **888 / 874 / 856 ms** | **1.11x / 1.29x / 1.17x** |
+| NPU vision + NPU backbone | 1163 / 1114 ms | 0.97x / 0.90x |
+| legacy bridge (vision+backbone) | 2678 ms | 0.42x |
+
+| gate | result |
+|---|---|
+| `make verify` (NPU vision + CPU backbone, production) | cosine **0.998996** / nmse **0.003023** **PASS** |
+| `make verify-npu-backbone` (vision + backbone on NPU) | cosine 0.993906 / nmse 0.012201 **PASS** |
+| `make verify-bridge` (legacy two-process path) | cosine 0.993906 / nmse 0.012201 **PASS** |
+
+The BLAS-thread clamp that the bridge applied globally is now scoped to the NPU
+dispatch loop at runtime (`npu_thread_limits`, ctypes on the loaded OpenBLAS +
+`torch.set_num_threads`, restored afterwards) so the CPU action expert keeps its
+threads; measured both ways with `make bench-e2e-all` (clamp ON is 17-88 ms
+better end to end and never worse). Full accounting — including why the result
+is ~856 ms rather than the naive ~745 ms projection — is in `docs/TODO.md`,
+section "A3-7".

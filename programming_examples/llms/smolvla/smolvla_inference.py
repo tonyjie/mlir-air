@@ -1,41 +1,55 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
 
-"""SmolVLA end-to-end hybrid inference (CPU prefix -> NPU backbone -> CPU expert).
+"""SmolVLA end-to-end hybrid inference (CPU prefix -> NPU stage(s) -> CPU expert).
 
-Runs in the LEROBOT venv (`~/Projects/smolvla_playground/.venv/bin/python`),
-which has torch + lerobot but NOT air/pyxrt. The NPU work runs in the WORKTREE
-python (`.../sandbox/bin/python3`, has air/pyxrt but not lerobot) via subprocess
-bridges exchanging tensors through .npz files.
+Runs in the LEROBOT venv (`~/Projects/smolvla_playground/.venv/bin/python`).
 
-Execution model = BRIDGED (two processes). Chosen because the two Python envs
-are genuinely disjoint (verified: lerobot venv has no `air`, worktree python has
-no `torch`/`lerobot`), so a single-process design is impossible. Each bridge is
-a single synchronous subprocess call inside a wrapped lerobot method.
+Two execution models, selected by `bridge=`:
 
-Pipeline (run_hybrid_forward):
+  bridge=False (DEFAULT, production)  — SINGLE PROCESS. With the mlir-air env
+    sourced, the lerobot venv imports `air`/`aircc`/`pyxrt` as well as
+    torch/lerobot, so the NPU stages run in-process through
+    `smolvla_npu_runtime` (weights + ELFs + XRT context loaded ONCE per process
+    and reused). This removes ~596 ms (backbone) / ~1163 ms (vision+backbone)
+    of per-inference bridge overhead that was pure process/reload cost.
+
+  bridge=True  — the original two-process design, kept as a reference/fallback
+    for an environment where the lerobot venv really cannot see `air`. Each NPU
+    stage is a synchronous subprocess (`run_npu_vision.py` /
+    `run_npu_backbone.py`) exchanging tensors through .npz files, paying process
+    spawn + safetensors reload + XRT/ELF load on EVERY inference.
+
+Which stages run on NPU is chosen independently (`npu_vision`, `npu_backbone`):
+
   1. Vision (3 cameras -> 3 x (64,960) image embeddings):
-       npu_vision=False (default): CPU lerobot SigLIP + connector, untouched.
-       npu_vision=True : ONE run_npu_vision.py subprocess encodes ALL 3 images
-         on NPU (12-layer ViT + connector GEMM); `vlm_with_expert.embed_image`
-         is swapped to serve those results. Everything after it — the sqrt(960)
-         scale, language/state tokens, prefix assembly — stays lerobot's.
+       npu_vision=False: CPU lerobot SigLIP + connector, untouched (222 ms/img).
+       npu_vision=True : ALL 3 images encoded on NPU in one go (12-layer ViT +
+         connector GEMM, 148 ms/img warm — a real 1.5x win);
+         `vlm_with_expert.embed_image` is swapped to serve those results.
+         Everything after it — the sqrt(960) scale, language/state tokens,
+         prefix assembly — stays lerobot's own code.
   2. CPU (lerobot): prefix assembly -> (241,960) prefix embed via the real
      embed_prefix, NOT reimplemented.
-  3. NPU (worktree python subprocess): run_backbone_prefill on the prefix embed
-     -> per-layer post-RoPE K + raw V (5 kv-heads), via run_npu_backbone.py.
-  4. CPU (lerobot): the real sample_actions() builds a correctly-structured
-     past_key_values (fill_kv_cache=True), which we OVERWRITE in place with the
-     NPU K/V, then the unchanged 10-step denoise loop reads it -> (1,50,6) chunk.
+  3. Backbone prefill:
+       npu_backbone=False: lerobot's own torch CPU prefill runs and is KEPT
+         (91 ms). Nothing is hooked, nothing is overwritten.
+       npu_backbone=True : run_backbone_prefill on NPU -> per-layer post-RoPE K
+         + raw V (5 kv-heads), which OVERWRITE the CPU KV cache the real
+         sample_actions() built with fill_kv_cache=True (229 ms — measured
+         SLOWER than the torch CPU path at seq=256, so it is not the default).
+  4. CPU (lerobot): the unchanged 10-step denoise loop -> (1,50,6) chunk.
 
-The NPU-lock discipline: the OUTER caller (test_e2e / make verify) holds
-`flock /tmp/mlir-air-npu.lock`. The subprocesses here do NOT re-lock that path
-(would self-deadlock); their KernelCache uses a distinct inner filelock.
+The fastest measured configuration is therefore npu_vision=True +
+npu_backbone=False + bridge=False (see docs/TODO.md A3-7).
 
-Timing attribution: pass a dict as `timings=` to collect, per bridge, the wall
-time the driver spent (spawn + npz I/O + subprocess) AND the subprocess-internal
-phase breakdown (weight load / ELF load / actual NPU compute), so bench_e2e.py
-can report both "as measured" and "compute-only" numbers.
+The NPU-lock discipline: the OUTER caller (make verify / make bench-e2e) holds
+`flock /tmp/mlir-air-npu.lock`. Nothing here re-locks that path (it would
+self-deadlock); the KernelCache uses a distinct inner filelock.
+
+Timing attribution: pass a dict as `timings=` to collect per stage the driver
+wall time AND the internal phase breakdown (weight load / ELF load / actual NPU
+compute), so bench_e2e.py can report both "as measured" and "compute-only".
 """
 
 from __future__ import annotations
@@ -75,15 +89,22 @@ def normalized_mse(chunk, ref) -> float:
     return float(np.mean((chunk - ref) ** 2) / max(power, 1e-12))
 
 
-def build_config(npu_vision: bool = False):
+def build_config(
+    npu_vision: bool = False, npu_backbone: bool = True, bridge: bool = False
+):
     """Minimal config dict for the verify adapter / reporting."""
+    stages = [s for s, on in (("vision", npu_vision), ("backbone", npu_backbone)) if on]
     return {
         "model": DEFAULT_MODEL,
         "prompt": DEFAULT_PROMPT,
-        "execution_model": "bridged (lerobot-venv driver + worktree-python NPU)",
+        "execution_model": (
+            "bridged (lerobot-venv driver + worktree-python NPU subprocess)"
+            if bridge
+            else "single-process (air/pyxrt in the lerobot venv)"
+        ),
         "seq_len": 256,
         "n_layers": 16,
-        "npu_stages": "vision+backbone" if npu_vision else "backbone",
+        "npu_stages": "+".join(stages) if stages else "none (pure CPU)",
     }
 
 
@@ -188,6 +209,18 @@ def _run_npu_vision(images, workdir, timings=None):
     return conn
 
 
+def warmup_npu(npu_vision=True, npu_backbone=False, attn_mode="gemm"):
+    """Build the single-process NPU runtimes and pay the one-time device cost
+    (XRT context, BO alloc, static weight upload) BEFORE any measured
+    inference. A no-op for the bridged path, which cannot amortize anything."""
+    from smolvla_npu_runtime import get_vision_runtime, get_backbone_runtime
+
+    if npu_vision:
+        get_vision_runtime().warmup()
+    if npu_backbone:
+        get_backbone_runtime(attn_mode=attn_mode)
+
+
 def run_hybrid_forward(
     batch,
     policy=None,
@@ -195,29 +228,59 @@ def run_hybrid_forward(
     workdir=None,
     attn_mode="gemm",
     npu_vision=False,
+    npu_backbone=True,
+    bridge=False,
     timings=None,
 ):
-    """Run the full hybrid pipeline once; return the (1, chunk, action_dim)
-    action chunk (unpadded to the real action dim).
+    """Run the pipeline once; return the (1, chunk, action_dim) action chunk.
 
-    attn_mode: forwarded to _run_npu_backbone -- "gemm" (default, approach-B,
-        production) or "flash" (EXPERIMENT: non-causal FlashAttention, no mask).
-    npu_vision: if True, the 3 camera images are encoded by the NPU SigLIP ViT +
-        connector (one run_npu_vision.py subprocess for all of them) instead of
-        lerobot's CPU vision tower. Default False keeps the CPU vision path as
-        the reference. The NPU backbone runs either way.
-    timings: optional dict; filled with per-bridge wall/phase timings (see
-        _record_bridge_timings)."""
+    npu_vision  : encode the 3 camera images with the NPU SigLIP ViT +
+        connector instead of lerobot's CPU vision tower (a measured 1.5x win).
+    npu_backbone: run the 16-layer prefill on NPU and overwrite the KV cache.
+        When False, lerobot's own torch CPU prefill result is kept as-is —
+        nothing is hooked and no KV injection happens, so the redundant
+        "compute on CPU then throw it away" of the old path disappears.
+    bridge      : False (default) = single process via `smolvla_npu_runtime`;
+        True = the legacy subprocess bridges (reference/fallback).
+    attn_mode   : NPU backbone attention -- "gemm" (production) or "flash".
+    timings     : optional dict; filled per NPU stage with wall/phase timings."""
     if policy is None:
         policy = SmolVLAPolicy.from_pretrained(DEFAULT_MODEL).eval()
 
     tmpdir_ctx = None
-    if workdir is None:
+    if workdir is None and bridge:
         tmpdir_ctx = tempfile.TemporaryDirectory()
         workdir = tmpdir_ctx.name
 
     vwe = policy.model.vlm_with_expert
     n_layers = len(vwe.get_vlm_model().text_model.layers)
+
+    # -- The two NPU entry points, bridged or in-process. Identical contracts. --
+    if bridge:
+
+        def _vision(images):
+            return _run_npu_vision(images, workdir, timings=timings)
+
+        def _backbone(prefix_embed, pad_masks, position_ids):
+            return _run_npu_backbone(
+                prefix_embed,
+                pad_masks,
+                position_ids,
+                workdir,
+                attn_mode=attn_mode,
+                timings=timings,
+            )
+
+    else:
+        from smolvla_npu_runtime import get_vision_runtime, get_backbone_runtime
+
+        def _vision(images):
+            return get_vision_runtime().encode(images, timings=timings)
+
+        def _backbone(prefix_embed, pad_masks, position_ids):
+            return get_backbone_runtime(attn_mode=attn_mode).prefill(
+                prefix_embed, pad_masks, position_ids, timings=timings
+            )
 
     # -- Capture the assembled prefix embed + pad masks; optionally serve the
     #    per-camera image embeddings from NPU. --
@@ -228,12 +291,12 @@ def run_hybrid_forward(
     def _wrapped_embed_prefix(*a, **kw):
         if npu_vision:
             # `images` is embed_prefix's first positional arg (a list of N
-            # camera tensors). Encode them ALL in one bridge call up front, then
-            # let the untouched embed_prefix pull them one at a time through the
+            # camera tensors). Encode them ALL in one call up front, then let
+            # the untouched embed_prefix pull them one at a time through the
             # swapped embed_image -- so the sqrt(960) scale, the pad/att masks
             # and the prefix assembly all stay lerobot's own code.
             images = kw["images"] if "images" in kw else a[0]
-            conn = _run_npu_vision(images, workdir, timings=timings)
+            conn = _vision(images)
             ref_dtype = next(policy.parameters()).dtype
             served = {"i": 0}
 
@@ -252,8 +315,9 @@ def run_hybrid_forward(
             assert served["i"] == len(images), (served["i"], len(images))
         else:
             embs, pad_masks, att_masks = orig_embed_prefix(*a, **kw)
-        captured["prefix_embed"] = embs.detach().float().numpy()[0]
-        captured["pad_masks"] = pad_masks.detach().bool().numpy()[0]
+        if npu_backbone:
+            captured["prefix_embed"] = embs.detach().float().numpy()[0]
+            captured["pad_masks"] = pad_masks.detach().bool().numpy()[0]
         return embs, pad_masks, att_masks
 
     policy.model.embed_prefix = _wrapped_embed_prefix
@@ -266,13 +330,8 @@ def run_hybrid_forward(
         if kw.get("fill_kv_cache", False):
             pkv = out[1]
             position_ids = kw["position_ids"].detach().numpy()[0].astype(np.int64)
-            npu_k, npu_v = _run_npu_backbone(
-                captured["prefix_embed"],
-                captured["pad_masks"],
-                position_ids,
-                workdir,
-                attn_mode=attn_mode,
-                timings=timings,
+            npu_k, npu_v = _backbone(
+                captured["prefix_embed"], captured["pad_masks"], position_ids
             )
             # Reassign whole contiguous tensors (recipe: don't mutate views).
             # Match each cached tensor's dtype/shape exactly: (1, L, 5, 64) bf16.
@@ -291,7 +350,12 @@ def run_hybrid_forward(
                 pkv[i]["value_states"] = v_t
         return out
 
-    vwe.forward = _wrapped_vwe_forward
+    # Only hook the backbone when it actually runs on NPU: with npu_backbone
+    # False lerobot's own CPU prefill IS the answer, so there is nothing to
+    # capture and nothing to overwrite (the old path computed the CPU prefill
+    # and then discarded it — pure waste).
+    if npu_backbone:
+        vwe.forward = _wrapped_vwe_forward
 
     try:
         policy.reset()
@@ -316,23 +380,39 @@ def _fixed_noise(policy):
 
 
 def main():
-    """Standalone: run one hybrid forward and print the action chunk summary."""
-    npu_vision = "--npu-vision" in sys.argv
+    """Standalone: run one forward and print the action chunk summary.
+
+    Default = the production config: NPU vision + CPU backbone, single process.
+      --npu-backbone   also run the 16-layer prefill on NPU (slower, for the record)
+      --cpu-vision     keep lerobot's CPU vision tower
+      --bridge         use the legacy two-process subprocess bridges"""
+    npu_vision = "--cpu-vision" not in sys.argv
+    npu_backbone = "--npu-backbone" in sys.argv
+    bridge = "--bridge" in sys.argv
     policy = SmolVLAPolicy.from_pretrained(DEFAULT_MODEL).eval()
     batch = build_oracle_batch(policy)
+    if not bridge:
+        warmup_npu(npu_vision=npu_vision, npu_backbone=npu_backbone)
     timings = {}
+    t0 = time.perf_counter()
     chunk = run_hybrid_forward(
         batch,
         policy=policy,
         noise=_fixed_noise(policy),
         npu_vision=npu_vision,
+        npu_backbone=npu_backbone,
+        bridge=bridge,
         timings=timings,
     )
-    print(f"[hybrid] npu stages: {build_config(npu_vision)['npu_stages']}")
+    wall_ms = (time.perf_counter() - t0) * 1e3
+    cfg = build_config(npu_vision, npu_backbone, bridge)
+    print(f"[hybrid] execution model: {cfg['execution_model']}")
+    print(f"[hybrid] npu stages: {cfg['npu_stages']}")
+    print(f"[hybrid] predict_action_chunk wall: {wall_ms:.1f} ms (warm)")
     print(f"[hybrid] action chunk shape {chunk.shape}")
     print(f"[hybrid] chunk[0,0] = {np.asarray(chunk[0, 0], np.float32)}")
     for stage, rec in timings.items():
-        print(f"[hybrid] bridge {stage}: {rec}")
+        print(f"[hybrid] stage {stage}: {rec}")
 
 
 if __name__ == "__main__":

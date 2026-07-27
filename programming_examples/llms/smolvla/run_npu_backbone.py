@@ -53,7 +53,7 @@ from smolvla_backbone_weights import (
     SmolVLABackboneConfig,
     generate_rope_lut,
 )
-from smolvla_cpu_helpers import build_prefix_mask
+from smolvla_cpu_helpers import build_padded_mask_and_positions
 from smolvla_backbone_prefill import compile_all_kernels, run_backbone_prefill
 from shared.infra.cache import KernelCache, Profiler
 
@@ -66,21 +66,6 @@ EXPECTED_KERNELS = {
     "gemm": {"rms_gemms_rope", "o_ffn", "qkt", "pv", "masked_softmax"},
     "flash": {"rms_gemms_rope", "o_ffn", "flash_attn"},
 }
-
-
-def build_padded_mask_and_positions(pad_mask, oracle_len):
-    """Extend the prefix mask + RoPE positions to NPU_SEQ_LEN=256.
-    Identical construction to test_full_backbone.build_padded_mask_and_positions."""
-    n_prefix = oracle_len - 1  # 240 visual+language, 1 state token
-    mask_o = build_prefix_mask(n_prefix, 1, pad_mask=pad_mask)
-    mask_256 = np.full((NPU_SEQ_LEN, NPU_SEQ_LEN), -np.inf, dtype=np.float32)
-    mask_256[:oracle_len, :oracle_len] = mask_o
-
-    pad_mask_256 = np.zeros((NPU_SEQ_LEN,), dtype=bool)
-    pad_mask_256[:oracle_len] = pad_mask
-    positions_256 = np.cumsum(pad_mask_256.astype(np.int64)) - 1
-    positions_256 = np.clip(positions_256, 0, None)
-    return mask_256, positions_256
 
 
 def main():
@@ -98,7 +83,9 @@ def main():
     weights = load_backbone_weights("lerobot/smolvla_base", config=cfg)
     t.mark("weight_load")
 
-    mask_256, positions_256 = build_padded_mask_and_positions(pad_mask, oracle_len)
+    mask_256, positions_256 = build_padded_mask_and_positions(
+        pad_mask, oracle_len, NPU_SEQ_LEN
+    )
 
     # Cross-check that our reconstructed positions match lerobot's actual ids
     # over the real (non-padding) region -- a mismatch here silently corrupts

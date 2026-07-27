@@ -7,7 +7,9 @@ Compares run_hybrid_forward's (1,50,6) action chunk (CPU prefix -> NPU backbone
 -> CPU expert 10-step denoise) against the pure-CPU oracle baseline
 (smolvla_oracle.npz['action_chunk'], same fixed zero noise) via regression_gate.
 
-Runs in the LEROBOT venv; the NPU subprocess is spawned by run_hybrid_forward.
+Runs in the LEROBOT venv, which also has air/pyxrt: run_hybrid_forward drives
+the NPU backbone IN-PROCESS (bridge=False default; pass bridge=True for the
+legacy subprocess path).
 Hold the NPU lock around the whole thing:
     flock -x -w 1800 /tmp/mlir-air-npu.lock \
         ~/Projects/smolvla_playground/.venv/bin/python test_e2e.py

@@ -148,11 +148,22 @@ hybrid pipeline exploits:
 3. The unchanged 10-step flow-matching denoise loop reads this cache exactly
    as it would in a pure-CPU run — the expert code has no NPU awareness.
 
-This is the **bridged execution model**: the lerobot venv (has `torch` +
-`lerobot`, no `air`/`pyxrt`) drives steps 2-3; the NPU backbone (step 1) runs
-in the worktree python as a **subprocess**, exchanging tensors through `.npz`
-files (`run_npu_backbone.py`), because the two Python environments are
-genuinely disjoint (verified: neither venv has the other's core dependency).
+**Execution model (A3-7): SINGLE PROCESS.** The lerobot venv turned out to
+have `air`/`aircc`/`pyxrt` too (with the mlir-air env sourced), so steps 1-3 all
+run in one interpreter: `smolvla_npu_runtime.BackboneRuntime` holds the weights,
+the ELF `KernelCache`, the XRT context and the device BOs for the process
+lifetime. The original **bridged** model — the NPU stage as a subprocess in the
+worktree python exchanging `.npz` files (`run_npu_backbone.py` /
+`run_npu_vision.py`) — is kept as a fallback behind
+`run_hybrid_forward(bridge=True)` for environments where the driver venv really
+cannot import `air`; it costs ~570-585 ms per NPU stage per inference in process
+spawn, safetensors reload and ELF/XRT load.
+
+**This whole KV-injection mechanism is DISABLED in the production config.**
+`npu_backbone=False` (the default since A3-7) leaves lerobot's own torch prefill
+result in place — nothing is hooked and nothing is overwritten — because the CPU
+prefill is measurably faster at seq=256 (76-93 ms vs 238-252 ms on NPU). The
+mechanism above is still exercised by `make verify-npu-backbone`.
 The outer caller (`make verify`/`make run`, via the Makefile's own recipe)
 holds `flock /tmp/mlir-air-npu.lock`; the subprocess does not re-acquire that
 same path (would self-deadlock) — its own `KernelCache` uses a distinct inner
