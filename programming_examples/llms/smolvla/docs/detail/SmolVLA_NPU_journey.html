@@ -863,18 +863,25 @@ once after 12 layers: <span style="color:#1e40af;font-weight:700">[NPU elf:layer
   </p>
 
   <div class="stat-row">
-    <div class="stat"><div class="big-num">141.6 ms</div><div class="label">NPU vision encoder<br>(12 layers, fused, measured)</div></div>
-    <div class="stat"><div class="big-num">719 ms</div><div class="label">real CPU vision stage<br>(bf16 PyTorch baseline)</div></div>
-    <div class="stat"><div class="big-num">0.990</div><div class="label">accuracy vs CPU answer key<br>(gate 0.99 — PASS)</div></div>
+    <div class="stat"><div class="big-num">138 ms</div><div class="label">NPU vision encoder<br>(per image, fused, measured)</div></div>
+    <div class="stat"><div class="big-num">237 ms</div><div class="label">CPU vision encoder<br>(per image, bf16 PyTorch)</div></div>
+    <div class="stat"><div class="big-num">1.72×</div><div class="label">NPU faster than CPU<br>(and passes the 0.99 gate)</div></div>
   </div>
   <div class="callout">
-    <b>Vision on the NPU is ~5× faster than the CPU, and it passes the accuracy gate.</b> Measured wall time
-    (compile excluded, median of 10 runs): the 12-layer encoder is <b>141.6 ms on NPU</b> vs the real lerobot
-    <b>719 ms CPU</b> vision stage. This is the opposite of the backbone result (Section 9), and the reason is
-    <em>shape</em>: vision runs at seq=1024 with big matmuls (fc up to 3072-wide, a 1024×1024 attention), so the
-    NPU's matrix engine is well-fed and the per-dispatch overhead is amortized — exactly where an NPU wins. The
-    backbone, at seq=256, is too small to fill the array. Since vision is 74% of end-to-end runtime, this is the
-    single biggest lever in the whole model.
+    <b>Vision on the NPU is 1.72× faster than the CPU, and it passes the accuracy gate.</b> Measured wall time
+    (compile excluded, median of 10 runs): <b>138 ms per image on NPU</b> vs <b>237 ms on CPU</b>.
+    <b>Careful with the units:</b> SmolVLA has <b>three cameras</b>, and the encoder runs once per image — so a
+    full inference is <b>3 × 138 = 413 ms on NPU</b> vs the <b>711–719 ms</b> CPU vision stage quoted in Section 4.
+    (Comparing one NPU image against the three-image CPU stage would wrongly suggest ~5×.)
+    The win's direction is still the opposite of the backbone result (Section 9), and the reason is <em>shape</em>:
+    vision runs at seq=1024 with big matmuls (fc up to 3072-wide, a 1024×1024 attention), so the NPU's matrix engine
+    is well-fed and per-dispatch overhead is amortized. The backbone, at seq=256, is too small to fill the array.
+  </div>
+  <div class="callout warn">
+    <b>Headroom not yet taken: batch the three cameras.</b> Today each image is a separate 37-dispatch run. Since
+    the per-image work is identical and independent, the three could share one set of dispatches (GEMMs at M=3072
+    instead of 1024), amortizing the launch overhead ~3×. Given that dispatch overhead is what dominated before
+    fusion, this is the obvious next optimization for vision.
   </div>
 
   <div class="callout">
@@ -1161,7 +1168,8 @@ once after 16 layers: (HOST) final RMSNorm [256,960]
   <div class="callout">
     <b>The A3 headline:</b> every vision leaf kernel is validated on real NPU2, the <b>whole 12-layer encoder runs
     on-chip</b> with <b>zero from-scratch kernels</b> (conv became im2col+GEMM, pixel-shuffle a host reshape), and
-    after fusion it is <b>~5× faster than the CPU vision stage while passing the accuracy gate</b> (0.990 vs 0.99).
+    after fusion it is <b>1.72× faster than the CPU encoder while passing the accuracy gate</b> (0.990 vs 0.99;
+    138 ms vs 237 ms per image — and the model runs it 3×, once per camera).
     What remains is wiring it into the end-to-end pipeline.
   </div>
   <div class="callout">
@@ -1198,7 +1206,8 @@ once after 16 layers: (HOST) final RMSNorm [256,960]
     SmolVLA's language brain (the 16-layer SmolLM2-360M) already runs entirely on the AMD NPU2 (action output
     verified against a pure-CPU baseline, similarity 0.9971, faster than the CPU backbone). The <b>vision
     encoder</b> — the 74% bottleneck — now <b>also runs entirely on-chip</b>, and after fusion it is
-    <b>141.6 ms vs the CPU's 719 ms (~5×) while passing the accuracy gate at 0.990</b>. This is the
+    <b>1.72× faster than the CPU encoder (138 ms vs 237 ms per image, ×3 cameras) while passing the accuracy gate
+    at 0.990</b>. This is the
     <b>first time a VLA model's core runs on the AMD NPU2</b>; the remaining step is wiring the NPU vision into the
     end-to-end pipeline to measure the full model, then moving the action expert across.</p>
   </div>
