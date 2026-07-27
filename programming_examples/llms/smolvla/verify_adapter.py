@@ -59,15 +59,24 @@ COS_MIN = 0.99
 NMSE_MAX = 0.04
 
 
-def build_config() -> dict:
-    cfg = _inference_config()
+def build_config(npu_vision: bool = False) -> dict:
+    cfg = _inference_config(npu_vision)
     cfg.update({"gate": "regression", "cos_min": COS_MIN, "nmse_max": NMSE_MAX})
     return cfg
 
 
-def run_gate(cos_min: float = COS_MIN, nmse_max: float = NMSE_MAX) -> dict:
+def run_gate(
+    cos_min: float = COS_MIN,
+    nmse_max: float = NMSE_MAX,
+    npu_vision: bool = False,
+) -> dict:
     """Run the hybrid pipeline once and return the gate dict. Gates on cosine
-    (primary) AND magnitude-invariant normalized MSE; raw MSE kept for report."""
+    (primary) AND magnitude-invariant normalized MSE; raw MSE kept for report.
+
+    npu_vision: also run the SigLIP vision tower + connector on NPU (the
+    `make verify-npu-vision` gate). The baseline is the SAME pure-CPU lerobot
+    action chunk either way, so this measures the FULL NPU error budget
+    (vision + backbone), not just the backbone's."""
     from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 
     o = np.load(_HERE / "smolvla_oracle.npz")
@@ -75,7 +84,9 @@ def run_gate(cos_min: float = COS_MIN, nmse_max: float = NMSE_MAX) -> dict:
 
     policy = SmolVLAPolicy.from_pretrained(DEFAULT_MODEL).eval()
     batch = build_oracle_batch(policy)
-    chunk = run_hybrid_forward(batch, policy=policy, noise=_fixed_noise(policy))
+    chunk = run_hybrid_forward(
+        batch, policy=policy, noise=_fixed_noise(policy), npu_vision=npu_vision
+    )
     assert chunk.shape == ref.shape, (chunk.shape, ref.shape)
 
     g = regression_gate(chunk, ref, cos_min=cos_min, mse_max=float("inf"))
@@ -87,9 +98,11 @@ def run_gate(cos_min: float = COS_MIN, nmse_max: float = NMSE_MAX) -> dict:
 
 
 def main() -> int:
-    g = run_gate()
+    npu_vision = "--npu-vision" in sys.argv
+    g = run_gate(npu_vision=npu_vision)
+    stages = "NPU vision + NPU backbone" if npu_vision else "NPU backbone"
     print("=" * 60)
-    print("SmolVLA verify: e2e action-chunk regression gate")
+    print(f"SmolVLA verify: e2e action-chunk regression gate [{stages}]")
     print("=" * 60)
     for k in ("cosine", "cos_min", "mse", "nmse", "nmse_max", "max_abs", "passed"):
         print(f"  {k:8s} = {g[k]}")

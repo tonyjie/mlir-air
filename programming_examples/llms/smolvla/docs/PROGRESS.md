@@ -102,3 +102,27 @@ tile_m=32/herd_m=8 — a pre-existing bug, not specific to this change). Worked
 around by scaling `tile_m` (96) to keep the batched M=768 within a single
 launch iteration; verified correct (mean_rel_L1 ~9.6e-3, within the bf16-out
 GEMM tier).
+
+## A3-5 Step 4-5: NPU vision spliced into the hybrid (DONE)
+
+Step 4 put the connector (modality projection) on NPU as one more ELF
+(`gemm_connector`, 64x12288x960, drain tile_m16/tn80, herd 4x4); Step 5 wired
+the NPU vision tower into `run_hybrid_forward` behind `npu_vision=True` via a
+new all-cameras-in-one-call bridge (`run_npu_vision.py`).
+
+| gate | result |
+|---|---|
+| connector ELF in isolation vs `vision_oracle['connector']` | cosine 0.999988 |
+| NPU encoder + connector, end to end | cosine 0.996624 |
+| `make verify` (NPU backbone) | cosine 0.997144 / nmse 0.007783 **PASS** |
+| `make verify-npu-vision` (NPU vision + backbone) | cosine 0.993975 / nmse 0.012201 **PASS** |
+
+End-to-end `predict_action_chunk` (`make bench-e2e`, median of 5): pure CPU
+967 ms; hybrid NPU backbone 2158 ms as measured / 1562 ms compute-only; hybrid
+NPU vision+backbone 2589 ms as measured / 1425 ms compute-only. The vision stage
+itself is a 1.5x NPU win (148 ms/image warm vs 222 ms CPU) but the pipeline as a
+whole is still slower than CPU — the NPU backbone (229 ms) is 2.5x slower than
+lerobot's torch CPU backbone (91 ms), each NPU stage is a fresh subprocess so it
+always pays cold-start, and the 307 ms CPU action expert is untouched. Full
+numbers, per-stage split and the reusable BLAS-thread-contention finding are in
+`docs/TODO.md`, section "A3-5 Step 4-5".

@@ -27,6 +27,8 @@ NPU kernels driven (all validated at these exact shapes in A3-1..A3-4, registry)
   layer_norm: 1024x768 affine (ln1, ln2, post_layernorm), herd_x=8
   gelu      : N=1024*3072 GELU-tanh, herd 8x2
   flash_attn: 1024/1024 12q/12kv MHA, head_dim=64, non-causal, hpu=2 (full array)
+  gemm_connector : 64x12288x960 (A3-5 Step 4 modality projection, drain
+                   tile_m16/tn80, herd 4x4 — the registry's per-shape override)
 """
 
 import sys
@@ -134,6 +136,29 @@ _GEMM_SHAPES = {
     ),
 }
 
+# A3-5 Step 4: the connector (modality projection) GEMM, 64x12288x960.
+# Registry row (drain, precision="high"): tile_m=16, tile_k_l2=256, tile_k_l1=32,
+# tile_n=80, with a per-shape HERD OVERRIDE of 4x4 — M=64 is only 4 tile_m rows,
+# so the usual 8-row herd cannot be filled (build_module asserts
+# m % (tile_m*herd_m) == 0). tile_m=16 also differs from the _m32 drain default,
+# so this ELF links its OWN symbol-suffixed microkernel (mm_m16_n80.o) and can
+# never collide with the encoder's mm_m32_n{96,128}.o (see the fused-ELF mm.o
+# gotcha in vit_fused_builders._force_tile_n_suffix).
+_CONNECTOR_GEMM = dict(
+    m=64,
+    k=12288,
+    n=960,
+    tile_m=16,
+    tile_k_l2=256,
+    tile_k_l1=32,
+    tile_n=80,
+    herd_m=4,
+    herd_n=4,
+    sym_suffix="_m16_n80",
+    obj="mm_m16_n80.o",
+)
+_PIXEL_SHUFFLE_FACTOR = 4
+
 
 # ---------------------------------------------------------------------------
 # Kernel compilation
@@ -179,7 +204,53 @@ def _compile_flash_attn(cache, config, seq_len, fa_bfp16):
     )
 
 
-def _compile_fused_kernels(cache, config, seq_len, fa_bfp16):
+def _compile_connector_gemm(cache):
+    """Compile the connector projection GEMM ELF (64x12288x960, drain 4x4 herd).
+
+    Registry-validated shape; see `_CONNECTOR_GEMM` for why it needs its own
+    tile_m=16 / herd 4x4 / symbol-suffixed microkernel. The pixel-shuffle that
+    produces its (64, 12288) input is a pure host reshape (no arithmetic), so
+    the connector's only math — the projection — runs on NPU.
+    """
+    from shared.infra.external_kernels import compile_gemm_mm
+    from matrix_multiplication.bf16_in_bf16_out.run import build_module as build_gemm
+
+    s = _CONNECTOR_GEMM
+    print(
+        f"  Compiling gemm_connector: {s['m']}x{s['k']}x{s['n']} "
+        f"(drain tile_m={s['tile_m']} tile_n={s['tile_n']} "
+        f"herd {s['herd_m']}x{s['herd_n']})"
+    )
+    compile_gemm_mm(
+        tile_m=s["tile_m"],
+        tile_n=s["tile_n"],
+        tile_k_l1=s["tile_k_l1"],
+        sym_suffix=s["sym_suffix"],
+        out_name=s["obj"],
+    )
+    mod = build_gemm(
+        s["m"],
+        s["k"],
+        s["n"],
+        s["tile_m"],
+        s["tile_k_l2"],
+        s["tile_k_l1"],
+        s["tile_n"],
+        s["herd_m"],
+        s["herd_n"],
+        bfloat16,
+        bfloat16,
+        arch="aie2p",
+        emit_external_call=True,
+        sym_suffix=s["sym_suffix"],
+        link_with_name=s["obj"],
+    )
+    cache.compile_and_cache(
+        "gemm_connector", mod, {"verbose": cache.verbose, **_gemm_backend()}
+    )
+
+
+def _compile_fused_kernels(cache, config, seq_len, fa_bfp16, with_connector=True):
     """A3-6b Lever 2+3: compile the two fused ViT multi-launch ELFs + FA.
 
     vit_ln_qkv  : LN1 + Q/K/V GEMM + Q/K/V bias-add       (7 launches, 1 ELF)
@@ -257,6 +328,9 @@ def _compile_fused_kernels(cache, config, seq_len, fa_bfp16):
 
     _compile_flash_attn(cache, config, seq_len, fa_bfp16)
 
+    if with_connector:
+        _compile_connector_gemm(cache)
+
     cache._save_manifest()
     print(f"\nAll {len(cache.artifacts)} vision kernels compiled to {cache.cache_dir}/")
     if cache.profiler.enabled:
@@ -264,8 +338,15 @@ def _compile_fused_kernels(cache, config, seq_len, fa_bfp16):
         print(f"Total compilation time: {total:.1f}s")
 
 
-def compile_all_kernels(cache, config, seq_len=1024, fa_bfp16=True, fused=True):
+def compile_all_kernels(
+    cache, config, seq_len=1024, fa_bfp16=True, fused=True, with_connector=True
+):
     """Pre-compile every unique vision-encoder kernel config to the cache.
+
+    with_connector: also compile the `gemm_connector` ELF (A3-5 Step 4, the
+        64x12288x960 modality projection). Needed for
+        `run_vit_encoder(do_connector=True)`; pass False to save ~1 ELF of
+        compile time when only the encoder's post_ln is wanted.
 
     fused: if True (A3-6b default), compile the two fused multi-launch ELFs
         (vit_ln_qkv + vit_o_ffn) plus flash_attn — 3 ELFs, 3 dispatches/layer.
@@ -310,7 +391,9 @@ def compile_all_kernels(cache, config, seq_len=1024, fa_bfp16=True, fused=True):
     print(f"{'='*60}\n")
 
     if fused:
-        _compile_fused_kernels(cache, config, seq_len, fa_bfp16)
+        _compile_fused_kernels(
+            cache, config, seq_len, fa_bfp16, with_connector=with_connector
+        )
         return
 
     # --- 1. Projection / MLP GEMMs (one ELF per distinct shape) ---
@@ -398,6 +481,10 @@ def compile_all_kernels(cache, config, seq_len=1024, fa_bfp16=True, fused=True):
         "flash_attn", attn_mod, {**_ATTN_BACKEND_KWARGS, "verbose": cache.verbose}
     )
 
+    # --- 5. Connector projection GEMM (A3-5 Step 4) ---
+    if with_connector:
+        _compile_connector_gemm(cache)
+
     cache._save_manifest()
     print(f"\nAll {len(cache.artifacts)} vision kernels compiled to {cache.cache_dir}/")
     if cache.profiler.enabled:
@@ -466,6 +553,30 @@ def _run_gelu(cache, x, M, N, bo_key):
         bo_key=bo_key,
     )
     return res[1].reshape(M, N)
+
+
+def _run_connector(cache, post_ln, connector_w, config, bo_key="gemm_connector"):
+    """Connector / modality projection on NPU (A3-5 Step 4).
+
+    post_ln (1024, 768) -> pixel_shuffle (host reshape, space-to-depth factor 4,
+    bit-exact vs HF) -> (64, 12288) -> GEMM against connector_w (12288, 960),
+    no bias -> (64, 960).
+
+    Returns the RAW connector output. lerobot's `embed_prefix` multiplies it by
+    sqrt(960) AFTER `embed_image` returns, so this must NOT pre-apply that scale
+    (the oracle keeps both: `connector` raw and `connector_scaled`).
+    """
+    from vision_cpu_helpers import pixel_shuffle
+
+    shuffled = pixel_shuffle(
+        np.asarray(post_ln, dtype=np.float32), scale_factor=_PIXEL_SHUFFLE_FACTOR
+    )  # (64, 12288)
+    s = _CONNECTOR_GEMM
+    assert shuffled.shape == (s["m"], s["k"]), (shuffled.shape, (s["m"], s["k"]))
+    out = _run_gemm(
+        cache, "gemm_connector", shuffled, connector_w, s["m"], s["n"], bo_key=bo_key
+    )
+    return np.asarray(out, dtype=np.float32)
 
 
 def _run_flash_attention(cache, q, k, v, config, seq_len):
@@ -729,16 +840,18 @@ def run_vit_encoder(
         config: SigLIPVisionConfig.
         cache: KernelCache with vision kernels pre-compiled.
         return_per_layer: if True, collect each layer's output.
-        do_connector: STUB — the connector (pixel-shuffle + big GEMM) is A3-5
-            Step 4, out of scope for this task. Must be False here.
+        do_connector: if True (A3-5 Step 4), also run the connector — host
+            pixel-shuffle (1024,768) -> (64,12288) then the `gemm_connector` ELF
+            -> (64, 960). Requires compile_all_kernels(with_connector=True).
+            The returned `connector` is the RAW projection; lerobot applies the
+            sqrt(960) scale afterwards in embed_prefix (do not double-apply).
 
     Returns:
         dict with:
             post_ln: (1024, 768) f32 — LayerNorm(post_layernorm) of the last layer.
             layer_hidden: list of 12 (1024, 768) bf16 [if return_per_layer].
+            connector: (64, 960) f32 [if do_connector].
     """
-    assert not do_connector, "connector is A3-5 Step 4, out of scope (stub)"
-
     inp = np.asarray(patch_embed_or_pixel)
     if inp.ndim == 3:
         # pixel_values (3, H, W) → host im2col patch-embed + pos-embed add.
@@ -785,4 +898,8 @@ def run_vit_encoder(
     result = {"post_ln": post_ln}
     if return_per_layer:
         result["layer_hidden"] = per_layer
+    if do_connector:
+        result["connector"] = _run_connector(
+            cache, post_ln, weights.connector_w, config
+        )
     return result

@@ -33,15 +33,20 @@ Invoke under the NPU lock:
 import sys
 from pathlib import Path
 
-import numpy as np
-from ml_dtypes import bfloat16
-
 _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 _LLMS_DIR = _HERE.parent
 if str(_LLMS_DIR) not in sys.path:
     sys.path.insert(0, str(_LLMS_DIR))
+
+# MUST run before numpy is imported — see bridge_common.limit_blas_threads.
+from bridge_common import limit_blas_threads, ensure_kernels, Timings  # noqa: E402
+
+limit_blas_threads()
+
+import numpy as np  # noqa: E402
+from ml_dtypes import bfloat16  # noqa: E402
 
 from smolvla_backbone_weights import (
     load_backbone_weights,
@@ -53,6 +58,14 @@ from smolvla_backbone_prefill import compile_all_kernels, run_backbone_prefill
 from shared.infra.cache import KernelCache, Profiler
 
 NPU_SEQ_LEN = 256  # registry kernels validated at M=256
+
+# ELFs each attention mode needs. A cache missing any of them is rebuilt
+# (bridge_common.ensure_kernels); otherwise the per-inference bridge would pay
+# the full aircc rebuild every call, which no deployment would do.
+EXPECTED_KERNELS = {
+    "gemm": {"rms_gemms_rope", "o_ffn", "qkt", "pv", "masked_softmax"},
+    "flash": {"rms_gemms_rope", "o_ffn", "flash_attn"},
+}
 
 
 def build_padded_mask_and_positions(pad_mask, oracle_len):
@@ -71,6 +84,7 @@ def build_padded_mask_and_positions(pad_mask, oracle_len):
 
 
 def main():
+    t = Timings()
     in_path, out_path = sys.argv[1], sys.argv[2]
     attn_mode = sys.argv[3] if len(sys.argv) > 3 else "gemm"
     assert attn_mode in ("gemm", "flash"), attn_mode
@@ -78,9 +92,11 @@ def main():
     prefix_embed = data["prefix_embed"]  # (ORACLE_LEN, emb_dim) f32
     pad_mask = data["pad_mask"].astype(bool)  # (ORACLE_LEN,)
     oracle_len = prefix_embed.shape[0]
+    t.mark("npz_read")
 
     cfg = SmolVLABackboneConfig()
     weights = load_backbone_weights("lerobot/smolvla_base", config=cfg)
+    t.mark("weight_load")
 
     mask_256, positions_256 = build_padded_mask_and_positions(pad_mask, oracle_len)
 
@@ -109,7 +125,15 @@ def main():
     cache = KernelCache(
         str(_HERE / "smolvla_block_kernel_cache"), verbose=False, profiler=Profiler()
     )
-    compile_all_kernels(cache, cfg, NPU_SEQ_LEN, cpu_attn=False, attn_mode=attn_mode)
+    compiled = ensure_kernels(
+        cache,
+        EXPECTED_KERNELS[attn_mode],
+        lambda: compile_all_kernels(
+            cache, cfg, NPU_SEQ_LEN, cpu_attn=False, attn_mode=attn_mode
+        ),
+        tag="npu-backbone",
+    )
+    t.mark("kernels")
 
     final_hidden, per_layer, kv_list = run_backbone_prefill(
         x_bf16,
@@ -124,6 +148,7 @@ def main():
         verbose=True,
         return_kv=True,
     )
+    t.mark("prefill")
 
     n_layers = cfg.n_layers
     k_out = np.stack(
@@ -139,6 +164,8 @@ def main():
         v=v_out,
         final_hidden=np.asarray(final_hidden[:oracle_len], np.float32),
         per_layer=per_layer_out,
+        compiled=np.asarray(compiled),
+        **t.as_npz_fields(),
     )
     assert k_out.shape == (
         n_layers,
@@ -146,6 +173,7 @@ def main():
         cfg.n_kv_heads,
         cfg.head_dim,
     ), k_out.shape
+    t.report("npu-backbone")
     print(
         f"[npu] wrote {out_path}: k{k_out.shape} v{v_out.shape} "
         f"final{final_hidden.shape}"

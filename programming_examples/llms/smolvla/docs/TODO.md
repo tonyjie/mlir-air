@@ -170,12 +170,127 @@ benefit here. bias-adds + residuals (the per-layer host glue) ARE all on-device.
 - `test_vit_fused_elfs.py` — standalone NPU correctness of each fused ELF vs numpy.
 - `bench_vision.py` — median-of-10 NPU vs CPU bench (mirrors bench_backbone.py).
 
+## A3-5 Step 4-5 — connector on NPU + NPU vision spliced into the hybrid (DONE)
+
+**Step 4 — connector (modality projection) on NPU.** `run_vit_encoder(...,
+do_connector=True)` now runs the real thing: host `pixel_shuffle` (a pure
+space-to-depth RESHAPE, no arithmetic, bit-exact vs HF) turns post_ln
+(1024, 768) into (64, 12288), then the new **`gemm_connector` ELF**
+(64x12288x960) does the projection on NPU. Registry row: drain, tile_m=16,
+tile_k_l2=256, tile_k_l1=32, tile_n=80, **herd 4x4** — the registry's per-shape
+herd override, needed because M=64 is only 4 tile_m rows and `build_module`
+asserts `m % (tile_m*herd_m) == 0`. tile_m=16 also differs from the `_m32`
+drain default, so the ELF links its own `mm_m16_n80.o` (symbol suffix
+`_m16_n80`) and cannot collide with the encoder's `mm_m32_n{96,128}.o`.
+
+Measured vs `vision_oracle.npz` (`make vision-connector` / `test_vit_connector.py`):
+
+| check | cosine |
+|---|---|
+| ELF in isolation (oracle post_ln in) vs `connector` | **0.999988** |
+| end-to-end (NPU encoder + NPU connector) vs `connector` | **0.996624** |
+| scale sanity `NPU*sqrt(960)` vs `connector_scaled` | 0.996624 (norm ratio 0.968) |
+
+The isolation number proves the kernel is clean; the e2e number is just the
+encoder's own 0.9906 post_ln BFP16 drift propagated (see the A3-6b section).
+The connector output returned is RAW — lerobot's `embed_prefix` applies the
+`sqrt(960)` scale AFTER `embed_image`, so it must not be pre-applied here.
+
+**Step 5 — spliced into the hybrid.** `run_npu_vision.py` (new bridge, mirrors
+`run_npu_backbone.py`) encodes **all 3 cameras in ONE subprocess invocation**;
+`smolvla_inference.run_hybrid_forward(npu_vision=True)` runs it once from inside
+the wrapped `embed_prefix` and swaps `vlm_with_expert.embed_image` to serve the
+3 precomputed results. Everything downstream — the sqrt(960) scale, language and
+state tokens, prefix assembly, the NPU backbone, the CPU action expert — is
+untouched lerobot code.
+
+Gate (`make verify-npu-vision`, same pure-CPU lerobot action chunk as baseline):
+
+| config | chunk cosine | nmse | gate |
+|---|---|---|---|
+| NPU backbone only (`make verify`) | 0.997144 | 0.007783 | **PASS** |
+| NPU vision + NPU backbone | **0.993975** | **0.012201** | **PASS** |
+
+Adding NPU vision costs ~0.003 of chunk cosine and still clears cos>=0.99 /
+nmse<=0.04 with margin.
+
+### Host-BLAS thread contention (new, reusable finding)
+
+The vision driver loop is HOST-BOUND (37 dispatches/image, ~1.75 ms of
+python+XRT each). OpenBLAS worker threads busy-spin after the one host matmul we
+do (im2col), preempting the dispatch thread: encoder 135 ms -> 178 ms per image.
+`bridge_common.limit_blas_threads()` (called before numpy is imported in BOTH
+bridges) pins BLAS to 1 thread: costs ~4 ms on im2col, buys back ~40 ms/image
+(~120 ms/inference over 3 cameras). Only the NPU bridge processes do this — the
+lerobot driver keeps all threads for the CPU action expert, which IS BLAS-bound.
+
+### ELF-cache reuse in the bridges
+
+A bridge process is spawned per inference, so the old unconditional
+`compile_all_kernels` rebuilt every ELF every call (~68 s for the backbone).
+`bridge_common.ensure_kernels` reuses the on-disk cache when its manifest
+resolves AND contains every expected kernel name, else rebuilds.
+`SMOLVLA_FORCE_COMPILE=1` forces a rebuild (the manifest does not track source
+hashes — set it after editing any kernel builder).
+
+### End-to-end measurement (`make bench-e2e`, median of 5, fixed zero noise)
+
+| config | as measured | bridge overhead | compute-only |
+|---|---|---|---|
+| pure CPU lerobot | **967 ms** | — | 967 ms |
+| hybrid, NPU backbone | 2158 ms | 596 ms | 1562 ms |
+| hybrid, NPU vision + backbone | 2589 ms | 1163 ms | 1425 ms |
+
+"bridge overhead" = process spawn + imports + safetensors weight load + XRT/ELF
+load + npz round-trip, measured by the bridges themselves; it is an artifact of
+the two-disjoint-venv setup, not of NPU deployment.
+
+Per-stage, the honest picture:
+
+| stage | CPU (lerobot) | NPU (ours) |
+|---|---|---|
+| vision, per image | 222 ms | 148 ms warm / 335 ms first (cold XRT+BO) |
+| vision, 3 cameras | 666 ms | 444 ms warm / 631 ms as the bridge runs it |
+| connector (3x) | 5.3 ms | 1.6 ms/image (inside the above) |
+| backbone prefill | 91 ms | 229 ms warm / ~378 ms cold |
+| action expert + rest | 307 ms | (stays on CPU) |
+
+**The vision tower is a genuine 1.5x NPU win** (148 vs 222 ms/image). The
+end-to-end pipeline is still SLOWER than pure CPU, for three reasons, none of
+which the vision work regressed:
+  1. Our NPU backbone (229 ms warm) is 2.5x SLOWER than lerobot's torch CPU
+     backbone (91 ms) at seq=256 — this was known and is Route 3 headroom
+     (fuse the 11 attention dispatches/layer into the per-layer ELF).
+  2. Each NPU stage is a fresh subprocess, so it always pays COLD-start NPU cost
+     (XRT context + ELF load + full weight upload) instead of the warm cost.
+  3. The CPU action expert (307 ms, 10 denoise steps) is untouched by A1/A3.
+
+Splice artifact worth noting: the hybrid still lets lerobot run its own CPU
+backbone prefill (91 ms) and then OVERWRITES the resulting KV cache with the NPU
+K/V. That redundant work is the price of reusing lerobot's exact cache
+structure; removing it is a follow-up, not a correctness issue.
+
 ## NPU-execution exceptions
 
 These are the operations that run on CPU rather than NPU, with the concrete
 reason for each. Everything else in the per-layer hot loop (RMSNorm, Q/K/V
 GEMMs, RoPE, O-proj, residual, SwiGLU FFN) runs on NPU via the fused
 `rms_gemms_rope` and `o_ffn` ELFs.
+
+- **Connector `pixel_shuffle`** (A3-5 Step 4): host. NOT a fallback — it is a
+  pure space-to-depth RESHAPE/transpose with zero arithmetic (`reshape` +
+  `transpose` + `reshape`), done once per image outside any loop. The
+  connector's only math, the 64x12288x960 projection, runs on NPU
+  (`gemm_connector`). Verified bit-exact vs HF.
+
+- **Vision im2col patch-embed**: host, one-time pre-loop (see A3-6b Lever 3
+  remainder above). Unchanged by Step 4-5.
+
+- **Prefix assembly, language/state token embedding, and the flow-matching
+  action expert** (10 denoise steps, 307 ms): CPU lerobot, BY DESIGN. The A1/A3
+  scope is the backbone + the vision tower; the expert is explicitly out of
+  scope and runs the real lerobot code so the gate compares against an
+  unmodified reference downstream.
 
 - **Final RMSNorm** (`text_model.norm` on the layer-15 output, in
   `run_backbone_prefill`): CPU F32.
@@ -212,6 +327,10 @@ GEMMs, RoPE, O-proj, residual, SwiGLU FFN) runs on NPU via the fused
   Per-head dispatch is a deliberate, correct-first design; fusing the 15 heads
   into one multi-launch attention ELF (kernel-first) is a Phase-4/5 optimization
   follow-up, not a correctness blocker.
+- Vision (A3-6b fused, `fused=True`): **3 ELF dispatches/layer** (`vit_ln_qkv`,
+  `flash_attn`, `vit_o_ffn`) x 12 layers + 1 `layer_norm` (post_ln) + 1
+  `gemm_connector` = **38 dispatches per image**, 5 distinct ELFs. With 3
+  cameras that is 114 dispatches per inference, all in one bridge invocation.
 
 ## NPU-attention GEMM shapes (not in the large-shape registry sweep)
 
