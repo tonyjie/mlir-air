@@ -630,7 +630,7 @@
     <tr><th>Stage</th><th>What it is</th><th>Share of CPU runtime</th><th>On the NPU?</th></tr>
     <tr><td><b>① Vision</b> (SigLIP)</td><td>12-layer ViT, run once per camera (<b>×3</b>)</td><td>~69%</td><td><span class="pill npu">✅ fully on NPU</span></td></tr>
     <tr><td><b>①b Connector</b></td><td>pixel-shuffle + projection into the language space</td><td>~0.5%</td><td><span class="pill npu">✅ on NPU</span> (the projection; the shuffle is a host reshape)</td></tr>
-    <tr><td><b>② Backbone</b> (SmolLM2-360M)</td><td>16-layer transformer prefill</td><td>~9%</td><td><span class="pill cpu">CPU by choice</span> — a full NPU port exists and is verified, but is <b>2.6× slower</b> there (Section 9)</td></tr>
+    <tr><td><b>② Backbone</b> (SmolLM2-360M)</td><td>16-layer transformer prefill</td><td>~9%</td><td><span class="pill cpu">CPU by choice</span> — a full NPU port exists and is verified, but is <b>~3× slower</b> there (Section 9)</td></tr>
     <tr><td><b>③ Action expert</b></td><td>16 layers × 10 denoising steps</td><td>~32%</td><td><span class="pill cpu">CPU</span> — not ported</td></tr>
   </table>
   <p class="legend">
@@ -641,7 +641,7 @@
   <div class="callout">
     <b>Why the backbone runs on the CPU even though we ported it.</b> We mapped all 16 backbone layers onto the NPU
     and verified them (that port still passes its own gate and is one flag away). But measured head-to-head it is
-    <b>229 ms on the NPU vs 91 ms on the CPU</b> — the NPU loses on this stage, for reasons Section 9 explains. Our
+    <b>229 ms on the NPU vs 77 ms on the CPU</b> — the NPU loses on this stage, for reasons Section 9 explains. Our
     goal is a genuinely faster robot policy, not maximum NPU coverage, so the shipping configuration puts the
     <em>vision encoder</em> on the NPU and leaves the backbone where it is fastest. Keeping it on the CPU also
     removes a redundancy: the pipeline no longer has to compute the backbone twice and overwrite the result.
@@ -674,7 +674,7 @@
     <text x="72" y="267" font-size="12" font-weight="700" fill="#92400e">CPU</text>
     <text x="430" y="269" text-anchor="middle" font-size="13" font-weight="700" fill="#78350f">② Language backbone — SmolLM2-360M, 16 layers</text>
     <text x="430" y="289" text-anchor="middle" font-size="11" fill="#78350f">per layer: RMSNorm → Q/K/V → RoPE → masked attention → O → residual → SwiGLU MLP</text>
-    <text x="430" y="305" text-anchor="middle" font-size="10.5" fill="#92400e">ported to the NPU and verified, but 2.6× slower there → kept on CPU (Section 9)</text>
+    <text x="430" y="305" text-anchor="middle" font-size="10.5" fill="#92400e">ported to the NPU and verified, but ~3× slower there → kept on CPU (Section 9)</text>
     <line x1="430" y1="311" x2="430" y2="331" stroke="#6b7280" stroke-width="2" marker-end="url(#ar2)"/>
 
     <rect x="20" y="334" width="820" height="24" rx="8" fill="#fef3c7" stroke="#d97706" stroke-width="1.5" stroke-dasharray="4 3"/>
@@ -837,33 +837,55 @@ once per image:       (HOST) pixel-shuffle → [NPU elf:gemm_connector] 64×1228
   <!-- ============================================================ -->
   <h2 id="perf">8. Performance: the measured numbers</h2>
 
+  <div class="callout warn">
+    <b>Measurement conditions — these matter, so they are stated up front.</b> Everything below was measured with
+    <b>both processors set to their maximum-performance mode</b>: the CPU at <code>governor=performance</code> +
+    <code>EPP=performance</code> (all 24 cores) and the NPU at <code>pmode=Turbo</code>, on an otherwise idle
+    machine. Configurations are run <em>interleaved</em> (round-robin, median of 9) so that thermal drift and
+    machine load affect all of them equally. This is deliberate: on the default power settings the CPU baseline is
+    throttled and our speedup looks <em>better</em> than it should. We report the harder number.
+  </div>
+
   <p class="lead">
-    All numbers are wall-clock on real hardware, median of repeated runs, one-time compilation excluded. The
-    reference is the <b>real lerobot CPU model</b> — not a simplified re-implementation. Configurations are measured
-    <em>interleaved</em> in the same session, because this machine is shared and minute-scale load drift would
-    otherwise masquerade as a difference between configurations.
+    All numbers are wall-clock on real hardware, one-time compilation excluded. The reference is the <b>real lerobot
+    CPU model</b> — not a simplified re-implementation.
   </p>
 
   <div class="stat-row">
-    <div class="stat"><div class="big-num">856 ms</div><div class="label">full policy, NPU vision<br>(best of 3 runs)</div></div>
-    <div class="stat"><div class="big-num">1005 ms</div><div class="label">same run, pure CPU<br>(lerobot baseline)</div></div>
-    <div class="stat"><div class="big-num">1.11–1.29×</div><div class="label">faster than CPU<br>end to end</div></div>
+    <div class="stat"><div class="big-num">851 ms</div><div class="label">full policy<br>NPU vision + CPU backbone</div></div>
+    <div class="stat"><div class="big-num">913 ms</div><div class="label">pure CPU<br>(lerobot baseline)</div></div>
+    <div class="stat"><div class="big-num">1.07×</div><div class="label">faster than CPU<br>both at max performance</div></div>
   </div>
 
-  <h3>End to end — the shipping configuration is faster than the CPU</h3>
+  <h3>End to end</h3>
   <table>
-    <tr><th>Configuration</th><th>run 1</th><th>run 2</th><th>run 3</th><th>vs CPU</th></tr>
-    <tr><td>Pure CPU (lerobot)</td><td>985 ms</td><td>1127 ms</td><td>1005 ms</td><td>1.00×</td></tr>
-    <tr><td><b>NPU vision + CPU backbone</b> <span class="pill done">shipping</span></td><td><b>888 ms</b></td><td><b>874 ms</b></td><td><b>856 ms</b></td><td><b>1.11× – 1.29×</b></td></tr>
-    <tr><td>NPU vision + NPU backbone</td><td>—</td><td>1163 ms</td><td>1114 ms</td><td>0.90× – 0.97×</td></tr>
-    <tr><td>earlier two-process version</td><td>—</td><td>2678 ms</td><td>—</td><td>0.42×</td></tr>
+    <tr><th>Configuration</th><th>max-performance mode</th><th>default power mode</th><th>vs CPU (max-perf)</th></tr>
+    <tr><td>Pure CPU (lerobot)</td><td><b>913 ms</b></td><td>964 ms</td><td>1.00×</td></tr>
+    <tr><td><b>NPU vision + CPU backbone</b> <span class="pill done">shipping</span></td><td><b>851 ms</b></td><td>858 ms</td><td><b>1.07×</b></td></tr>
+    <tr><td>NPU vision + NPU backbone</td><td>—</td><td>1114–1163 ms</td><td>0.8× (slower)</td></tr>
+    <tr><td>earlier two-process version</td><td>—</td><td>2678 ms</td><td>0.34× (slower)</td></tr>
+  </table>
+  <div class="callout">
+    <b>Turning on maximum performance <em>reduced</em> our advantage — and that is the honest result.</b> Going from
+    the default power settings to max performance made the <b>CPU baseline 5.3% faster</b> (964 → 913 ms) but our
+    configuration only <b>0.9% faster</b> (858 → 851 ms), so the ratio fell from 1.12× to <b>1.07×</b>. The reason
+    is simply that the work we removed from the CPU was the part that benefits most from unthrottling it.
+    Quoting the throttled-CPU number would have been flattering and wrong.
+  </div>
+
+  <h3>A diagnostic surprise: NPU Turbo speeds up kernels but not this pipeline</h3>
+  <table>
+    <tr><th>What was measured</th><th>Default mode</th><th>Turbo</th><th>Change</th></tr>
+    <tr><td>A single vision matmul (<span class="shape">1024×768×768</span>)</td><td>3763 GFLOP/s</td><td><b>4045 GFLOP/s</b></td><td><b>+7.5%</b></td></tr>
+    <tr><td>The whole vision encoder, 3 images</td><td>461 ms</td><td>465 ms</td><td><b>~0%</b></td></tr>
   </table>
   <p class="legend">
-    <b>Why the ratio is a range, not a number.</b> Our configuration is very stable (856 / 874 / 888 ms; its NPU
-    vision segment stays at 440–475 ms almost regardless of machine load). What moves is the <em>CPU baseline</em>
-    (985–1127 ms), whose vision tower ranges 187–223 ms per image depending on how busy the machine is. When the CPU
-    is loaded we look 1.29× better; when it is idle, 1.11×. Reporting a single number would be picking a favourable
-    moment.
+    Turbo raises the NPU's compute clock, and the matmul kernel duly gets 7.5% faster — but the encoder as a whole
+    does not move. That tells us something useful: <b>the encoder is not limited by NPU compute speed.</b> Its time
+    is spread across memory-bound operations (LayerNorm, GELU) that a higher clock does not help, attention, launch
+    overhead, and ~35 ms of host-side patch reshaping that never touches the NPU at all. Raising the clock only
+    accelerates the part that was already fastest. <em>This is a better guide to where to optimise next than any
+    projection would have been.</em>
   </p>
 
   <h3>Per stage — and the honest reason each one lands where it does</h3>
@@ -877,23 +899,23 @@ once per image:       (HOST) pixel-shuffle → [NPU elf:gemm_connector] 64×1228
     <tr>
       <td><b>① Vision</b><br>per image</td>
       <td>seq <b>1024</b>, hidden 768<br>big matmuls, 1024² attention</td>
-      <td><b>147 ms</b></td>
-      <td>187–223 ms</td>
-      <td><span class="pill done">NPU wins ~1.5×</span> Large matrices keep the compute array fed, and after fusion only 38 dispatches carry the whole image.</td>
+      <td><b>155 ms</b></td>
+      <td>184 ms</td>
+      <td><span class="pill done">NPU wins 1.19×</span> Large matrices keep the compute array fed, and after fusion only 38 dispatches carry the whole image. Includes ~12 ms/image of host patch reshaping.</td>
     </tr>
     <tr>
       <td>①b Connector<br>per image</td>
       <td>M = 64 (a single wide matmul)</td>
       <td>~1.6 ms</td>
-      <td>~1.8 ms</td>
-      <td>≈ parity. M=64 fills only 4×4 of the 8×4 array — latency-bound, but it is tiny either way.</td>
+      <td>~1.6 ms</td>
+      <td>≈ parity. M=64 fills only 4×4 of the 8×4 array — latency-bound, but tiny either way.</td>
     </tr>
     <tr>
       <td><b>② Backbone</b><br>per inference</td>
       <td>seq <b>256</b>, hidden 960<br>GQA 15/5, prefix-LM mask</td>
       <td>229 ms</td>
-      <td><b>91 ms</b></td>
-      <td><span class="pill" style="background:#fee2e2;color:#991b1b;border:1px solid #fca5a5">NPU loses 2.6×</span> Two compounding reasons — small shapes run the array at ~half efficiency, and its attention is still <b>11 unfused dispatches per layer</b> (208 total). See Section 9.</td>
+      <td><b>77 ms</b></td>
+      <td><span class="pill" style="background:#fee2e2;color:#991b1b;border:1px solid #fca5a5">NPU loses ~3×</span> Two compounding reasons — small shapes run the array at ~half efficiency, and its attention is still <b>11 unfused dispatches per layer</b> (208 total). See Section 9.</td>
     </tr>
     <tr>
       <td><b>③ Action expert</b><br>per inference</td>
@@ -910,8 +932,9 @@ once per image:       (HOST) pixel-shuffle → [NPU elf:gemm_connector] 64×1228
 
   <div class="callout">
     <b>The result in one line.</b> Putting the largest compute block — the vision encoder — on the NPU, and leaving
-    every stage where it is fastest, makes the complete robot policy <b>1.11–1.29× faster than the pure-CPU model
-    while still producing the same actions</b> (similarity 0.9990 against the real CPU output).
+    every stage where it is fastest, makes the complete robot policy <b>1.07× faster than the pure-CPU model with
+    both processors at maximum performance</b>, while still producing the same actions (similarity 0.9990 against
+    the real CPU output).
   </div>
 
   <h3>What made this possible: removing the two-process bridge</h3>
@@ -931,7 +954,7 @@ once per image:       (HOST) pixel-shuffle → [NPU elf:gemm_connector] 64×1228
   </table>
   <p class="legend">
     On top of that the bridge could never amortise the first-image cost (347 ms cold vs 147 ms warm), because each
-    inference started from cold. This one change is the difference between 2678 ms and 874 ms.
+    inference started from cold. This one change is the difference between 2678 ms and ~851 ms.
   </p>
 
   <div class="callout">
@@ -939,7 +962,7 @@ once per image:       (HOST) pixel-shuffle → [NPU elf:gemm_connector] 64×1228
     after the one host-side matmul in the vision path, stealing CPU from the thread that issues NPU work — inflating
     the encoder from 135 ms to 178 ms per image. Capping those threads <em>only around the NPU section</em> and
     restoring them afterwards recovers it without hurting the thread-hungry action expert: 874 ms with the cap vs
-    962 ms without, and the expert stage is unaffected (305 ms either way).
+    962 ms without, and the expert stage is unaffected either way.
   </div>
 
   <!-- ============================================================ -->
@@ -1014,8 +1037,8 @@ once per image:       (HOST) pixel-shuffle → [NPU elf:gemm_connector] 64×1228
   </ul>
   <p class="legend">
     Worth stating plainly: of the four effects in this section, <b>only the first is a property of the hardware.</b>
-    The other three were engineering — and removing them is what turned a 0.42× pipeline into a 1.11–1.29× one on
-    exactly the same silicon and the same kernels.
+    The other three were engineering — and removing them is what turned a 0.42× pipeline into a 1.07× one on exactly
+    the same silicon and the same kernels.
   </p>
 
   <h3>What this adds up to</h3>
@@ -1034,11 +1057,12 @@ once per image:       (HOST) pixel-shuffle → [NPU elf:gemm_connector] 64×1228
   <h3>Where we are</h3>
   <ul class="clean">
     <li><span class="pill done">✅</span> <b>The complete robot policy is faster on the NPU than on the CPU</b> —
-      1.11–1.29× end to end, with the vision encoder (the largest compute block) running entirely on-chip.</li>
+      <b>1.07×</b> end to end with both processors at maximum performance, with the vision encoder (the largest
+      compute block) running entirely on-chip.</li>
     <li><span class="pill done">✅</span> <b>It still produces the same actions</b> — similarity <b>0.9990</b>,
       normalized MSE 0.0030 against the real lerobot CPU output (gate: 0.99 / 0.04).</li>
-    <li><span class="pill done">✅</span> <b>The vision encoder is 1.5× faster than the CPU</b> (147 ms vs
-      187–223 ms per image), after fusion cut it from 121 dispatches to 37.</li>
+    <li><span class="pill done">✅</span> <b>The vision encoder is 1.19× faster than the CPU</b> (155 ms vs
+      184 ms per image, both at max performance), after fusion cut it from 121 dispatches to 37.</li>
     <li><span class="pill done">✅</span> <b>The backbone is fully ported and verified too</b> — but measured 2.6×
       slower on the NPU, so it ships on the CPU. The port is one flag away and still gated.</li>
     <li><span class="pill done">✅</span> Along the way: 2 kernels promoted into the shared registry (affine
@@ -1087,8 +1111,8 @@ once per image:       (HOST) pixel-shuffle → [NPU elf:gemm_connector] 64×1228
   <div class="card" style="margin-top:2rem;background:#f0f9ff;border-color:#7dd3fc">
     <p style="margin:0"><b>In one sentence:</b>
     SmolVLA's vision encoder — the largest block of compute in a vision-language-action robot policy — now runs
-    entirely on the AMD NPU2, making the complete policy <b>1.11–1.29× faster than the pure-CPU model while
-    producing the same actions</b> (0.9990 similarity). The language backbone is ported and verified too, and stays
+    entirely on the AMD NPU2, making the complete policy <b>1.07× faster than the pure-CPU model — with both
+    processors at maximum performance — while producing the same actions</b> (0.9990 similarity). The language backbone is ported and verified too, and stays
     on the CPU for the honest reason that it is faster there — a decision we could only make because every stage was
     measured on both.</p>
   </div>
