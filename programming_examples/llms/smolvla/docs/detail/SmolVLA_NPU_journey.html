@@ -1082,6 +1082,116 @@ once per image:       (HOST) pixel-shuffle → [NPU elf:gemm_connector] 64×1228
     <tr><td><code>layer_norm</code> (final)</td><td>0.63</td><td>0.5%</td><td>GELU + residual + interleave</td><td>14.3%</td></tr>
   </table>
 
+  <div class="fig">
+  <svg viewBox="0 0 900 470" xmlns="http://www.w3.org/2000/svg" font-family="system-ui, sans-serif">
+    <style>
+      .ttl{font-size:12.5px;font-weight:700;fill:#111827}
+      .sub{font-size:10px;fill:#6b7280}
+      .lb{font-size:9.5px;fill:#1f2937}
+      .lbw{font-size:9.5px;fill:#fff;font-weight:600}
+      .tick{font-size:9px;fill:#9ca3af}
+    </style>
+
+    <!-- ================= ROW 1 : whole inference ================= -->
+    <text x="40" y="22" class="ttl">One inference — 470.9 ms accounted (3 camera images)</text>
+    <rect x="40"    y="30" width="693.5" height="30" fill="#2563eb"/>
+    <rect x="733.5" y="30" width="40.6"  height="30" fill="#93c5fd"/>
+    <rect x="774.1" y="30" width="26.8"  height="30" fill="#fbbf24"/>
+    <rect x="800.9" y="30" width="13.6"  height="30" fill="#d1d5db"/>
+    <rect x="814.5" y="30" width="14.1"  height="30" fill="#e5e7eb"/>
+    <rect x="828.6" y="30" width="8.2"   height="30" fill="#c7d2fe"/>
+    <rect x="836.8" y="30" width="3.7"   height="30" fill="#f3f4f6"/>
+    <text x="386" y="50" text-anchor="middle" class="lbw">NPU executing — 408.1 ms (86.6%)</text>
+    <text x="840" y="76" text-anchor="end" class="lb">
+      <tspan fill="#1d4ed8">▮</tspan> data in 23.9 ·
+      <tspan fill="#b45309">▮</tspan> host im2col 15.8 ·
+      <tspan fill="#6b7280">▮</tspan> launch 8.0 ·
+      <tspan fill="#6b7280">▮</tspan> unattributed 8.3 ·
+      <tspan fill="#4f46e5">▮</tspan> data out 4.8 · other 2.2
+    </text>
+
+    <!-- ================= ROW 2 : device time, per image ================= -->
+    <text x="40" y="116" class="ttl">Zoom: the NPU time for ONE image — 136 ms, by compiled program</text>
+    <text x="40" y="130" class="sub">12 layers × 3 programs, then the connector. Width ∝ measured time.</text>
+    <rect x="40"    y="138" width="204.7" height="34" fill="#7c3aed"/>
+    <rect x="244.7" y="138" width="197.6" height="34" fill="#ea580c"/>
+    <rect x="442.3" y="138" width="388.8" height="34" fill="#2563eb"/>
+    <rect x="831.1" y="138" width="5.6"   height="34" fill="#059669"/>
+    <rect x="836.7" y="138" width="3.7"   height="34" fill="#a78bfa"/>
+    <text x="142"   y="159" text-anchor="middle" class="lbw">vit_ln_qkv  34.8 ms</text>
+    <text x="343"   y="159" text-anchor="middle" class="lbw">flash_attn  33.6</text>
+    <text x="636"   y="159" text-anchor="middle" class="lbw">vit_o_ffn  66.1 ms  (48.6%)</text>
+    <text x="840"   y="188" text-anchor="end" class="lb"><tspan fill="#059669">▮</tspan> connector 0.95 · <tspan fill="#7c3aed">▮</tspan> final norm 0.63</text>
+
+    <!-- ================= ROW 3 : one layer expanded ================= -->
+    <text x="40" y="226" class="ttl">Zoom: ONE of the 12 layers — 10.5 ms, mapped onto the architecture</text>
+    <text x="40" y="240" class="sub">Colour = kind of operation. Width ∝ measured time. Brackets = the three compiled programs above.</text>
+
+    <!-- program brackets -->
+    <path d="M40,252 v-6 h195 v6" fill="none" stroke="#7c3aed" stroke-width="1.5"/>
+    <path d="M235,252 v-6 h213 v6" fill="none" stroke="#ea580c" stroke-width="1.5"/>
+    <path d="M448,252 v-6 h392 v6" fill="none" stroke="#2563eb" stroke-width="1.5"/>
+
+    <!-- vit_ln_qkv -->
+    <rect x="40"    y="256" width="29.5" height="40" fill="#a78bfa"/>
+    <rect x="69.5"  y="256" width="44"   height="40" fill="#3b82f6"/>
+    <rect x="113.5" y="256" width="44"   height="40" fill="#3b82f6"/>
+    <rect x="157.5" y="256" width="44"   height="40" fill="#3b82f6"/>
+    <rect x="201.5" y="256" width="33.6" height="40" fill="#9ca3af"/>
+    <!-- attention -->
+    <rect x="235.1" y="256" width="213"  height="40" fill="#fb923c"/>
+    <!-- vit_o_ffn -->
+    <rect x="448.1" y="256" width="44"   height="40" fill="#3b82f6"/>
+    <rect x="492.1" y="256" width="11.2" height="40" fill="#9ca3af"/>
+    <rect x="503.3" y="256" width="13.3" height="40" fill="#6b7280"/>
+    <rect x="516.6" y="256" width="29.5" height="40" fill="#a78bfa"/>
+    <rect x="546.1" y="256" width="111"  height="40" fill="#3b82f6"/>
+    <rect x="657.1" y="256" width="27.6" height="40" fill="#9ca3af"/>
+    <rect x="684.7" y="256" width="43.8" height="40" fill="#34d399"/>
+    <rect x="728.5" y="256" width="87"   height="40" fill="#3b82f6"/>
+    <rect x="815.5" y="256" width="11.2" height="40" fill="#9ca3af"/>
+    <rect x="826.7" y="256" width="13.3" height="40" fill="#6b7280"/>
+
+    <!-- in-box labels for the big ones -->
+    <text x="341"   y="280" text-anchor="middle" class="lbw">attention  2798 µs</text>
+    <text x="601"   y="280" text-anchor="middle" class="lbw">fc1  1461</text>
+    <text x="772"   y="280" text-anchor="middle" class="lbw">fc2  1143</text>
+    <text x="91.5"  y="280" text-anchor="middle" class="lbw">Q</text>
+    <text x="135.5" y="280" text-anchor="middle" class="lbw">K</text>
+    <text x="179.5" y="280" text-anchor="middle" class="lbw">V</text>
+    <text x="470"   y="280" text-anchor="middle" class="lbw">O</text>
+
+    <!-- leader labels below -->
+    <text x="54"  y="312" text-anchor="middle" class="lb">LN1</text>
+    <text x="54"  y="323" text-anchor="middle" class="tick">388</text>
+    <text x="218" y="312" text-anchor="middle" class="lb">+bias ×3</text>
+    <text x="218" y="323" text-anchor="middle" class="tick">442</text>
+    <text x="531" y="312" text-anchor="middle" class="lb">LN2</text>
+    <text x="531" y="323" text-anchor="middle" class="tick">388</text>
+    <text x="671" y="312" text-anchor="middle" class="lb">+bias</text>
+    <text x="671" y="323" text-anchor="middle" class="tick">363</text>
+    <text x="706" y="312" text-anchor="middle" class="lb">GELU</text>
+    <text x="706" y="323" text-anchor="middle" class="tick">576</text>
+    <text x="440" y="340" text-anchor="middle" class="lb">the four projections Q / K / V / O — 578 µs each</text>
+    <text x="510" y="352" text-anchor="middle" class="tick">residual adds 175 µs each · O-bias / fc2-bias 147 µs each</text>
+
+    <!-- legend -->
+    <rect x="40" y="376" width="12" height="12" fill="#3b82f6"/><text x="58" y="386" class="lb">matmul — 43.9% of NPU time</text>
+    <rect x="250" y="376" width="12" height="12" fill="#fb923c"/><text x="268" y="386" class="lb">attention — 25.0%</text>
+    <rect x="420" y="376" width="12" height="12" fill="#9ca3af"/><text x="438" y="386" class="lb">bias adds — 9.8%</text>
+    <rect x="590" y="376" width="12" height="12" fill="#a78bfa"/><text x="608" y="386" class="lb">LayerNorm — 6.9%</text>
+    <rect x="760" y="376" width="12" height="12" fill="#34d399"/><text x="778" y="386" class="lb">GELU — 5.1%</text>
+    <rect x="40" y="396" width="12" height="12" fill="#6b7280"/><text x="58" y="406" class="lb">residual adds — 3.1%</text>
+    <text x="250" y="406" class="sub">remaining ~6% = the chip switching between the three programs each layer</text>
+
+    <!-- takeaway -->
+    <rect x="40" y="424" width="800" height="34" rx="6" fill="#eff6ff" stroke="#93c5fd"/>
+    <text x="52" y="438" class="lb"><tspan font-weight="700">Read it this way:</tspan> the MLP half of each layer (fc1 + fc2 + GELU + norms + adds) is the single biggest block —</text>
+    <text x="52" y="451" class="lb">and the grey/■ bias and residual adds, 13% of all NPU time, are pure launch + memory traffic that a matmul epilogue could absorb.</text>
+  </svg>
+  <figcaption>Measured on real NPU2 at maximum power mode. Row widths are proportional to measured time within each row.</figcaption>
+  </div>
+
   <h3>Two plausible theories, both refuted by measurement</h3>
   <p>
     We went in with two hypotheses about where the waste was. Measuring killed both — which is itself the useful
