@@ -620,23 +620,32 @@
   <h2 id="mapping">6. What runs on the NPU today</h2>
 
   <p class="lead">
-    Both heavy stages of SmolVLA now run on the NPU — <b>the vision encoder and the language backbone</b>. Only the
-    action expert is still on the CPU. This section is the single picture of what sits where; the two sections after
-    it give the accuracy and the speed.
+    SmolVLA's <b>vision encoder — the single biggest block of compute in the model — runs entirely on the NPU</b>,
+    and that is what makes the whole policy faster than the CPU (Section 8). The language backbone is <em>also</em>
+    fully ported and verified, but it measured slower on the NPU, so the shipping configuration leaves it on the
+    CPU. This section is the single picture of what sits where; the two after it give the accuracy and the speed.
   </p>
 
   <table>
     <tr><th>Stage</th><th>What it is</th><th>Share of CPU runtime</th><th>On the NPU?</th></tr>
     <tr><td><b>① Vision</b> (SigLIP)</td><td>12-layer ViT, run once per camera (<b>×3</b>)</td><td>~69%</td><td><span class="pill npu">✅ fully on NPU</span></td></tr>
     <tr><td><b>①b Connector</b></td><td>pixel-shuffle + projection into the language space</td><td>~0.5%</td><td><span class="pill npu">✅ on NPU</span> (the projection; the shuffle is a host reshape)</td></tr>
-    <tr><td><b>② Backbone</b> (SmolLM2-360M)</td><td>16-layer transformer prefill</td><td>~9%</td><td><span class="pill npu">✅ fully on NPU</span></td></tr>
-    <tr><td><b>③ Action expert</b></td><td>16 layers × 10 denoising steps</td><td>~32%</td><td><span class="pill cpu">CPU</span> — not started</td></tr>
+    <tr><td><b>② Backbone</b> (SmolLM2-360M)</td><td>16-layer transformer prefill</td><td>~9%</td><td><span class="pill cpu">CPU by choice</span> — a full NPU port exists and is verified, but is <b>2.6× slower</b> there (Section 9)</td></tr>
+    <tr><td><b>③ Action expert</b></td><td>16 layers × 10 denoising steps</td><td>~32%</td><td><span class="pill cpu">CPU</span> — not ported</td></tr>
   </table>
   <p class="legend">
-    Percentages are of the measured pure-CPU <code>predict_action_chunk</code> (Section 8's harness). Everything
-    inside stages ① / ①b / ② — every matmul, norm, attention and activation — executes on the NPU; there is
-    <b>no CPU fallback</b> inside them. The host only does data-shuffling glue (see below).
+    Percentages are of the measured pure-CPU <code>predict_action_chunk</code> (Section 8's harness). Inside
+    stages ① / ①b every matmul, norm, attention and activation executes on the NPU — there is <b>no CPU
+    fallback</b>; the host only does data-shuffling glue (see below).
   </p>
+  <div class="callout">
+    <b>Why the backbone runs on the CPU even though we ported it.</b> We mapped all 16 backbone layers onto the NPU
+    and verified them (that port still passes its own gate and is one flag away). But measured head-to-head it is
+    <b>229 ms on the NPU vs 91 ms on the CPU</b> — the NPU loses on this stage, for reasons Section 9 explains. Our
+    goal is a genuinely faster robot policy, not maximum NPU coverage, so the shipping configuration puts the
+    <em>vision encoder</em> on the NPU and leaves the backbone where it is fastest. Keeping it on the CPU also
+    removes a redundancy: the pipeline no longer has to compute the backbone twice and overwrite the result.
+  </div>
 
   <div class="fig">
   <svg viewBox="0 0 860 360" xmlns="http://www.w3.org/2000/svg" font-family="system-ui, sans-serif">
@@ -661,18 +670,18 @@
     <text x="430" y="213" text-anchor="middle" font-size="12" fill="#78350f">assemble the prefix: 192 vision + 48 language + 1 state = 241 tokens</text>
     <line x1="430" y1="226" x2="430" y2="246" stroke="#6b7280" stroke-width="2" marker-end="url(#ar2)"/>
 
-    <rect x="60" y="249" width="740" height="62" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="3"/>
-    <text x="72" y="267" font-size="12" font-weight="700" fill="#1e40af">NPU2 ★</text>
-    <text x="430" y="269" text-anchor="middle" font-size="13" font-weight="700" fill="#1e3a8a">② Language backbone — SmolLM2-360M, 16 layers</text>
-    <text x="430" y="289" text-anchor="middle" font-size="11" fill="#1e3a8a">per layer: RMSNorm → Q/K/V → RoPE → masked attention → O → residual → SwiGLU MLP</text>
-    <text x="430" y="305" text-anchor="middle" font-size="10.5" fill="#6b7280">13 dispatches per layer · 208 total — produces the K/V cache</text>
+    <rect x="60" y="249" width="740" height="62" rx="8" fill="#fef3c7" stroke="#d97706" stroke-width="2" stroke-dasharray="4 3"/>
+    <text x="72" y="267" font-size="12" font-weight="700" fill="#92400e">CPU</text>
+    <text x="430" y="269" text-anchor="middle" font-size="13" font-weight="700" fill="#78350f">② Language backbone — SmolLM2-360M, 16 layers</text>
+    <text x="430" y="289" text-anchor="middle" font-size="11" fill="#78350f">per layer: RMSNorm → Q/K/V → RoPE → masked attention → O → residual → SwiGLU MLP</text>
+    <text x="430" y="305" text-anchor="middle" font-size="10.5" fill="#92400e">ported to the NPU and verified, but 2.6× slower there → kept on CPU (Section 9)</text>
     <line x1="430" y1="311" x2="430" y2="331" stroke="#6b7280" stroke-width="2" marker-end="url(#ar2)"/>
 
     <rect x="20" y="334" width="820" height="24" rx="8" fill="#fef3c7" stroke="#d97706" stroke-width="1.5" stroke-dasharray="4 3"/>
     <text x="32" y="351" font-size="12" font-weight="700" fill="#92400e">CPU</text>
     <text x="430" y="351" text-anchor="middle" font-size="12" fill="#78350f">③ action expert · 10-step denoise → (50, 6) action chunk</text>
   </svg>
-  <figcaption>Both compute-heavy stages run on the NPU; the CPU keeps the cheap glue and the action expert.</figcaption>
+  <figcaption>The shipping configuration: the vision encoder on the NPU, everything else on the CPU. The backbone's NPU port exists and is verified, but is slower there.</figcaption>
   </div>
 
   <h3>Which original operator each NPU kernel replaces</h3>
@@ -793,12 +802,15 @@ once per image:       (HOST) pixel-shuffle → [NPU elf:gemm_connector] 64×1228
     <tr><td>Vision encoder output (12 layers)</td><td>real lerobot vision output</td><td>similarity <b>0.9906</b> <span class="pill done">PASS</span></td></tr>
     <tr><td>Connector output</td><td>real lerobot connector output</td><td>similarity <b>0.99999</b> (kernel alone) <span class="pill done">PASS</span></td></tr>
     <tr><td>Backbone: each of 16 layers</td><td>real lerobot per-layer output</td><td>all <b>&gt; 0.98</b> <span class="pill done">PASS</span></td></tr>
-    <tr><td><b>Final action chunk</b> — NPU backbone only</td><td>pure-CPU lerobot action chunk</td><td>cosine <b>0.9971</b>, nMSE 0.0078 <span class="pill done">PASS</span></td></tr>
-    <tr><td><b>Final action chunk</b> — NPU vision <em>and</em> backbone</td><td>pure-CPU lerobot action chunk</td><td>cosine <b>0.9940</b>, nMSE 0.0122 <span class="pill done">PASS</span></td></tr>
+    <tr style="background:#f0fdf4"><td><b>Final action chunk — the shipping configuration</b><br>(NPU vision, CPU backbone)</td><td>pure-CPU lerobot action chunk</td><td>cosine <b>0.9990</b>, nMSE <b>0.0030</b> <span class="pill done">PASS</span></td></tr>
+    <tr><td><b>Final action chunk</b> — NPU vision <em>and</em> NPU backbone</td><td>pure-CPU lerobot action chunk</td><td>cosine 0.9940, nMSE 0.0122 <span class="pill done">PASS</span></td></tr>
+    <tr><td><b>Final action chunk</b> — NPU backbone only</td><td>pure-CPU lerobot action chunk</td><td>cosine 0.9971, nMSE 0.0078 <span class="pill done">PASS</span></td></tr>
   </table>
   <p class="legend">
     Gate thresholds: cosine ≥ 0.99 and normalized MSE ≤ 0.04, on the full (50, 6) action chunk with fixed noise so
-    the comparison is deterministic. Adding the NPU vision costs only ~0.003 cosine — comfortable margin.
+    the comparison is deterministic. The shipping configuration scores highest because the vision encoder is then
+    the <em>only</em> source of NPU-induced deviation. All three configurations pass, and the two that include the
+    NPU backbone are bit-identical to each other — which is how we check that a refactor did not change the maths.
     The per-layer checks are <em>diagnosis</em>, never the gate: an earlier experiment passed every layer yet failed
     end-to-end, so only the action chunk decides.
   </p>
@@ -826,42 +838,109 @@ once per image:       (HOST) pixel-shuffle → [NPU elf:gemm_connector] 64×1228
   <h2 id="perf">8. Performance: the measured numbers</h2>
 
   <p class="lead">
-    All numbers below are wall-clock on real hardware, median of repeated runs, one-time compilation excluded.
-    The reference is the <b>real lerobot CPU model</b> — not a simplified re-implementation.
+    All numbers are wall-clock on real hardware, median of repeated runs, one-time compilation excluded. The
+    reference is the <b>real lerobot CPU model</b> — not a simplified re-implementation. Configurations are measured
+    <em>interleaved</em> in the same session, because this machine is shared and minute-scale load drift would
+    otherwise masquerade as a difference between configurations.
   </p>
 
-  <h3>Per stage</h3>
-  <table>
-    <tr><th>Stage</th><th>CPU (lerobot)</th><th>NPU (ours)</th><th>Result</th></tr>
-    <tr><td>Vision — <b>per image</b></td><td>222 ms</td><td><b>148 ms</b></td><td><span class="pill done">1.5× faster</span></td></tr>
-    <tr><td>Vision — per inference (3 cameras)</td><td>666 ms</td><td><b>444 ms</b></td><td><span class="pill done">1.5× faster</span></td></tr>
-    <tr><td>Connector (×3)</td><td>5.3 ms</td><td>~4.8 ms</td><td>≈ parity</td></tr>
-    <tr><td><b>Backbone</b></td><td><b>91 ms</b></td><td><b>229 ms</b></td><td><span class="pill" style="background:#fee2e2;color:#991b1b;border:1px solid #fca5a5">2.5× slower</span></td></tr>
-    <tr><td>Action expert + remainder</td><td>307 ms</td><td>— (still CPU)</td><td>—</td></tr>
-  </table>
-  <p class="legend">
-    Vision is a genuine win. The backbone is a genuine loss — and it is large enough to cancel most of the vision
-    gain. Section 9 explains both.
-  </p>
-
-  <h3>End to end</h3>
-  <table>
-    <tr><th>Configuration</th><th>As measured</th><th>Of which: process bridge</th><th>Compute only</th><th>vs CPU</th></tr>
-    <tr><td>Pure CPU (lerobot)</td><td><b>967 ms</b></td><td>—</td><td>967 ms</td><td>1.00×</td></tr>
-    <tr><td>NPU backbone only</td><td>2158 ms</td><td>596 ms</td><td>1562 ms</td><td>0.62× <span style="color:#991b1b">(slower)</span></td></tr>
-    <tr><td><b>NPU vision + backbone</b></td><td>2589 ms</td><td>1163 ms</td><td><b>1425 ms</b></td><td>0.68× <span style="color:#991b1b">(slower)</span></td></tr>
-  </table>
-  <div class="callout warn">
-    <b>The honest headline: end-to-end we are still slower than the CPU.</b> Even with the process-bridge overhead
-    removed, the full pipeline is ~0.68× the pure-CPU speed. The vision win is real, but three things eat it — and
-    two of them are fixable engineering, not hardware limits. That is exactly what the next section is about.
+  <div class="stat-row">
+    <div class="stat"><div class="big-num">856 ms</div><div class="label">full policy, NPU vision<br>(best of 3 runs)</div></div>
+    <div class="stat"><div class="big-num">1005 ms</div><div class="label">same run, pure CPU<br>(lerobot baseline)</div></div>
+    <div class="stat"><div class="big-num">1.11–1.29×</div><div class="label">faster than CPU<br>end to end</div></div>
   </div>
+
+  <h3>End to end — the shipping configuration is faster than the CPU</h3>
+  <table>
+    <tr><th>Configuration</th><th>run 1</th><th>run 2</th><th>run 3</th><th>vs CPU</th></tr>
+    <tr><td>Pure CPU (lerobot)</td><td>985 ms</td><td>1127 ms</td><td>1005 ms</td><td>1.00×</td></tr>
+    <tr><td><b>NPU vision + CPU backbone</b> <span class="pill done">shipping</span></td><td><b>888 ms</b></td><td><b>874 ms</b></td><td><b>856 ms</b></td><td><b>1.11× – 1.29×</b></td></tr>
+    <tr><td>NPU vision + NPU backbone</td><td>—</td><td>1163 ms</td><td>1114 ms</td><td>0.90× – 0.97×</td></tr>
+    <tr><td>earlier two-process version</td><td>—</td><td>2678 ms</td><td>—</td><td>0.42×</td></tr>
+  </table>
   <p class="legend">
-    <b>What the "process bridge" is:</b> our CPU and NPU code live in two separate Python environments (one has
-    PyTorch, the other has the NPU runtime), so every NPU stage is launched as a fresh subprocess — paying process
-    startup, weight loading and device-context setup <em>every time</em>. It is an artifact of this development
-    setup, not of NPU deployment, which is why the "compute only" column is the fairer comparison.
+    <b>Why the ratio is a range, not a number.</b> Our configuration is very stable (856 / 874 / 888 ms; its NPU
+    vision segment stays at 440–475 ms almost regardless of machine load). What moves is the <em>CPU baseline</em>
+    (985–1127 ms), whose vision tower ranges 187–223 ms per image depending on how busy the machine is. When the CPU
+    is loaded we look 1.29× better; when it is idle, 1.11×. Reporting a single number would be picking a favourable
+    moment.
   </p>
+
+  <h3>Per stage — and the honest reason each one lands where it does</h3>
+  <p>
+    This is the reference table: for every stage, the best NPU number we have measured, the CPU number it must beat,
+    and <em>why</em> it wins or loses. A stage losing on the NPU is not a failure to explain away — it is a shape
+    property worth knowing.
+  </p>
+  <table>
+    <tr><th>Stage</th><th>Shape it runs at</th><th>Best NPU</th><th>CPU</th><th>Verdict &amp; reason</th></tr>
+    <tr>
+      <td><b>① Vision</b><br>per image</td>
+      <td>seq <b>1024</b>, hidden 768<br>big matmuls, 1024² attention</td>
+      <td><b>147 ms</b></td>
+      <td>187–223 ms</td>
+      <td><span class="pill done">NPU wins ~1.5×</span> Large matrices keep the compute array fed, and after fusion only 38 dispatches carry the whole image.</td>
+    </tr>
+    <tr>
+      <td>①b Connector<br>per image</td>
+      <td>M = 64 (a single wide matmul)</td>
+      <td>~1.6 ms</td>
+      <td>~1.8 ms</td>
+      <td>≈ parity. M=64 fills only 4×4 of the 8×4 array — latency-bound, but it is tiny either way.</td>
+    </tr>
+    <tr>
+      <td><b>② Backbone</b><br>per inference</td>
+      <td>seq <b>256</b>, hidden 960<br>GQA 15/5, prefix-LM mask</td>
+      <td>229 ms</td>
+      <td><b>91 ms</b></td>
+      <td><span class="pill" style="background:#fee2e2;color:#991b1b;border:1px solid #fca5a5">NPU loses 2.6×</span> Two compounding reasons — small shapes run the array at ~half efficiency, and its attention is still <b>11 unfused dispatches per layer</b> (208 total). See Section 9.</td>
+    </tr>
+    <tr>
+      <td><b>③ Action expert</b><br>per inference</td>
+      <td>seq <b>50</b>, hidden 720<br>× <b>10</b> sequential denoise steps</td>
+      <td colspan="2" style="text-align:center"><em>feasibility study in progress</em></td>
+      <td>Expected to lose badly: the smallest shape in the model <em>and</em> a 10× sequential multiplier on the dispatch count. Being measured rather than assumed.</td>
+    </tr>
+  </table>
+  <p class="legend">
+    "Best NPU" means the best we have actually measured, not a theoretical peak. For the backbone in particular it is
+    <b>not</b> its ceiling: it has never received the fusion treatment that took vision from 368 ms to 141 ms, so a
+    fused backbone would be meaningfully faster than 229 ms — we simply have not built it yet.
+  </p>
+
+  <div class="callout">
+    <b>The result in one line.</b> Putting the largest compute block — the vision encoder — on the NPU, and leaving
+    every stage where it is fastest, makes the complete robot policy <b>1.11–1.29× faster than the pure-CPU model
+    while still producing the same actions</b> (similarity 0.9990 against the real CPU output).
+  </div>
+
+  <h3>What made this possible: removing the two-process bridge</h3>
+  <p>
+    An earlier version ran the NPU stages as separate subprocesses, because our CPU and NPU code were assumed to
+    need different Python environments. They do not — one environment can host both. Collapsing to a single process
+    lets the weights, the compiled programs and the device context load <b>once at startup</b> instead of on every
+    inference:
+  </p>
+  <table>
+    <tr><th>Cost paid per inference by the old bridge</th><th>Vision</th><th>Backbone</th></tr>
+    <tr><td>process start + imports</td><td>194 ms</td><td>166 ms</td></tr>
+    <tr><td>re-loading model weights from disk</td><td>353 ms</td><td>368 ms</td></tr>
+    <tr><td>compiled-program + device setup</td><td>32 ms</td><td>32 ms</td></tr>
+    <tr><td>data hand-off files</td><td>6 ms</td><td>2 ms</td></tr>
+    <tr><td><b>total, every single inference</b></td><td><b>585 ms</b></td><td><b>568 ms</b></td></tr>
+  </table>
+  <p class="legend">
+    On top of that the bridge could never amortise the first-image cost (347 ms cold vs 147 ms warm), because each
+    inference started from cold. This one change is the difference between 2678 ms and 874 ms.
+  </p>
+
+  <div class="callout">
+    <b>A tuning detail that mattered more than expected.</b> The numerical library's worker threads keep spinning
+    after the one host-side matmul in the vision path, stealing CPU from the thread that issues NPU work — inflating
+    the encoder from 135 ms to 178 ms per image. Capping those threads <em>only around the NPU section</em> and
+    restoring them afterwards recovers it without hurting the thread-hungry action expert: 874 ms with the cap vs
+    962 ms without, and the expert stage is unaffected (305 ms either way).
+  </div>
 
   <!-- ============================================================ -->
   <h2 id="whyperf">9. Why the performance looks like this</h2>
@@ -921,86 +1000,97 @@ once per image:       (HOST) pixel-shuffle → [NPU elf:gemm_connector] 64×1228
     fix.
   </p>
 
-  <h3>③ The two-process bridge, and one redundant computation</h3>
+  <h3>③ Two overheads that were not the hardware's fault (both now fixed)</h3>
   <ul class="clean">
-    <li><b>Bridge (596–1163 ms).</b> Each NPU stage is a fresh subprocess: process start, model weights loaded from
-      disk, device context and compiled programs loaded — every inference. A single-process deployment pays this
-      once at startup, not per call.</li>
-    <li><b>A redundant CPU backbone (~91 ms).</b> To reuse lerobot's exact cache structures, the CPU still runs its
-      own backbone and we then overwrite the result with the NPU's. Correct, but wasted work.</li>
-    <li><b>A subtle one we found and fixed:</b> the numerical library's worker threads kept spinning after the one
-      host matmul, stealing CPU from the thread issuing NPU dispatches — inflating the encoder from 135 ms to
-      178 ms per image. Capping those threads recovered ~120 ms per inference. The symptom looked like an NPU
-      problem; the cause was CPU-side thread contention.</li>
+    <li><b>The two-process bridge (585 ms + 568 ms per inference).</b> Launching each NPU stage as a subprocess
+      re-paid process startup, weight loading and device setup on <em>every</em> call. It turned out both halves can
+      live in one Python environment, so this is simply gone (Section 8).</li>
+    <li><b>A redundant CPU backbone (~91 ms).</b> When the NPU ran the backbone, the CPU still computed its own copy
+      first and we overwrote the result. Keeping the backbone on the CPU removed the duplication entirely.</li>
+    <li><b>Thread contention that looked like an NPU problem.</b> The numerical library's workers kept spinning
+      after the one host matmul and stole CPU from the thread issuing NPU work — 135 ms → 178 ms per image. The
+      giveaway was misleading: the same kernel took 139 ms on a cached array and 178 ms on a freshly computed one.
+      Scoped thread-capping fixed it.</li>
   </ul>
+  <p class="legend">
+    Worth stating plainly: of the four effects in this section, <b>only the first is a property of the hardware.</b>
+    The other three were engineering — and removing them is what turned a 0.42× pipeline into a 1.11–1.29× one on
+    exactly the same silicon and the same kernels.
+  </p>
 
   <h3>What this adds up to</h3>
   <p>
-    Vision on the NPU saves ~222 ms per inference. The backbone on the NPU <em>costs</em> ~138 ms. The bridge costs
-    another ~1163 ms in the current two-process setup, and the action expert (307 ms) has not been touched. Fix the
-    backbone's dispatch count and remove the bridge, and the same silicon and the same kernels move from 0.68× to
-    roughly parity or better — without any new hardware capability.
+    Vision on the NPU saves roughly 190 ms per inference; that is the whole win, and it is enough because vision is
+    the largest block of compute in the model. The backbone would <em>cost</em> ~138 ms on the NPU, so it stays on
+    the CPU. The overheads that used to dominate — over a second of process bridging — are gone. What remains on the
+    table is real but bounded: fusing the backbone's attention (the same fix that gave vision 2.6×) could plausibly
+    make the backbone worth moving too, and splitting the three cameras across CPU and NPU in parallel is measured
+    to be worth about another 0.06× — at the cost of concurrency in a robot control loop.
   </p>
 
+  <!-- ============================================================ -->
   <h2 id="status">10. Current status and next steps</h2>
 
   <h3>Where we are</h3>
   <ul class="clean">
-    <li><span class="pill done">✅</span> <b>Both heavy stages run on the NPU</b> — the 12-layer vision encoder
-      (×3 cameras) and the 16-layer language backbone, with no CPU fallback inside either. Only the action expert
-      remains on the CPU.</li>
-    <li><span class="pill done">✅</span> <b>Correctness holds end-to-end</b> — the produced action chunk matches the
-      pure-CPU lerobot output at cosine <b>0.994</b> (gate 0.99), verified on real hardware.</li>
-    <li><span class="pill done">✅</span> <b>Vision is 1.5× faster than the CPU</b> (148 ms vs 222 ms per image),
-      after fusion cut it from 121 dispatches to 37.</li>
-    <li><span class="pill warn">⚠️</span> <b>End-to-end we are still ~0.68× the CPU speed</b> — the backbone on the
-      NPU is 2.5× slower than the CPU's, and the two-process bridge adds ~1.2 s. Both are addressable (Section 9).</li>
+    <li><span class="pill done">✅</span> <b>The complete robot policy is faster on the NPU than on the CPU</b> —
+      1.11–1.29× end to end, with the vision encoder (the largest compute block) running entirely on-chip.</li>
+    <li><span class="pill done">✅</span> <b>It still produces the same actions</b> — similarity <b>0.9990</b>,
+      normalized MSE 0.0030 against the real lerobot CPU output (gate: 0.99 / 0.04).</li>
+    <li><span class="pill done">✅</span> <b>The vision encoder is 1.5× faster than the CPU</b> (147 ms vs
+      187–223 ms per image), after fusion cut it from 121 dispatches to 37.</li>
+    <li><span class="pill done">✅</span> <b>The backbone is fully ported and verified too</b> — but measured 2.6×
+      slower on the NPU, so it ships on the CPU. The port is one flag away and still gated.</li>
     <li><span class="pill done">✅</span> Along the way: 2 kernels promoted into the shared registry (affine
       LayerNorm, GELU-tanh), 1 written from scratch (masked-softmax), 17 (kernel, shape) rows validated on real
       NPU2, and a shared-code bug fixed with no regression to the sibling models.</li>
   </ul>
 
-  <h3>What to do next, in order of expected payoff</h3>
+  <div class="callout">
+    <b>The lesson we would carry to the next model.</b> Maximum NPU coverage and maximum speed are not the same
+    goal. Three of the four things standing between us and a win were <em>not</em> hardware limits — a process
+    bridge, a duplicated computation, and thread contention — and the fourth (small shapes) is best answered by
+    choosing <em>which</em> stages to move, not by moving everything. Measuring each stage on both processors, and
+    being willing to leave one on the CPU, is what produced the speedup.
+  </div>
+
+  <h3>What is worth doing next</h3>
   <table>
-    <tr><th>#</th><th>Work</th><th>Why it matters</th></tr>
+    <tr><th>#</th><th>Work</th><th>Expected payoff</th></tr>
     <tr>
       <td><b>1</b></td>
       <td><b>Fuse the backbone's attention</b> (11 dispatches/layer → ~1)</td>
-      <td>The backbone is host-bound exactly as vision was before fusion — 208 dispatches on a small stage. Vision's
-          identical fix gave 2.6×. This is what turns the backbone from a 138 ms <em>loss</em> into a win.</td>
+      <td>The backbone is host-bound exactly as vision was — 208 dispatches on a small stage. Vision's identical fix
+          gave 2.6×. If it lands, the backbone becomes worth moving to the NPU as well, adding to the win instead of
+          subtracting from it.</td>
     </tr>
     <tr>
       <td><b>2</b></td>
-      <td><b>Single-process deployment</b> (remove the two-venv bridge)</td>
-      <td>Removes ~1.2 s of per-inference process startup, weight loading and device setup — pure overhead that a
-          real deployment would pay once, not every call.</td>
+      <td>Split the 3 cameras across CPU and NPU in parallel</td>
+      <td>Measured headroom: vision 470 ms → ~360 ms, end to end ≈ 1.35×. Deliberately deferred — it introduces
+          concurrency into a control loop that a correctness gate has to protect.</td>
     </tr>
     <tr>
       <td><b>3</b></td>
-      <td>Stop the redundant CPU backbone</td>
-      <td>~91 ms currently computed on CPU and then overwritten by the NPU result.</td>
+      <td><b>Action expert</b> — decide from the feasibility study, not from its 32% share</td>
+      <td>It is the largest remaining CPU block, but also the <em>worst</em> shape in the model (seq 50, ×10
+          sequential steps). Being measured before any porting effort is committed.</td>
     </tr>
     <tr>
       <td><b>4</b></td>
-      <td>Move the <b>action expert</b> to the NPU</td>
-      <td>The last 32% still on CPU. Reuses the backbone's kernels at smaller shapes, and its cross-attention already
-          reads the K/V cache the NPU backbone produces.</td>
-    </tr>
-    <tr>
-      <td><b>5</b></td>
-      <td>Batch the 3 cameras into one set of dispatches</td>
-      <td>Measured ~17–20% on the vision matmuls (bigger shapes use the array better); a smaller but cheap win —
-          no kernel changes, only re-validation.</td>
+      <td>Batch the 3 cameras into one encoder pass</td>
+      <td>~17–20% on the vision matmuls, but only a few percent end to end now that dispatch overhead is down to
+          ~4 ms per image. Cheap in kernels (no code changes), but needs re-validation at the new size.</td>
     </tr>
   </table>
 
   <div class="card" style="margin-top:2rem;background:#f0f9ff;border-color:#7dd3fc">
     <p style="margin:0"><b>In one sentence:</b>
-    Both compute-heavy stages of SmolVLA — the vision encoder and the language backbone — now run entirely on the
-    AMD NPU2 and still produce the right actions (0.994 vs the real CPU model). The vision encoder is genuinely
-    1.5× faster than the CPU; the full pipeline is not yet, because the backbone's attention has not been fused and
-    a development-time process bridge dominates the measurement. Both are known, measured, and fixable — which is
-    the useful state to be in.</p>
+    SmolVLA's vision encoder — the largest block of compute in a vision-language-action robot policy — now runs
+    entirely on the AMD NPU2, making the complete policy <b>1.11–1.29× faster than the pure-CPU model while
+    producing the same actions</b> (0.9990 similarity). The language backbone is ported and verified too, and stays
+    on the CPU for the honest reason that it is faster there — a decision we could only make because every stage was
+    measured on both.</p>
   </div>
 
   <div class="meta" style="margin-top:3rem;border-bottom:none;border-top:1px solid var(--card-border);padding-top:1rem">
