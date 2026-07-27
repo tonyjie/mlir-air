@@ -1051,6 +1051,92 @@ once per image:       (HOST) pixel-shuffle → [NPU elf:gemm_connector] 64×1228
     the same silicon and the same kernels.
   </p>
 
+  <h3>Where the vision encoder's time actually goes — a full accounting</h3>
+  <p>
+    Since the vision encoder is the part we ship on the NPU, we profiled it end to end and made every millisecond
+    account for itself. Per inference (3 images), against a 465.7 ms measured baseline:
+  </p>
+  <table>
+    <tr><th>Component</th><th>ms</th><th>share</th></tr>
+    <tr style="background:#eff6ff"><td><b>NPU executing</b></td><td><b>408.1</b></td><td><b>86.6%</b></td></tr>
+    <tr><td>moving input data to the chip</td><td>23.9</td><td>5.1%</td></tr>
+    <tr><td>host patch reshaping (im2col)</td><td>15.8</td><td>3.4%</td></tr>
+    <tr><td>launch cost — 114 dispatches × 70 µs</td><td>8.0</td><td>1.7%</td></tr>
+    <tr><td><em>unattributed Python (residual)</em></td><td><em>8.3</em></td><td><em>1.8%</em></td></tr>
+    <tr><td>reading results back</td><td>4.8</td><td>1.0%</td></tr>
+    <tr><td>other host numpy</td><td>2.2</td><td>0.5%</td></tr>
+    <tr><td><b>total accounted</b></td><td><b>470.9</b></td><td>100%</td></tr>
+  </table>
+  <p class="legend">
+    The 8.3 ms residual is stated rather than absorbed into another row. <b>The headline: the encoder is now
+    NPU-bound, not host-bound</b> — the opposite of where it started. All the host glue inside the loop adds up to
+    ~10 ms; the chip itself is busy 87% of the time. Further speed has to come from the device side.
+  </p>
+  <p>Inside those 408 ms of device time, per image:</p>
+  <table>
+    <tr><th>Program</th><th>ms/image</th><th>share</th><th></th><th>By operation type</th><th>share</th></tr>
+    <tr><td><code>vit_o_ffn</code> (O + residual + norm + MLP)</td><td>66.1</td><td>48.6%</td><td rowspan="5"></td><td>matmul</td><td>43.9%</td></tr>
+    <tr><td><code>vit_ln_qkv</code> (norm + Q/K/V)</td><td>34.8</td><td>25.6%</td><td>attention</td><td>25.0%</td></tr>
+    <tr><td><code>flash_attn</code></td><td>33.6</td><td>24.7%</td><td>bias adds</td><td>9.8%</td></tr>
+    <tr><td><code>gemm_connector</code></td><td>0.95</td><td>0.7%</td><td>LayerNorm</td><td>6.9%</td></tr>
+    <tr><td><code>layer_norm</code> (final)</td><td>0.63</td><td>0.5%</td><td>GELU + residual + interleave</td><td>14.3%</td></tr>
+  </table>
+
+  <h3>Two plausible theories, both refuted by measurement</h3>
+  <p>
+    We went in with two hypotheses about where the waste was. Measuring killed both — which is itself the useful
+    result, because it redirected the search.
+  </p>
+  <table>
+    <tr><th>Hypothesis</th><th>Result</th></tr>
+    <tr>
+      <td><b>Fusing operations into one program costs device time.</b> A parallel study of the <em>backbone's</em>
+          fused programs found them 1.4–1.8× slower than the sum of their individually-tuned parts, so we expected
+          the same drag on vision.</td>
+      <td><span class="pill" style="background:#fee2e2;color:#991b1b;border:1px solid #fca5a5">refuted</span>
+          Vision's fused programs cost only <b>1.015× and 1.025×</b> versus their parts — fusion here is
+          essentially free. (The backbone's penalty does not generalise.) The small extra cost seen in deployment is
+          the chip switching between three different programs each layer, not the fusing itself.</td>
+    </tr>
+    <tr>
+      <td><b>The tile sizes inside the fused programs are compromises.</b> A fused program must pick one device
+          configuration; separately, the connector's matmul had just been re-tuned for a 1.33× win.</td>
+      <td><span class="pill" style="background:#fef9c3;color:#854d0e;border:1px solid #ca8a04">mostly refuted</span>
+          The Q/K/V/O matmuls are flat within <b>0.5%</b> across four tile sizes. Re-tuning the two MLP matmuls is
+          worth <b>3.8 ms</b> total — real, but not the 1.33× the connector saw.</td>
+    </tr>
+  </table>
+  <div class="callout warn">
+    <b>What neither hypothesis was looking at — and it is the biggest single gap.</b> The <em>same</em> matmul, with
+    the <em>same</em> tiles, is <b>1.26–1.42× slower</b> when compiled into the multi-program format our deployment
+    must use than when compiled as a standalone binary:
+    <table style="margin:0.6rem 0">
+      <tr><th>Matmul shape</th><th>deployment format</th><th>standalone format</th><th>penalty</th></tr>
+      <tr><td><span class="shape">1024×768×768</span></td><td>620 µs</td><td>435 µs</td><td><b>1.42×</b></td></tr>
+      <tr><td><span class="shape">1024×768×3072</span></td><td>1962 µs</td><td>1555 µs</td><td>1.26×</td></tr>
+      <tr><td><span class="shape">1024×3072×768</span></td><td>1501 µs</td><td>1140 µs</td><td>1.32×</td></tr>
+    </table>
+    This is a property of the compilation path, not of the kernel or its tiling. It also means the throughput
+    figures in our kernel catalogue — all measured in the standalone format — <b>systematically flatter what a
+    deployed pipeline will actually see</b>. Worth knowing before quoting them as deployment estimates.
+  </div>
+
+  <h3>What this makes worth doing, in order</h3>
+  <table>
+    <tr><th>#</th><th>Opportunity</th><th>Worth</th><th>Effort</th></tr>
+    <tr><td>1</td><td>Extend the thread-capping to cover the host patch reshaping too — the first image currently costs 37.9 ms more than the second and third, because the numerical library's idle workers preempt the dispatch thread</td><td><b>−32.6 ms</b> <span style="font-size:0.85em;color:#166534">measured</span></td><td>one line</td></tr>
+    <tr><td>2</td><td>Close the deployment-format matmul gap (above)</td><td>−64.6 ms <em>est.</em></td><td>compiler/runtime</td></tr>
+    <tr><td>3</td><td>Fold the bias and residual adds into the matmul's own output stage</td><td>−52.2 ms <em>est.</em></td><td>medium</td></tr>
+    <tr><td>4</td><td>Merge attention into the fused program — 1 program per layer instead of 3</td><td>−24.7 ms <em>est.</em></td><td>medium (now supported by the refuted H1)</td></tr>
+    <tr><td>5</td><td>Speed up the affine LayerNorm — it runs at 8.1 GB/s where a same-sized add reaches 34.7</td><td>−21.1 ms <em>est.</em></td><td>kernel tuning</td></tr>
+    <tr><td>6</td><td>Re-tile the two MLP matmuls</td><td><b>−3.8 ms</b> <span style="font-size:0.85em;color:#166534">measured</span></td><td>two constants</td></tr>
+    <tr><td>—</td><td><em>Attention</em> is 21% of the wall clock but already runs at its standalone speed — there is no pipeline-level headroom, only a kernel rewrite</td><td>—</td><td>large</td></tr>
+  </table>
+  <p class="legend">
+    Items 1 and 6 alone are ~36 ms (7.8%), both measured and both a few lines of code. The estimates are labelled as
+    such: they are derived from measured per-operation costs assuming full absorption, i.e. upper bounds.
+  </p>
+
   <h3>What this adds up to</h3>
   <p>
     Vision on the NPU saves roughly 190 ms per inference; that is the whole win, and it is enough because vision is
@@ -1075,6 +1161,9 @@ once per image:       (HOST) pixel-shuffle → [NPU elf:gemm_connector] 64×1228
       184 ms per image, both at max performance), after fusion cut it from 121 dispatches to 37.</li>
     <li><span class="pill done">✅</span> <b>The backbone is fully ported and verified too</b> — but measured 2.6×
       slower on the NPU, so it ships on the CPU. The port is one flag away and still gated.</li>
+    <li><span class="pill done">✅</span> <b>The encoder is now NPU-bound, not host-bound</b> — a full accounting
+      puts 86.6% of its time in the chip actually executing, with ~10 ms of host glue left in the loop and an
+      honestly-reported 1.8% residual (Section 9).</li>
     <li><span class="pill done">✅</span> Along the way: 2 kernels promoted into the shared registry (affine
       LayerNorm, GELU-tanh), 1 written from scratch (masked-softmax), 17 (kernel, shape) rows validated on real
       NPU2, and a shared-code bug fixed with no regression to the sibling models.</li>
@@ -1099,10 +1188,11 @@ once per image:       (HOST) pixel-shuffle → [NPU elf:gemm_connector] 64×1228
     </tr>
     <tr>
       <td><b>2</b></td>
-      <td>Attack what is left <em>inside</em> the vision encoder</td>
-      <td>Turbo mode showed the encoder is not compute-clock-bound (Section 8), so the remaining time is in
-          memory-bound norms/activations, attention, and ~35 ms per inference of host-side patch reshaping that
-          could move onto the device.</td>
+      <td>Work the ranked list from the encoder breakdown (Section 9)</td>
+      <td>Two of them are measured and nearly free: extending the thread-cap over the host patch reshaping
+          (<b>−32.6 ms</b>, one line) and re-tiling the two MLP matmuls (<b>−3.8 ms</b>, two constants) — together
+          ~7.8%. Beyond that the estimates point at the deployment-format matmul gap (−64.6 ms) and folding the
+          bias/residual adds into the matmul epilogue (−52.2 ms).</td>
     </tr>
     <tr>
       <td><b>3</b></td>
