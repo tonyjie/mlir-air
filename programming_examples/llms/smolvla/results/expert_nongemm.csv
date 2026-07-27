@@ -1,0 +1,32 @@
+# Non-GEMM measurements, NPU2, device start+wait, PERF_ITERS=20 (this session).
+# Extracted from results/logs/ (the .log files themselves are covered by the
+# repo-wide *.log gitignore; re-generate with the commands in
+# docs/expert_npu_feasibility.md section 10).
+kernel,config,latency_us,correctness,note
+FlashAttention,lq=256 lqp=256 lk=256 nqt=4 hpu=1 ncs=4 (15q/5kv dk=dv=64),919.7,PASS mean_rel_L1=4.264e-02,ODD/cross layers; Q 50->256 KV 241->256; DEPLOYABLE
+FlashAttention,lq=256 lqp=256 lk=384 nqt=4 hpu=1 ncs=3,891.6,PASS mean_rel_L1=4.203e-02,EVEN/self layers; Q 50->256 KV 291->384; DEPLOYABLE
+FlashAttention,lq=64 lqp=64 lk=256 nqt=1 hpu=1 ncs=4,368.7,BROKEN inf/NaN,timing only - numerically invalid
+FlashAttention,lq=64 lqp=64 lk=384 nqt=1 hpu=1 ncs=3,350.0,BROKEN inf/NaN,timing only - numerically invalid
+FlashAttention,lq=64 lqp=64 lk=512 nqt=1 hpu=1 ncs=4,410.5,BROKEN inf/NaN,timing only
+FlashAttention,lq=64 lk=256 nqt=1 hpu=1 ncs=4 (attn_npu2.py heads-first),360.2,BROKEN NaN,second variant fails the same way
+FlashAttention,lq=128 lqp=128 lk=256 nqt=2 hpu=1 ncs=4,538.0,BROKEN mean_rel_L1=1.192,
+FlashAttention,lq=128 lqp=128 lk=384 nqt=2 hpu=1 ncs=3,519.6,BROKEN,
+RMSNorm,M=64 N=720 vector_size=16 tiling=[4;4],151.3,PASS mean_rel_L1=2.663e-02,expert layer norm
+RMSNorm,M=256 N=960 vector_size=16 tiling=[4;4],428.8,PASS,backbone reference for the fusion-penalty comparison
+EltwiseAdd,n=46080 (64x720) tile_n=1920 herd_x=8 herd_y=1 bf16,86.6,PASS mean_rel_L1=1.875e-03,expert residual
+EltwiseAdd,n=245760 (256x960) tile_n=1920 herd_x=8 herd_y=1 bf16,113.7,PASS,backbone reference
+SiLU-and-Mul,n=131072 (64x2048) tile_n=4096 herd_x=8 herd_y=1,121.6,PASS mean_rel_L1=1.021e-02,expert FFN
+SiLU-and-Mul,n=655360 (256x2560) tile_n=4096 herd_x=8 herd_y=1,246.6,PASS,backbone reference
+RoPE half-split,rows=960 head_dim=64 herd_x=8 herd_y=1,106.3,PASS mean_rel_L1=2.798e-03,expert q (64 tokens x 15 heads)
+RoPE half-split,rows=320 head_dim=64 herd_x=8 herd_y=1,83.0,PASS,expert k (64 tokens x 5 heads)
+RoPE half-split,rows=3840 head_dim=64 herd_x=8 herd_y=1,119.9,PASS,backbone reference (256 x 15)
+RoPE half-split,rows=1280 head_dim=64 herd_x=8 herd_y=1,93.1,PASS,backbone reference (256 x 5)
+GEMM low-precision,64x720x960 direct-codegen HIGH_PRECISION=false,139.8,PASS mean_rel_L1=1.032e-02,lever check - not adopted
+GEMM low-precision,64x720x2048 direct-codegen,169.1,PASS mean_rel_L1=1.034e-02,lever check
+GEMM low-precision,64x2048x768 direct-codegen,191.6,PASS mean_rel_L1=1.277e-02,lever check - SLOWER than high-precision 179.5
+dispatch overhead,q_proj 64x720x960 via cache.load_and_run x200,24.0,n/a,driver wall 156us - start+wait 132us
+dispatch overhead,trivial 64x32x32 via cache.load_and_run x200,38.0,n/a,driver wall 144us - start+wait 106us
+fused ELF,rms_gemms_rope seq=256 (backbone; 6 launches),2030.0,n/a,vs 1134us as standalone parts = 1.79x fusion penalty
+fused ELF,o_ffn seq=256 (backbone; 8 launches),3370.0,n/a,vs 2418us as standalone parts = 1.39x fusion penalty
+CPU reference,action expert per denoise step (real lerobot; Ryzen AI 9 HX 370; 12 threads),32540.0,n/a,median of 50 steps
+CPU reference,action expert per inference (10 steps),323940.0,n/a,median of 5 chunks
