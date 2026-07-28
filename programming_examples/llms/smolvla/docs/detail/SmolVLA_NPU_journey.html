@@ -693,7 +693,7 @@
   <p style="margin-bottom:0.3rem"><b>① Vision (SigLIP)</b> — seq = 1024 patch tokens, hidden 768, 12 heads (plain MHA), <b>no</b> mask</p>
   <table class="arch">
     <tr><th>Original operator</th><th>NPU kernel</th><th>Shape</th></tr>
-    <tr><td><code>Conv2d</code> patch embed</td><td><span class="knl">GEMM</span> (after a host im2col reshape)</td><td><span class="shape">1024×768×768</span></td></tr>
+    <tr><td><code>Conv2d</code> patch embed</td><td><span class="knl adapt">host numpy</span> — im2col reshape <em>and</em> its matmul both still run on the CPU (see Section 9)</td><td><span class="shape">1024×768×768</span></td></tr>
     <tr><td><code>nn.LayerNorm</code> ×2/layer + final</td><td><span class="knl">LayerNorm</span> (affine γ,β)</td><td><span class="shape">1024×768</span></td></tr>
     <tr><td><code>q/k/v/out_proj</code> (+bias)</td><td><span class="knl">GEMM</span> (bias folded in)</td><td><span class="shape">1024×768×768</span></td></tr>
     <tr><td><code>eager_attention</code> (bidirectional)</td><td><span class="knl">FlashAttention</span> (non-causal)</td><td><span class="shape">1024×1024</span>, 12/12</td></tr>
@@ -1268,6 +1268,65 @@ once per image:       (HOST) pixel-shuffle → [NPU elf:gemm_connector] 64×1228
   <figcaption>Per-operation comparison of one of the 12 SigLIP encoder layers, measured on the same machine with both processors at maximum performance.</figcaption>
   </div>
 
+  <h3>Zooming back out: the <em>whole</em> encoder, not just its 12 layers</h3>
+  <p>
+    The 12 layers are most of the vision encoder but not all of it. Putting the surrounding stages on the same
+    footing changes the picture in one important way — and exposes something we had wrong.
+  </p>
+  <table>
+    <tr><th>Stage of the vision encoder</th><th>CPU</th><th>our NPU path</th><th>result</th></tr>
+    <tr style="background:#fef2f2">
+      <td><b>patch embedding + position</b><br><span class="sub" style="font-size:0.85em;color:#6b7280">image → 1024 tokens</span></td>
+      <td><b>1.36 ms</b><br><span style="font-size:0.85em;color:#6b7280">an optimised Conv2d</span></td>
+      <td><b>6.00 ms</b><br><span style="font-size:0.85em;color:#991b1b">entirely on the host, in numpy</span></td>
+      <td><span class="pill" style="background:#fee2e2;color:#991b1b;border:1px solid #fca5a5">4.4× SLOWER</span></td>
+    </tr>
+    <tr>
+      <td><b>12 × encoder layer</b></td>
+      <td>173.7 ms</td>
+      <td><b>134.5 ms</b> on the NPU</td>
+      <td><span class="pill done">1.29× faster</span></td>
+    </tr>
+    <tr>
+      <td>final LayerNorm</td>
+      <td>0.04 ms</td>
+      <td>0.63 ms</td>
+      <td>18× slower — but 0.6 ms, and it runs once</td>
+    </tr>
+    <tr>
+      <td><b>connector</b><br><span style="font-size:0.85em;color:#6b7280">pixel-shuffle + projection</span></td>
+      <td>1.43 ms</td>
+      <td><b>1.06 ms</b><br><span style="font-size:0.85em;color:#6b7280">0.11 host reshape + 0.95 NPU</span></td>
+      <td><span class="pill done">1.35× faster</span></td>
+    </tr>
+    <tr><td><b>Σ compute</b></td><td><b>176.5 ms</b></td><td><b>142.2 ms</b></td><td>1.24×</td></tr>
+    <tr><td>+ NPU data movement, launches, Python</td><td>—</td><td>~12.8 ms</td><td></td></tr>
+    <tr style="background:#f0f9ff"><td><b>measured, per image</b></td><td><b>183.7 ms</b></td><td><b>155 ms</b></td><td><b>1.19×</b></td></tr>
+  </table>
+
+  <div class="callout warn">
+    <b>A correction: the patch embedding never made it onto the NPU.</b> We had described it as "im2col reshape on
+    the host, then a matmul on the NPU". In fact <em>both halves</em> run on the host in numpy, and it is the one
+    stage where our pipeline is dramatically worse than the CPU's — 6.00 ms against an optimised Conv2d's 1.36 ms.
+    Breaking those 6 ms down shows three separate, entirely fixable causes:
+    <table style="margin:0.6rem 0">
+      <tr><th>Inside the 6.00 ms</th><th>cost</th><th>why it is avoidable</th></tr>
+      <tr><td>im2col patch extraction</td><td>0.95 ms</td><td>a Python loop running 1024 times; it is a pure reshape that numpy can do in one call</td></tr>
+      <tr><td>the matmul <span class="shape">1024×768×768</span></td><td>1.91 ms</td><td>the NPU does this exact shape in <b>0.58 ms</b> — it is simply not being sent there</td></tr>
+      <tr><td>dtype conversions + position add</td><td>3.14 ms</td><td>the weights are converted from bf16 to fp32 on <em>every call</em> instead of once at startup</td></tr>
+    </table>
+    None of this is a hardware limit. Fixing all three should bring the stage to roughly 1.2 ms — <b>saving ~4.8 ms
+    per image, ~14 ms per inference</b>, which is larger than most of the items on the opportunity list below. It
+    survived this long precisely because it sits outside the 12-layer loop everyone was profiling.
+  </div>
+
+  <p class="legend">
+    Two smaller observations from the same table. The <b>final LayerNorm is 18× slower</b> on the NPU — the same
+    memory-bound weakness as the in-layer norms, just harmless here because it runs once. The <b>connector is
+    1.35× faster</b>: its projection is a <span class="shape">64×12288×960</span> matmul whose very deep inner
+    dimension is exactly the shape the NPU likes, and the pixel-shuffle beside it is a pure reshape costing 0.1 ms.
+  </p>
+
   <h3>Two plausible theories, both refuted by measurement</h3>
   <p>
     We went in with two hypotheses about where the waste was. Measuring killed both — which is itself the useful
@@ -1311,11 +1370,12 @@ once per image:       (HOST) pixel-shuffle → [NPU elf:gemm_connector] 64×1228
   <table>
     <tr><th>#</th><th>Opportunity</th><th>Worth</th><th>Effort</th></tr>
     <tr><td>1</td><td>Extend the thread-capping to cover the host patch reshaping too — the first image currently costs 37.9 ms more than the second and third, because the numerical library's idle workers preempt the dispatch thread</td><td><b>−32.6 ms</b> <span style="font-size:0.85em;color:#166534">measured</span></td><td>one line</td></tr>
-    <tr><td>2</td><td>Close the deployment-format matmul gap (above)</td><td>−64.6 ms <em>est.</em></td><td>compiler/runtime</td></tr>
-    <tr><td>3</td><td>Fold the bias and residual adds into the matmul's own output stage</td><td>−52.2 ms <em>est.</em></td><td>medium</td></tr>
-    <tr><td>4</td><td>Merge attention into the fused program — 1 program per layer instead of 3</td><td>−24.7 ms <em>est.</em></td><td>medium (now supported by the refuted H1)</td></tr>
-    <tr><td>5</td><td>Speed up the affine LayerNorm — it runs at 8.1 GB/s where a same-sized add reaches 34.7</td><td>−21.1 ms <em>est.</em></td><td>kernel tuning</td></tr>
-    <tr><td>6</td><td>Re-tile the two MLP matmuls</td><td><b>−3.8 ms</b> <span style="font-size:0.85em;color:#166534">measured</span></td><td>two constants</td></tr>
+    <tr style="background:#f0fdf4"><td>2</td><td><b>Fix the patch embedding</b> — vectorise the im2col loop, send its matmul to the NPU, and convert the weights once instead of per call (above)</td><td><b>−14 ms</b> <em>est.</em></td><td>small — all three are host-side</td></tr>
+    <tr><td>3</td><td>Close the deployment-format matmul gap (above)</td><td>−64.6 ms <em>est.</em></td><td>compiler/runtime</td></tr>
+    <tr><td>4</td><td>Fold the bias and residual adds into the matmul's own output stage</td><td>−52.2 ms <em>est.</em></td><td>medium</td></tr>
+    <tr><td>5</td><td>Merge attention into the fused program — 1 program per layer instead of 3</td><td>−24.7 ms <em>est.</em></td><td>medium (now supported by the refuted H1)</td></tr>
+    <tr><td>6</td><td>Speed up the affine LayerNorm — it runs at 8.1 GB/s where a same-sized add reaches 34.7</td><td>−21.1 ms <em>est.</em></td><td>kernel tuning</td></tr>
+    <tr><td>7</td><td>Re-tile the two MLP matmuls</td><td><b>−3.8 ms</b> <span style="font-size:0.85em;color:#166534">measured</span></td><td>two constants</td></tr>
     <tr><td>—</td><td><em>Attention</em> is 21% of the wall clock but already runs at its standalone speed — there is no pipeline-level headroom, only a kernel rewrite</td><td>—</td><td>large</td></tr>
   </table>
   <p class="legend">
