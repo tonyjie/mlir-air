@@ -1,0 +1,20 @@
+Loading expert weights...
+[expert] reusing 10 cached ELFs from expert_kernel_cache (SMOLVLA_FORCE_COMPILE=1 to rebuild)
+cross K/V: hoisted out of the denoise loop (16 GEMMs)
+
+L3  free-running 10 steps (reported, not blocking)
+    step        v_t        x_t
+       0   0.980267   0.980266
+       1   0.986478   0.984292
+       2   0.989724   0.987014
+       3   0.992001   0.989231
+       4   0.993928   0.991342
+       5   0.994573   0.993114
+       6   0.995021   0.994627
+       7   0.994072   0.995980
+       8   0.991693   0.997285
+       9   0.974322        nan
+    worst v_t 0.974322
+    FINAL x_t cosine vs oracle: 0.998343
+
+PASS

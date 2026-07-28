@@ -104,23 +104,26 @@ def level2(d, r, steps):
 
 
 def level3(d, r):
-    """Free-running: only step 0's input is the oracle's. Reported, not blocking.
+    """Genuinely free-running: nothing after step 0's x_t comes from the oracle.
 
-    This is where BFP16 error compounds -- 10 sequential passes through the
-    whole stack, each consuming the previous one's output.
+    Each step's input is the previous step's output, closed through the CPU
+    head/tail (embed_suffix -> NPU 16 layers -> action_out_proj -> x_t update).
+    This is the only level where BFP16 error actually compounds across the
+    denoise loop. Reported, not blocking.
     """
     print("\nL3  free-running 10 steps (reported, not blocking)")
-    n = int(d["v_t"].shape[0])
-    print(f"    {'step':>4} {'final_norm':>12}")
-    x = d["suffix_embs"][0]
-    worst = 1.0
-    for s in range(n):
-        out = r.run_step(x if s == 0 else d["suffix_embs"][s])
-        c = cos(out, d["final_norm"][s])
-        worst = min(worst, c)
-        print(f"    {s:4d} {c:12.6f}")
-    print(f"    worst {worst:.6f}")
-    return worst
+    x_final, per = r.run_denoise_loop(timesteps=list(d["timesteps"]))
+    print(f"    {'step':>4} {'v_t':>10} {'x_t':>10}")
+    worst_v = 1.0
+    for s, rec in enumerate(per):
+        cv = cos(rec["v_t"], d["v_t"][s])
+        cx = cos(rec["x_t"], d["x_t"][s + 1]) if s + 1 < len(d["x_t"]) else float("nan")
+        worst_v = min(worst_v, cv)
+        print(f"    {s:4d} {cv:10.6f} {cx:10.6f}")
+    cf = cos(x_final, d["x_t_final"])
+    print(f"    worst v_t {worst_v:.6f}")
+    print(f"    FINAL x_t cosine vs oracle: {cf:.6f}")
+    return cf
 
 
 def main():

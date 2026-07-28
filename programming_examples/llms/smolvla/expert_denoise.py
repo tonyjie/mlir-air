@@ -431,6 +431,41 @@ class ExpertRunner:
         rstd = 1.0 / np.sqrt((real**2).mean(-1, keepdims=True) + c.rms_norm_eps)
         return real * rstd * w
 
+    # -- the whole flow-matching loop ---------------------------------------
+    def run_denoise_loop(self, timesteps=None, x0=None):
+        """All 10 denoise steps: CPU head/tail around the NPU's 16 layers.
+
+        This is the real thing, not a teacher-forced replay -- each step
+        consumes the previous step's output, which is how BFP16 error actually
+        compounds. `embed_suffix` and `action_out_proj` stay on CPU (2.4% of the
+        expert, and both are pure launch-floor shapes on NPU).
+
+        Returns (x_t_final, per_step) with per_step[s] = {'v_t', 'x_t'}.
+        """
+        from expert_cpu_helpers import embed_suffix
+
+        c = self.cfg
+        n = c.num_steps
+        dt = -1.0 / n
+        if timesteps is None:
+            timesteps = [1.0 - s / n for s in range(n)]
+        x_t = (
+            np.zeros((self.seq_real, c.action_dim), np.float32)
+            if x0 is None
+            else np.asarray(x0, np.float32)
+        )
+        aw = np.asarray(self.w.action_out_w, np.float32)
+        ab = np.asarray(self.w.action_out_b, np.float32)
+
+        per_step = []
+        for s in range(n):
+            emb = embed_suffix(x_t, timesteps[s], self.w, c)  # CPU
+            fn = self.run_step(emb)  # NPU, 208 dispatches
+            v_t = fn @ aw + ab  # CPU
+            x_t = x_t + dt * v_t
+            per_step.append({"v_t": v_t, "x_t": x_t.copy()})
+        return x_t, per_step
+
     # -- compilation --------------------------------------------------------
     KERNELS = (
         "expert_rms_qkv_rope",
