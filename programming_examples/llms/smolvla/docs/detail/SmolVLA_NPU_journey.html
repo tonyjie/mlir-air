@@ -958,13 +958,21 @@ once per image:       (HOST) pixel-shuffle → [NPU elf:gemm_connector] 64×1228
 
   <p class="lead">
     Section 8 said the vision encoder is 1.19× faster on the NPU. This section takes that apart, one level at a
-    time: inside a layer → inside the chip's own time → the underlying reason → what we got wrong → what is left.
+    time: inside a layer → the cost of issuing that work → the underlying reason → what to do next.
   </p>
 
   <h3>Level 1 — inside one encoder layer: which operations actually win</h3>
   <p>
     Both sides profiled at the same granularity, on the same machine. The bars group each <code>Linear</code> with
     the separate bias kernel the NPU needs for it; the table below unmerges them and adds shapes.
+  </p>
+  <p class="legend">
+    <b>What the NPU column measures.</b> Each figure is the <em>device</em> time of one kernel as it runs inside our
+    compiled program — it includes that kernel's fixed start-up cost on the chip, but <em>not</em> the host-side cost
+    of issuing work, moving data, or Python. Those are real and are accounted separately in Level 2. Concretely, a
+    layer's 12 rows below are 18 kernel launches that we have packed into just <b>3</b> programs
+    (<code>vit_ln_qkv</code> holds 7, <code>flash_attn</code> 1, <code>vit_o_ffn</code> 10), so the host pays its
+    per-issue cost 3 times per layer rather than 18.
   </p>
   <div class="fig">
   <svg viewBox="0 0 900 424" xmlns="http://www.w3.org/2000/svg" font-family="system-ui, sans-serif">
@@ -1077,122 +1085,48 @@ once per image:       (HOST) pixel-shuffle → [NPU elf:gemm_connector] 64×1228
     enough.
   </p>
 
-  <h3>Level 2 — inside the chip's own time</h3>
-  <div class="fig">
-  <svg viewBox="0 0 900 470" xmlns="http://www.w3.org/2000/svg" font-family="system-ui, sans-serif">
-    <style>
-      .ttl{font-size:12.5px;font-weight:700;fill:#111827}
-      .sub{font-size:10px;fill:#6b7280}
-      .lb{font-size:9.5px;fill:#1f2937}
-      .lbw{font-size:9.5px;fill:#fff;font-weight:600}
-      .tick{font-size:9px;fill:#9ca3af}
-    </style>
-
-    <!-- ================= ROW 1 : whole inference ================= -->
-    <text x="40" y="22" class="ttl">One inference — 465 ms measured, 470.9 ms accounted below (3 images)</text>
-    <rect x="40"    y="30" width="693.5" height="30" fill="#2563eb"/>
-    <rect x="733.5" y="30" width="40.6"  height="30" fill="#93c5fd"/>
-    <rect x="774.1" y="30" width="26.8"  height="30" fill="#fbbf24"/>
-    <rect x="800.9" y="30" width="13.6"  height="30" fill="#d1d5db"/>
-    <rect x="814.5" y="30" width="14.1"  height="30" fill="#e5e7eb"/>
-    <rect x="828.6" y="30" width="8.2"   height="30" fill="#c7d2fe"/>
-    <rect x="836.8" y="30" width="3.7"   height="30" fill="#f3f4f6"/>
-    <text x="386" y="50" text-anchor="middle" class="lbw">NPU executing — 408.1 ms (86.6%)</text>
-    <text x="840" y="76" text-anchor="end" class="lb">
-      <tspan fill="#1d4ed8">▮</tspan> data in 23.9 ·
-      <tspan fill="#b45309">▮</tspan> host im2col 15.8 ·
-      <tspan fill="#6b7280">▮</tspan> launch 8.0 ·
-      <tspan fill="#6b7280">▮</tspan> unattributed 8.3 ·
-      <tspan fill="#4f46e5">▮</tspan> data out 4.8 · other 2.2
-    </text>
-
-    <!-- ================= ROW 2 : device time, per image ================= -->
-    <text x="40" y="116" class="ttl">Zoom: the NPU time for ONE image — 136 ms, by compiled program</text>
-    <text x="40" y="130" class="sub">12 layers × 3 programs, then the connector. Width ∝ measured time.</text>
-    <rect x="40"    y="138" width="204.7" height="34" fill="#7c3aed"/>
-    <rect x="244.7" y="138" width="197.6" height="34" fill="#ea580c"/>
-    <rect x="442.3" y="138" width="388.8" height="34" fill="#2563eb"/>
-    <rect x="831.1" y="138" width="5.6"   height="34" fill="#059669"/>
-    <rect x="836.7" y="138" width="3.7"   height="34" fill="#a78bfa"/>
-    <text x="142"   y="159" text-anchor="middle" class="lbw">vit_ln_qkv  34.8 ms</text>
-    <text x="343"   y="159" text-anchor="middle" class="lbw">flash_attn  33.6</text>
-    <text x="636"   y="159" text-anchor="middle" class="lbw">vit_o_ffn  66.1 ms  (48.6%)</text>
-    <text x="840"   y="188" text-anchor="end" class="lb"><tspan fill="#059669">▮</tspan> connector 0.95 · <tspan fill="#7c3aed">▮</tspan> final norm 0.63</text>
-
-    <!-- ================= ROW 3 : one layer expanded ================= -->
-    <text x="40" y="226" class="ttl">Zoom: ONE of the 12 layers — 10.5 ms, mapped onto the architecture</text>
-    <text x="40" y="240" class="sub">Colour = kind of operation. Width ∝ measured time. Brackets = the three compiled programs above.</text>
-
-    <!-- program brackets -->
-    <path d="M40,252 v-6 h195 v6" fill="none" stroke="#7c3aed" stroke-width="1.5"/>
-    <path d="M235,252 v-6 h213 v6" fill="none" stroke="#ea580c" stroke-width="1.5"/>
-    <path d="M448,252 v-6 h392 v6" fill="none" stroke="#2563eb" stroke-width="1.5"/>
-
-    <!-- vit_ln_qkv -->
-    <rect x="40"    y="256" width="29.5" height="40" fill="#a78bfa"/>
-    <rect x="69.5"  y="256" width="44"   height="40" fill="#3b82f6"/>
-    <rect x="113.5" y="256" width="44"   height="40" fill="#3b82f6"/>
-    <rect x="157.5" y="256" width="44"   height="40" fill="#3b82f6"/>
-    <rect x="201.5" y="256" width="33.6" height="40" fill="#9ca3af"/>
-    <!-- attention -->
-    <rect x="235.1" y="256" width="213"  height="40" fill="#fb923c"/>
-    <!-- vit_o_ffn -->
-    <rect x="448.1" y="256" width="44"   height="40" fill="#3b82f6"/>
-    <rect x="492.1" y="256" width="11.2" height="40" fill="#9ca3af"/>
-    <rect x="503.3" y="256" width="13.3" height="40" fill="#6b7280"/>
-    <rect x="516.6" y="256" width="29.5" height="40" fill="#a78bfa"/>
-    <rect x="546.1" y="256" width="111"  height="40" fill="#3b82f6"/>
-    <rect x="657.1" y="256" width="27.6" height="40" fill="#9ca3af"/>
-    <rect x="684.7" y="256" width="43.8" height="40" fill="#34d399"/>
-    <rect x="728.5" y="256" width="87"   height="40" fill="#3b82f6"/>
-    <rect x="815.5" y="256" width="11.2" height="40" fill="#9ca3af"/>
-    <rect x="826.7" y="256" width="13.3" height="40" fill="#6b7280"/>
-
-    <!-- in-box labels for the big ones -->
-    <text x="341"   y="280" text-anchor="middle" class="lbw">attention  2798 µs</text>
-    <text x="601"   y="280" text-anchor="middle" class="lbw">fc1  1461</text>
-    <text x="772"   y="280" text-anchor="middle" class="lbw">fc2  1143</text>
-    <text x="91.5"  y="280" text-anchor="middle" class="lbw">Q</text>
-    <text x="135.5" y="280" text-anchor="middle" class="lbw">K</text>
-    <text x="179.5" y="280" text-anchor="middle" class="lbw">V</text>
-    <text x="470"   y="280" text-anchor="middle" class="lbw">O</text>
-
-    <!-- leader labels below -->
-    <text x="54"  y="312" text-anchor="middle" class="lb">LN1</text>
-    <text x="54"  y="323" text-anchor="middle" class="tick">388</text>
-    <text x="218" y="312" text-anchor="middle" class="lb">+bias ×3</text>
-    <text x="218" y="323" text-anchor="middle" class="tick">442</text>
-    <text x="531" y="312" text-anchor="middle" class="lb">LN2</text>
-    <text x="531" y="323" text-anchor="middle" class="tick">388</text>
-    <text x="671" y="312" text-anchor="middle" class="lb">+bias</text>
-    <text x="671" y="323" text-anchor="middle" class="tick">363</text>
-    <text x="706" y="312" text-anchor="middle" class="lb">GELU</text>
-    <text x="706" y="323" text-anchor="middle" class="tick">576</text>
-    <text x="440" y="340" text-anchor="middle" class="lb">the four projections Q / K / V / O — 578 µs each</text>
-    <text x="510" y="352" text-anchor="middle" class="tick">residual adds 175 µs each · O-bias / fc2-bias 147 µs each</text>
-
-    <!-- legend -->
-    <rect x="40" y="376" width="12" height="12" fill="#3b82f6"/><text x="58" y="386" class="lb">matmul — 43.9% of NPU time</text>
-    <rect x="250" y="376" width="12" height="12" fill="#fb923c"/><text x="268" y="386" class="lb">attention — 25.0%</text>
-    <rect x="420" y="376" width="12" height="12" fill="#9ca3af"/><text x="438" y="386" class="lb">bias adds — 9.8%</text>
-    <rect x="590" y="376" width="12" height="12" fill="#a78bfa"/><text x="608" y="386" class="lb">LayerNorm — 6.9%</text>
-    <rect x="760" y="376" width="12" height="12" fill="#34d399"/><text x="778" y="386" class="lb">GELU — 5.1%</text>
-    <rect x="40" y="396" width="12" height="12" fill="#6b7280"/><text x="58" y="406" class="lb">residual adds — 3.1%</text>
-    <text x="250" y="406" class="sub">remaining ~6% = the chip switching between the three programs each layer</text>
-
-    <!-- takeaway -->
-    <rect x="40" y="424" width="800" height="34" rx="6" fill="#eff6ff" stroke="#93c5fd"/>
-    <text x="52" y="438" class="lb"><tspan font-weight="700">Read it this way:</tspan> the MLP half of each layer (fc1 + fc2 + GELU + norms + adds) is the single biggest block —</text>
-    <text x="52" y="451" class="lb">and the grey/■ bias and residual adds, 13% of all NPU time, are pure launch + memory traffic that a matmul epilogue could absorb.</text>
-  </svg>
-  <figcaption>Measured on real NPU2 at maximum power mode. Row widths are proportional to measured time within each row.</figcaption>
-  </div>
-  <p class="legend">
-    Same numbers as Section 8's table, viewed as time rather than as a list: 86.6% of the encoder's wall clock is
-    now the NPU executing. The host glue that once dominated is down to about 10 ms per inference. <b>The encoder is
-    NPU-bound</b>, which is why further gains have to come from the device side or from the two stages that are
-    still on the host.
+  <h3>Level 2 — what Level 1 leaves out: issuing the work</h3>
+  <p>
+    Level 1 counted only what happens on the chip. Around it sits the cost of <em>getting</em> work onto the chip,
+    and that cost is the reason we merge kernels at all. Per inference (3 images), against the 465 ms measured:
   </p>
+  <table>
+    <tr><th>Component</th><th>ms</th><th>share</th></tr>
+    <tr style="background:#eff6ff"><td><b>the NPU executing</b> — everything in Level 1</td><td><b>408.1</b></td><td><b>86.6%</b></td></tr>
+    <tr><td>moving input data to the chip</td><td>23.9</td><td>5.1%</td></tr>
+    <tr><td>host patch reshaping (never moved onto the NPU — see Section 8)</td><td>15.8</td><td>3.4%</td></tr>
+    <tr><td>issuing the work — 114 dispatches × 70 µs</td><td>8.0</td><td>1.7%</td></tr>
+    <tr><td><em>unattributed Python (residual)</em></td><td><em>8.3</em></td><td><em>1.8%</em></td></tr>
+    <tr><td>reading results back</td><td>4.8</td><td>1.0%</td></tr>
+    <tr><td>other host numpy</td><td>2.2</td><td>0.5%</td></tr>
+    <tr><td><b>total accounted</b></td><td><b>470.9</b></td><td>(+1.3% vs measured)</td></tr>
+  </table>
+  <div class="callout">
+    <b>Why merging kernels mattered.</b> A layer is 18 kernel launches. Issued one at a time that would be
+    218 dispatches per image; packed into three programs it is <b>38</b>. At the measured 70 µs per dispatch, the
+    merge saves roughly <b>38 ms per inference</b> of pure issuing cost — which is why the host share is now 13%
+    instead of dominating. The flip side, measured: folding launches together costs almost nothing in device time
+    for vision (1.01–1.03× versus running them separately), unlike the language backbone where the same trick
+    measured 1.4–1.8× <em>worse</em>. Merging is close to free here, and it is the main reason this stage is
+    NPU-bound rather than host-bound.
+  </div>
+  <p>Within those 408 ms of device time, per image:</p>
+  <table>
+    <tr><th>Compiled program</th><th>launches</th><th>ms / image</th><th>share</th></tr>
+    <tr><td><code>vit_o_ffn</code> — O proj + residual + norm + MLP</td><td>10</td><td><b>66.1</b></td><td><b>48.6%</b></td></tr>
+    <tr><td><code>vit_ln_qkv</code> — norm + Q/K/V</td><td>7</td><td>34.8</td><td>25.6%</td></tr>
+    <tr><td><code>flash_attn</code></td><td>1</td><td>33.6</td><td>24.7%</td></tr>
+    <tr><td><code>gemm_connector</code></td><td>1</td><td>0.95</td><td>0.7%</td></tr>
+    <tr><td><code>layer_norm</code> (final)</td><td>1</td><td>0.63</td><td>0.5%</td></tr>
+  </table>
+  <div class="callout warn">
+    <b>One cost that is invisible from either side: how we compile.</b> The <em>same</em> matmul with the
+    <em>same</em> tiles runs <b>1.26–1.42× slower</b> inside a multi-program ELF — the format a deployment must use
+    — than as a standalone binary (<span class="shape">1024×768×768</span>: 620 µs vs 435 µs). It is a property of
+    the compilation path, not of the kernel. It also means our kernel catalogue's throughput numbers, all measured
+    standalone, <b>systematically flatter what a deployed pipeline sees</b>.
+  </div>
+
   <h3>Level 3 — the underlying reason: shape</h3>
   <p>
     One property explains the vision win, the backbone loss and the expert verdict alike. An NPU is a grid of
@@ -1219,62 +1153,7 @@ once per image:       (HOST) pixel-shuffle → [NPU elf:gemm_connector] 64×1228
     harder</b>: every kernel it runs loses head-to-head at seq=50, so no amount of assembly work flips it.
   </p>
 
-  <h3>Level 4 — what we got wrong</h3>
-  <p>
-    Four things we believed, and what measuring them actually showed. They are listed because each one redirected
-    the work.
-  </p>
-  <table>
-    <tr><th>We believed</th><th>Measurement said</th></tr>
-    <tr>
-      <td>Fusing operations into one program costs device time — the <em>backbone's</em> fused programs measured
-          1.4–1.8× slower than the sum of their parts, so vision should suffer the same.</td>
-      <td><span class="pill" style="background:#fee2e2;color:#991b1b;border:1px solid #fca5a5">refuted</span>
-          Vision's fused programs cost <b>1.015× and 1.025×</b> — fusion here is essentially free. The backbone's
-          penalty does not generalise.</td>
-    </tr>
-    <tr>
-      <td>The tile sizes inside those fused programs are compromises forced by sharing one device configuration.</td>
-      <td><span class="pill" style="background:#fef9c3;color:#854d0e;border:1px solid #ca8a04">mostly refuted</span>
-          Q/K/V/O are flat within <b>0.5%</b> across four tile sizes; re-tuning the two MLP matmuls is worth 3.8 ms.</td>
-    </tr>
-    <tr>
-      <td>Turning on the NPU's Turbo mode should speed the encoder up.</td>
-      <td><span class="pill" style="background:#fef9c3;color:#854d0e;border:1px solid #ca8a04">only partly</span>
-          Turbo gives <b>+7.5%</b> on a single matmul (3763 → 4045 GFLOP/s) but <b>~0%</b> on the encoder — proof
-          that it is not limited by compute clock, but by memory-bound operations, launches and host work.</td>
-    </tr>
-    <tr>
-      <td>The patch embedding does its reshape on the host and its matmul on the NPU.</td>
-      <td><span class="pill" style="background:#fee2e2;color:#991b1b;border:1px solid #fca5a5">wrong</span>
-          <b>Both halves run on the host</b>, and it is the one stage far worse than the CPU's. See below.</td>
-    </tr>
-  </table>
-
-  <div class="callout warn">
-    <b>The patch embedding: 5.3 ms where the CPU needs 1.36 ms.</b> It escaped attention for months because it sits
-    <em>outside</em> the 12-layer loop everyone was profiling. Timed on its own the same function takes 6.0 ms — the
-    5.3 ms above is what the in-deployment profiler attributes to it, and the gap is measurement context, not a
-    disagreement. That 6.0 ms decomposes into three independent, entirely host-side causes — none of them a
-    hardware limit:
-    <table style="margin:0.6rem 0">
-      <tr><th>Component</th><th>cost</th><th>why it is avoidable</th></tr>
-      <tr><td>im2col patch extraction</td><td>0.95 ms</td><td>a Python loop running 1024 times, for what is a single numpy reshape</td></tr>
-      <tr><td>the matmul <span class="shape">1024×768×768</span></td><td>1.91 ms</td><td>the NPU does this exact shape in <b>0.58 ms</b> — it is simply never sent there</td></tr>
-      <tr><td>dtype conversions + position add</td><td>3.14 ms</td><td>weights converted from bf16 to fp32 on <em>every call</em> rather than once at startup</td></tr>
-    </table>
-    Fixing all three should bring the stage to roughly 1.2 ms: <b>~4 ms per image, ~12 ms per inference</b>.
-  </div>
-
-  <div class="callout warn">
-    <b>And one finding that reaches beyond this model.</b> The <em>same</em> matmul with the <em>same</em> tiles is
-    <b>1.26–1.42× slower</b> compiled into the multi-program format a deployment must use than as a standalone
-    binary (<span class="shape">1024×768×768</span>: 620 µs vs 435 µs). That is a property of the compilation path,
-    not of the kernel. It also means our kernel catalogue's throughput figures — all measured in the standalone
-    format — <b>systematically flatter what a deployed pipeline will see</b>.
-  </div>
-
-  <h3>Level 5 — what is left on the table</h3>
+  <h3>Level 4 — the to-do list</h3>
   <table>
     <tr><th>#</th><th>Opportunity</th><th>Worth</th><th>Effort</th></tr>
     <tr><td>1</td><td>Extend the thread-capping over the host patch reshaping — the first image costs 37.9 ms more than the second and third because the numerical library's idle workers preempt the dispatch thread</td><td><b>−32.6 ms</b> <span style="font-size:0.85em;color:#166534">measured</span></td><td>one line</td></tr>
@@ -1287,9 +1166,10 @@ once per image:       (HOST) pixel-shuffle → [NPU elf:gemm_connector] 64×1228
     <tr><td>—</td><td><em>Attention</em> is 25% of NPU time but already runs at its standalone speed — no pipeline-level headroom, only a kernel rewrite</td><td>—</td><td>large</td></tr>
   </table>
   <p class="legend">
-    Items 1, 2 and 7 are ~48 ms between them, all host-side and all small changes. The estimates are upper bounds
-    derived from measured per-operation costs assuming full absorption. Notice what is <em>not</em> on this list:
-    fusing the backbone's attention, and porting the action expert — both were measured and ruled out (Level 3).
+    Items 1, 2 and 7 are ~48 ms between them, all host-side and all small changes; together with item 4 that is
+    roughly 100 ms of the 851 ms chunk. Estimates are upper bounds, derived from measured per-operation costs
+    assuming full absorption. Two things are deliberately <em>absent</em>: fusing the backbone's attention and
+    porting the action expert — both measured and ruled out in Level 3, so they are not open questions.
   </p>
 
   <h2 id="status">10. Current status and next steps</h2>
