@@ -544,14 +544,6 @@
     <em>ten</em> times in the denoise loop. This is what tells us <b>where acceleration would matter most</b>.
   </div>
 
-  <p class="legend">
-    <b>A note on an earlier version of this table.</b> We first profiled at default power settings and using
-    leaf-operator attribution (summing time <em>inside</em> torch ops), which gave vision 719 ms / 73.6% and the
-    expert 197 ms / 20.1%, and left 67 ms unattributed. The numbers above are wall-clock per stage at maximum
-    performance and close to the total. The expert moved most: leaf-operator time genuinely is ~217 ms, but it
-    issues ~165 torch ops per denoise step, and the Python dispatch between them is another ~100 ms of real
-    wall-clock. Everything in Part B uses the wall-clock figures.
-  </p>
 
   <!-- ####################  PART B  #################### -->
   <div class="part-banner b">Part B — Running it on the NPU
@@ -920,7 +912,9 @@ once per image:       (HOST) pixel-shuffle → [NPU elf:gemm_connector] 64×1228
   <p class="legend">
     <b>Note the "how often" column — it is where the end-to-end arithmetic comes from.</b> The vision encoder is
     1.19× faster <em>per image</em>, but the model runs it <b>three times, once per camera</b>, so the saving is
-    3 × 29 ms ≈ 81 ms of the 913 ms chunk. That, minus a few milliseconds given back elsewhere, is the whole 1.07×.
+    3 × 29 ms ≈ 87 ms of the 913 ms chunk. The chunk actually improves by 62 ms, not 87: the backbone costs 6 ms
+    more once the NPU has run (a thread-pool re-entry effect, Section 9), and roughly 19 ms of new host-side cost
+    appears handing tensors between torch and the NPU runtime. 87 − 6 − 19 ≈ 62 ms is the whole 1.07×.
     Conversely the expert's ×10 is why it is 31% of the chunk despite being the smallest network in the model.
   </p>
   <p class="legend">
@@ -948,8 +942,8 @@ once per image:       (HOST) pixel-shuffle → [NPU elf:gemm_connector] 64×1228
     <tr><td><b>12 × encoder layer</b></td><td><b>173.7 ms</b></td><td><b>134.5 ms</b> <span style="font-size:0.85em;color:#6b7280">on the NPU</span></td><td><span class="pill done">1.29× faster</span></td></tr>
     <tr><td>final LayerNorm</td><td>0.04 ms</td><td>0.63 ms</td><td>slower, but runs once</td></tr>
     <tr><td><b>connector</b> <span style="font-size:0.85em;color:#6b7280">shuffle + projection</span></td><td>1.43 ms</td><td><b>1.06 ms</b> <span style="font-size:0.85em;color:#6b7280">0.11 host + 0.95 NPU</span></td><td><span class="pill done">1.35× faster</span></td></tr>
-    <tr style="border-top:2px solid #9ca3af"><td><b>compute subtotal</b></td><td><b>175.1 ms</b></td><td><b>141.5 ms</b></td><td>1.24×</td></tr>
-    <tr><td>framework / dispatch overhead</td><td>8.6 ms <span style="font-size:0.85em;color:#6b7280">torch module dispatch</span></td><td>15.7 ms <span style="font-size:0.85em;color:#6b7280">data in/out 9.6 · launches 2.7 · Python 3.5</span></td><td></td></tr>
+    <tr style="border-top:2px solid #9ca3af"><td><b>compute subtotal</b></td><td><b>176.5 ms</b></td><td><b>141.5 ms</b></td><td>1.25×</td></tr>
+    <tr><td>framework / dispatch overhead</td><td>7.2 ms <span style="font-size:0.85em;color:#6b7280">torch module dispatch</span></td><td>15.7 ms <span style="font-size:0.85em;color:#6b7280">data in/out 9.6 · launches 2.7 · Python 3.5</span></td><td></td></tr>
     <tr style="background:#f0f9ff"><td><b>measured, per image</b></td><td><b>183.7 ms</b></td><td><b>155 ms</b></td><td><b>1.19×</b></td></tr>
   </table>
   <p class="legend">
@@ -1072,7 +1066,7 @@ once per image:       (HOST) pixel-shuffle → [NPU elf:gemm_connector] 64×1228
     </style>
 
     <!-- ================= ROW 1 : whole inference ================= -->
-    <text x="40" y="22" class="ttl">One inference — 470.9 ms accounted (3 camera images)</text>
+    <text x="40" y="22" class="ttl">One inference — 465 ms measured, 470.9 ms accounted below (3 images)</text>
     <rect x="40"    y="30" width="693.5" height="30" fill="#2563eb"/>
     <rect x="733.5" y="30" width="40.6"  height="30" fill="#93c5fd"/>
     <rect x="774.1" y="30" width="26.8"  height="30" fill="#fbbf24"/>
