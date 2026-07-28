@@ -1235,60 +1235,133 @@ once per image:       (HOST) pixel-shuffle → [NPU elf:gemm_connector] 64×1228
     of it</b>.
   </div>
 
-  <h3>10.1 — What the expert actually computes</h3>
+  <h3>10.1 — What the expert actually computes, from input to output</h3>
   <p>
-    The expert is a 16-layer transformer at hidden <b>720</b>, run <b>ten times</b> over 50 action tokens. Two
-    things make it unlike the backbone. First, <b>q_dim (960) is not the same as hidden (720)</b> — 15 query heads × 64 makes the
-    attention block non-square, so <code>q_proj</code> is 720→960 and <code>o_proj</code> is 960→720. Second, the
-    layers <b>alternate</b>: even layers self-attend, odd layers cross-attend, and the two kinds read different
-    keys and values.
+    The expert is the part of the model that decides what the robot will <em>do</em>. It is worth understanding in
+    its own right before looking at timings, because its structure — not its size — is what makes it expensive.
+    <b>It is the smallest network in SmolVLA and it takes the second-most time</b>, and the reason is that it does
+    not run once.
+  </p>
+
+  <h4 style="margin:22px 0 8px;font-size:1.05em">Step 1 of 3 — the outer loop: it refines an answer ten times</h4>
+  <p>
+    The expert is a <b>flow-matching denoiser</b>. It starts from pure noise and nudges it toward a real answer ten
+    times over. The thing being predicted is an <b>action chunk</b>: the next <b>50 timesteps</b> of robot
+    movement, each <b>32</b> numbers wide (this robot only uses the first 6), all predicted at once rather than one
+    after another.
   </p>
   <div class="fig">
-    <svg viewBox="0 0 1180 268" width="100%" style="max-width:1180px">
-      <defs><marker id="ar10" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
-        <path d="M0,0 L0,6 L7,3 z" fill="#64748b"/></marker></defs>
-      <rect x="8" y="8" width="1164" height="130" rx="8" fill="#f0fdf4" stroke="#86efac"/>
-      <text x="20" y="30" font-size="13" font-weight="700" fill="#15803d">EVEN layer — self-attention · 8 of 16 · K/V = 241 cached prefix ++ 50 new = 291</text>
-      <text x="20" y="56" font-size="12" fill="#334155">x (50,720)</text>
-      <text x="110" y="56" font-size="12" fill="#334155">RMSNorm →(50,720)</text>
-      <text x="255" y="56" font-size="12" fill="#334155">q_proj 720×960 →(50,960)</text>
-      <text x="450" y="56" font-size="12" fill="#334155">k,v_proj 720×320 →(50,320)</text>
-      <text x="655" y="56" font-size="12" fill="#334155">RoPE q,k</text>
-      <text x="760" y="56" font-size="12" fill="#334155">cat with cache →(291,5,64)</text>
-      <text x="20" y="82" font-size="12" fill="#334155">GQA expand 5→15 heads</text>
-      <text x="215" y="82" font-size="12" fill="#334155">QK<tspan baseline-shift="super" font-size="9">T</tspan> (15,50,64)@(15,64,291) →(15,50,291)</text>
-      <text x="560" y="82" font-size="12" fill="#334155">×⅛ · mask · softmax</text>
-      <text x="720" y="82" font-size="12" fill="#334155">PV (15,50,291)@(15,291,64) →(15,50,64)</text>
-      <text x="20" y="108" font-size="12" fill="#334155">reshape →(50,960)</text>
-      <text x="170" y="108" font-size="12" fill="#334155">o_proj 960×720 →(50,720)</text>
-      <text x="360" y="108" font-size="12" fill="#334155">+residual</text>
-      <text x="450" y="108" font-size="12" fill="#334155">RMSNorm</text>
-      <text x="540" y="108" font-size="12" fill="#334155">gate,up 720×2048 →(50,2048)</text>
-      <text x="760" y="108" font-size="12" fill="#334155">SiLU×up</text>
-      <text x="850" y="108" font-size="12" fill="#334155">down 2048×720 →(50,720)</text>
-      <text x="1040" y="108" font-size="12" fill="#334155">+residual</text>
-      <rect x="8" y="150" width="1164" height="108" rx="8" fill="#eff6ff" stroke="#93c5fd"/>
-      <text x="20" y="172" font-size="13" font-weight="700" fill="#1d4ed8">ODD layer — cross-attention · 8 of 16 · K/V = the 241-token prefix, re-projected</text>
-      <text x="20" y="198" font-size="12" fill="#334155">x (50,720)</text>
-      <text x="110" y="198" font-size="12" fill="#334155">RMSNorm</text>
-      <text x="200" y="198" font-size="12" fill="#334155">q_proj 720×960 →(50,960)</text>
-      <text x="395" y="198" font-size="12" fill="#334155">RoPE q (positions re-based to 0)</text>
-      <text x="640" y="198" font-size="12" font-weight="700" fill="#b45309">k,v_proj run over the PREFIX: (241,320)@(320,320) →(241,320) · fp32 weights</text>
-      <text x="20" y="224" font-size="12" fill="#334155">QK<tspan baseline-shift="super" font-size="9">T</tspan> (15,50,64)@(15,64,241)</text>
-      <text x="235" y="224" font-size="12" fill="#334155">mask · softmax</text>
-      <text x="355" y="224" font-size="12" fill="#334155">PV →(15,50,64)</text>
-      <text x="500" y="224" font-size="12" fill="#334155">o_proj · +residual · RMSNorm · gate/up · SiLU · down · +residual  (identical to the even layer)</text>
-      <text x="20" y="248" font-size="11.5" fill="#6b7280">no RoPE on K/V here — the prefix was already RoPE'd by the backbone, and the cross projection does not re-apply it</text>
+    <svg viewBox="0 0 1120 172" width="100%" style="max-width:1120px">
+      <defs><marker id="aE" markerWidth="10" markerHeight="10" refX="8" refY="3.2" orient="auto">
+        <path d="M0,0 L0,6.4 L8,3.2 z" fill="#64748b"/></marker></defs>
+      <rect x="10" y="46" width="150" height="52" rx="8" fill="#f1f5f9" stroke="#94a3b8"/>
+      <text x="85" y="68" text-anchor="middle" font-size="13" font-weight="700" fill="#334155">noise</text>
+      <text x="85" y="86" text-anchor="middle" font-size="11.5" fill="#64748b">x(50, 32)</text>
+      <line x1="162" y1="72" x2="222" y2="72" stroke="#64748b" stroke-width="1.6" marker-end="url(#aE)"/>
+      <rect x="226" y="26" width="450" height="92" rx="10" fill="#eef2ff" stroke="#818cf8" stroke-width="1.8"/>
+      <text x="451" y="48" text-anchor="middle" font-size="13" font-weight="700" fill="#4338ca">one denoise step — the whole 16-layer network</text>
+      <text x="451" y="70" text-anchor="middle" font-size="12" fill="#3730a3">v = expert( x , t , backbone K/V cache )</text>
+      <text x="451" y="90" text-anchor="middle" font-size="12" fill="#3730a3">x ← x + (−0.1) × v</text>
+      <text x="451" y="108" text-anchor="middle" font-size="11" fill="#6366f1">v is not the answer — it is the direction toward it</text>
+      <path d="M451,124 L451,146 L246,146 L246,86" fill="none" stroke="#818cf8" stroke-width="1.8" marker-end="url(#aE)"/>
+      <text x="360" y="163" text-anchor="middle" font-size="12" font-weight="700" fill="#4338ca">repeat 10×, t = 1.0, 0.9, … 0.1</text>
+      <line x1="680" y1="72" x2="740" y2="72" stroke="#64748b" stroke-width="1.6" marker-end="url(#aE)"/>
+      <rect x="744" y="46" width="190" height="52" rx="8" fill="#f0fdf4" stroke="#86efac"/>
+      <text x="839" y="68" text-anchor="middle" font-size="13" font-weight="700" fill="#15803d">action chunk</text>
+      <text x="839" y="86" text-anchor="middle" font-size="11.5" fill="#166534">(50, 32) → first 6 used</text>
+      <text x="950" y="60" font-size="11.5" fill="#475569">50 future timesteps of</text>
+      <text x="950" y="76" font-size="11.5" fill="#475569">robot movement, all</text>
+      <text x="950" y="92" font-size="11.5" fill="#475569">predicted at once</text>
     </svg>
   </div>
+  <div class="callout">
+    <b>This loop is the single most important fact about the expert's cost.</b> It is narrower than the language
+    backbone (hidden 720 vs 960) and sees a fifth as many tokens (50 vs 241) — but the backbone runs <b>once</b>
+    and the expert runs <b>ten times</b>. That is why the smallest network in the model is 31% of the runtime.
+  </div>
+
+  <h4 style="margin:22px 0 8px;font-size:1.05em">Step 2 of 3 — inside one denoise step</h4>
+  <p>
+    Three inputs: the current guess <code>x</code>, the scalar timestep <code>t</code>, and the
+    <b>backbone's K/V cache</b> — 16 layers × 241 tokens, computed once before the loop and frozen. That cache is
+    the entire connection between what the robot <em>sees and hears</em> and what it <em>does</em>.
+  </p>
+  <table>
+    <tr><th style="width:34px">#</th><th>What happens</th><th>Shapes</th></tr>
+    <tr><td colspan="3" style="background:#fefce8"><b>embed_suffix</b> — turn the 32-wide guess and the timestep into a 720-wide sequence</td></tr>
+    <tr><td>1</td><td><code>action_in_proj</code> — lift the current guess into the model's width</td><td><span class="shape">(50,32)</span> @ <span class="shape">(32,720)</span> → <span class="shape">(50,720)</span></td></tr>
+    <tr><td>2</td><td>sin/cos embedding of the timestep, broadcast over all 50 tokens</td><td>scalar → <span class="shape">(720)</span> → <span class="shape">(50,720)</span></td></tr>
+    <tr><td>3</td><td>concatenate the two</td><td>→ <span class="shape">(50,1440)</span></td></tr>
+    <tr><td>4</td><td><code>action_time_mlp_in</code> → SiLU → <code>action_time_mlp_out</code></td><td><span class="shape">(50,1440)</span>@<span class="shape">(1440,720)</span>, then <span class="shape">(720,720)</span> → <span class="shape">(50,720)</span></td></tr>
+    <tr><td colspan="3" style="background:#eef2ff"><b>the 16 transformer layers</b> — alternating, Step 3 below</td></tr>
+    <tr><td>5</td><td>layers 0…15, each one reading the backbone cache</td><td><span class="shape">(50,720)</span> → <span class="shape">(50,720)</span></td></tr>
+    <tr><td colspan="3" style="background:#f0fdf4"><b>back out to action space</b></td></tr>
+    <tr><td>6</td><td>final <code>RMSNorm</code></td><td><span class="shape">(50,720)</span> → <span class="shape">(50,720)</span></td></tr>
+    <tr><td>7</td><td><code>action_out_proj</code> — back down to action width</td><td><span class="shape">(50,720)</span> @ <span class="shape">(720,32)</span> → <span class="shape">(50,32)</span></td></tr>
+    <tr><td>8</td><td>take the step: <code>x ← x + (−0.1)·v</code></td><td><span class="shape">(50,32)</span></td></tr>
+  </table>
   <p class="legend">
-    <b>Around the 16 layers, once per denoise step:</b> <code>embed_suffix</code> — action_in
-    <span class="shape">(50,32)@(32,720)</span>, a sin/cos time embedding <span class="shape">(720)</span> broadcast
-    and concatenated to <span class="shape">(50,1440)</span>, time_mlp_in
-    <span class="shape">(1440,720)</span>, SiLU, time_mlp_out <span class="shape">(720,720)</span> — then after the
-    layers a final RMSNorm and <code>action_out_proj</code> <span class="shape">(50,720)@(720,32)</span> →
-    <span class="shape">(50,32)</span>, and finally x<sub>t</sub> += dt·v<sub>t</sub>. These heads carry biases and
-    run in fp32; they are 2.4% of the step and stay on the CPU in the port.
+    Steps 1–4 and 6–8 are the "head and tail". They are <b>2.4%</b> of the step, carry biases, and run in fp32;
+    the port leaves them on the CPU. Everything expensive is step 5.
+  </p>
+
+  <h4 style="margin:22px 0 8px;font-size:1.05em">Step 3 of 3 — inside one layer, and why there are two kinds</h4>
+  <p>
+    All 16 layers share one skeleton — <b>attention block, add the input back, MLP block, add again</b>. They
+    differ in <em>one</em> place: where the keys and values come from. Even layers self-attend, odd layers
+    cross-attend, and they alternate all the way up.
+  </p>
+  <table>
+    <tr><th style="width:15%">Stage</th><th style="width:42.5%">EVEN layers — self-attention (0, 2, … 14)</th><th style="width:42.5%">ODD layers — cross-attention (1, 3, … 15)</th></tr>
+    <tr><td colspan="3" style="background:#f9fafb"><b>In:</b> <span class="shape">x (50,720)</span> &nbsp;·&nbsp; also available: this layer's slice of the frozen backbone cache, <span class="shape">(241,5,64)</span> for K and for V</td></tr>
+    <tr><td><b>normalise</b></td><td colspan="2" style="text-align:center"><code>RMSNorm(x)</code> → <span class="shape">h (50,720)</span></td></tr>
+    <tr><td><b>queries</b></td><td colspan="2" style="text-align:center"><code>q = h @ Wq</code> <span class="shape">(720,960)</span> → <span class="shape">(50,15,64)</span> — 15 heads of 64</td></tr>
+    <tr style="background:#fff7ed">
+      <td><b>keys &amp; values</b><br><span style="font-size:0.85em;color:#9a3412">the only real difference</span></td>
+      <td>computed from the <b>action tokens</b>:<br>
+        <code>k = h @ Wk</code> <span class="shape">(720,320)</span> → <span class="shape">(50,5,64)</span><br>
+        <code>v = h @ Wv</code> → <span class="shape">(50,5,64)</span><br>
+        then <b>concatenated onto the cache</b>:<br>
+        <span class="shape">241 cached ++ 50 new = (291,5,64)</span></td>
+      <td>computed from the <b>backbone cache itself</b>:<br>
+        <code>k = cache @ Wk_cross</code> <span class="shape">(241,320)@(320,320)</span> → <span class="shape">(241,5,64)</span><br>
+        <code>v = cache @ Wv_cross</code> → <span class="shape">(241,5,64)</span><br>
+        <span style="color:#9a3412">these two run over <b>241 prefix tokens</b>, not the 50 actions — and they are the only <b>fp32</b> weights in the expert</span></td>
+    </tr>
+    <tr>
+      <td><b>positions</b></td>
+      <td>RoPE on <b>q and k</b>, absolute positions <b>241…290</b> (the actions sit after the prefix)</td>
+      <td>RoPE on <b>q only</b>, positions re-based to <b>0…49</b>. The cache was already RoPE'd by the backbone, so K/V are left alone</td>
+    </tr>
+    <tr><td><b>attention</b></td>
+      <td>5 KV heads expanded to 15 · <code>q@kᵀ×⅛</code> → <span class="shape">(15,50,291)</span> · mask · softmax · <code>@v</code> → <span class="shape">(50,960)</span></td>
+      <td>same, but <span class="shape">(15,50,241)</span> — the actions see the prefix and nothing else</td>
+    </tr>
+    <tr><td><b>the mask</b></td>
+      <td>241 prefix columns (only <b>197 real</b> — the language block is padded) + the 50 action columns
+        <b>causal</b> among themselves</td>
+      <td>the same 197-of-241 prefix mask</td>
+    </tr>
+    <tr><td colspan="3" style="background:#f9fafb"><b>identical from here on:</b>
+      <code>o_proj</code> <span class="shape">(960,720)</span> → <b>x = x + o</b> →
+      <code>RMSNorm</code> → <code>gate</code>,<code>up</code> <span class="shape">(720,2048)</span> →
+      <code>SiLU(gate)×up</code> → <code>down</code> <span class="shape">(2048,720)</span> → <b>x = x + down</b>
+      → <span class="shape">out (50,720)</span></td></tr>
+  </table>
+  <p class="legend">
+    <b>Read the two attention columns as one sentence each.</b> An even layer asks "given everything the robot saw
+    and heard, <em>and</em> the actions decided so far, what next?" An odd layer asks only "given everything the
+    robot saw and heard, what next?" — it re-reads the scene from scratch, ignoring the other actions.
+  </p>
+  <p class="legend">
+    <b>Three things here become the port's headaches later.</b>
+    <b>(a)</b> <code>q_proj</code> is 720→960 and <code>o_proj</code> is 960→720 — the attention block is
+    <em>not square</em>, which is why the expert needed its own fused programs rather than reusing the backbone's.
+    <b>(b)</b> The odd layers' two K/V projections depend only on the frozen cache, so their result is identical on
+    all ten denoise steps — lerobot recomputes them anyway, and the port hoists them out of the loop (160 matmuls
+    → 16).
+    <b>(c)</b> Both layer kinds carry a real mask, because only 197 of the 241 prefix tokens are real. That single
+    fact is what makes FlashAttention unusable and costs 378 ms in Section 10.6.
   </p>
 
   <h3>10.2 — CPU: where the 278 ms goes</h3>
