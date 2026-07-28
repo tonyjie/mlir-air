@@ -963,8 +963,8 @@ once per image:       (HOST) pixel-shuffle → [NPU elf:gemm_connector] 64×1228
 
   <h3>Level 1 — inside one encoder layer: which operations actually win</h3>
   <p>
-    The aggregate 1.19× hides a much sharper picture. Both sides were profiled at the same granularity on the same
-    machine: the NPU is <em>much</em> faster at a few operations, slower at several, and the net is what survives.
+    Both sides profiled at the same granularity, on the same machine. The bars group each <code>Linear</code> with
+    the separate bias kernel the NPU needs for it; the table below unmerges them and adds shapes.
   </p>
   <div class="fig">
   <svg viewBox="0 0 900 424" xmlns="http://www.w3.org/2000/svg" font-family="system-ui, sans-serif">
@@ -1035,11 +1035,6 @@ once per image:       (HOST) pixel-shuffle → [NPU elf:gemm_connector] 64×1228
   </svg>
   <figcaption>Per-operation comparison of one of the 12 SigLIP encoder layers, measured on the same machine with both processors at maximum performance.</figcaption>
   </div>
-  <p>
-    The bars above group each <code>Linear</code> with the separate bias kernel the NPU needs for it, so that the
-    two sides line up. That grouping hides something worth seeing, so here is the same layer with <b>both sides at
-    their own natural granularity</b>, shapes included and nothing merged:
-  </p>
   <table style="font-size:0.86rem">
     <tr>
       <th>Step in the layer</th><th>Shape</th>
@@ -1060,45 +1055,26 @@ once per image:       (HOST) pixel-shuffle → [NPU elf:gemm_connector] 64×1228
     <tr><td>residual add 2</td><td><span class="shape">1024×768</span></td><td><code>torch.add</code></td><td style="text-align:right">74</td><td><code>eltwise add</code></td><td style="text-align:right">175</td><td style="text-align:right;color:#991b1b">2.35×</td></tr>
     <tr style="border-top:2px solid #9ca3af"><td colspan="3"><b>whole layer</b></td><td style="text-align:right"><b>14476</b></td><td></td><td style="text-align:right"><b>10517</b></td><td style="text-align:right"><b>0.73×</b></td></tr>
   </table>
-
   <div class="callout">
-    <b>What the merged view was hiding: five kernels the CPU never has to run.</b> PyTorch's <code>nn.Linear</code>
-    applies its bias inside the same operator; on the NPU each bias is a <em>separate</em> kernel launch over the
-    whole activation. Those five bias kernels cost <b>1100 µs per layer — 10.5% of the NPU's layer time — against a
-    CPU counterpart of exactly zero.</b> Strip them out and the four projections stop being a wash and become a
-    clear NPU win (e.g. Q: 578 µs of matmul against the CPU's 693 µs). This is the single most concrete argument for
-    folding the bias into the matmul's output stage, and it is invisible unless the two sides are listed at their
-    own granularity.
-  </div>
-
-  <p class="legend">
-    <b>What these two columns mean, precisely.</b> The CPU column is wall-clock around each <code>nn.Module</code>
-    call, so it includes PyTorch's own per-operator dispatch; the per-operator sum (173.7 ms/image) is 95% of the
-    measured stage, the rest being framework overhead. The NPU column is device execution time per kernel; the
-    per-kernel sum (126.2 ms/image) is 94% of the deployed layer time, the rest being the cost of switching between
-    the layer's three programs — and the NPU's host-side costs (data movement, launches, Python) are accounted
-    separately in Level 2 rather than smuggled into these rows. Both columns are therefore "the work itself", with
-    each side's overhead kept visible elsewhere — but they are <em>not</em> the same definition, and should not be
-    added together.
-  </p>
-
-  <p class="legend">
-    <b>Reconciling this with Section 8:</b> these parts sum to 10.5 ms, and 12 layers of them is 126.2 ms — but the
-    deployed encoder spends 134.5 ms on those layers. The 8.3 ms difference (6.5%) is the chip switching between
-    the layer's three compiled programs, measured separately; it is not unexplained.
-  </p>
-  <div class="callout">
-    <b>The entire advantage comes from three operations.</b> Of the 4.0 ms the NPU gains per layer, attention alone
-    accounts for 2.9 ms (73%), and fc2 + fc1 for another 1.9 ms. Everything memory-bound runs the other way —
-    LayerNorm hands back 0.64 ms and the residual adds 0.20 ms. Two consequences worth holding onto: the win rests
-    on a small number of large matrix operations, and <b>the remaining headroom is concentrated in the small
-    memory-bound ones</b>, not in making the big ones faster.
+    <b>Three operations carry the whole win — and five kernels quietly give part of it back.</b> Attention alone
+    saves 2.9 ms of the 4.0 ms gained per layer, fc2 and fc1 another 1.9 ms. Against that, everything memory-bound
+    runs the wrong way, and PyTorch's <code>nn.Linear</code> folds its bias in while the NPU launches a separate
+    kernel for each: those five bias kernels cost <b>1100 µs per layer (10.5%) against a CPU counterpart of zero</b>.
+    Strip them and the projections stop being a wash — Q becomes 578 µs of matmul against the CPU's 693. That is
+    the case for folding bias into the matmul epilogue.
   </div>
   <p class="legend">
-    One row deserves a note. The Q/K/V projections are the <em>same</em> <span class="shape">1024×768×768</span>
-    matmul shape three times, yet they come out 1.08× <em>slower</em> than the CPU, while fc1 and fc2 win clearly.
-    The difference is the other dimension: fc1 writes 3072 values wide and fc2 reduces over 3072, both of which fill
-    the compute array; 768×768 does not. "Matmuls are fast on an NPU" is only true once they are big enough.
+    <b>Reading the two columns.</b> CPU is wall-clock per <code>nn.Module</code> call (per-op sum = 95% of the
+    measured stage, rest is framework dispatch); NPU is device time per kernel (sum = 94% of the deployed layer,
+    rest is switching between its three programs, with host costs kept separate in Level 2). Both are "the work
+    itself" — but they are different definitions and should not be added together. Scaling up: 10.5 ms × 12 layers
+    = 126.2 ms, versus 134.5 ms deployed; the 8.3 ms gap is that program switching.
+  </p>
+  <p class="legend">
+    Note the Q/K/V rows: the <em>same</em> <span class="shape">1024×768×768</span> matmul as fc1 and fc2 in kind,
+    yet they lose while fc1/fc2 win. The difference is width — fc1 writes 3072 values and fc2 reduces over 3072,
+    which fills the compute array; 768×768 does not. "Matmuls are fast on an NPU" holds only once they are big
+    enough.
   </p>
 
   <h3>Level 2 — inside the chip's own time</h3>
