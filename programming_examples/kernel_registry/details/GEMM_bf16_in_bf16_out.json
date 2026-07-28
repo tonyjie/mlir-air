@@ -410,6 +410,114 @@
       }
     },
     {
+      "M": 192,
+      "K": 64,
+      "N": 256,
+      "used_by": "SmolVLA action expert QK^T on ODD (cross-attn) layers: group-batched S = Q_group @ K_h^T against the frozen 241-token prefix, padded to 256",
+      "methods": {
+        "drain": {
+          "tile": {
+            "tile_m": 32,
+            "tile_k_l2": 64,
+            "tile_k_l1": 32,
+            "tile_n": 64
+          },
+          "gflops": 82,
+          "mean_rel_L1": 0.00939,
+          "tier": "high",
+          "herd": [
+            6,
+            4
+          ]
+        }
+      },
+      "best": {
+        "high": "drain"
+      },
+      "_note": "M=192 (GQA group 3 x 64 padded action tokens) admits only three (tile_m, herd_m) pairs under mm.o's tile_m%16==0, run.py's M%(tile_m*herd_m)==0, and the single-M-launch-iteration rule M//tile_m//herd_m==1: 32x6, 48x4, 64x3. Measured: 32x6 and 48x4 are within noise of each other, 64x3 is consistently slowest (only 12 of 32 tiles). Sweep status was NUMFAIL on the near-zero-reference elements (atol artifact, same class as the projection rows); mean_rel_L1 is in-tier and the datapath is correct."
+    },
+    {
+      "M": 192,
+      "K": 64,
+      "N": 320,
+      "used_by": "SmolVLA action expert QK^T on EVEN (self-attn) layers: group-batched S = Q_group @ K_h^T, K/V len 291 (241 prefix + 50 action) padded to 320",
+      "methods": {
+        "drain": {
+          "tile": {
+            "tile_m": 48,
+            "tile_k_l2": 64,
+            "tile_k_l1": 32,
+            "tile_n": 80
+          },
+          "gflops": 95,
+          "mean_rel_L1": 0.00942,
+          "tier": "high",
+          "herd": [
+            4,
+            4
+          ]
+        }
+      },
+      "best": {
+        "high": "drain"
+      },
+      "_note": "M=192 (GQA group 3 x 64 padded action tokens) admits only three (tile_m, herd_m) pairs under mm.o's tile_m%16==0, run.py's M%(tile_m*herd_m)==0, and the single-M-launch-iteration rule M//tile_m//herd_m==1: 32x6, 48x4, 64x3. Measured: 32x6 and 48x4 are within noise of each other, 64x3 is consistently slowest (only 12 of 32 tiles). tile_n=80 (=320/4) is required for herd_n=4 and is worth 1.6x over tile_n=16 (82.9 us vs 129.2 us). Padding N to 384 instead of 320 is slower (86.7 us) -- the extra FLOPs are not amortized at this size. Sweep status was NUMFAIL on the near-zero-reference elements (atol artifact, same class as the projection rows); mean_rel_L1 is in-tier and the datapath is correct."
+    },
+    {
+      "M": 192,
+      "K": 256,
+      "N": 64,
+      "used_by": "SmolVLA action expert P@V on ODD (cross-attn) layers: group-batched O = P_group @ V_h over the 241-token prefix, K padded to 256",
+      "methods": {
+        "drain": {
+          "tile": {
+            "tile_m": 32,
+            "tile_k_l2": 64,
+            "tile_k_l1": 64,
+            "tile_n": 16
+          },
+          "gflops": 89,
+          "mean_rel_L1": 0.00945,
+          "tier": "high",
+          "herd": [
+            6,
+            4
+          ]
+        }
+      },
+      "best": {
+        "high": "drain"
+      },
+      "_note": "M=192 (GQA group 3 x 64 padded action tokens) admits only three (tile_m, herd_m) pairs under mm.o's tile_m%16==0, run.py's M%(tile_m*herd_m)==0, and the single-M-launch-iteration rule M//tile_m//herd_m==1: 32x6, 48x4, 64x3. Measured: 32x6 and 48x4 are within noise of each other, 64x3 is consistently slowest (only 12 of 32 tiles). Unlike the K=320 sibling, every K-tiling tried at K=256 was numerically correct (9.452e-3 across tile_k_l2 in {64,128,256} and tile_k_l1 in {32,64}) -- the corruption tracks non-power-of-two K. Sweep status was NUMFAIL on the near-zero-reference elements (atol artifact, same class as the projection rows); mean_rel_L1 is in-tier and the datapath is correct."
+    },
+    {
+      "M": 192,
+      "K": 320,
+      "N": 64,
+      "used_by": "SmolVLA action expert P@V on EVEN (self-attn) layers: group-batched O = P_group @ V_h, K = 291 padded to 320",
+      "methods": {
+        "drain": {
+          "tile": {
+            "tile_m": 32,
+            "tile_k_l2": 320,
+            "tile_k_l1": 32,
+            "tile_n": 16
+          },
+          "gflops": 109,
+          "mean_rel_L1": 0.00927,
+          "tier": "high",
+          "herd": [
+            6,
+            4
+          ]
+        }
+      },
+      "best": {
+        "high": "drain"
+      },
+      "_note": "M=192 (GQA group 3 x 64 padded action tokens) admits only three (tile_m, herd_m) pairs under mm.o's tile_m%16==0, run.py's M%(tile_m*herd_m)==0, and the single-M-launch-iteration rule M//tile_m//herd_m==1: 32x6, 48x4, 64x3. Measured: 32x6 and 48x4 are within noise of each other, 64x3 is consistently slowest (only 12 of 32 tiles). K=320 IS A SILENT-CORRUPTION TRAP: tile_k_l2=160 (0.91), tile_k_l2=64/tile_k_l1=64 (0.71) and tile_k_l2=320/tile_k_l1=64 (0.80) all compile, run, report plausible latency and return garbage. Only tile_k_l1 in {16, 32} with tile_k_l2=320 (single reduction tile) was measured correct. Sweep status was NUMFAIL on the near-zero-reference elements (atol artifact, same class as the projection rows); mean_rel_L1 is in-tier and the datapath is correct."
+    },
+    {
       "M": 256,
       "K": 64,
       "N": 256,

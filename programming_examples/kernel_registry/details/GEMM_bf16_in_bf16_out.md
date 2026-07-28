@@ -185,6 +185,40 @@ Shapes cover LLM weight-projection shapes (the four 2048-row entries) and a squa
 | 64×720×32 | 16/144/48/32 (herd **4×1**) | 37 | 9.0e-3 | ✅ SmolVLA action_out_proj (N=32 → TILE_N=32, HERD_N=1) |
 | 64×720×1600 | 16/144/48/80 (herd **4×4**) | 713 | 9.4e-3 | ✅ SmolVLA action expert **q‖k‖v concatenated weights** — 206.8 µs vs 348.6 µs for the three separate GEMMs |
 | 64×720×4096 | 16/144/48/128 (herd **4×4**) | 1163 | 9.4e-3 | ✅ SmolVLA action expert **gate‖up concatenated weights** — 324.6 µs vs 370.0 µs for two |
+| 192×64×320 | 48/64/32/80 (herd **4×4**) | 95 | 9.4e-3 | ✅ SmolVLA action expert **QKᵀ, EVEN (self-attn) layers** — group-batched M=3·64; K/V len 291 padded to 320. `tile_n=80` for herd_n=4 — see expert-attention note |
+| 192×320×64 | 32/320/32/16 (herd **6×4**) | 109 | 9.3e-3 | ✅ SmolVLA action expert **P@V, EVEN layers** — K=291→320. **Three K-tilings here are silent-corruption traps** (0.71–0.91) |
+| 192×64×256 | 32/64/32/64 (herd **6×4**) | 82 | 9.4e-3 | ✅ SmolVLA action expert **QKᵀ, ODD (cross-attn) layers** — against the frozen 241-token prefix, padded to 256 |
+| 192×256×64 | 32/64/64/16 (herd **6×4**) | 89 | 9.5e-3 | ✅ SmolVLA action expert **P@V, ODD layers** — K=241→256; every K-tiling tried was correct, unlike the K=320 sibling |
+
+> **SmolVLA action-expert attention note — decomposed QKᵀ / P@V, GQA 15q/5kv, head_dim 64, 50 action tokens → 64.**
+> The four `192×…` rows above were measured on real NPU2 on 2026-07-28 (CPU governor
+> `performance`, NPU `pmode=Turbo`); raw sweep in `llms/smolvla/results/expert_attn_gemm.csv`
+> (53 runs, 2–4 repeats on the leaders). The expert uses the **decomposed** attention path,
+> not FlashAttention — the FA ELF cannot express its prefix-LM mask. Both GEMMs are batched
+> across the GQA group (`group = 15/5 = 3`) so **M = 3·64 = 192**, halving dispatches to
+> `2·n_kv_heads` per layer. Even layers attend over prefix+action (291→**320**), odd
+> (cross-attn) layers over the 241-token prefix only (→**256**).
+> **(1) M=192 admits exactly three (tile_m, herd_m) pairs**: 32×6, 48×4, 64×3 — the
+> intersection of `mm.o`'s `tile_m%16==0` (`bf16_in_fp32_out/mm_aie2p.cc:136`,
+> `static_assert(m%(2·8)==0)` plus the 6D L1 layout's `tile_m/8`), `run.py:62`
+> `M%(tile_m·herd_m)==0`, and the single-M-launch-iteration rule `M//tile_m//herd_m==1`
+> (`run.py:266`; >1 silently corrupts the external-mm.o path). The backbone's usual
+> `tile_m = group·seq//8` gives 24 and is **illegal** here. Measured: 32×6 and 48×4 are
+> within run-to-run noise; **64×3 is consistently slowest** (12 of 32 tiles busy).
+> **(2) K=320 is a trap, K=256 is not.** At 192×320×64, `tile_k_l2=160` (0.915),
+> `64/tile_k_l1=64` (0.707) and `320/tile_k_l1=64` (0.799) all compile, run, report
+> plausible latency and return garbage. Only `tile_k_l2=320` (one reduction tile) with
+> `tile_k_l1 ∈ {16,32}` was measured correct. At 192×256×64 every combination tried
+> (`tile_k_l2 ∈ {64,128,256}` × `tile_k_l1 ∈ {32,64}`) was clean at 9.452e-3 — the
+> corruption tracks **non-power-of-two K**, same as the K=720/1440 projections.
+> **(3) tile_n matters much more than tile_k on the QKᵀ side**: at 192×64×320,
+> `tile_n=80` (herd_n=4) is 82.9 µs vs `tile_n=16` at 129.2 µs — 1.6×. Padding N to
+> **384** instead of 320 is *slower* (86.7 µs), unlike the o_proj/down_proj rows where
+> padding won; at K=64 there is no weight-DMA to amortize the extra FLOPs against.
+> **(4) All 53 runs report NUMFAIL** and none of it is a datapath error: these shapes
+> have many near-zero reference elements and the harness's high-precision `atol=1.5e-3`
+> trips on ~4% of them (typical: expected −0.0405, actual −0.0430). The gate is
+> `mean_rel_L1` — correct configs 9.27–9.45e-3, corrupt ones 0.71–0.91.
 
 > **SmolVLA action-expert note — flow-matching action head, hidden=720, q_dim=960, seq 50→64.**
 > All 15 rows above were measured on real NPU2 on 2026-07-27; raw sweep in
