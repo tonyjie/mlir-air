@@ -1088,37 +1088,46 @@ once per image:       (HOST) pixel-shuffle → [NPU elf:gemm_connector] 64×1228
   <h3>Level 2 — what Level 1 leaves out: issuing the work</h3>
   <p>
     Level 1 counted only what happens on the chip. Around it sits the cost of <em>getting</em> work onto the chip,
-    and that cost is the reason we merge kernels at all. Per inference (3 images), against the 465 ms measured:
+    and that cost is the reason we merge kernels at all. <b>All figures below are per inference — that is, all three
+    camera images</b> — against the 465 ms measured. Every row is measured on real hardware except the two marked.
   </p>
   <table>
     <tr><th>Component</th><th>ms</th><th>share</th></tr>
     <tr style="background:#eff6ff"><td><b>the NPU executing</b> — everything in Level 1</td><td><b>408.1</b></td><td><b>86.6%</b></td></tr>
     <tr><td>moving input data to the chip</td><td>23.9</td><td>5.1%</td></tr>
     <tr><td>host patch reshaping (never moved onto the NPU — see Section 8)</td><td>15.8</td><td>3.4%</td></tr>
-    <tr><td>issuing the work — 114 dispatches × 70 µs</td><td>8.0</td><td>1.7%</td></tr>
-    <tr><td><em>unattributed Python (residual)</em></td><td><em>8.3</em></td><td><em>1.8%</em></td></tr>
+    <tr><td>issuing the work — 114 dispatches × 70 µs <span style="font-size:0.85em;color:#6b7280">(derived)</span></td><td>8.0</td><td>1.7%</td></tr>
+    <tr><td><em>unattributed Python</em> <span style="font-size:0.85em;color:#6b7280">(residual — what the other rows do not explain)</span></td><td><em>8.3</em></td><td><em>1.8%</em></td></tr>
     <tr><td>reading results back</td><td>4.8</td><td>1.0%</td></tr>
     <tr><td>other host numpy</td><td>2.2</td><td>0.5%</td></tr>
     <tr><td><b>total accounted</b></td><td><b>470.9</b></td><td>(+1.3% vs measured)</td></tr>
   </table>
   <div class="callout">
-    <b>Why merging kernels mattered.</b> A layer is 18 kernel launches. Issued one at a time that would be
-    218 dispatches per image; packed into three programs it is <b>38</b>. At the measured 70 µs per dispatch, the
-    merge saves roughly <b>38 ms per inference</b> of pure issuing cost — which is why the host share is now 13%
-    instead of dominating. The flip side, measured: folding launches together costs almost nothing in device time
+    <b>Why merging kernels mattered.</b> Issuing those 218 launches individually would be 218 dispatches per image
+    (654 per inference) instead of 38 (114). At the measured 70 µs per dispatch that is a saving of roughly
+    <b>38 ms per inference</b> in issuing cost alone — which is why the host share is 13% rather than dominating.
+    (70 µs is what <em>these</em> programs cost to issue, each carrying many buffers; a single small kernel measures
+    24–36 µs.) The flip side, measured: folding launches together costs almost nothing in device time
     for vision (1.01–1.03× versus running them separately), unlike the language backbone where the same trick
     measured 1.4–1.8× <em>worse</em>. Merging is close to free here, and it is the main reason this stage is
     NPU-bound rather than host-bound.
   </div>
-  <p>Within those 408 ms of device time, per image:</p>
+  <p>Those 408 ms are 3 images of 136 ms. <b>Switching to per-image units</b>, one image breaks down as:</p>
   <table>
-    <tr><th>Compiled program</th><th>launches</th><th>ms / image</th><th>share</th></tr>
-    <tr><td><code>vit_o_ffn</code> — O proj + residual + norm + MLP</td><td>10</td><td><b>66.1</b></td><td><b>48.6%</b></td></tr>
-    <tr><td><code>vit_ln_qkv</code> — norm + Q/K/V</td><td>7</td><td>34.8</td><td>25.6%</td></tr>
-    <tr><td><code>flash_attn</code></td><td>1</td><td>33.6</td><td>24.7%</td></tr>
-    <tr><td><code>gemm_connector</code></td><td>1</td><td>0.95</td><td>0.7%</td></tr>
-    <tr><td><code>layer_norm</code> (final)</td><td>1</td><td>0.63</td><td>0.5%</td></tr>
+    <tr><th>Compiled program</th><th>kernel launches<br><span style="font-weight:400;font-size:0.85em;color:#6b7280">packed inside it</span></th><th>times it runs<br><span style="font-weight:400;font-size:0.85em;color:#6b7280">per image</span></th><th>ms / image</th><th>share</th></tr>
+    <tr><td><code>vit_o_ffn</code> — O proj + residual + norm + MLP</td><td>10</td><td>12 <span style="font-size:0.85em;color:#6b7280">(once per layer)</span></td><td><b>66.1</b></td><td><b>48.6%</b></td></tr>
+    <tr><td><code>vit_ln_qkv</code> — norm + Q/K/V</td><td>7</td><td>12</td><td>34.8</td><td>25.6%</td></tr>
+    <tr><td><code>flash_attn</code></td><td>1</td><td>12</td><td>33.6</td><td>24.7%</td></tr>
+    <tr><td><code>layer_norm</code> (final)</td><td>1</td><td>1</td><td>0.63</td><td>0.5%</td></tr>
+    <tr><td><code>gemm_connector</code></td><td>1</td><td>1</td><td>0.95</td><td>0.7%</td></tr>
+    <tr style="border-top:2px solid #9ca3af"><td><b>per image</b></td><td><b>218 launches</b></td><td><b>38 dispatches</b></td><td><b>136.0</b></td><td>100%</td></tr>
   </table>
+  <p class="legend">
+    The two count columns are different things, and the distinction is the whole point of merging: 12 layers ×
+    (10 + 7 + 1) launches, plus the final norm and the connector, is <b>218 kernel launches</b> of real work — issued
+    to the chip as only <b>38 dispatches</b>. Per inference (×3 images) that is 654 launches on 114 dispatches, the
+    row in the table above.
+  </p>
   <div class="callout warn">
     <b>One cost that is invisible from either side: how we compile.</b> The <em>same</em> matmul with the
     <em>same</em> tiles runs <b>1.26–1.42× slower</b> inside a multi-program ELF — the format a deployment must use
