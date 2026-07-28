@@ -170,6 +170,44 @@ Shapes cover LLM weight-projection shapes (the four 2048-row entries) and a squa
 | 1024×3072×768 | 32/384/64/96 | 5790 | 9.4e-3 | ✅ SmolVLA vision mlp fc2 (K=3072 tile_k_l2=384; N=768→TILE_N=96; clean abs_err 8.5e-4) |
 | 1024×768×3072 | 32/256/32/128 | 4195 | 9.4e-3 | ✅ SmolVLA vision mlp fc1 (N=3072 stock TILE_N=128; **use this — high-prec drain is faster (4195 vs low-prec direct 3650) AND more accurate (9.4e-3 vs 1.1e-2)**; the standalone harness reports FAIL only on one near-zero-reference element (abs_err 1.953e-3 > high-prec atol=1.5e-3), a tolerance artifact identical to every Qwen Gate/Up, not a datapath error — see vision note) |
 | 64×12288×960 | 16/384/32/**240** | **2246** | 9.5e-3 | ✅ SmolVLA connector proj (M=64→tile_m=16 herd_m=4, 16 tiles = the hard ceiling; K=12288 places fine; **TILE_N=240, not 80** — 1.33× faster at identical accuracy; weight-DMA-bound, see vision note) |
+| 64×720×960 | 16/144/48/80 (herd **4×4**) | 559 | 9.4e-3 | ✅ SmolVLA action expert q_proj (hidden 720 → q_dim 960; seq 50 padded to 64). **K=720 admits no tile_k_l1=32** — see expert note |
+| 64×720×320 | 16/144/48/80 (herd **4×4**) | 310 | 9.4e-3 | ✅ SmolVLA action expert k/v proj, EVEN (self-attn) layers |
+| 64×960×768 | 16/320/32/96 (herd **4×4**) | **685** | 9.5e-3 | ✅ SmolVLA action expert o_proj, **N padded 720→768** — faster than native despite +6.7% FLOPs (135.6 vs 165.9 µs) |
+| 64×960×720 | 16/320/32/80 (herd **4×3**) | 533 | 9.5e-3 | ✅ SmolVLA action expert o_proj, native N=720 (**N=720 cannot use herd_n=4**) |
+| 64×720×2048 | 16/144/48/128 (herd **4×4**) | 1020 | 9.4e-3 | ✅ SmolVLA action expert gate/up proj |
+| 64×2048×768 | 16/256/32/96 (herd **4×4**) | **1122** | 9.3e-3 | ✅ SmolVLA action expert down_proj, **N padded 720→768** (179.5 vs 212.3 µs) |
+| 64×2048×720 | 16/256/32/80 (herd **4×3**) | 889 | 9.4e-3 | ✅ SmolVLA action expert down_proj, native N=720 |
+| 256×320×320 | 32/320/32/80 | 466 | 9.4e-3 | ✅ SmolVLA action expert k/v proj, ODD (cross-attn) layers — runs over the **241-token backbone prefix** (padded 256), not the 50 action tokens. **tile_k_l2=160 is a silent-corruption trap** (0.793) |
+| 64×1440×768 | 16/144/48/96 (herd **4×4**) | 931 | 9.3e-3 | ✅ SmolVLA action_time_mlp_in, N padded 720→768 |
+| 64×1440×720 | 16/144/48/80 (herd **4×3**) | 749 | 9.3e-3 | ✅ SmolVLA action_time_mlp_in, native N=720. **K=1440 admits no tile_k_l1=32** |
+| 64×720×720 | 16/144/48/80 (herd **4×3**) | 447 | 9.5e-3 | ✅ SmolVLA action_time_mlp_out |
+| 64×32×720 | 16/32/32/80 (herd **4×3**) | 25 | 9.3e-3 | ✅ SmolVLA action_in_proj — 115.9 µs for 3.3 MFLOP is ~100% per-launch floor |
+| 64×720×32 | 16/144/48/32 (herd **4×1**) | 37 | 9.0e-3 | ✅ SmolVLA action_out_proj (N=32 → TILE_N=32, HERD_N=1) |
+| 64×720×1600 | 16/144/48/80 (herd **4×4**) | 713 | 9.4e-3 | ✅ SmolVLA action expert **q‖k‖v concatenated weights** — 206.8 µs vs 348.6 µs for the three separate GEMMs |
+| 64×720×4096 | 16/144/48/128 (herd **4×4**) | 1163 | 9.4e-3 | ✅ SmolVLA action expert **gate‖up concatenated weights** — 324.6 µs vs 370.0 µs for two |
+
+> **SmolVLA action-expert note — flow-matching action head, hidden=720, q_dim=960, seq 50→64.**
+> All 15 rows above were measured on real NPU2 on 2026-07-27; raw sweep in
+> `llms/smolvla/results/expert_gemm.csv`, medianed table in
+> `llms/smolvla/docs/expert_npu_feasibility.md` §2. Four things make this family awkward:
+> **(1) M=64** is only 4 rows of `tile_m=16`, so `herd_m=4` — half the 8×4 array is idle
+> before a single instruction runs, and every row here is latency-bound rather than
+> compute-bound (559 GFLOP/s for q_proj vs 2046 for the *backbone's* equivalent at
+> seq=256). **(2) K=720 and K=1440** are `2^4·45` / `2^5·45` and admit **no**
+> `tile_k_l1=32`, the registry default. Several legal-looking K-tilings pass every
+> divisibility assert, compile, run, and **return garbage with no error** — 64×720×960
+> at 240/48, 360/40, 720/48, 720/80 all report `mean_rel_L1` 0.78–1.02; 64×1440×720 at
+> 288/32 and 480/32 likewise; 256×320×320 at `tile_k_l2=160`. Always read `mean_rel_L1`.
+> **(3) N=720 cannot use herd_n=4** (no `tile_n%16==0` satisfies `720%(4·tile_n)==0`), so
+> either drop to `herd_n=3` or pad N to 768 — **padding is faster** despite the extra
+> FLOPs, for both o_proj and down_proj. Both variants are recorded; pick per ELF.
+> **(4) Sweep `status` is not the gate.** `gate_up`, `kv_cross` and `act_in` are recorded
+> NUMFAIL by the standalone harness on a handful of near-zero-reference elements — the
+> same `atol` artifact every Qwen Gate/Up row carries — while sitting at 9.3–9.4e-3.
+> The corrupt tilings in (2) are two orders of magnitude away, which is how they were told
+> apart. The two `‖`-concatenated rows exist for the fused-weight optimisation: issuing
+> q‖k‖v as one 64×720×1600 GEMM beats three separate ones by 1.7×, because at M=64 almost
+> all of the cost is per-launch floor rather than arithmetic.
 
 ### low-precision (`--high-precision false`), direct-codegen bf16
 
