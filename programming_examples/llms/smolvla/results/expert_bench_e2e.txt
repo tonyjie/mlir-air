@@ -1,0 +1,101 @@
+WARNING:root:No accelerated backend detected. Using default cpu, this will be slow.
+WARNING:lerobot.configs.policies:Device 'cuda' is not available. Switching to 'cpu'.
+WARNING:root:No accelerated backend detected. Using default cpu, this will be slow.
+WARNING:lerobot.configs.policies:Device 'cuda' is not available. Switching to 'cpu'.
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+[transformers] Model config: pad_token_id must be `None` or an integer within the vocabulary (between 0 and 31999), got 128002. This may result in unexpected behavior.
+Loading  HuggingFaceTB/SmolVLM2-500M-Video-Instruct weights ...
+Loading weights:   0%|          | 0/489 [00:00<?, ?it/s]Loading weights: 100%|██████████| 489/489 [00:00<00:00, 6578.04it/s]
+Reducing the number of VLM layers to 16 ...
+[bench] building single-process NPU runtimes (one-time startup)...
+[npu-vision] reusing 5 cached ELFs from /home/jiajli/apps/mlir-air/.claude/worktrees/smolvla/programming_examples/llms/smolvla/vision_kernel_cache (SMOLVLA_FORCE_COMPILE=1 to rebuild)
+[expert] reusing 10 cached ELFs from expert_kernel_cache (SMOLVLA_FORCE_COMPILE=1 to rebuild)
+[bench] NPU startup 1070 ms (once)
+
+[bench] --- warmup round 0 ---
+
+[bench] --- round 0 (interleaved) ---
+[bench]   cpu                      wall   1002.3 ms  (NPU     0.0 ms, ovh   0.0 ms, expert+rest  339.7 ms)
+[bench]   expert                   wall   1974.3 ms  (NPU     0.0 ms, ovh   0.0 ms, expert+rest 1314.3 ms)
+[bench]   vision                   wall    867.4 ms  (NPU   434.8 ms, ovh  18.5 ms, expert+rest  326.6 ms)
+[bench]   vision+expert            wall   1888.9 ms  (NPU   431.5 ms, ovh  36.6 ms, expert+rest 1332.0 ms)
+
+[bench] --- round 1 (interleaved) ---
+[bench]   cpu                      wall    994.0 ms  (NPU     0.0 ms, ovh   0.0 ms, expert+rest  334.5 ms)
+[bench]   expert                   wall   1998.6 ms  (NPU     0.0 ms, ovh   0.0 ms, expert+rest 1349.0 ms)
+[bench]   vision                   wall    839.2 ms  (NPU   441.8 ms, ovh  25.5 ms, expert+rest  286.4 ms)
+[bench]   vision+expert            wall   1847.7 ms  (NPU   445.0 ms, ovh  22.7 ms, expert+rest 1300.6 ms)
+
+[bench] --- round 2 (interleaved) ---
+[bench]   cpu                      wall    912.5 ms  (NPU     0.0 ms, ovh   0.0 ms, expert+rest  282.0 ms)
+[bench]   expert                   wall   1978.5 ms  (NPU     0.0 ms, ovh   0.0 ms, expert+rest 1348.4 ms)
+[bench]   vision                   wall    850.4 ms  (NPU   463.9 ms, ovh  24.2 ms, expert+rest  281.5 ms)
+[bench]   vision+expert            wall   1845.2 ms  (NPU   442.2 ms, ovh  39.6 ms, expert+rest 1277.7 ms)
+
+[bench] --- round 3 (interleaved) ---
+[bench]   cpu                      wall    990.1 ms  (NPU     0.0 ms, ovh   0.0 ms, expert+rest  339.0 ms)
+[bench]   expert                   wall   1984.8 ms  (NPU     0.0 ms, ovh   0.0 ms, expert+rest 1329.8 ms)
+[bench]   vision                   wall    834.4 ms  (NPU   443.9 ms, ovh  25.4 ms, expert+rest  278.3 ms)
+[bench]   vision+expert            wall   1830.5 ms  (NPU   446.5 ms, ovh  23.4 ms, expert+rest 1275.1 ms)
+
+[bench] --- round 4 (interleaved) ---
+[bench]   cpu                      wall    966.0 ms  (NPU     0.0 ms, ovh   0.0 ms, expert+rest  324.9 ms)
+[bench]   expert                   wall   1984.0 ms  (NPU     0.0 ms, ovh   0.0 ms, expert+rest 1340.4 ms)
+[bench]   vision                   wall    816.6 ms  (NPU   433.1 ms, ovh  20.1 ms, expert+rest  284.1 ms)
+[bench]   vision+expert            wall   1900.4 ms  (NPU   435.8 ms, ovh  53.8 ms, expert+rest 1326.8 ms)
+
+[bench] --- round 5 (interleaved) ---
+[bench]   cpu                      wall    908.9 ms  (NPU     0.0 ms, ovh   0.0 ms, expert+rest  274.0 ms)
+[bench]   expert                   wall   1916.4 ms  (NPU     0.0 ms, ovh   0.0 ms, expert+rest 1287.3 ms)
+[bench]   vision                   wall    840.7 ms  (NPU   447.6 ms, ovh  27.7 ms, expert+rest  281.1 ms)
+[bench]   vision+expert            wall   1852.7 ms  (NPU   446.4 ms, ovh  20.8 ms, expert+rest 1303.8 ms)
+
+[bench] --- round 6 (interleaved) ---
+[bench]   cpu                      wall    988.4 ms  (NPU     0.0 ms, ovh   0.0 ms, expert+rest  338.3 ms)
+[bench]   expert                   wall   1954.2 ms  (NPU     0.0 ms, ovh   0.0 ms, expert+rest 1306.0 ms)
+[bench]   vision                   wall    937.8 ms  (NPU   464.9 ms, ovh  36.6 ms, expert+rest  345.3 ms)
+[bench]   vision+expert            wall   1872.6 ms  (NPU   449.0 ms, ovh  36.2 ms, expert+rest 1290.5 ms)
+
+================================================================================================
+SmolVLA end-to-end predict_action_chunk latency  (median of 7, same batch + fixed zero noise)
+================================================================================================
+config                       as measured      best   stage ovh  NPU compute    vs CPU
+------------------------------------------------------------------------------------------------
+cpu                             988.4 ms  908.9 ms      0.0 ms       0.0 ms     1.00x
+expert                         1978.5 ms 1916.4 ms      0.0 ms       0.0 ms     0.50x
+vision                          840.7 ms  816.6 ms     25.4 ms     443.9 ms     1.18x
+vision+expert                  1852.7 ms 1830.5 ms     36.2 ms     445.0 ms     0.53x
+------------------------------------------------------------------------------------------------
+  'as measured' = honest wall clock of predict_action_chunk. For the
+  single-process rows that IS the deployable number (weights/ELFs/XRT
+  loaded once at startup). 'stage ovh' = per-inference non-device cost:
+  for bridge:* rows the spawn + safetensors reload + npz round-trip;
+  for single-process rows only the host im2col patch-embed (~14 ms).
+
+--- per-stage breakdown (median of the same 7 timed iterations) ---
+stage                                          cpu                    expert                    vision             vision+expert
+vision (CPU)                              559.7 ms                  560.3 ms                    0.0 ms                    0.0 ms
+connector (CPU)                             4.8 ms                    4.9 ms                    0.0 ms                    0.0 ms
+vision+conn (NPU)                           0.0 ms                    0.0 ms                  469.3 ms                  469.9 ms
+backbone prefill (CPU)                     83.1 ms                   83.0 ms                   85.5 ms                   85.6 ms
+backbone prefill (NPU)                      0.0 ms                    0.0 ms                    0.0 ms                    0.0 ms
+action expert + rest                      334.5 ms                 1329.8 ms                  284.1 ms                 1300.6 ms
+TOTAL                                     988.4 ms                 1978.5 ms                  840.7 ms                 1852.7 ms
+
+--- NPU stage detail, config 'vision' (last iter) ---
+  [vision] driver wall      :    501.5 ms
+      t_encode_ms         :    464.9 ms <- NPU compute
+      t_im2col_ms         :     36.5 ms
+      t_image_ms          : [183.67963680066168, 140.26630483567715, 140.93302190303802] ms
+
+--- NPU stage detail, config 'vision+expert' (last iter) ---
+  [vision] driver wall      :    485.1 ms
+      t_encode_ms         :    449.0 ms <- NPU compute
+      t_im2col_ms         :     36.0 ms
+      t_image_ms          : [164.76377192884684, 142.19784690067172, 142.02391891740263] ms
+
+--- action-chunk agreement vs the pure-CPU chunk ---
+  cpu                        cosine 1.000000   nmse 0.000000
+  expert                     cosine 0.998618   nmse 0.002823
+  vision                     cosine 0.998996   nmse 0.003023
+  vision+expert              cosine 0.996330   nmse 0.008252

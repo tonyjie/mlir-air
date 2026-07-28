@@ -64,14 +64,17 @@ from smolvla_inference import (  # noqa: E402
 # execution-model overhead — zero by construction in the single-process path.
 _COMPUTE_PHASE = {"vision": "t_encode_ms", "backbone": "t_prefill_ms"}
 
-# name -> (npu_vision, npu_backbone, bridge)
+# name -> (npu_vision, npu_backbone, npu_expert, bridge)
 CONFIGS = {
-    "cpu": (False, False, False),
-    "vision": (True, False, False),
-    "vision+backbone": (True, True, False),
-    "backbone": (False, True, False),
-    "bridge:backbone": (False, True, True),
-    "bridge:vision+backbone": (True, True, True),
+    "cpu": (False, False, False, False),
+    "vision": (True, False, False, False),
+    "vision+backbone": (True, True, False, False),
+    "backbone": (False, True, False, False),
+    "expert": (False, False, True, False),
+    "vision+expert": (True, False, True, False),
+    "all": (True, True, True, False),
+    "bridge:backbone": (False, True, False, True),
+    "bridge:vision+backbone": (True, True, False, True),
 }
 
 
@@ -281,17 +284,24 @@ def main():
     noise = _fixed_noise(policy)
 
     # Build the NPU runtimes ONCE, before any timing (a deployment's startup).
-    need_v = any(CONFIGS[w][0] and not CONFIGS[w][2] for w in wanted) or args.blas_ab
-    need_b = any(CONFIGS[w][1] and not CONFIGS[w][2] for w in wanted)
-    if need_v or need_b:
+    need_v = any(CONFIGS[w][0] and not CONFIGS[w][3] for w in wanted) or args.blas_ab
+    need_b = any(CONFIGS[w][1] and not CONFIGS[w][3] for w in wanted)
+    need_e = any(CONFIGS[w][2] for w in wanted)
+    if need_v or need_b or need_e:
         print("[bench] building single-process NPU runtimes (one-time startup)...")
         t0 = time.perf_counter()
         warmup_npu(npu_vision=need_v, npu_backbone=need_b)
+        if need_e:
+            # Expert runtime is built here too, so its weight load + ELF load
+            # lands in startup rather than in the first timed iteration.
+            from smolvla_npu_runtime import get_expert_runtime
+
+            get_expert_runtime()
         print(f"[bench] NPU startup {(time.perf_counter()-t0)*1e3:.0f} ms (once)")
 
     def make_fn(name):
-        npu_v, npu_b, bridge = CONFIGS[name]
-        if not npu_v and not npu_b:
+        npu_v, npu_b, npu_e, bridge = CONFIGS[name]
+        if not npu_v and not npu_b and not npu_e:
 
             def _cpu():
                 policy.reset()
@@ -309,6 +319,7 @@ def main():
                 noise=noise,
                 npu_vision=npu_v,
                 npu_backbone=npu_b,
+                npu_expert=npu_e,
                 bridge=bridge,
                 timings=t,
             )

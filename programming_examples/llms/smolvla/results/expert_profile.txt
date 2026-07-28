@@ -1,0 +1,42 @@
+[expert] reusing 10 cached ELFs from expert_kernel_cache (SMOLVLA_FORCE_COMPILE=1 to rebuild)
+
+=== wall per denoise step: 112.7 ms  (x10 steps = 1127 ms/inference) ===
+
+============================================================
+PROFILING REPORT
+============================================================
+
+--- Wall-Time Attribution ---
+  NPU XRT calls            307.55ms  (624 calls)
+
+--- NPU XRT Call Breakdown (avg per invocation) ---
+  expert_o_ffn                             avg=   1.71ms  min=   1.69ms  max=   1.76ms  (x48)
+  expert_rms_q_rope                        avg=   0.66ms  min=   0.61ms  max=   0.91ms  (x24)
+  expert_rms_qkv_rope                      avg=   1.23ms  min=   1.14ms  max=   1.72ms  (x24)
+  masked_softmax_cross                     avg=   0.52ms  min=   0.50ms  max=   0.60ms  (x24)
+  masked_softmax_self                      avg=   0.58ms  min=   0.56ms  max=   0.66ms  (x24)
+  pv_cross                                 avg=   0.33ms  min=   0.29ms  max=   0.44ms  (x120)
+  pv_self                                  avg=   0.33ms  min=   0.31ms  max=   0.49ms  (x120)
+  qkt_cross                                avg=   0.34ms  min=   0.30ms  max=   0.95ms  (x120)
+  qkt_self                                 avg=   0.28ms  min=   0.24ms  max=   0.53ms  (x120)
+
+--- Fine-Grained NPU Breakdown (avg per invocation) ---
+  Three-segment timing of each XRT call:
+    BO Write = host→DDR memcpy of dynamic inputs (weights
+               pre-loaded once via static_input_indices)
+    NPU Run  = xrt.run.start() + wait() — actual NPU exec
+    BO Read  = numpy view construction (zero-copy, ~0)
+  Kernel                 BO Write    NPU Run    BO Read      Total   Written   Read
+  ──────────────────── ────────── ────────── ────────── ──────────  ──────── ──────
+  expert_o_ffn             0.02ms     1.67ms     0.01ms     1.69ms     0.2MB    1bo  (x48)
+  expert_rms_q_rope        0.01ms     0.63ms     0.01ms     0.64ms     0.1MB    1bo  (x24)
+  expert_rms_qkv_rope      0.01ms     1.18ms     0.01ms     1.20ms     0.1MB    3bo  (x24)
+  masked_softmax_cross     0.05ms     0.45ms     0.01ms     0.50ms     0.9MB    1bo  (x24)
+  masked_softmax_self      0.06ms     0.49ms     0.01ms     0.55ms     1.2MB    1bo  (x24)
+  pv_cross                 0.01ms     0.29ms     0.00ms     0.31ms     0.1MB    1bo  (x120)
+  pv_self                  0.01ms     0.30ms     0.00ms     0.31ms     0.2MB    1bo  (x120)
+  qkt_cross                0.01ms     0.30ms     0.00ms     0.32ms     0.1MB    1bo  (x120)
+  qkt_self                 0.02ms     0.23ms     0.00ms     0.25ms     0.2MB    1bo  (x120)
+  ──────────────────── ────────── ────────── ────────── ──────────
+  TOTAL                    10.5ms    280.1ms      2.6ms    293.2ms
+  %                          4%       96%        1%
