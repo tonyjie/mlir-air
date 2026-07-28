@@ -49,3 +49,7 @@ CLAUDE.md
 
 # documents
 *.pdf
+
+# subagent working artifacts (findings are distilled into programming_examples/llms/smolvla/docs/)
+/reports/
+/status/

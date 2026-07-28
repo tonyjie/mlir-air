@@ -14,3 +14,4 @@ air_project/
 air.mlir
 _prof_*.py
 bench_expert_dispatch_cache/
+bench_kernel_cache_flash/
