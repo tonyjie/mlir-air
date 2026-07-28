@@ -1,5 +1,6 @@
 smolvla_oracle.npz
 vision_oracle.npz
+expert_oracle.npz
 vision_kernel_cache/
 # kernel caches + compiled ELF/obj artifacts (rebuilt by compile_all_kernels)
 *_kernel_cache/
