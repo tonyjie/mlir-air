@@ -835,253 +835,199 @@ once per image:       (HOST) pixel-shuffle → [NPU elf:gemm_connector] 64×1228
   </ul>
 
   <!-- ============================================================ -->
-  <h2 id="perf">8. Performance: the measured numbers</h2>
+  <h2 id="perf">8. Performance: how fast is it?</h2>
 
   <div class="callout warn">
-    <b>Measurement conditions — these matter, so they are stated up front.</b> Everything below was measured with
-    <b>both processors set to their maximum-performance mode</b>: the CPU at <code>governor=performance</code> +
-    <code>EPP=performance</code> (all 24 cores) and the NPU at <code>pmode=Turbo</code>, on an otherwise idle
-    machine. Configurations are run <em>interleaved</em> (round-robin, median of 9) so that thermal drift and
-    machine load affect all of them equally. This is deliberate: on the default power settings the CPU baseline is
-    throttled and our speedup looks <em>better</em> than it should. We report the harder number.
+    <b>Measurement conditions.</b> Everything below was measured with <b>both processors at maximum performance</b>
+    — CPU <code>governor=performance</code> + <code>EPP=performance</code> (all 24 cores), NPU
+    <code>pmode=Turbo</code> — on an otherwise idle machine, configurations run interleaved, median of 9. On the
+    default power settings the CPU baseline is throttled and our speedup looks <em>better</em>; we report the harder
+    number.
   </div>
 
-  <p class="lead">
-    All numbers are wall-clock on real hardware, one-time compilation excluded. The reference is the <b>real lerobot
-    CPU model</b> — not a simplified re-implementation.
-  </p>
-
+  <h3>The whole policy</h3>
   <div class="stat-row">
     <div class="stat"><div class="big-num">851 ms</div><div class="label">full policy<br>NPU vision + CPU backbone</div></div>
     <div class="stat"><div class="big-num">913 ms</div><div class="label">pure CPU<br>(lerobot baseline)</div></div>
-    <div class="stat"><div class="big-num">1.07×</div><div class="label">faster than CPU<br>both at max performance</div></div>
+    <div class="stat"><div class="big-num">1.07×</div><div class="label">faster than CPU<br>end to end</div></div>
   </div>
-
-  <h3>End to end</h3>
   <table>
-    <tr><th>Configuration</th><th>max-performance mode</th><th>default power mode</th><th>vs CPU (max-perf)</th></tr>
+    <tr><th>Configuration</th><th>max-performance mode</th><th>default power mode</th><th>vs CPU</th></tr>
     <tr><td>Pure CPU (lerobot)</td><td><b>913 ms</b></td><td>964 ms</td><td>1.00×</td></tr>
     <tr><td><b>NPU vision + CPU backbone</b> <span class="pill done">shipping</span></td><td><b>851 ms</b></td><td>858 ms</td><td><b>1.07×</b></td></tr>
-    <tr><td>NPU vision + NPU backbone</td><td>—</td><td>1114–1163 ms</td><td>0.8× (slower)</td></tr>
-    <tr><td>earlier two-process version</td><td>—</td><td>2678 ms</td><td>0.34× (slower)</td></tr>
-  </table>
-  <div class="callout">
-    <b>Turning on maximum performance <em>reduced</em> our advantage — and that is the honest result.</b> Going from
-    the default power settings to max performance made the <b>CPU baseline 5.3% faster</b> (964 → 913 ms) but our
-    configuration only <b>0.9% faster</b> (858 → 851 ms), so the ratio fell from 1.12× to <b>1.07×</b>. The reason
-    is simply that the work we removed from the CPU was the part that benefits most from unthrottling it.
-    Quoting the throttled-CPU number would have been flattering and wrong.
-  </div>
-
-  <h3>A diagnostic surprise: NPU Turbo speeds up kernels but not this pipeline</h3>
-  <table>
-    <tr><th>What was measured</th><th>Default mode</th><th>Turbo</th><th>Change</th></tr>
-    <tr><td>A single vision matmul (<span class="shape">1024×768×768</span>)</td><td>3763 GFLOP/s</td><td><b>4045 GFLOP/s</b></td><td><b>+7.5%</b></td></tr>
-    <tr><td>The whole vision encoder, 3 images</td><td>461 ms</td><td>465 ms</td><td><b>~0%</b></td></tr>
+    <tr><td>NPU vision + NPU backbone</td><td>—</td><td>1114–1163 ms</td><td>0.8×</td></tr>
+    <tr><td>earlier two-process version</td><td>—</td><td>2678 ms</td><td>0.34×</td></tr>
   </table>
   <p class="legend">
-    Turbo raises the NPU's compute clock, and the matmul kernel duly gets 7.5% faster — but the encoder as a whole
-    does not move. That tells us something useful: <b>the encoder is not limited by NPU compute speed.</b> Its time
-    is spread across memory-bound operations (LayerNorm, GELU) that a higher clock does not help, attention, launch
-    overhead, and ~35 ms of host-side patch reshaping that never touches the NPU at all. Raising the clock only
-    accelerates the part that was already fastest. <em>This is a better guide to where to optimise next than any
-    projection would have been.</em>
+    <b>Unthrottling the CPU cost us, and we report it.</b> Going to maximum performance made the CPU baseline 5.3%
+    faster (964 → 913 ms) but our configuration only 0.9% (858 → 851 ms), so the ratio fell from 1.12× to 1.07× —
+    the work we removed from the CPU is exactly the part that benefits most from unthrottling it. The earlier
+    two-process version is shown because it is the same code: collapsing it into one process (weights, compiled
+    programs and device context loaded once instead of per inference) is what moved 2678 ms to 851 ms.
   </p>
 
-  <h3>Per stage — and the honest reason each one lands where it does</h3>
+  <h3>Which stage runs where, and why</h3>
   <p>
-    This is the reference table: for every stage, the best NPU number we have measured, the CPU number it must beat,
-    and <em>why</em> it wins or loses. A stage losing on the NPU is not a failure to explain away — it is a shape
-    property worth knowing.
+    We ship each stage on whichever processor is faster for it. That decision needed a number for every stage on
+    both sides — this table is that reference, and Section 9 explains each verdict.
   </p>
   <table>
-    <tr><th>Stage</th><th>Shape it runs at</th><th>Best NPU</th><th>CPU</th><th>Verdict &amp; reason</th></tr>
+    <tr><th>Stage</th><th>Shape it runs at</th><th>Best NPU</th><th>CPU</th><th>Verdict</th></tr>
     <tr>
-      <td><b>① Vision</b><br>per image</td>
-      <td>seq <b>1024</b>, hidden 768<br>big matmuls, 1024² attention</td>
-      <td><b>155 ms</b></td>
-      <td>184 ms</td>
-      <td><span class="pill done">NPU wins 1.19×</span> Large matrices keep the compute array fed, and after fusion only 38 dispatches carry the whole image. Includes ~12 ms/image of host patch reshaping.</td>
+      <td><b>① Vision</b> · per image</td>
+      <td>seq <b>1024</b>, hidden 768</td>
+      <td><b>155 ms</b></td><td>184 ms</td>
+      <td><span class="pill done">NPU 1.19× — we ship this on the NPU</span></td>
     </tr>
     <tr>
-      <td>①b Connector<br>per image</td>
-      <td>M = 64 (a single wide matmul)</td>
-      <td>~1.6 ms</td>
-      <td>~1.6 ms</td>
-      <td>≈ parity. M=64 fills only 4×4 of the 8×4 array — latency-bound, but tiny either way.</td>
+      <td><b>② Backbone</b> · per inference</td>
+      <td>seq <b>256</b>, hidden 960</td>
+      <td>229 ms</td><td><b>77 ms</b></td>
+      <td><span class="pill" style="background:#fee2e2;color:#991b1b;border:1px solid #fca5a5">NPU ~3× slower — ported, verified, kept on CPU</span></td>
     </tr>
     <tr>
-      <td><b>② Backbone</b><br>per inference</td>
-      <td>seq <b>256</b>, hidden 960<br>GQA 15/5, prefix-LM mask</td>
-      <td>229 ms</td>
-      <td><b>77 ms</b></td>
-      <td><span class="pill" style="background:#fee2e2;color:#991b1b;border:1px solid #fca5a5">NPU loses ~3×</span> Two compounding reasons — small shapes run the array at ~half efficiency, and its attention is still <b>11 unfused dispatches per layer</b> (208 total). See Section 9.</td>
-    </tr>
-    <tr>
-      <td><b>③ Action expert</b><br>per inference</td>
-      <td>seq <b>50</b>, hidden 720<br>× <b>10</b> sequential denoise steps</td>
-      <td><b>387–526 ms</b><br><span style="font-size:0.8em;color:#6b7280">projected</span></td>
-      <td><b>324 ms</b></td>
-      <td><span class="pill" style="background:#fee2e2;color:#991b1b;border:1px solid #fca5a5">NPU loses 1.2–1.6×</span> seq=50 is the smallest shape in the model: its kernels run at 200–1100 GFLOP/s versus 2046–3366 for the <em>same</em> kernels at the backbone's seq=256. On top of that every launch costs ~85 µs however little work it carries, and a denoise step needs 239 of them.</td>
+      <td><b>③ Action expert</b> · per inference</td>
+      <td>seq <b>50</b> × 10 denoise steps</td>
+      <td>387–526 ms <span style="font-size:0.85em;color:#6b7280">projected</span></td><td><b>324 ms</b></td>
+      <td><span class="pill" style="background:#fee2e2;color:#991b1b;border:1px solid #fca5a5">NPU 1.2–1.6× slower — not ported</span></td>
     </tr>
   </table>
   <p class="legend">
-    "Best NPU" means the best we have <em>measured</em> — except the action expert, which was <b>never ported</b>:
-    its figure is a projection built by measuring every one of its kernels individually on real NPU2 at its own
-    shapes and summing them. That projection is the weaker part of the study; the robust part is that the NPU loses
-    <em>head-to-head on every single kernel the expert runs</em>, by 1.1× (gate/up) to 6.6× (attention). We stopped
-    before writing the port, which is what a feasibility study is for.
+    The expert figure is the one <b>projection</b> here: it was never ported. Every one of its kernels was measured
+    individually on real NPU2 at seq=50 and the total assembled from those; the robust part of that study is that
+    the NPU loses <em>head-to-head on every kernel the expert runs</em> (1.1×–6.6×), so the verdict does not rest on
+    the projection. The backbone's 229 ms is also not its ceiling — it has never had the fusion treatment vision got.
   </p>
 
-  <div class="callout">
-    <b>The result in one line.</b> Putting the largest compute block — the vision encoder — on the NPU, and leaving
-    every stage where it is fastest, makes the complete robot policy <b>1.07× faster than the pure-CPU model with
-    both processors at maximum performance</b>, while still producing the same actions (similarity 0.9990 against
-    the real CPU output).
-  </div>
-
-  <h3>What made this possible: removing the two-process bridge</h3>
+  <h3>The vision encoder, end to end</h3>
   <p>
-    An earlier version ran the NPU stages as separate subprocesses, because our CPU and NPU code were assumed to
-    need different Python environments. They do not — one environment can host both. Collapsing to a single process
-    lets the weights, the compiled programs and the device context load <b>once at startup</b> instead of on every
-    inference:
+    This is the stage we actually ship on the NPU, so it is worth the full accounting. Per image, with every
+    component of both paths on the same footing:
   </p>
   <table>
-    <tr><th>Cost paid per inference by the old bridge</th><th>Vision</th><th>Backbone</th></tr>
-    <tr><td>process start + imports</td><td>194 ms</td><td>166 ms</td></tr>
-    <tr><td>re-loading model weights from disk</td><td>353 ms</td><td>368 ms</td></tr>
-    <tr><td>compiled-program + device setup</td><td>32 ms</td><td>32 ms</td></tr>
-    <tr><td>data hand-off files</td><td>6 ms</td><td>2 ms</td></tr>
-    <tr><td><b>total, every single inference</b></td><td><b>585 ms</b></td><td><b>568 ms</b></td></tr>
+    <tr><th>Stage of the encoder</th><th>CPU</th><th>our NPU path</th><th></th></tr>
+    <tr style="background:#fef2f2">
+      <td><b>patch embedding + position</b><br><span style="font-size:0.85em;color:#6b7280">image → 1024 tokens</span></td>
+      <td><b>1.36 ms</b><br><span style="font-size:0.85em;color:#6b7280">an optimised Conv2d</span></td>
+      <td><b>5.27 ms</b><br><span style="font-size:0.85em;color:#991b1b">still entirely on the host, in numpy</span></td>
+      <td><span class="pill" style="background:#fee2e2;color:#991b1b;border:1px solid #fca5a5">3.9× slower</span></td>
+    </tr>
+    <tr><td><b>12 × encoder layer</b></td><td><b>173.7 ms</b></td><td><b>134.5 ms</b> <span style="font-size:0.85em;color:#6b7280">on the NPU</span></td><td><span class="pill done">1.29× faster</span></td></tr>
+    <tr><td>final LayerNorm</td><td>0.04 ms</td><td>0.63 ms</td><td>slower, but runs once</td></tr>
+    <tr><td><b>connector</b> <span style="font-size:0.85em;color:#6b7280">shuffle + projection</span></td><td>1.43 ms</td><td><b>1.06 ms</b> <span style="font-size:0.85em;color:#6b7280">0.11 host + 0.95 NPU</span></td><td><span class="pill done">1.35× faster</span></td></tr>
+    <tr style="border-top:2px solid #9ca3af"><td><b>compute subtotal</b></td><td><b>175.1 ms</b></td><td><b>141.5 ms</b></td><td>1.24×</td></tr>
+    <tr><td>framework / dispatch overhead</td><td>8.6 ms <span style="font-size:0.85em;color:#6b7280">torch module dispatch</span></td><td>15.7 ms <span style="font-size:0.85em;color:#6b7280">data in/out 9.6 · launches 2.7 · Python 3.5</span></td><td></td></tr>
+    <tr style="background:#f0f9ff"><td><b>measured, per image</b></td><td><b>183.7 ms</b></td><td><b>155 ms</b></td><td><b>1.19×</b></td></tr>
   </table>
   <p class="legend">
-    On top of that the bridge could never amortise the first-image cost (347 ms cold vs 147 ms warm), because each
-    inference started from cold. This one change is the difference between 2678 ms and ~851 ms.
+    The two paths close to within a couple of percent of their measured totals (NPU: 157.2 accounted vs 155
+    measured, +1.5%). <b>Read across the rows and the shape of the win is already visible</b>: the NPU takes 39 ms
+    out of the 12 layers, gives 4 ms back on a patch embedding that never made it onto the chip, and roughly breaks
+    even elsewhere. Section 9 takes each of those rows apart.
   </p>
-
-  <div class="callout">
-    <b>A tuning detail that mattered more than expected.</b> The numerical library's worker threads keep spinning
-    after the one host-side matmul in the vision path, stealing CPU from the thread that issues NPU work — inflating
-    the encoder from 135 ms to 178 ms per image. Capping those threads <em>only around the NPU section</em> and
-    restoring them afterwards recovers it without hurting the thread-hungry action expert: 874 ms with the cap vs
-    962 ms without, and the expert stage is unaffected either way.
-  </div>
 
   <!-- ============================================================ -->
-  <h2 id="whyperf">9. Why the performance looks like this</h2>
+  <h2 id="whyperf">9. Why: where every millisecond goes</h2>
 
   <p class="lead">
-    Three effects explain the whole picture. The first is a property of the hardware; the other two are things we
-    have not finished doing.
+    Section 8 said the vision encoder is 1.19× faster on the NPU. This section takes that apart, one level at a
+    time: inside a layer → inside the chip's own time → the underlying reason → what we got wrong → what is left.
   </p>
 
-  <h3>① Big shapes win, small shapes lose — this is the hardware's nature</h3>
+  <h3>Level 1 — inside one encoder layer: which operations actually win</h3>
   <p>
-    An NPU is a large grid of compute tiles. Efficiency depends on whether a given operation has enough work to
-    fill that grid. Vision and the backbone sit on opposite sides of that line:
+    The aggregate 1.19× hides a much sharper picture. Both sides were profiled at the same granularity on the same
+    machine: the NPU is <em>much</em> faster at a few operations, slower at several, and the net is what survives.
   </p>
-  <table>
-    <tr><th>Kernel, at the shape we actually use</th><th>NPU</th><th>CPU</th><th></th></tr>
-    <tr><td>Matmul at <b>vision</b> size (<span class="shape">1024×768×768</span>)</td><td>3798 GFLOP/s</td><td>—</td><td>array well fed</td></tr>
-    <tr><td>Matmul at <b>backbone</b> size (<span class="shape">256×960×960</span>)</td><td>1896 GFLOP/s</td><td>—</td><td>half the efficiency</td></tr>
-    <tr><td>Attention at <b>vision</b> size (1024², 12 heads)</td><td>1292 GFLOP/s</td><td>—</td><td>fills the full grid</td></tr>
-    <tr><td>Attention at <b>backbone</b> size (256², 15 heads)</td><td>280 GFLOP/s</td><td>~500 GFLOP/s</td><td><b>NPU loses to CPU</b></td></tr>
-  </table>
+  <div class="fig">
+  <svg viewBox="0 0 900 424" xmlns="http://www.w3.org/2000/svg" font-family="system-ui, sans-serif">
+    <style>
+      .t{font-size:12.5px;font-weight:700;fill:#111827}
+      .n{font-size:10.5px;fill:#1f2937}
+      .s{font-size:9px;fill:#6b7280}
+      .w{font-size:9.5px;font-weight:700;fill:#166534}
+      .l{font-size:9.5px;font-weight:700;fill:#991b1b}
+      .v{font-size:9px;fill:#fff;font-weight:600}
+    </style>
+    <text x="8" y="18" class="t">The same SigLIP layer, operation by operation: CPU vs NPU</text>
+    <text x="8" y="32" class="s">Measured per layer, both at maximum power mode. Bar length ∝ time (same scale for both processors).</text>
+
+    <rect x="178" y="42" width="10" height="9" fill="#f59e0b"/><text x="193" y="50" class="s">CPU (lerobot, 12 threads)</text>
+    <rect x="330" y="42" width="10" height="9" fill="#2563eb"/><text x="345" y="50" class="s">NPU2</text>
+    <text x="620" y="50" class="s">who wins this operation</text>
+
+    <!-- rows: name | CPU bar | NPU bar | verdict -->
+    <!-- 1 LayerNorm -->
+    <text x="168" y="70" text-anchor="end" class="n">LayerNorm ×2</text>
+    <rect x="178" y="62" width="10.0" height="11" fill="#f59e0b"/><text x="194" y="71" class="s">136 µs</text>
+    <rect x="178" y="75" width="57.3" height="11" fill="#2563eb"/><text x="241" y="84" class="s">775 µs</text>
+    <text x="620" y="77" class="l">NPU 5.7× SLOWER</text>
+    <!-- 2 QKV -->
+    <text x="168" y="106" text-anchor="end" class="n">Q / K / V projections ×3</text>
+    <rect x="178" y="98" width="148.5" height="11" fill="#f59e0b"/><text x="332" y="107" class="s">2008 µs</text>
+    <rect x="178" y="111" width="161.0" height="11" fill="#2563eb"/><text x="345" y="120" class="s">2177 µs</text>
+    <text x="620" y="113" class="l">NPU 1.08× slower</text>
+    <!-- 3 attention -->
+    <text x="168" y="142" text-anchor="end" class="n">attention</text>
+    <rect x="178" y="134" width="420.0" height="11" fill="#f59e0b"/><text x="393" y="143" class="v">5680 µs — 39% of the CPU layer</text>
+    <rect x="178" y="147" width="206.9" height="11" fill="#2563eb"/><text x="281" y="156" class="v">2798 µs</text>
+    <text x="620" y="149" class="w">NPU 2.03× faster ★</text>
+    <!-- 4 out proj -->
+    <text x="168" y="178" text-anchor="end" class="n">output projection</text>
+    <rect x="178" y="170" width="54.7" height="11" fill="#f59e0b"/><text x="238" y="179" class="s">740 µs</text>
+    <rect x="178" y="183" width="53.7" height="11" fill="#2563eb"/><text x="237" y="192" class="s">726 µs</text>
+    <text x="620" y="185" class="s">parity (1.02×)</text>
+    <!-- 5 fc1 -->
+    <text x="168" y="214" text-anchor="end" class="n">MLP fc1 (768→3072)</text>
+    <rect x="178" y="206" width="188.5" height="11" fill="#f59e0b"/><text x="372" y="215" class="s">2549 µs</text>
+    <rect x="178" y="219" width="134.9" height="11" fill="#2563eb"/><text x="318" y="228" class="s">1825 µs</text>
+    <text x="620" y="221" class="w">NPU 1.40× faster</text>
+    <!-- 6 GELU -->
+    <text x="168" y="250" text-anchor="end" class="n">GELU-tanh</text>
+    <rect x="178" y="242" width="53.8" height="11" fill="#f59e0b"/><text x="237" y="251" class="s">728 µs</text>
+    <rect x="178" y="255" width="42.6" height="11" fill="#2563eb"/><text x="226" y="264" class="s">576 µs</text>
+    <text x="620" y="257" class="w">NPU 1.26× faster</text>
+    <!-- 7 fc2 -->
+    <text x="168" y="286" text-anchor="end" class="n">MLP fc2 (3072→768)</text>
+    <rect x="178" y="278" width="183.9" height="11" fill="#f59e0b"/><text x="367" y="287" class="s">2487 µs</text>
+    <rect x="178" y="291" width="95.4" height="11" fill="#2563eb"/><text x="279" y="300" class="s">1290 µs</text>
+    <text x="620" y="293" class="w">NPU 1.93× faster ★</text>
+    <!-- 8 residual -->
+    <text x="168" y="322" text-anchor="end" class="n">residual adds ×2</text>
+    <rect x="178" y="314" width="10.9" height="11" fill="#f59e0b"/><text x="195" y="323" class="s">147 µs</text>
+    <rect x="178" y="327" width="25.9" height="11" fill="#2563eb"/><text x="210" y="336" class="s">350 µs</text>
+    <text x="620" y="329" class="l">NPU 2.37× SLOWER</text>
+
+    <line x1="178" y1="348" x2="880" y2="348" stroke="#d1d5db"/>
+    <text x="168" y="366" text-anchor="end" class="t">whole layer</text>
+    <text x="178" y="366" class="n"><tspan fill="#b45309" font-weight="700">CPU 14.5 ms</tspan>  vs  <tspan fill="#1d4ed8" font-weight="700">NPU 10.5 ms</tspan>   →   <tspan font-weight="700">NPU 1.38× faster</tspan>   (×12 layers = 174 ms vs 126 ms per image)</text>
+
+    <rect x="8" y="378" width="884" height="40" rx="6" fill="#eff6ff" stroke="#93c5fd"/>
+    <text x="20" y="393" class="n"><tspan font-weight="700">The whole win comes from three operations.</tspan> Attention alone saves 2.9 ms of the 4.0 ms the NPU gains per layer (73% of it); fc2 and fc1 give another 1.9 ms.</text>
+    <text x="20" y="408" class="n">Everything memory-bound goes the other way — <tspan font-weight="700">LayerNorm hands back 0.64 ms</tspan> and the residual adds 0.20 ms, which is where the remaining headroom is.</text>
+  </svg>
+  <figcaption>Per-operation comparison of one of the 12 SigLIP encoder layers, measured on the same machine with both processors at maximum performance.</figcaption>
+  </div>
   <p class="legend">
-    The backbone's attention is the worst case: its sequence is short <em>and</em> its 15 heads are an odd number,
-    which forces the kernel onto half the grid (an even head count, like vision's 12, packs two per unit and fills
-    it — measured 1.58× just from that). For reference the same matmul kernel reaches 8898 GFLOP/s at large sizes,
-    so the backbone shapes run at roughly a fifth of the chip's capability.
+    <b>Reconciling this with Section 8:</b> these parts sum to 10.5 ms, and 12 layers of them is 126.2 ms — but the
+    deployed encoder spends 134.5 ms on those layers. The 8.3 ms difference (6.5%) is the chip switching between
+    the layer's three compiled programs, measured separately; it is not unexplained.
   </p>
-
-  <h3>② The backbone's kernels are genuinely slower at its size</h3>
-  <p>
-    Before it was optimized, the vision encoder spent only 141 ms of its total on real NPU compute; the other
-    <b>212 ms sat between dispatches</b>, on the host. It was <em>host-bound, not compute-bound</em>, and fusing its
-    operations into merged programs removed that gap:
-  </p>
-  <p>Fusing vision's operations into merged programs fixed exactly that:</p>
-  <table>
-    <tr><th>Vision encoder</th><th>Before fusion</th><th>After fusion</th></tr>
-    <tr><td>dispatches</td><td>121</td><td><b>37</b></td></tr>
-    <tr><td>dispatch overhead</td><td>212 ms</td><td><b>4 ms</b></td></tr>
-    <tr><td>wall time</td><td>368 ms</td><td><b>141.6 ms</b></td></tr>
-    <tr><td>accuracy</td><td>0.945</td><td><b>0.990</b></td></tr>
-  </table>
   <div class="callout">
-    <b>A surprise worth recording: fusing for speed also fixed accuracy.</b> Before fusion the 12 layers in sequence
-    only reached 0.945 similarity, and we had accepted that as a hardware precision ceiling — the NPU's fast matmul
-    format (a block of numbers sharing one exponent) leaves a small <em>systematic</em> bias, and unlike random
-    noise, systematic bias accumulates coherently across layers. Fusion removed it as a side effect: doing the small
-    additions on-chip eliminated a host round-trip that had been <em>amplifying</em> that bias each layer. Accuracy
-    went to 0.990 and passed. An apparent hardware limit turned out to be an artifact of how the pipeline was
-    assembled.
+    <b>The entire advantage comes from three operations.</b> Of the 4.0 ms the NPU gains per layer, attention alone
+    accounts for 2.9 ms (73%), and fc2 + fc1 for another 1.9 ms. Everything memory-bound runs the other way —
+    LayerNorm hands back 0.64 ms and the residual adds 0.20 ms. Two consequences worth holding onto: the win rests
+    on a small number of large matrix operations, and <b>the remaining headroom is concentrated in the small
+    memory-bound ones</b>, not in making the big ones faster.
   </div>
-  <div class="callout warn">
-    <b>But the backbone is a different problem — and we got this wrong at first.</b> The obvious inference was that
-    the backbone suffers the same disease: its attention is still 11 separate dispatches per layer, 208 in total,
-    so fusing it should give the same win. <b>Direct measurement says otherwise.</b> Profiling the real 16-layer
-    backbone (832 dispatches over 4 inferences) breaks its time down as:
-    <table style="margin:0.6rem 0">
-      <tr><th>Moving data to the chip</th><th><b>The NPU actually computing</b></th><th>Reading results back</th></tr>
-      <tr><td>10%</td><td><b>90%</b></td><td>1%</td></tr>
-    </table>
-    A separate microbenchmark puts the host cost of one dispatch at <b>24–36 µs</b>, not milliseconds. So the
-    backbone is <em>compute</em>-bound, not host-bound: its 229 ms is ~206 ms of the NPU genuinely working. Even
-    driving the host overhead to zero would leave it far above the CPU's 77 ms. <b>Fusion cannot rescue the
-    backbone</b> — the kernels themselves are slower at seq=256, which is effect ① above, not effect ②.
-  </div>
-
-  <h3>③ Two overheads that were not the hardware's fault (both now fixed)</h3>
-  <ul class="clean">
-    <li><b>The two-process bridge (585 ms + 568 ms per inference).</b> Launching each NPU stage as a subprocess
-      re-paid process startup, weight loading and device setup on <em>every</em> call. It turned out both halves can
-      live in one Python environment, so this is simply gone (Section 8).</li>
-    <li><b>A redundant CPU backbone (~91 ms).</b> When the NPU ran the backbone, the CPU still computed its own copy
-      first and we overwrote the result. Keeping the backbone on the CPU removed the duplication entirely.</li>
-    <li><b>Thread contention that looked like an NPU problem.</b> The numerical library's workers kept spinning
-      after the one host matmul and stole CPU from the thread issuing NPU work — 135 ms → 178 ms per image. The
-      giveaway was misleading: the same kernel took 139 ms on a cached array and 178 ms on a freshly computed one.
-      Scoped thread-capping fixed it.</li>
-  </ul>
   <p class="legend">
-    Worth stating plainly: of the four effects in this section, <b>only the first is a property of the hardware.</b>
-    The other three were engineering — and removing them is what turned a 0.42× pipeline into a 1.07× one on exactly
-    the same silicon and the same kernels.
+    One row deserves a note. The Q/K/V projections are the <em>same</em> <span class="shape">1024×768×768</span>
+    matmul shape three times, yet they come out 1.08× <em>slower</em> than the CPU, while fc1 and fc2 win clearly.
+    The difference is the other dimension: fc1 writes 3072 values wide and fc2 reduces over 3072, both of which fill
+    the compute array; 768×768 does not. "Matmuls are fast on an NPU" is only true once they are big enough.
   </p>
 
-  <h3>Where the vision encoder's time actually goes — a full accounting</h3>
-  <p>
-    Since the vision encoder is the part we ship on the NPU, we profiled it end to end and made every millisecond
-    account for itself. Per inference (3 images), against a 465.7 ms measured baseline:
-  </p>
-  <table>
-    <tr><th>Component</th><th>ms</th><th>share</th></tr>
-    <tr style="background:#eff6ff"><td><b>NPU executing</b></td><td><b>408.1</b></td><td><b>86.6%</b></td></tr>
-    <tr><td>moving input data to the chip</td><td>23.9</td><td>5.1%</td></tr>
-    <tr><td>host patch reshaping (im2col)</td><td>15.8</td><td>3.4%</td></tr>
-    <tr><td>launch cost — 114 dispatches × 70 µs</td><td>8.0</td><td>1.7%</td></tr>
-    <tr><td><em>unattributed Python (residual)</em></td><td><em>8.3</em></td><td><em>1.8%</em></td></tr>
-    <tr><td>reading results back</td><td>4.8</td><td>1.0%</td></tr>
-    <tr><td>other host numpy</td><td>2.2</td><td>0.5%</td></tr>
-    <tr><td><b>total accounted</b></td><td><b>470.9</b></td><td>100%</td></tr>
-  </table>
-  <p class="legend">
-    The 8.3 ms residual is stated rather than absorbed into another row. <b>The headline: the encoder is now
-    NPU-bound, not host-bound</b> — the opposite of where it started. All the host glue inside the loop adds up to
-    ~10 ms; the chip itself is busy 87% of the time. Further speed has to come from the device side.
-  </p>
-  <p>Inside those 408 ms of device time, per image:</p>
-  <table>
-    <tr><th>Program</th><th>ms/image</th><th>share</th><th></th><th>By operation type</th><th>share</th></tr>
-    <tr><td><code>vit_o_ffn</code> (O + residual + norm + MLP)</td><td>66.1</td><td>48.6%</td><td rowspan="5"></td><td>matmul</td><td>43.9%</td></tr>
-    <tr><td><code>vit_ln_qkv</code> (norm + Q/K/V)</td><td>34.8</td><td>25.6%</td><td>attention</td><td>25.0%</td></tr>
-    <tr><td><code>flash_attn</code></td><td>33.6</td><td>24.7%</td><td>bias adds</td><td>9.8%</td></tr>
-    <tr><td><code>gemm_connector</code></td><td>0.95</td><td>0.7%</td><td>LayerNorm</td><td>6.9%</td></tr>
-    <tr><td><code>layer_norm</code> (final)</td><td>0.63</td><td>0.5%</td><td>GELU + residual + interleave</td><td>14.3%</td></tr>
-  </table>
-
+  <h3>Level 2 — inside the chip's own time</h3>
   <div class="fig">
   <svg viewBox="0 0 900 470" xmlns="http://www.w3.org/2000/svg" font-family="system-ui, sans-serif">
     <style>
@@ -1191,209 +1137,111 @@ once per image:       (HOST) pixel-shuffle → [NPU elf:gemm_connector] 64×1228
   </svg>
   <figcaption>Measured on real NPU2 at maximum power mode. Row widths are proportional to measured time within each row.</figcaption>
   </div>
-
-  <h3>Operation by operation: where the NPU actually beats the CPU</h3>
-  <p>
-    The encoder as a whole is 1.19× faster on the NPU. That single number hides a much sharper story: the NPU is
-    <em>much</em> faster at some operations, slower at others, and the net is what survives. Both sides were
-    profiled at the same granularity on the same machine.
-  </p>
-  <div class="fig">
-  <svg viewBox="0 0 900 424" xmlns="http://www.w3.org/2000/svg" font-family="system-ui, sans-serif">
-    <style>
-      .t{font-size:12.5px;font-weight:700;fill:#111827}
-      .n{font-size:10.5px;fill:#1f2937}
-      .s{font-size:9px;fill:#6b7280}
-      .w{font-size:9.5px;font-weight:700;fill:#166534}
-      .l{font-size:9.5px;font-weight:700;fill:#991b1b}
-      .v{font-size:9px;fill:#fff;font-weight:600}
-    </style>
-    <text x="8" y="18" class="t">The same SigLIP layer, operation by operation: CPU vs NPU</text>
-    <text x="8" y="32" class="s">Measured per layer, both at maximum power mode. Bar length ∝ time (same scale for both processors).</text>
-
-    <rect x="178" y="42" width="10" height="9" fill="#f59e0b"/><text x="193" y="50" class="s">CPU (lerobot, 12 threads)</text>
-    <rect x="330" y="42" width="10" height="9" fill="#2563eb"/><text x="345" y="50" class="s">NPU2</text>
-    <text x="620" y="50" class="s">who wins this operation</text>
-
-    <!-- rows: name | CPU bar | NPU bar | verdict -->
-    <!-- 1 LayerNorm -->
-    <text x="168" y="70" text-anchor="end" class="n">LayerNorm ×2</text>
-    <rect x="178" y="62" width="10.0" height="11" fill="#f59e0b"/><text x="194" y="71" class="s">136 µs</text>
-    <rect x="178" y="75" width="57.3" height="11" fill="#2563eb"/><text x="241" y="84" class="s">775 µs</text>
-    <text x="620" y="77" class="l">NPU 5.7× SLOWER</text>
-    <!-- 2 QKV -->
-    <text x="168" y="106" text-anchor="end" class="n">Q / K / V projections ×3</text>
-    <rect x="178" y="98" width="148.5" height="11" fill="#f59e0b"/><text x="332" y="107" class="s">2008 µs</text>
-    <rect x="178" y="111" width="161.0" height="11" fill="#2563eb"/><text x="345" y="120" class="s">2177 µs</text>
-    <text x="620" y="113" class="l">NPU 1.08× slower</text>
-    <!-- 3 attention -->
-    <text x="168" y="142" text-anchor="end" class="n">attention</text>
-    <rect x="178" y="134" width="420.0" height="11" fill="#f59e0b"/><text x="393" y="143" class="v">5680 µs — 39% of the CPU layer</text>
-    <rect x="178" y="147" width="206.9" height="11" fill="#2563eb"/><text x="281" y="156" class="v">2798 µs</text>
-    <text x="620" y="149" class="w">NPU 2.03× faster ★</text>
-    <!-- 4 out proj -->
-    <text x="168" y="178" text-anchor="end" class="n">output projection</text>
-    <rect x="178" y="170" width="54.7" height="11" fill="#f59e0b"/><text x="238" y="179" class="s">740 µs</text>
-    <rect x="178" y="183" width="53.7" height="11" fill="#2563eb"/><text x="237" y="192" class="s">726 µs</text>
-    <text x="620" y="185" class="s">parity (1.02×)</text>
-    <!-- 5 fc1 -->
-    <text x="168" y="214" text-anchor="end" class="n">MLP fc1 (768→3072)</text>
-    <rect x="178" y="206" width="188.5" height="11" fill="#f59e0b"/><text x="372" y="215" class="s">2549 µs</text>
-    <rect x="178" y="219" width="134.9" height="11" fill="#2563eb"/><text x="318" y="228" class="s">1825 µs</text>
-    <text x="620" y="221" class="w">NPU 1.40× faster</text>
-    <!-- 6 GELU -->
-    <text x="168" y="250" text-anchor="end" class="n">GELU-tanh</text>
-    <rect x="178" y="242" width="53.8" height="11" fill="#f59e0b"/><text x="237" y="251" class="s">728 µs</text>
-    <rect x="178" y="255" width="42.6" height="11" fill="#2563eb"/><text x="226" y="264" class="s">576 µs</text>
-    <text x="620" y="257" class="w">NPU 1.26× faster</text>
-    <!-- 7 fc2 -->
-    <text x="168" y="286" text-anchor="end" class="n">MLP fc2 (3072→768)</text>
-    <rect x="178" y="278" width="183.9" height="11" fill="#f59e0b"/><text x="367" y="287" class="s">2487 µs</text>
-    <rect x="178" y="291" width="95.4" height="11" fill="#2563eb"/><text x="279" y="300" class="s">1290 µs</text>
-    <text x="620" y="293" class="w">NPU 1.93× faster ★</text>
-    <!-- 8 residual -->
-    <text x="168" y="322" text-anchor="end" class="n">residual adds ×2</text>
-    <rect x="178" y="314" width="10.9" height="11" fill="#f59e0b"/><text x="195" y="323" class="s">147 µs</text>
-    <rect x="178" y="327" width="25.9" height="11" fill="#2563eb"/><text x="210" y="336" class="s">350 µs</text>
-    <text x="620" y="329" class="l">NPU 2.37× SLOWER</text>
-
-    <line x1="178" y1="348" x2="880" y2="348" stroke="#d1d5db"/>
-    <text x="168" y="366" text-anchor="end" class="t">whole layer</text>
-    <text x="178" y="366" class="n"><tspan fill="#b45309" font-weight="700">CPU 14.5 ms</tspan>  vs  <tspan fill="#1d4ed8" font-weight="700">NPU 10.5 ms</tspan>   →   <tspan font-weight="700">NPU 1.38× faster</tspan>   (×12 layers = 174 ms vs 126 ms per image)</text>
-
-    <rect x="8" y="378" width="884" height="40" rx="6" fill="#eff6ff" stroke="#93c5fd"/>
-    <text x="20" y="393" class="n"><tspan font-weight="700">The whole win comes from three operations.</tspan> Attention alone saves 2.9 ms of the 4.0 ms the NPU gains per layer (73% of it); fc2 and fc1 give another 1.9 ms.</text>
-    <text x="20" y="408" class="n">Everything memory-bound goes the other way — <tspan font-weight="700">LayerNorm hands back 0.64 ms</tspan> and the residual adds 0.20 ms, which is where the remaining headroom is.</text>
-  </svg>
-  <figcaption>Per-operation comparison of one of the 12 SigLIP encoder layers, measured on the same machine with both processors at maximum performance.</figcaption>
-  </div>
-
-  <h3>Zooming back out: the <em>whole</em> encoder, not just its 12 layers</h3>
-  <p>
-    The 12 layers are most of the vision encoder but not all of it. Putting the surrounding stages on the same
-    footing changes the picture in one important way — and exposes something we had wrong.
-  </p>
-  <table>
-    <tr><th>Stage of the vision encoder</th><th>CPU</th><th>our NPU path</th><th>result</th></tr>
-    <tr style="background:#fef2f2">
-      <td><b>patch embedding + position</b><br><span class="sub" style="font-size:0.85em;color:#6b7280">image → 1024 tokens</span></td>
-      <td><b>1.36 ms</b><br><span style="font-size:0.85em;color:#6b7280">an optimised Conv2d</span></td>
-      <td><b>6.00 ms</b><br><span style="font-size:0.85em;color:#991b1b">entirely on the host, in numpy</span></td>
-      <td><span class="pill" style="background:#fee2e2;color:#991b1b;border:1px solid #fca5a5">4.4× SLOWER</span></td>
-    </tr>
-    <tr>
-      <td><b>12 × encoder layer</b></td>
-      <td>173.7 ms</td>
-      <td><b>134.5 ms</b> on the NPU</td>
-      <td><span class="pill done">1.29× faster</span></td>
-    </tr>
-    <tr>
-      <td>final LayerNorm</td>
-      <td>0.04 ms</td>
-      <td>0.63 ms</td>
-      <td>18× slower — but 0.6 ms, and it runs once</td>
-    </tr>
-    <tr>
-      <td><b>connector</b><br><span style="font-size:0.85em;color:#6b7280">pixel-shuffle + projection</span></td>
-      <td>1.43 ms</td>
-      <td><b>1.06 ms</b><br><span style="font-size:0.85em;color:#6b7280">0.11 host reshape + 0.95 NPU</span></td>
-      <td><span class="pill done">1.35× faster</span></td>
-    </tr>
-    <tr><td><b>Σ compute</b></td><td><b>176.5 ms</b></td><td><b>142.2 ms</b></td><td>1.24×</td></tr>
-    <tr><td>+ NPU data movement, launches, Python</td><td>—</td><td>~12.8 ms</td><td></td></tr>
-    <tr style="background:#f0f9ff"><td><b>measured, per image</b></td><td><b>183.7 ms</b></td><td><b>155 ms</b></td><td><b>1.19×</b></td></tr>
-  </table>
-
-  <div class="callout warn">
-    <b>A correction: the patch embedding never made it onto the NPU.</b> We had described it as "im2col reshape on
-    the host, then a matmul on the NPU". In fact <em>both halves</em> run on the host in numpy, and it is the one
-    stage where our pipeline is dramatically worse than the CPU's — 6.00 ms against an optimised Conv2d's 1.36 ms.
-    Breaking those 6 ms down shows three separate, entirely fixable causes:
-    <table style="margin:0.6rem 0">
-      <tr><th>Inside the 6.00 ms</th><th>cost</th><th>why it is avoidable</th></tr>
-      <tr><td>im2col patch extraction</td><td>0.95 ms</td><td>a Python loop running 1024 times; it is a pure reshape that numpy can do in one call</td></tr>
-      <tr><td>the matmul <span class="shape">1024×768×768</span></td><td>1.91 ms</td><td>the NPU does this exact shape in <b>0.58 ms</b> — it is simply not being sent there</td></tr>
-      <tr><td>dtype conversions + position add</td><td>3.14 ms</td><td>the weights are converted from bf16 to fp32 on <em>every call</em> instead of once at startup</td></tr>
-    </table>
-    None of this is a hardware limit. Fixing all three should bring the stage to roughly 1.2 ms — <b>saving ~4.8 ms
-    per image, ~14 ms per inference</b>, which is larger than most of the items on the opportunity list below. It
-    survived this long precisely because it sits outside the 12-layer loop everyone was profiling.
-  </div>
-
   <p class="legend">
-    Two smaller observations from the same table. The <b>final LayerNorm is 18× slower</b> on the NPU — the same
-    memory-bound weakness as the in-layer norms, just harmless here because it runs once. The <b>connector is
-    1.35× faster</b>: its projection is a <span class="shape">64×12288×960</span> matmul whose very deep inner
-    dimension is exactly the shape the NPU likes, and the pixel-shuffle beside it is a pure reshape costing 0.1 ms.
+    Same numbers as Section 8's table, viewed as time rather than as a list: 86.6% of the encoder's wall clock is
+    now the NPU executing. The host glue that once dominated is down to about 10 ms per inference. <b>The encoder is
+    NPU-bound</b>, which is why further gains have to come from the device side or from the two stages that are
+    still on the host.
   </p>
-
-  <h3>Two plausible theories, both refuted by measurement</h3>
+  <h3>Level 3 — the underlying reason: shape</h3>
   <p>
-    We went in with two hypotheses about where the waste was. Measuring killed both — which is itself the useful
-    result, because it redirected the search.
+    One property explains the vision win, the backbone loss and the expert verdict alike. An NPU is a grid of
+    compute tiles; efficiency depends on whether an operation has enough work to fill it. Measured on the same
+    kernels at each stage's own size:
   </p>
   <table>
-    <tr><th>Hypothesis</th><th>Result</th></tr>
+    <tr><th>Stage</th><th>Sequence length</th><th>Matmul throughput</th><th>Outcome</th></tr>
+    <tr><td>Vision</td><td>1024</td><td>3798–5790 GFLOP/s</td><td><span class="pill done">beats the CPU</span></td></tr>
+    <tr><td>Backbone</td><td>256</td><td>2046–3366</td><td>loses ~3×</td></tr>
+    <tr><td>Action expert</td><td>50</td><td>200–1100</td><td>loses 1.2–1.6×</td></tr>
+  </table>
+  <p class="legend">
+    The backbone's attention is the worst case: short sequences <em>and</em> an odd 15 heads, which forces the
+    kernel onto half the grid — an even head count like vision's 12 packs two per unit and fills it, measured at
+    1.58× purely from that. For scale, the same matmul kernel reaches 8898 GFLOP/s at large sizes, so the backbone
+    runs at roughly a fifth of the chip's capability and the expert well below that.
+  </p>
+  <p>
+    Two consequences follow directly, and both were confirmed by measurement rather than assumed. <b>The backbone
+    cannot be rescued by better scheduling</b>: profiling the real 16-layer backbone (832 dispatches) shows 90% of
+    its time is the NPU genuinely computing and only 10% data movement, with one dispatch costing 24–36 µs of host
+    time — so even perfect host overlap leaves it far above the CPU's 77 ms. <b>The expert is the same story,
+    harder</b>: every kernel it runs loses head-to-head at seq=50, so no amount of assembly work flips it.
+  </p>
+
+  <h3>Level 4 — what we got wrong</h3>
+  <p>
+    Four things we believed, and what measuring them actually showed. They are listed because each one redirected
+    the work.
+  </p>
+  <table>
+    <tr><th>We believed</th><th>Measurement said</th></tr>
     <tr>
-      <td><b>Fusing operations into one program costs device time.</b> A parallel study of the <em>backbone's</em>
-          fused programs found them 1.4–1.8× slower than the sum of their individually-tuned parts, so we expected
-          the same drag on vision.</td>
+      <td>Fusing operations into one program costs device time — the <em>backbone's</em> fused programs measured
+          1.4–1.8× slower than the sum of their parts, so vision should suffer the same.</td>
       <td><span class="pill" style="background:#fee2e2;color:#991b1b;border:1px solid #fca5a5">refuted</span>
-          Vision's fused programs cost only <b>1.015× and 1.025×</b> versus their parts — fusion here is
-          essentially free. (The backbone's penalty does not generalise.) The small extra cost seen in deployment is
-          the chip switching between three different programs each layer, not the fusing itself.</td>
+          Vision's fused programs cost <b>1.015× and 1.025×</b> — fusion here is essentially free. The backbone's
+          penalty does not generalise.</td>
     </tr>
     <tr>
-      <td><b>The tile sizes inside the fused programs are compromises.</b> A fused program must pick one device
-          configuration; separately, the connector's matmul had just been re-tuned for a 1.33× win.</td>
+      <td>The tile sizes inside those fused programs are compromises forced by sharing one device configuration.</td>
       <td><span class="pill" style="background:#fef9c3;color:#854d0e;border:1px solid #ca8a04">mostly refuted</span>
-          The Q/K/V/O matmuls are flat within <b>0.5%</b> across four tile sizes. Re-tuning the two MLP matmuls is
-          worth <b>3.8 ms</b> total — real, but not the 1.33× the connector saw.</td>
+          Q/K/V/O are flat within <b>0.5%</b> across four tile sizes; re-tuning the two MLP matmuls is worth 3.8 ms.</td>
+    </tr>
+    <tr>
+      <td>Turning on the NPU's Turbo mode should speed the encoder up.</td>
+      <td><span class="pill" style="background:#fef9c3;color:#854d0e;border:1px solid #ca8a04">only partly</span>
+          Turbo gives <b>+7.5%</b> on a single matmul (3763 → 4045 GFLOP/s) but <b>~0%</b> on the encoder — proof
+          that it is not limited by compute clock, but by memory-bound operations, launches and host work.</td>
+    </tr>
+    <tr>
+      <td>The patch embedding does its reshape on the host and its matmul on the NPU.</td>
+      <td><span class="pill" style="background:#fee2e2;color:#991b1b;border:1px solid #fca5a5">wrong</span>
+          <b>Both halves run on the host</b>, and it is the one stage far worse than the CPU's. See below.</td>
     </tr>
   </table>
+
   <div class="callout warn">
-    <b>What neither hypothesis was looking at — and it is the biggest single gap.</b> The <em>same</em> matmul, with
-    the <em>same</em> tiles, is <b>1.26–1.42× slower</b> when compiled into the multi-program format our deployment
-    must use than when compiled as a standalone binary:
+    <b>The patch embedding: 5.3 ms where the CPU needs 1.36 ms.</b> It escaped attention for months because it sits
+    <em>outside</em> the 12-layer loop everyone was profiling. Timed on its own the same function takes 6.0 ms — the
+    5.3 ms above is what the in-deployment profiler attributes to it, and the gap is measurement context, not a
+    disagreement. That 6.0 ms decomposes into three independent, entirely host-side causes — none of them a
+    hardware limit:
     <table style="margin:0.6rem 0">
-      <tr><th>Matmul shape</th><th>deployment format</th><th>standalone format</th><th>penalty</th></tr>
-      <tr><td><span class="shape">1024×768×768</span></td><td>620 µs</td><td>435 µs</td><td><b>1.42×</b></td></tr>
-      <tr><td><span class="shape">1024×768×3072</span></td><td>1962 µs</td><td>1555 µs</td><td>1.26×</td></tr>
-      <tr><td><span class="shape">1024×3072×768</span></td><td>1501 µs</td><td>1140 µs</td><td>1.32×</td></tr>
+      <tr><th>Component</th><th>cost</th><th>why it is avoidable</th></tr>
+      <tr><td>im2col patch extraction</td><td>0.95 ms</td><td>a Python loop running 1024 times, for what is a single numpy reshape</td></tr>
+      <tr><td>the matmul <span class="shape">1024×768×768</span></td><td>1.91 ms</td><td>the NPU does this exact shape in <b>0.58 ms</b> — it is simply never sent there</td></tr>
+      <tr><td>dtype conversions + position add</td><td>3.14 ms</td><td>weights converted from bf16 to fp32 on <em>every call</em> rather than once at startup</td></tr>
     </table>
-    This is a property of the compilation path, not of the kernel or its tiling. It also means the throughput
-    figures in our kernel catalogue — all measured in the standalone format — <b>systematically flatter what a
-    deployed pipeline will actually see</b>. Worth knowing before quoting them as deployment estimates.
+    Fixing all three should bring the stage to roughly 1.2 ms: <b>~4 ms per image, ~12 ms per inference</b>.
   </div>
 
-  <h3>What this makes worth doing, in order</h3>
+  <div class="callout warn">
+    <b>And one finding that reaches beyond this model.</b> The <em>same</em> matmul with the <em>same</em> tiles is
+    <b>1.26–1.42× slower</b> compiled into the multi-program format a deployment must use than as a standalone
+    binary (<span class="shape">1024×768×768</span>: 620 µs vs 435 µs). That is a property of the compilation path,
+    not of the kernel. It also means our kernel catalogue's throughput figures — all measured in the standalone
+    format — <b>systematically flatter what a deployed pipeline will see</b>.
+  </div>
+
+  <h3>Level 5 — what is left on the table</h3>
   <table>
     <tr><th>#</th><th>Opportunity</th><th>Worth</th><th>Effort</th></tr>
-    <tr><td>1</td><td>Extend the thread-capping to cover the host patch reshaping too — the first image currently costs 37.9 ms more than the second and third, because the numerical library's idle workers preempt the dispatch thread</td><td><b>−32.6 ms</b> <span style="font-size:0.85em;color:#166534">measured</span></td><td>one line</td></tr>
-    <tr style="background:#f0fdf4"><td>2</td><td><b>Fix the patch embedding</b> — vectorise the im2col loop, send its matmul to the NPU, and convert the weights once instead of per call (above)</td><td><b>−14 ms</b> <em>est.</em></td><td>small — all three are host-side</td></tr>
-    <tr><td>3</td><td>Close the deployment-format matmul gap (above)</td><td>−64.6 ms <em>est.</em></td><td>compiler/runtime</td></tr>
-    <tr><td>4</td><td>Fold the bias and residual adds into the matmul's own output stage</td><td>−52.2 ms <em>est.</em></td><td>medium</td></tr>
-    <tr><td>5</td><td>Merge attention into the fused program — 1 program per layer instead of 3</td><td>−24.7 ms <em>est.</em></td><td>medium (now supported by the refuted H1)</td></tr>
-    <tr><td>6</td><td>Speed up the affine LayerNorm — it runs at 8.1 GB/s where a same-sized add reaches 34.7</td><td>−21.1 ms <em>est.</em></td><td>kernel tuning</td></tr>
+    <tr><td>1</td><td>Extend the thread-capping over the host patch reshaping — the first image costs 37.9 ms more than the second and third because the numerical library's idle workers preempt the dispatch thread</td><td><b>−32.6 ms</b> <span style="font-size:0.85em;color:#166534">measured</span></td><td>one line</td></tr>
+    <tr><td>2</td><td>Fix the patch embedding (three causes above)</td><td><b>−12 ms</b> <em>est.</em></td><td>small, all host-side</td></tr>
+    <tr><td>3</td><td>Close the deployment-format matmul gap</td><td>−64.6 ms <em>est.</em></td><td>compiler/runtime</td></tr>
+    <tr><td>4</td><td>Fold the bias and residual adds into the matmul's own output stage — 13% of all NPU time is these, and they are pure launch plus memory traffic</td><td>−52.2 ms <em>est.</em></td><td>medium</td></tr>
+    <tr><td>5</td><td>Merge attention into the fused program — one program per layer instead of three, removing the 6.5% switching cost</td><td>−24.7 ms <em>est.</em></td><td>medium</td></tr>
+    <tr><td>6</td><td>Speed up the affine LayerNorm — 8.1 GB/s where a same-sized add reaches 34.7</td><td>−21.1 ms <em>est.</em></td><td>kernel tuning</td></tr>
     <tr><td>7</td><td>Re-tile the two MLP matmuls</td><td><b>−3.8 ms</b> <span style="font-size:0.85em;color:#166534">measured</span></td><td>two constants</td></tr>
-    <tr><td>—</td><td><em>Attention</em> is 21% of the wall clock but already runs at its standalone speed — there is no pipeline-level headroom, only a kernel rewrite</td><td>—</td><td>large</td></tr>
+    <tr><td>—</td><td><em>Attention</em> is 25% of NPU time but already runs at its standalone speed — no pipeline-level headroom, only a kernel rewrite</td><td>—</td><td>large</td></tr>
   </table>
   <p class="legend">
-    Items 1 and 6 alone are ~36 ms (7.8%), both measured and both a few lines of code. The estimates are labelled as
-    such: they are derived from measured per-operation costs assuming full absorption, i.e. upper bounds.
+    Items 1, 2 and 7 are ~48 ms between them, all host-side and all small changes. The estimates are upper bounds
+    derived from measured per-operation costs assuming full absorption. Notice what is <em>not</em> on this list:
+    fusing the backbone's attention, and porting the action expert — both were measured and ruled out (Level 3).
   </p>
 
-  <h3>What this adds up to</h3>
-  <p>
-    Vision on the NPU saves roughly 190 ms per inference; that is the whole win, and it is enough because vision is
-    the largest block of compute in the model. The backbone would <em>cost</em> ~138 ms on the NPU, so it stays on
-    the CPU. The overheads that used to dominate — over a second of process bridging — are gone. What remains on the
-    table is real but bounded: fusing the backbone's attention (the same fix that gave vision 2.6×) could plausibly
-    make the backbone worth moving too, and splitting the three cameras across CPU and NPU in parallel is measured
-    to be worth about another 0.06× — at the cost of concurrency in a robot control loop.
-  </p>
-
-  <!-- ============================================================ -->
   <h2 id="status">10. Current status and next steps</h2>
 
   <h3>Where we are</h3>
