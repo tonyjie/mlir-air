@@ -519,24 +519,39 @@
     Before touching any accelerator, we profiled the <b>real CPU baseline</b> — the unmodified
     <code>lerobot/smolvla_base</code> running its own <code>predict_action_chunk</code> (a true reference,
     not a reimplementation). The loaded weights are already <b>bfloat16</b> (474 bf16 + 26 fp32 tensors,
-    the fp32 ones being norms / state_proj). One action chunk takes <b>~1044 ms</b> on CPU.
+    the fp32 ones being norms / state_proj). One action chunk takes <b>913 ms</b> on CPU with the processor at
+    maximum performance — the same measurement session used for every comparison in Part B.
   </p>
   <table>
     <tr><th>Stage</th><th>CPU time / chunk</th><th>Share</th><th>Runs per chunk</th></tr>
-    <tr><td>① vision (SigLIP)</td><td><b>719 ms</b></td><td><b>73.6%</b></td><td>1×</td></tr>
-    <tr><td>①b connector</td><td>4.5 ms</td><td>0.5%</td><td>1×</td></tr>
-    <tr><td>② backbone</td><td>56.8 ms</td><td>5.8%</td><td>1×</td></tr>
-    <tr><td>③ action expert</td><td>196.8 ms</td><td>20.1%</td><td>10× (denoise loop)</td></tr>
+    <tr><td><b>① vision (SigLIP)</b></td><td><b>546 ms</b></td><td><b>59.8%</b></td><td><b>3× — once per camera, serially</b> (182 ms each)</td></tr>
+    <tr><td>①b connector</td><td>4.8 ms</td><td>0.5%</td><td>3×</td></tr>
+    <tr><td>② backbone</td><td>77 ms</td><td>8.5%</td><td>1×</td></tr>
+    <tr><td><b>③ action expert</b> + remaining glue</td><td><b>285 ms</b></td><td><b>31.2%</b></td><td>10× (denoise loop)</td></tr>
+    <tr><td><b>total</b></td><td><b>913 ms</b></td><td>100%</td><td></td></tr>
   </table>
-  <p class="legend">By operation type across the whole model: matmul 55% · attention 36% · norm 4.4% · activation 3.7% · conv 0.4%.</p>
+  <p class="legend">
+    Wall-clock per stage, measured with hooks on the real model; the rows close to the measured total. By operation
+    type across the whole model: matmul 55% · attention 36% · norm 4.4% · activation 3.7% · conv 0.4%.
+  </p>
 
   <div class="callout warn">
-    <b>The surprising bottleneck: vision (73.6%).</b> Nearly three-quarters of the time is the SigLIP vision
-    encoder — because its attention matrix is large (1024×1024) and it has 12 layers. The language backbone,
-    despite being the "main" model, is only 5.8% (it runs just once). The action expert is 20.1% because it runs
-    10 times in the denoise loop. This breakdown tells us <b>where acceleration would matter most</b> — a fact
-    we return to in Part B.
+    <b>The bottleneck is vision — and the reason is that it runs three times.</b> The model has <b>three cameras</b>,
+    and the encoder is invoked once per image, serially: 182 ms each, 546 ms together, <b>60% of the chunk</b>.
+    Each image is independent work — 1024 patch tokens through 12 layers with a 1024×1024 attention — so three
+    cameras genuinely cost three times as much (batching them saves only ~9%, measured). The language backbone,
+    despite being the "main" model, is 8.5% because it runs once. The action expert is 31% because it runs
+    <em>ten</em> times in the denoise loop. This is what tells us <b>where acceleration would matter most</b>.
   </div>
+
+  <p class="legend">
+    <b>A note on an earlier version of this table.</b> We first profiled at default power settings and using
+    leaf-operator attribution (summing time <em>inside</em> torch ops), which gave vision 719 ms / 73.6% and the
+    expert 197 ms / 20.1%, and left 67 ms unattributed. The numbers above are wall-clock per stage at maximum
+    performance and close to the total. The expert moved most: leaf-operator time genuinely is ~217 ms, but it
+    issues ~165 torch ops per denoise step, and the Python dispatch between them is another ~100 ms of real
+    wall-clock. Everything in Part B uses the wall-clock figures.
+  </p>
 
   <!-- ####################  PART B  #################### -->
   <div class="part-banner b">Part B — Running it on the NPU
@@ -628,15 +643,16 @@
 
   <table>
     <tr><th>Stage</th><th>What it is</th><th>Share of CPU runtime</th><th>On the NPU?</th></tr>
-    <tr><td><b>① Vision</b> (SigLIP)</td><td>12-layer ViT, run once per camera (<b>×3</b>)</td><td>~69%</td><td><span class="pill npu">✅ fully on NPU</span></td></tr>
-    <tr><td><b>①b Connector</b></td><td>pixel-shuffle + projection into the language space</td><td>~0.5%</td><td><span class="pill npu">✅ on NPU</span> (the projection; the shuffle is a host reshape)</td></tr>
-    <tr><td><b>② Backbone</b> (SmolLM2-360M)</td><td>16-layer transformer prefill</td><td>~9%</td><td><span class="pill cpu">CPU by choice</span> — a full NPU port exists and is verified, but is <b>~3× slower</b> there (Section 9)</td></tr>
-    <tr><td><b>③ Action expert</b></td><td>16 layers × 10 denoising steps</td><td>~32%</td><td><span class="pill cpu">CPU</span> — not ported</td></tr>
+    <tr><td><b>① Vision</b> (SigLIP)</td><td>12-layer ViT, run once per camera (<b>×3</b>)</td><td><b>59.8%</b></td><td><span class="pill npu">✅ fully on NPU</span></td></tr>
+    <tr><td><b>①b Connector</b></td><td>pixel-shuffle + projection into the language space</td><td>0.5%</td><td><span class="pill npu">✅ on NPU</span> (the projection; the shuffle is a host reshape)</td></tr>
+    <tr><td><b>② Backbone</b> (SmolLM2-360M)</td><td>16-layer transformer prefill</td><td>8.5%</td><td><span class="pill cpu">CPU by choice</span> — a full NPU port exists and is verified, but is <b>~3× slower</b> there (Section 9)</td></tr>
+    <tr><td><b>③ Action expert</b></td><td>16 layers × 10 denoising steps</td><td>31.2%</td><td><span class="pill cpu">CPU</span> — not ported</td></tr>
   </table>
   <p class="legend">
-    Percentages are of the measured pure-CPU <code>predict_action_chunk</code> (Section 8's harness). Inside
-    stages ① / ①b every matmul, norm, attention and activation executes on the NPU — there is <b>no CPU
-    fallback</b>; the host only does data-shuffling glue (see below).
+    Percentages are of the measured 913 ms pure-CPU <code>predict_action_chunk</code> (Section 4). Vision's share
+    is large because <b>the encoder runs three times, once per camera</b>, at 182 ms each. Inside stages ① / ①b
+    every matmul, norm, attention and activation executes on the NPU — there is <b>no CPU fallback</b>; the host
+    only does data-shuffling glue (see below).
   </p>
   <div class="callout">
     <b>Why the backbone runs on the CPU even though we ported it.</b> We mapped all 16 backbone layers onto the NPU
@@ -872,31 +888,48 @@ once per image:       (HOST) pixel-shuffle → [NPU elf:gemm_connector] 64×1228
     both sides — this table is that reference, and Section 9 explains each verdict.
   </p>
   <table>
-    <tr><th>Stage</th><th>Shape it runs at</th><th>Best NPU</th><th>CPU</th><th>Verdict</th></tr>
-    <tr>
-      <td><b>① Vision</b> · per image</td>
-      <td>seq <b>1024</b>, hidden 768</td>
-      <td><b>155 ms</b></td><td>184 ms</td>
-      <td><span class="pill done">NPU 1.19× — we ship this on the NPU</span></td>
+    <tr><th>Stage</th><th>Shape · how often</th><th>CPU</th><th>Best NPU</th><th>Verdict</th></tr>
+    <tr style="background:#f0fdf4">
+      <td><b>① Vision</b></td>
+      <td>seq <b>1024</b>, hidden 768<br><b>×3 — once per camera, serially</b></td>
+      <td>184 ms / image<br><b>546 ms / inference</b></td>
+      <td>155 ms / image<br><b>465 ms / inference</b></td>
+      <td><span class="pill done">NPU 1.19× — shipped on the NPU</span><br><span style="font-size:0.85em;color:#166534">saves ~81 ms of the chunk</span></td>
     </tr>
     <tr>
-      <td><b>② Backbone</b> · per inference</td>
-      <td>seq <b>256</b>, hidden 960</td>
-      <td>229 ms</td><td><b>77 ms</b></td>
-      <td><span class="pill" style="background:#fee2e2;color:#991b1b;border:1px solid #fca5a5">NPU ~3× slower — ported, verified, kept on CPU</span></td>
+      <td>①b Connector</td>
+      <td>M = 64 · ×3</td>
+      <td>4.8 ms</td><td>3.2 ms</td>
+      <td>NPU 1.35× — shipped alongside vision</td>
     </tr>
     <tr>
-      <td><b>③ Action expert</b> · per inference</td>
-      <td>seq <b>50</b> × 10 denoise steps</td>
-      <td>387–526 ms <span style="font-size:0.85em;color:#6b7280">projected</span></td><td><b>324 ms</b></td>
-      <td><span class="pill" style="background:#fee2e2;color:#991b1b;border:1px solid #fca5a5">NPU 1.2–1.6× slower — not ported</span></td>
+      <td><b>② Backbone</b></td>
+      <td>seq <b>256</b>, hidden 960 · ×1</td>
+      <td><b>77 ms</b></td><td>229 ms</td>
+      <td><span class="pill" style="background:#fee2e2;color:#991b1b;border:1px solid #fca5a5">NPU ~3× slower</span><br><span style="font-size:0.85em;color:#6b7280">ported and verified, kept on CPU</span></td>
     </tr>
+    <tr>
+      <td><b>③ Action expert</b></td>
+      <td>seq <b>50</b> · <b>×10</b> denoise steps</td>
+      <td><b>285 ms</b></td>
+      <td>~1.2–1.6× of the CPU<br><span style="font-size:0.85em;color:#6b7280">projected</span></td>
+      <td><span class="pill" style="background:#fee2e2;color:#991b1b;border:1px solid #fca5a5">NPU slower — not ported</span></td>
+    </tr>
+    <tr><td colspan="2"><b>whole chunk</b></td><td><b>913 ms</b></td><td><b>851 ms</b></td><td><b>1.07×</b></td></tr>
   </table>
   <p class="legend">
-    The expert figure is the one <b>projection</b> here: it was never ported. Every one of its kernels was measured
-    individually on real NPU2 at seq=50 and the total assembled from those; the robust part of that study is that
-    the NPU loses <em>head-to-head on every kernel the expert runs</em> (1.1×–6.6×), so the verdict does not rest on
-    the projection. The backbone's 229 ms is also not its ceiling — it has never had the fusion treatment vision got.
+    <b>Note the "how often" column — it is where the end-to-end arithmetic comes from.</b> The vision encoder is
+    1.19× faster <em>per image</em>, but the model runs it <b>three times, once per camera</b>, so the saving is
+    3 × 29 ms ≈ 81 ms of the 913 ms chunk. That, minus a few milliseconds given back elsewhere, is the whole 1.07×.
+    Conversely the expert's ×10 is why it is 31% of the chunk despite being the smallest network in the model.
+  </p>
+  <p class="legend">
+    The expert row is the one <b>projection</b>: it was never ported. Every one of its kernels was measured
+    individually on real NPU2 at seq=50 and the total assembled from those, giving 1.2–1.6× the CPU's time. The
+    robust part of that study is not the projection but that the NPU loses <em>head-to-head on every kernel the
+    expert runs</em> (1.1×–6.6×). (That study ran in a session whose whole chunk was 1028 ms rather than 913 ms, so
+    it is quoted here as a ratio; the expert's share of the chunk agreed closely — 31.5% there, 31.2% here.)
+    The backbone's 229 ms is also not its ceiling — it never had the fusion treatment vision got.
   </p>
 
   <h3>The vision encoder, end to end</h3>
