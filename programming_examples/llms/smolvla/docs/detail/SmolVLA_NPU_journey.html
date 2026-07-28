@@ -1035,6 +1035,53 @@ once per image:       (HOST) pixel-shuffle → [NPU elf:gemm_connector] 64×1228
   </svg>
   <figcaption>Per-operation comparison of one of the 12 SigLIP encoder layers, measured on the same machine with both processors at maximum performance.</figcaption>
   </div>
+  <p>
+    The bars above group each <code>Linear</code> with the separate bias kernel the NPU needs for it, so that the
+    two sides line up. That grouping hides something worth seeing, so here is the same layer with <b>both sides at
+    their own natural granularity</b>, shapes included and nothing merged:
+  </p>
+  <table style="font-size:0.86rem">
+    <tr>
+      <th>Step in the layer</th><th>Shape</th>
+      <th>CPU operator</th><th style="text-align:right">µs</th>
+      <th>NPU kernel(s)</th><th style="text-align:right">µs</th><th style="text-align:right">NPU/CPU</th>
+    </tr>
+    <tr><td>LayerNorm 1</td><td><span class="shape">1024×768</span></td><td><code>nn.LayerNorm</code></td><td style="text-align:right">74</td><td><code>layer_norm</code> (affine)</td><td style="text-align:right">388</td><td style="text-align:right;color:#991b1b">5.23×</td></tr>
+    <tr><td>Q projection</td><td><span class="shape">1024×768×768</span></td><td><code>nn.Linear</code></td><td style="text-align:right">693</td><td><code>GEMM</code> 578 &nbsp;+&nbsp; <code>eltwise bias</code> 147</td><td style="text-align:right">726</td><td style="text-align:right">1.05×</td></tr>
+    <tr><td>K projection</td><td><span class="shape">1024×768×768</span></td><td><code>nn.Linear</code></td><td style="text-align:right">657</td><td><code>GEMM</code> 578 &nbsp;+&nbsp; <code>eltwise bias</code> 147</td><td style="text-align:right">726</td><td style="text-align:right">1.10×</td></tr>
+    <tr><td>V projection</td><td><span class="shape">1024×768×768</span></td><td><code>nn.Linear</code></td><td style="text-align:right">658</td><td><code>GEMM</code> 578 &nbsp;+&nbsp; <code>eltwise bias</code> 147</td><td style="text-align:right">726</td><td style="text-align:right">1.10×</td></tr>
+    <tr style="background:#f0fdf4"><td><b>attention</b></td><td><span class="shape">1024×1024</span>, 12 heads, d<sub>k</sub> 64</td><td><code>scaled_dot_product_attention</code></td><td style="text-align:right"><b>5680</b></td><td><code>flash_attn</code> (non-causal)</td><td style="text-align:right"><b>2798</b></td><td style="text-align:right;color:#166534"><b>0.49×</b></td></tr>
+    <tr><td>output projection</td><td><span class="shape">1024×768×768</span></td><td><code>nn.Linear</code></td><td style="text-align:right">740</td><td><code>GEMM</code> 578 &nbsp;+&nbsp; <code>eltwise bias</code> 147</td><td style="text-align:right">726</td><td style="text-align:right">0.98×</td></tr>
+    <tr><td>residual add 1</td><td><span class="shape">1024×768</span></td><td><code>torch.add</code></td><td style="text-align:right">73</td><td><code>eltwise add</code></td><td style="text-align:right">175</td><td style="text-align:right;color:#991b1b">2.40×</td></tr>
+    <tr><td>LayerNorm 2</td><td><span class="shape">1024×768</span></td><td><code>nn.LayerNorm</code></td><td style="text-align:right">62</td><td><code>layer_norm</code> (affine)</td><td style="text-align:right">388</td><td style="text-align:right;color:#991b1b">6.30×</td></tr>
+    <tr style="background:#f0fdf4"><td><b>MLP fc1</b></td><td><span class="shape">1024×768×3072</span></td><td><code>nn.Linear</code></td><td style="text-align:right"><b>2549</b></td><td><code>GEMM</code> 1461 &nbsp;+&nbsp; <code>eltwise bias</code> 363</td><td style="text-align:right"><b>1825</b></td><td style="text-align:right;color:#166534"><b>0.72×</b></td></tr>
+    <tr><td>GELU-tanh</td><td><span class="shape">1024×3072</span></td><td><code>GELUTanh</code></td><td style="text-align:right">728</td><td><code>gelu</code></td><td style="text-align:right">576</td><td style="text-align:right;color:#166534">0.79×</td></tr>
+    <tr style="background:#f0fdf4"><td><b>MLP fc2</b></td><td><span class="shape">1024×3072×768</span></td><td><code>nn.Linear</code></td><td style="text-align:right"><b>2487</b></td><td><code>GEMM</code> 1143 &nbsp;+&nbsp; <code>eltwise bias</code> 147</td><td style="text-align:right"><b>1290</b></td><td style="text-align:right;color:#166534"><b>0.52×</b></td></tr>
+    <tr><td>residual add 2</td><td><span class="shape">1024×768</span></td><td><code>torch.add</code></td><td style="text-align:right">74</td><td><code>eltwise add</code></td><td style="text-align:right">175</td><td style="text-align:right;color:#991b1b">2.35×</td></tr>
+    <tr style="border-top:2px solid #9ca3af"><td colspan="3"><b>whole layer</b></td><td style="text-align:right"><b>14476</b></td><td></td><td style="text-align:right"><b>10517</b></td><td style="text-align:right"><b>0.73×</b></td></tr>
+  </table>
+
+  <div class="callout">
+    <b>What the merged view was hiding: five kernels the CPU never has to run.</b> PyTorch's <code>nn.Linear</code>
+    applies its bias inside the same operator; on the NPU each bias is a <em>separate</em> kernel launch over the
+    whole activation. Those five bias kernels cost <b>1100 µs per layer — 10.5% of the NPU's layer time — against a
+    CPU counterpart of exactly zero.</b> Strip them out and the four projections stop being a wash and become a
+    clear NPU win (e.g. Q: 578 µs of matmul against the CPU's 693 µs). This is the single most concrete argument for
+    folding the bias into the matmul's output stage, and it is invisible unless the two sides are listed at their
+    own granularity.
+  </div>
+
+  <p class="legend">
+    <b>What these two columns mean, precisely.</b> The CPU column is wall-clock around each <code>nn.Module</code>
+    call, so it includes PyTorch's own per-operator dispatch; the per-operator sum (173.7 ms/image) is 95% of the
+    measured stage, the rest being framework overhead. The NPU column is device execution time per kernel; the
+    per-kernel sum (126.2 ms/image) is 94% of the deployed layer time, the rest being the cost of switching between
+    the layer's three programs — and the NPU's host-side costs (data movement, launches, Python) are accounted
+    separately in Level 2 rather than smuggled into these rows. Both columns are therefore "the work itself", with
+    each side's overhead kept visible elsewhere — but they are <em>not</em> the same definition, and should not be
+    added together.
+  </p>
+
   <p class="legend">
     <b>Reconciling this with Section 8:</b> these parts sum to 10.5 ms, and 12 layers of them is 126.2 ms — but the
     deployed encoder spends 134.5 ms on those layers. The 8.3 ms difference (6.5%) is the chip switching between
