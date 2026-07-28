@@ -131,6 +131,7 @@
       <li><a href="#correct"><b>Correctness</b></a> — does it still produce the right actions?</li>
       <li><a href="#perf"><b>Performance</b></a> — the measured numbers</li>
       <li><a href="#whyperf"><b>Why the performance looks like this</b></a></li>
+      <li><a href="#expert"><b>The action expert</b></a> — ported, and why it is still slower</li>
       <li><a href="#status">Current status and next steps</a></li>
     </ol>
   </div>
@@ -377,8 +378,16 @@
     The three masks, concretely: <b>SigLIP</b> = no mask (all 1024 patches see each other). <b>backbone</b> =
     a (241,241) prefix-LM mask — the top-left 240×240 block is all-visible (0), and only the state column (the
     241st) is −∞ for the first 240 rows (prefix can't see state; state sees everything). <b>expert self-attn</b> =
-    causal among the 50 action tokens; <b>expert cross-attn</b> = no mask (all 50 actions attend to all 241 prefix
-    tokens).
+    a (50, 291) mask: the 241 prefix columns carry the prefix padding mask, and the 50 action columns are causal
+    among themselves. <b>expert cross-attn</b> = a (50, 241) mask, the same prefix padding mask.
+  </p>
+  <p class="legend">
+    <b>Correction, and it mattered.</b> This paragraph previously said the expert's cross-attention takes "no mask
+    — all 50 actions attend to all 241 prefix tokens". That was derived by calling the model's mask helper with a
+    synthetic all-ones input. Dumped from the real checkpoint, only <b>197 of the 241</b> prefix tokens are real —
+    the language block is padded out to the tokenizer's maximum length — so both expert attention types carry a
+    genuine mask. This is not a cosmetic fix: a missing mask does not crash, it silently produces a slightly wrong
+    model, and it is the reason FlashAttention could not be used for either layer type (Section 10).
   </p>
 
   <!-- STAGE 1 vision -->
@@ -618,9 +627,9 @@
     registry, conv2d turned out to be im2col + an existing GEMM, pixel-shuffle is a host reshape, and the large
     1024×1024 attention ran on the registry FlashAttention (its <em>even</em> 12 heads even fill the whole array).
     So <b>every kernel both stages need is now validated on real NPU2</b>, and both stages run there — the next
-    section shows exactly how. The <b>action expert</b>, still on the CPU, reuses the backbone's kernels at smaller
-    shapes; its sin/cos already has an example too. Net: progress is gated by integration and validation effort,
-    not by missing kernels.
+    section shows exactly how. The <b>action expert</b> has since been ported too (Section 10), reusing the
+    backbone's kernels at smaller shapes; it stays on the CPU because it is measurably slower on the NPU, not
+    because it is unported. Net: progress is gated by integration and validation effort, not by missing kernels.
   </div>
 
   <!-- ============================================================ -->
@@ -638,7 +647,7 @@
     <tr><td><b>① Vision</b> (SigLIP)</td><td>12-layer ViT, run once per camera (<b>×3</b>)</td><td><b>59.8%</b></td><td><span class="pill npu">✅ fully on NPU</span></td></tr>
     <tr><td><b>①b Connector</b></td><td>pixel-shuffle + projection into the language space</td><td>0.5%</td><td><span class="pill npu">✅ on NPU</span> (the projection; the shuffle is a host reshape)</td></tr>
     <tr><td><b>② Backbone</b> (SmolLM2-360M)</td><td>16-layer transformer prefill</td><td>8.5%</td><td><span class="pill cpu">CPU by choice</span> — a full NPU port exists and is verified, but is <b>~3× slower</b> there (Section 9)</td></tr>
-    <tr><td><b>③ Action expert</b></td><td>16 layers × 10 denoising steps</td><td>31.2%</td><td><span class="pill cpu">CPU</span> — not ported</td></tr>
+    <tr><td><b>③ Action expert</b></td><td>16 layers × 10 denoising steps</td><td>31.2%</td><td><span class="pill cpu">CPU by choice</span> — a full NPU port exists and is verified, but is <b>~4× slower</b> there (Section 10)</td></tr>
   </table>
   <p class="legend">
     Percentages are of the measured 913 ms pure-CPU <code>predict_action_chunk</code> (Section 4). Vision's share
@@ -771,7 +780,8 @@ once per image:       (HOST) pixel-shuffle → [NPU elf:gemm_connector] 64×1228
     <li><b>The backbone's attention glue</b> — reshaping to heads, transposing Kᵀ, folding the mask into the score
       buffer. This is a consequence of attention not being fused, and disappears if it is.</li>
     <li><b>One final RMSNorm</b> after layer 16 (outside the hot loop, consistent with the sibling deployments).</li>
-    <li><b>The whole action expert</b> — by design, not yet started.</li>
+    <li><b>The action expert</b> — ported and verified since, but ~4× slower on the NPU, so the shipping
+      configuration still runs it on the CPU (Section 10).</li>
   </ul>
 
   <!-- ============================================================ -->
@@ -813,6 +823,11 @@ once per image:       (HOST) pixel-shuffle → [NPU elf:gemm_connector] 64×1228
     <tr style="background:#f0fdf4"><td><b>Final action chunk — the shipping configuration</b><br>(NPU vision, CPU backbone)</td><td>pure-CPU lerobot action chunk</td><td>cosine <b>0.9990</b>, nMSE <b>0.0030</b> <span class="pill done">PASS</span></td></tr>
     <tr><td><b>Final action chunk</b> — NPU vision <em>and</em> NPU backbone</td><td>pure-CPU lerobot action chunk</td><td>cosine 0.9940, nMSE 0.0122 <span class="pill done">PASS</span></td></tr>
     <tr><td><b>Final action chunk</b> — NPU backbone only</td><td>pure-CPU lerobot action chunk</td><td>cosine 0.9971, nMSE 0.0078 <span class="pill done">PASS</span></td></tr>
+    <tr><td>Action expert: each of 16 layers × 10 steps<br><span style="font-size:0.85em;color:#6b7280">teacher-forced, one layer at a time</span></td><td>real lerobot per-layer output</td><td>worst <b>0.99992</b> <span class="pill done">PASS</span></td></tr>
+    <tr><td>Action expert: all 16 layers, one denoise step</td><td>real lerobot final-norm output</td><td>worst <b>0.99872</b> <span class="pill done">PASS</span></td></tr>
+    <tr><td>Action expert: the full free-running 10-step loop</td><td>real lerobot final x<sub>t</sub></td><td><b>0.99834</b> <span class="pill done">PASS</span></td></tr>
+    <tr><td><b>Final action chunk</b> — NPU expert only</td><td>pure-CPU lerobot action chunk</td><td>cosine <b>0.9987</b>, nMSE 0.0028 <span class="pill done">PASS</span></td></tr>
+    <tr><td><b>Final action chunk</b> — NPU vision <em>and</em> NPU expert</td><td>pure-CPU lerobot action chunk</td><td>cosine 0.9965, nMSE 0.0083 <span class="pill done">PASS</span></td></tr>
   </table>
   <p class="legend">
     Gate thresholds: cosine ≥ 0.99 and normalized MSE ≤ 0.04, on the full (50, 6) action chunk with fixed noise so
@@ -822,6 +837,23 @@ once per image:       (HOST) pixel-shuffle → [NPU elf:gemm_connector] 64×1228
     The per-layer checks are <em>diagnosis</em>, never the gate: an earlier experiment passed every layer yet failed
     end-to-end, so only the action chunk decides.
   </p>
+  <p class="legend">
+    <b>The expert's three rows are a ladder, and building it that way paid for itself immediately.</b> The first run
+    showed self-attention layers at 0.99997 and cross-attention layers at 0.9666 — the split localised the fault to
+    the cross path in one measurement. Before touching the hardware we reproduced the one known numeric deviation
+    (the cross layers' weights are stored fp32 in the checkpoint; we run them bf16) in plain numpy: 0.999997 either
+    way. That ruled out precision and left only a wiring error, which it was — two dispatches had been given the
+    same buffer key, so one silently reused the other's weights <em>and</em> its output view. Fixing it moved cross
+    layers to 0.99997.
+  </p>
+
+  <div class="callout" style="border-left-color:#0d9488;background:#f0fdfa">
+    <b>The expert's error does not compound over the 10 denoise steps — it damps.</b> This was the main risk going
+    in: ten sequential passes through the same stack, each consuming the previous one's output, is exactly the
+    shape of computation where block-float error is supposed to snowball. Measured free-running, the state
+    similarity <em>rises</em> monotonically 0.980 → 0.997 across the loop. Flow matching is self-correcting — each
+    step emits a fresh correction toward the same target, so a perturbation gets absorbed rather than carried.
+  </div>
 
   <div class="callout">
     <b>The port is verified end-to-end against the real model.</b> With both the vision encoder and the language
@@ -904,8 +936,8 @@ once per image:       (HOST) pixel-shuffle → [NPU elf:gemm_connector] 64×1228
       <td><b>③ Action expert</b></td>
       <td>seq <b>50</b> · <b>×10</b> denoise steps</td>
       <td><b>285 ms</b></td>
-      <td>~1.2–1.6× of the CPU<br><span style="font-size:0.85em;color:#6b7280">projected</span></td>
-      <td><span class="pill" style="background:#fee2e2;color:#991b1b;border:1px solid #fca5a5">NPU slower — not ported</span></td>
+      <td><b>3.98× the CPU</b><br><span style="font-size:0.85em;color:#6b7280">measured, no longer projected</span></td>
+      <td><span class="pill" style="background:#fee2e2;color:#991b1b;border:1px solid #fca5a5">NPU ~4× slower</span><br><span style="font-size:0.85em;color:#6b7280">ported and verified, kept on CPU</span></td>
     </tr>
     <tr><td colspan="2"><b>whole chunk</b></td><td><b>913 ms</b></td><td><b>851 ms</b></td><td><b>1.07×</b></td></tr>
   </table>
@@ -918,12 +950,19 @@ once per image:       (HOST) pixel-shuffle → [NPU elf:gemm_connector] 64×1228
     Conversely the expert's ×10 is why it is 31% of the chunk despite being the smallest network in the model.
   </p>
   <p class="legend">
-    The expert row is the one <b>projection</b>: it was never ported. Every one of its kernels was measured
-    individually on real NPU2 at seq=50 and the total assembled from those, giving 1.2–1.6× the CPU's time. The
-    robust part of that study is not the projection but that the NPU loses <em>head-to-head on every kernel the
-    expert runs</em> (1.1×–6.6×). (That study ran in a session whose whole chunk was 1028 ms rather than 913 ms, so
-    it is quoted here as a ratio; the expert's share of the chunk agreed closely — 31.5% there, 31.2% here.)
+    <b>Every row is now measured; none is a projection.</b> The expert was the last holdout — it used to carry a
+    1.2–1.6× estimate assembled from per-kernel measurements. It has since been ported and run end to end, and the
+    real answer is <b>3.98× slower</b>, not 1.2–1.6×. Section 10 explains the gap, which is not a modelling error
+    so much as two wrong inputs to a sound model. The direction of the old verdict was right; its magnitude was
+    optimistic by 2.5×.
     The backbone's 229 ms is also not its ceiling — it never had the fusion treatment vision got.
+  </p>
+  <p class="legend">
+    <b>On mixing sessions.</b> The expert's 3.98× comes from its own interleaved run, whose pure-CPU baseline read
+    988 ms rather than this table's 913 ms (a busier machine; the whole CPU config was uniformly ~8% slower, and
+    the two NPU-stage numbers moved with it). Ratios <em>within</em> one interleaved run are the trustworthy
+    quantity and that is what is quoted; absolute expert milliseconds appear only in Section 10, against their own
+    run's baseline.
   </p>
 
   <h3>The vision encoder, end to end</h3>
@@ -1146,7 +1185,7 @@ once per image:       (HOST) pixel-shuffle → [NPU elf:gemm_connector] 64×1228
     <tr><th>Stage</th><th>Sequence length</th><th>Matmul throughput</th><th>Outcome</th></tr>
     <tr><td>Vision</td><td>1024</td><td>3798–5790 GFLOP/s</td><td><span class="pill done">beats the CPU</span></td></tr>
     <tr><td>Backbone</td><td>256</td><td>2046–3366</td><td>loses ~3×</td></tr>
-    <tr><td>Action expert</td><td>50</td><td>200–1100</td><td>loses 1.2–1.6×</td></tr>
+    <tr><td>Action expert</td><td>50</td><td>25–1163</td><td>loses <b>~4×</b> <span style="font-size:0.85em;color:#6b7280">measured, Section 10</span></td></tr>
   </table>
   <p class="legend">
     The backbone's attention is the worst case: short sequences <em>and</em> an odd 15 heads, which forces the
@@ -1177,11 +1216,100 @@ once per image:       (HOST) pixel-shuffle → [NPU elf:gemm_connector] 64×1228
   <p class="legend">
     Items 1, 2 and 7 are ~48 ms between them, all host-side and all small changes; together with item 4 that is
     roughly 100 ms of the 851 ms chunk. Estimates are upper bounds, derived from measured per-operation costs
-    assuming full absorption. Two things are deliberately <em>absent</em>: fusing the backbone's attention and
-    porting the action expert — both measured and ruled out in Level 3, so they are not open questions.
+    assuming full absorption. One thing is deliberately <em>absent</em>: fusing the backbone's attention, measured
+    and ruled out in Level 3. Porting the action expert used to sit here too as a ruled-out estimate; it has since
+    been built and measured, which is Section 10.
   </p>
 
-  <h2 id="status">10. Current status and next steps</h2>
+  <h2 id="expert">10. The action expert: ported, and why it is still slower</h2>
+  <p>
+    Every other stage was decided by a measurement. The expert was decided by a <em>projection</em> — 1.2–1.6×
+    slower, assembled from its kernels measured individually. That is a weaker kind of evidence than the rest of
+    this document rests on, so the expert was built for real: all 16 layers, all 10 denoise steps, on the NPU,
+    spliced into the actual lerobot policy. It is correct (Section 7) and it is <b>3.98× slower than the CPU</b>.
+  </p>
+  <div class="callout">
+    <b>Being slower was an accepted outcome, not a failure.</b> The goal was a complete, correct mapping and an
+    honest comparison — the interesting question was never "does it win" but "how much does it lose, and to what".
+  </div>
+
+  <h3>What it costs</h3>
+  <table>
+    <tr><th>Configuration</th><th>Whole chunk</th><th>Expert stage</th><th>vs CPU expert</th></tr>
+    <tr><td>Pure CPU</td><td>988 ms</td><td><b>334 ms</b></td><td>1.00×</td></tr>
+    <tr style="background:#fef2f2"><td><b>NPU expert</b>, CPU vision</td><td>1979 ms</td><td><b>1330 ms</b></td><td><b>3.98× slower</b></td></tr>
+    <tr style="background:#f0fdf4"><td>NPU vision, CPU expert <span class="pill done">shipping</span></td><td><b>841 ms</b></td><td>284 ms</td><td>—</td></tr>
+    <tr><td>NPU vision + NPU expert</td><td>1853 ms</td><td>1301 ms</td><td>4.58× slower</td></tr>
+  </table>
+  <p class="legend">
+    One interleaved run, 7 iterations, fixed noise, machine idle, both processors at maximum performance. This
+    run's CPU baseline reads 988 ms against Section 4's 913 ms — the whole CPU configuration was uniformly ~8%
+    slower on a slightly busier machine — so the <em>ratios</em>, which are internal to the run, are the numbers to
+    carry away.
+  </p>
+
+  <h3>Where the time goes — and where it does not</h3>
+  <p>
+    A 4× loss invites the assumption that it is overhead: too many dispatches, too much driver, too much host glue.
+    Profiling says otherwise.
+  </p>
+  <table>
+    <tr><th>Per denoise step</th><th>ms</th><th>share</th></tr>
+    <tr><td>wall clock</td><td>112.7</td><td>100%</td></tr>
+    <tr style="background:#fef2f2"><td>&nbsp;&nbsp;└ <b>NPU actually executing</b></td><td><b>98.4</b></td><td><b>87%</b></td></tr>
+    <tr><td>&nbsp;&nbsp;└ buffer writes to the device</td><td>4.1</td><td>4%</td></tr>
+    <tr><td>&nbsp;&nbsp;└ reading results back</td><td>1.0</td><td>1%</td></tr>
+    <tr><td>&nbsp;&nbsp;└ host glue outside the driver</td><td>10.2</td><td>9%</td></tr>
+  </table>
+  <p class="legend">
+    <b>Nine tenths of the cost is the device doing the work.</b> This is not a dispatch-overhead problem and not a
+    driver problem — no amount of runtime engineering moves it. It is the same conclusion the vision study reached
+    from the opposite direction, where the win also turned out to be device-side rather than host-side.
+  </p>
+
+  <h3>Why the projection said 1.9× and reality said 4×</h3>
+  <p>
+    The gap is 601 ms and it resolves into exactly two causes. Neither is a flaw in the projection's reasoning;
+    both are inputs to it that turned out to be wrong.
+  </p>
+  <table>
+    <tr><th>Cause</th><th>Cost</th><th>Why it was missed</th></tr>
+    <tr>
+      <td><b>FlashAttention is unusable here</b> — attention costs 11 dispatches per layer, not 1</td>
+      <td><b>+378 ms</b></td>
+      <td>Only <b>197 of the 241</b> prefix tokens are real (the language block is padded), so <em>both</em> layer
+      kinds carry a mask the FlashAttention kernel cannot express. The projection — and this port's own first
+      plan — derived the mask from a synthetic all-ones input instead of dumping it from the real model.</td>
+    </tr>
+    <tr>
+      <td><b>The fusion penalty</b> — merging operations into one program costs device time</td>
+      <td><b>+143 ms</b></td>
+      <td>The projection assumed one dispatch per operation. This port fuses, following the pattern the vision and
+      backbone stages use. Measured penalty 1.48–1.71×, reproducing the 1.39–1.79× already measured on the
+      backbone's fused programs.</td>
+    </tr>
+    <tr><td colspan="3" style="background:#f9fafb"><b>440 ms projected device time + 378 + 143 ≈ 961 ms</b>, against <b>934 ms</b> measured. The model was sound.</td></tr>
+  </table>
+  <p class="legend">
+    Un-fusing would recover the 143 ms — 1127 → ~984 ms — and leave the expert <b>still 3.4× slower</b>. Worth
+    doing if this path is ever deployed; not worth doing to change the verdict.
+  </p>
+
+  <h3>The underlying reason, same as everywhere else in this document: shape</h3>
+  <p>
+    50 tokens pad to 64, and 64 admits only a tiling that occupies <b>half the 8×4 array</b> before a single
+    instruction runs. The same kernels that reach 2046–3366 GFLOP/s at the backbone's 256 tokens reach 25–1163 at
+    the expert's shapes. Every launch costs ~85 µs regardless of how little work is in it, and one denoise step
+    issues <b>208</b> of them. And matmul is only 57% of the expert's CPU time to begin with, so even a perfect
+    matmul accelerator caps the achievable win.
+  </p>
+  <div class="callout">
+    <b>The expert is the mirror image of the vision tower.</b> Vision wins because 1024 tokens and 768/3072-wide
+    matmuls saturate the array. The expert loses because 50 tokens cannot fill it — and it runs ten times per
+    inference, so it cannot amortise anything either.
+  </div>
+
+  <h2 id="status">11. Current status and next steps</h2>
 
   <h3>Where we are</h3>
   <ul class="clean">
@@ -1194,12 +1322,17 @@ once per image:       (HOST) pixel-shuffle → [NPU elf:gemm_connector] 64×1228
       184 ms per image, both at max performance), after fusion cut it from 121 dispatches to 37.</li>
     <li><span class="pill done">✅</span> <b>The backbone is fully ported and verified too</b> — but measured 2.6×
       slower on the NPU, so it ships on the CPU. The port is one flag away and still gated.</li>
+    <li><span class="pill done">✅</span> <b>The action expert is now ported and verified as well</b> — all 16
+      layers × 10 denoise steps on-chip, action chunk 0.9987 against the CPU model. It is <b>3.98× slower</b>, so
+      it also ships on the CPU. <b>All three stages have now been built and measured on both processors; nothing
+      in this document rests on a projection any more.</b></li>
     <li><span class="pill done">✅</span> <b>The encoder is now NPU-bound, not host-bound</b> — a full accounting
       puts 86.6% of its time in the chip actually executing, with ~10 ms of host glue left in the loop and an
       honestly-reported 1.8% residual (Section 9).</li>
     <li><span class="pill done">✅</span> Along the way: 2 kernels promoted into the shared registry (affine
-      LayerNorm, GELU-tanh), 1 written from scratch (masked-softmax), 17 (kernel, shape) rows validated on real
-      NPU2, and a shared-code bug fixed with no regression to the sibling models.</li>
+      LayerNorm, GELU-tanh), 1 written from scratch (masked-softmax), <b>36</b> (kernel, shape) rows validated on
+      real NPU2 (the registry went 43 → 62 shapes), and shared-code bugs fixed with no regression to the sibling
+      models.</li>
   </ul>
 
   <div class="callout">
@@ -1208,6 +1341,15 @@ once per image:       (HOST) pixel-shuffle → [NPU elf:gemm_connector] 64×1228
     bridge, a duplicated computation, and thread contention — and the fourth (small shapes) is best answered by
     choosing <em>which</em> stages to move, not by moving everything. Measuring each stage on both processors, and
     being willing to leave one on the CPU, is what produced the speedup.
+  </div>
+
+  <div class="callout" style="border-left-color:#7c3aed;background:#faf5ff">
+    <b>The second lesson: a projection is not a measurement, even a careful one.</b> The expert's per-kernel study
+    was rigorous — every kernel measured on real hardware at the real shapes — and it still landed 2.5× off,
+    because two of its <em>inputs</em> were wrong: it assumed an attention kernel that turns out to be unusable
+    here, and it assumed no fusion penalty. Both errors were invisible until the thing was built. The verdict it
+    reached (keep the expert on the CPU) was correct; the number it reached was not. Where a decision is expensive
+    to get wrong, the projection is a reason to go and measure, not a substitute for it.
   </div>
 
   <h3>What is worth doing next</h3>
