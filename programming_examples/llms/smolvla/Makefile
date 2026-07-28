@@ -68,6 +68,18 @@ run:
 verify:
 	cd $(srcdir) && $(NPU_LOCK) $(LEROBOT_PYTHON) verify_adapter.py
 
+## Same gate with the ACTION EXPERT (16 layers x 10 denoise steps) on NPU.
+verify-npu-expert:
+	cd $(srcdir) && $(NPU_LOCK) $(LEROBOT_PYTHON) verify_adapter.py --npu-expert
+
+## Expert on NPU, CPU vision -- isolates the expert's own error budget.
+verify-expert-only:
+	cd $(srcdir) && $(NPU_LOCK) $(LEROBOT_PYTHON) verify_adapter.py --npu-expert --cpu-vision
+
+## Tiered teacher-forced gate for the expert (per layer / per step / free-run).
+expert-gate:
+	cd $(srcdir) && $(NPU_LOCK) $(NPU_PYTHON) test_expert_npu.py --level 123
+
 ## Same gate with the 16-layer backbone prefill ALSO on NPU: the full
 ## vision+backbone error budget (slower, kept for the record).
 verify-npu-backbone:

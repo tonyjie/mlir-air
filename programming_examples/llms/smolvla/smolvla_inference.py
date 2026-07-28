@@ -90,10 +90,21 @@ def normalized_mse(chunk, ref) -> float:
 
 
 def build_config(
-    npu_vision: bool = False, npu_backbone: bool = True, bridge: bool = False
+    npu_vision: bool = False,
+    npu_backbone: bool = True,
+    npu_expert: bool = False,
+    bridge: bool = False,
 ):
     """Minimal config dict for the verify adapter / reporting."""
-    stages = [s for s, on in (("vision", npu_vision), ("backbone", npu_backbone)) if on]
+    stages = [
+        s
+        for s, on in (
+            ("vision", npu_vision),
+            ("backbone", npu_backbone),
+            ("expert", npu_expert),
+        )
+        if on
+    ]
     return {
         "model": DEFAULT_MODEL,
         "prompt": DEFAULT_PROMPT,
@@ -229,6 +240,7 @@ def run_hybrid_forward(
     attn_mode="gemm",
     npu_vision=False,
     npu_backbone=True,
+    npu_expert=False,
     bridge=False,
     timings=None,
 ):
@@ -240,6 +252,10 @@ def run_hybrid_forward(
         When False, lerobot's own torch CPU prefill result is kept as-is —
         nothing is hooked and no KV injection happens, so the redundant
         "compute on CPU then throw it away" of the old path disappears.
+    npu_expert  : run the action expert's 16 layers x 10 denoise steps on NPU.
+        Only `vlm_with_expert.forward` is replaced -- lerobot's own
+        `embed_suffix` and `action_out_proj` still run on CPU, so the head/tail
+        stays the real code path. Single-process only (no bridge).
     bridge      : False (default) = single process via `smolvla_npu_runtime`;
         True = the legacy subprocess bridges (reference/fallback).
     attn_mode   : NPU backbone attention -- "gemm" (production) or "flash".
@@ -357,6 +373,15 @@ def run_hybrid_forward(
     if npu_backbone:
         vwe.forward = _wrapped_vwe_forward
 
+    _restore_expert = None
+    if npu_expert:
+        if bridge:
+            raise ValueError("npu_expert is single-process only (bridge=True unsupported)")
+        from expert_hook import install_npu_expert
+        from smolvla_npu_runtime import get_expert_runtime
+
+        _restore_expert = install_npu_expert(policy, get_expert_runtime())
+
     try:
         policy.reset()
         with torch.no_grad():
@@ -365,6 +390,8 @@ def run_hybrid_forward(
         policy.model.embed_prefix = orig_embed_prefix
         vwe.embed_image = orig_embed_image
         vwe.forward = orig_vwe_forward
+        if _restore_expert is not None:
+            _restore_expert()
         if tmpdir_ctx is not None:
             tmpdir_ctx.cleanup()
 

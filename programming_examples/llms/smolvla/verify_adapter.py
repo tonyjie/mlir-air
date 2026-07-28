@@ -66,9 +66,12 @@ NMSE_MAX = 0.04
 
 
 def build_config(
-    npu_vision: bool = True, npu_backbone: bool = False, bridge: bool = False
+    npu_vision: bool = True,
+    npu_backbone: bool = False,
+    npu_expert: bool = False,
+    bridge: bool = False,
 ) -> dict:
-    cfg = _inference_config(npu_vision, npu_backbone, bridge)
+    cfg = _inference_config(npu_vision, npu_backbone, npu_expert, bridge)
     cfg.update({"gate": "regression", "cos_min": COS_MIN, "nmse_max": NMSE_MAX})
     return cfg
 
@@ -78,6 +81,7 @@ def run_gate(
     nmse_max: float = NMSE_MAX,
     npu_vision: bool = True,
     npu_backbone: bool = False,
+    npu_expert: bool = False,
     bridge: bool = False,
 ) -> dict:
     """Run the pipeline once and return the gate dict. Gates on cosine
@@ -102,6 +106,7 @@ def run_gate(
         noise=_fixed_noise(policy),
         npu_vision=npu_vision,
         npu_backbone=npu_backbone,
+        npu_expert=npu_expert,
         bridge=bridge,
     )
     assert chunk.shape == ref.shape, (chunk.shape, ref.shape)
@@ -118,13 +123,20 @@ def main() -> int:
     """Default gate = the production config (NPU vision, CPU backbone, single
     process). Flags select the other configs:
       --npu-backbone  also run the 16-layer prefill on NPU
+      --npu-expert    also run the action expert's 16 layers x 10 steps on NPU
       --cpu-vision    keep lerobot's CPU vision tower
       --bridge        drive the NPU stages through the legacy subprocesses"""
     npu_vision = "--cpu-vision" not in sys.argv
     npu_backbone = "--npu-backbone" in sys.argv
+    npu_expert = "--npu-expert" in sys.argv
     bridge = "--bridge" in sys.argv
-    g = run_gate(npu_vision=npu_vision, npu_backbone=npu_backbone, bridge=bridge)
-    cfg = build_config(npu_vision, npu_backbone, bridge)
+    g = run_gate(
+        npu_vision=npu_vision,
+        npu_backbone=npu_backbone,
+        npu_expert=npu_expert,
+        bridge=bridge,
+    )
+    cfg = build_config(npu_vision, npu_backbone, npu_expert, bridge)
     print("=" * 60)
     print("SmolVLA verify: e2e action-chunk regression gate")
     print(f"  NPU stages     : {cfg['npu_stages']}")

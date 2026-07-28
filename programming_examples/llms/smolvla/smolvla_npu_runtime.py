@@ -452,6 +452,7 @@ class BackboneRuntime:
 
 _vision_rt = None
 _backbone_rt = {}
+_expert_rt = None
 
 
 def get_vision_runtime(**kw):
@@ -467,3 +468,27 @@ def get_backbone_runtime(attn_mode="gemm", **kw):
     if attn_mode not in _backbone_rt:
         _backbone_rt[attn_mode] = BackboneRuntime(attn_mode=attn_mode, **kw)
     return _backbone_rt[attn_mode]
+
+
+def get_expert_runtime(hoist_cross_kv=True, **kw):
+    """The action expert's runner: weights + 10 ELFs loaded once per process.
+
+    Matters more here than for the other two stages -- the expert runs its 16
+    layers TEN times per inference, so a per-call rebuild of the KernelCache
+    would dominate everything.
+    """
+    global _expert_rt
+    if _expert_rt is None:
+        from expert_denoise import ExpertRunner
+        from expert_weights import SmolVLAExpertConfig, load_expert_weights
+
+        cfg = SmolVLAExpertConfig()
+        rt = ExpertRunner(
+            weights=load_expert_weights(config=cfg),
+            config=cfg,
+            hoist_cross_kv=hoist_cross_kv,
+            **kw,
+        )
+        rt.ensure_kernels()
+        _expert_rt = rt
+    return _expert_rt
