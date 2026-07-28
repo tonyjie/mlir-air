@@ -1221,19 +1221,274 @@ once per image:       (HOST) pixel-shuffle → [NPU elf:gemm_connector] 64×1228
     been built and measured, which is Section 10.
   </p>
 
-  <h2 id="expert">10. The action expert: ported, and why it is still slower</h2>
+  <h2 id="expert">10. The action expert: what it computes, and what it costs on each processor</h2>
   <p>
-    Every other stage was decided by a measurement. The expert was decided by a <em>projection</em> — 1.2–1.6×
-    slower, assembled from its kernels measured individually. That is a weaker kind of evidence than the rest of
+    Every other stage in this document was decided by a measurement. The expert was decided by a <em>projection</em>
+    — 1.2–1.6× slower, assembled from its kernels measured individually. That is weaker evidence than the rest of
     this document rests on, so the expert was built for real: all 16 layers, all 10 denoise steps, on the NPU,
     spliced into the actual lerobot policy. It is correct (Section 7) and it is <b>3.98× slower than the CPU</b>.
   </p>
   <div class="callout">
     <b>Being slower was an accepted outcome, not a failure.</b> The goal was a complete, correct mapping and an
     honest comparison — the interesting question was never "does it win" but "how much does it lose, and to what".
+    The answer turns out to be far more specific than "4× slower": <b>one operation family accounts for almost all
+    of it</b>.
   </div>
 
-  <h3>What it costs</h3>
+  <h3>10.1 — What the expert actually computes</h3>
+  <p>
+    The expert is a 16-layer transformer at hidden <b>720</b>, run <b>ten times</b> over 50 action tokens. Two
+    things make it unlike the backbone. First, <b>q_dim (960) is not the same as hidden (720)</b> — 15 query heads × 64 makes the
+    attention block non-square, so <code>q_proj</code> is 720→960 and <code>o_proj</code> is 960→720. Second, the
+    layers <b>alternate</b>: even layers self-attend, odd layers cross-attend, and the two kinds read different
+    keys and values.
+  </p>
+  <div class="fig">
+    <svg viewBox="0 0 1180 268" width="100%" style="max-width:1180px">
+      <defs><marker id="ar10" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+        <path d="M0,0 L0,6 L7,3 z" fill="#64748b"/></marker></defs>
+      <rect x="8" y="8" width="1164" height="130" rx="8" fill="#f0fdf4" stroke="#86efac"/>
+      <text x="20" y="30" font-size="13" font-weight="700" fill="#15803d">EVEN layer — self-attention · 8 of 16 · K/V = 241 cached prefix ++ 50 new = 291</text>
+      <text x="20" y="56" font-size="12" fill="#334155">x (50,720)</text>
+      <text x="110" y="56" font-size="12" fill="#334155">RMSNorm →(50,720)</text>
+      <text x="255" y="56" font-size="12" fill="#334155">q_proj 720×960 →(50,960)</text>
+      <text x="450" y="56" font-size="12" fill="#334155">k,v_proj 720×320 →(50,320)</text>
+      <text x="655" y="56" font-size="12" fill="#334155">RoPE q,k</text>
+      <text x="760" y="56" font-size="12" fill="#334155">cat with cache →(291,5,64)</text>
+      <text x="20" y="82" font-size="12" fill="#334155">GQA expand 5→15 heads</text>
+      <text x="215" y="82" font-size="12" fill="#334155">QK<tspan baseline-shift="super" font-size="9">T</tspan> (15,50,64)@(15,64,291) →(15,50,291)</text>
+      <text x="560" y="82" font-size="12" fill="#334155">×⅛ · mask · softmax</text>
+      <text x="720" y="82" font-size="12" fill="#334155">PV (15,50,291)@(15,291,64) →(15,50,64)</text>
+      <text x="20" y="108" font-size="12" fill="#334155">reshape →(50,960)</text>
+      <text x="170" y="108" font-size="12" fill="#334155">o_proj 960×720 →(50,720)</text>
+      <text x="360" y="108" font-size="12" fill="#334155">+residual</text>
+      <text x="450" y="108" font-size="12" fill="#334155">RMSNorm</text>
+      <text x="540" y="108" font-size="12" fill="#334155">gate,up 720×2048 →(50,2048)</text>
+      <text x="760" y="108" font-size="12" fill="#334155">SiLU×up</text>
+      <text x="850" y="108" font-size="12" fill="#334155">down 2048×720 →(50,720)</text>
+      <text x="1040" y="108" font-size="12" fill="#334155">+residual</text>
+      <rect x="8" y="150" width="1164" height="108" rx="8" fill="#eff6ff" stroke="#93c5fd"/>
+      <text x="20" y="172" font-size="13" font-weight="700" fill="#1d4ed8">ODD layer — cross-attention · 8 of 16 · K/V = the 241-token prefix, re-projected</text>
+      <text x="20" y="198" font-size="12" fill="#334155">x (50,720)</text>
+      <text x="110" y="198" font-size="12" fill="#334155">RMSNorm</text>
+      <text x="200" y="198" font-size="12" fill="#334155">q_proj 720×960 →(50,960)</text>
+      <text x="395" y="198" font-size="12" fill="#334155">RoPE q (positions re-based to 0)</text>
+      <text x="640" y="198" font-size="12" font-weight="700" fill="#b45309">k,v_proj run over the PREFIX: (241,320)@(320,320) →(241,320) · fp32 weights</text>
+      <text x="20" y="224" font-size="12" fill="#334155">QK<tspan baseline-shift="super" font-size="9">T</tspan> (15,50,64)@(15,64,241)</text>
+      <text x="235" y="224" font-size="12" fill="#334155">mask · softmax</text>
+      <text x="355" y="224" font-size="12" fill="#334155">PV →(15,50,64)</text>
+      <text x="500" y="224" font-size="12" fill="#334155">o_proj · +residual · RMSNorm · gate/up · SiLU · down · +residual  (identical to the even layer)</text>
+      <text x="20" y="248" font-size="11.5" fill="#6b7280">no RoPE on K/V here — the prefix was already RoPE'd by the backbone, and the cross projection does not re-apply it</text>
+    </svg>
+  </div>
+  <p class="legend">
+    <b>Around the 16 layers, once per denoise step:</b> <code>embed_suffix</code> — action_in
+    <span class="shape">(50,32)@(32,720)</span>, a sin/cos time embedding <span class="shape">(720)</span> broadcast
+    and concatenated to <span class="shape">(50,1440)</span>, time_mlp_in
+    <span class="shape">(1440,720)</span>, SiLU, time_mlp_out <span class="shape">(720,720)</span> — then after the
+    layers a final RMSNorm and <code>action_out_proj</code> <span class="shape">(50,720)@(720,32)</span> →
+    <span class="shape">(50,32)</span>, and finally x<sub>t</sub> += dt·v<sub>t</sub>. These heads carry biases and
+    run in fp32; they are 2.4% of the step and stay on the CPU in the port.
+  </p>
+
+  <h3>10.2 — CPU: where the 278 ms goes</h3>
+  <p>
+    Measured in situ on the real model, three levels, each closed against an independently-measured wall clock.
+  </p>
+  <table>
+    <tr><th>Stage of one denoise step</th><th>µs / step</th><th>ms / inference</th><th>share</th></tr>
+    <tr><td><code>embed_suffix</code> (action_in + time MLP)</td><td>642</td><td>6.4</td><td>2.3%</td></tr>
+    <tr style="background:#f9fafb"><td><b>the 16 layers</b></td><td><b>27064</b></td><td><b>270.6</b></td><td><b>97.2%</b></td></tr>
+    <tr><td>&nbsp;&nbsp;├ even: attention block</td><td>6977</td><td>69.8</td><td>25.1%</td></tr>
+    <tr><td>&nbsp;&nbsp;├ even: o_proj + norm + MLP</td><td>5981</td><td>59.8</td><td>21.5%</td></tr>
+    <tr><td>&nbsp;&nbsp;├ odd: attention block</td><td>6946</td><td>69.5</td><td>24.9%</td></tr>
+    <tr><td>&nbsp;&nbsp;├ odd: o_proj + norm + MLP</td><td>6068</td><td>60.7</td><td>21.8%</td></tr>
+    <tr><td>&nbsp;&nbsp;└ final RMSNorm</td><td>58</td><td>0.6</td><td>0.2%</td></tr>
+    <tr><td><code>action_out_proj</code></td><td>32</td><td>0.3</td><td>0.1%</td></tr>
+    <tr><td colspan="2"><b>denoise step, wall clock</b></td><td><b>278.4</b></td><td>100%</td></tr>
+  </table>
+  <p class="legend">
+    Closure: the three top-level stages sum to 27738 µs against a measured 27843 µs step — <b>0.38%</b> unexplained
+    (mask construction and Python). The 16-layer internals sum to 26031 against 27064 — <b>3.81%</b>, which is the
+    residual adds and the tensor clone the loop does between blocks.
+    <b>Even and odd layers cost the same</b> (69.8 vs 69.5 ms): the cross layers' 241-token K/V re-projection is
+    almost exactly as expensive as the RoPE and 291-token attention it replaces.
+  </p>
+
+  <h3>10.3 — CPU: every operation, with its shapes</h3>
+  <p>
+    One layer of each kind, replayed operation by operation with tensors captured from a real inference. This is
+    the level at which the NPU comparison is meaningful, so the shapes are spelled out.
+  </p>
+  <table style="font-size:0.88em">
+    <tr><th>#</th><th>Operation</th><th>Input → output</th><th>EVEN µs</th><th>ODD µs</th></tr>
+    <tr><td>1</td><td><code>input_layernorm</code> (RMSNorm)</td><td><span class="shape">(50,720)</span> + w<span class="shape">(720)</span> → <span class="shape">(50,720)</span></td><td>39.5</td><td>52.0</td></tr>
+    <tr><td>2</td><td>cast hidden → bf16</td><td><span class="shape">(50,720)</span></td><td>6.1</td><td>0.5</td></tr>
+    <tr style="background:#fefce8"><td>3</td><td><b><code>q_proj</code></b></td><td><span class="shape">(50,720)</span> @ <span class="shape">(720,960)</span> → <span class="shape">(50,960)</span></td><td><b>98.7</b></td><td><b>100.4</b></td></tr>
+    <tr style="background:#fefce8"><td>4</td><td><b><code>k_proj</code></b></td><td>even <span class="shape">(50,720)</span>@<span class="shape">(720,320)</span>→<span class="shape">(50,320)</span><br>odd <span class="shape">(241,320)</span>@<span class="shape">(320,320)</span>→<span class="shape">(241,320)</span> <b>fp32</b></td><td>50.5</td><td><b>114.9</b></td></tr>
+    <tr style="background:#fefce8"><td>5</td><td><b><code>v_proj</code></b></td><td>same shapes as k_proj</td><td>47.6</td><td><b>102.3</b></td></tr>
+    <tr><td>6</td><td>cast + view the K/V cache</td><td>odd only: <span class="shape">(241,5,64)</span>→<span class="shape">(241,320)</span> fp32</td><td>—</td><td>25.2</td></tr>
+    <tr><td>7</td><td>single-element <code>cat</code> of q,k,v</td><td>no-op copies</td><td>14.7</td><td>—</td></tr>
+    <tr style="background:#eff6ff"><td>8</td><td><b><code>RoPE q</code></b></td><td><span class="shape">(50,15,64)</span> × lut<span class="shape">(50,64)</span> → <span class="shape">(50,15,64)</span></td><td><b>96.7</b></td><td><b>100.9</b></td></tr>
+    <tr style="background:#eff6ff"><td>9</td><td><b><code>RoPE k</code></b></td><td>even only: <span class="shape">(50,5,64)</span> → <span class="shape">(50,5,64)</span></td><td>51.6</td><td>—</td></tr>
+    <tr><td>10</td><td><code>cat</code> K,V with the prefix cache</td><td>even: 241 ++ 50 → <span class="shape">(291,5,64)</span></td><td>27.0</td><td>—</td></tr>
+    <tr><td>11</td><td>position rebase / mask slice</td><td>odd only</td><td>—</td><td>8.9</td></tr>
+    <tr style="background:#fdf2f8"><td>12</td><td>GQA expand K,V</td><td>5 → 15 heads, <span class="shape">(291,64)</span> / <span class="shape">(241,64)</span></td><td>35.2</td><td>42.3</td></tr>
+    <tr style="background:#fdf2f8"><td>13</td><td>cast q,k → fp32 + transpose</td><td>→ <span class="shape">(1,15,50,64)</span>, <span class="shape">(1,15,291,64)</span></td><td>26.8</td><td>14.8</td></tr>
+    <tr style="background:#fdf2f8"><td>14</td><td><b><code>QK</code><sup>T</sup></b> (fp32)</td><td><span class="shape">(15,50,64)</span> @ <span class="shape">(15,64,291|241)</span> → <span class="shape">(15,50,291|241)</span></td><td><b>89.0</b></td><td><b>74.6</b></td></tr>
+    <tr style="background:#fdf2f8"><td>15</td><td>scale ×⅛</td><td><span class="shape">(15,50,291|241)</span></td><td>20.6</td><td>20.5</td></tr>
+    <tr style="background:#fdf2f8"><td>16</td><td><code>where</code>(mask)</td><td><span class="shape">(15,50,291|241)</span></td><td>31.2</td><td>31.7</td></tr>
+    <tr style="background:#fdf2f8"><td>17</td><td><code>softmax</code> (fp32) + cast</td><td><span class="shape">(15,50,291|241)</span></td><td>36.9</td><td>20.3</td></tr>
+    <tr style="background:#fdf2f8"><td>18</td><td><b><code>PV</code></b></td><td><span class="shape">(15,50,291|241)</span> @ <span class="shape">(15,291|241,64)</span> → <span class="shape">(15,50,64)</span></td><td><b>65.0</b></td><td><b>66.5</b></td></tr>
+    <tr><td>19</td><td>permute + reshape + cast + slice</td><td>→ <span class="shape">(50,960)</span></td><td>11.9</td><td>20.7</td></tr>
+    <tr style="background:#fefce8"><td>20</td><td><b><code>o_proj</code></b></td><td><span class="shape">(50,960)</span> @ <span class="shape">(960,720)</span> → <span class="shape">(50,720)</span></td><td><b>84.8</b></td><td><b>87.2</b></td></tr>
+    <tr><td>21</td><td>residual add 1 + clone</td><td><span class="shape">(50,720)</span></td><td>26.3</td><td>14.5</td></tr>
+    <tr><td>22</td><td><code>post_attention_layernorm</code></td><td><span class="shape">(50,720)</span> → <span class="shape">(50,720)</span></td><td>51.9</td><td>56.0</td></tr>
+    <tr style="background:#fefce8"><td>23</td><td><b><code>gate_proj</code></b></td><td><span class="shape">(50,720)</span> @ <span class="shape">(720,2048)</span> → <span class="shape">(50,2048)</span></td><td><b>170.6</b></td><td><b>173.2</b></td></tr>
+    <tr style="background:#fefce8"><td>24</td><td><b><code>up_proj</code></b></td><td><span class="shape">(50,720)</span> @ <span class="shape">(720,2048)</span> → <span class="shape">(50,2048)</span></td><td><b>165.1</b></td><td><b>166.3</b></td></tr>
+    <tr><td>25</td><td>SiLU(gate) × up</td><td><span class="shape">(50,2048)</span></td><td>32.5</td><td>33.0</td></tr>
+    <tr style="background:#fefce8"><td>26</td><td><b><code>down_proj</code></b></td><td><span class="shape">(50,2048)</span> @ <span class="shape">(2048,720)</span> → <span class="shape">(50,720)</span></td><td><b>155.6</b></td><td><b>159.0</b></td></tr>
+    <tr><td>27</td><td>residual add 2</td><td><span class="shape">(50,720)</span></td><td>7.9</td><td>7.7</td></tr>
+    <tr style="background:#f9fafb"><td colspan="3"><b>Σ of the parts</b></td><td><b>1443.9</b></td><td><b>1493.5</b></td></tr>
+    <tr style="background:#f9fafb"><td colspan="3">whole block, timed independently</td><td>1427.3</td><td>1495.2</td></tr>
+    <tr style="background:#f9fafb"><td colspan="3">closure gap</td><td>−1.16%</td><td>+0.11%</td></tr>
+  </table>
+  <p class="legend">
+    Colour: <span style="background:#fefce8">yellow</span> = matmul, <span style="background:#fdf2f8">pink</span> =
+    attention, <span style="background:#eff6ff">blue</span> = RoPE. Median of 40 replays with tensors captured from
+    a real inference; grouped rows are summed from the individual measurements, so the column adds up to within
+    0.2 µs of the Σ row.
+    <b>Two things in this table are surprising and both matter for the port.</b>
+    <b>(a) RoPE costs as much as the matmul that feeds it</b> — 96.7 µs for a ~0.3 MFLOP rotation against 98.7 µs
+    for the 69 MFLOP <code>q_proj</code>, because lerobot recomputes the sin/cos table from scratch, in fp32, on
+    every single call.
+    <b>(b) The odd layers' k/v projections are the most expensive matmuls in the attention block</b> (114.9 /
+    102.3 µs) — they run over 241 prefix tokens rather than 50 action tokens, they are the only <b>fp32</b> weights
+    in the expert, and lerobot recomputes them on all ten denoise steps even though they cannot change.
+  </p>
+  <p class="legend">
+    <b>Why the parts sum to 235 ms but the wall clock says 278 ms.</b> Rolling this table up over 8 layers of each
+    kind × 10 steps gives 235.0 ms; Section 10.2 measures 270.6 ms for the same work. The difference is <b>cache
+    behaviour, and it was verified rather than assumed</b>: running the identical block hot on one layer versus
+    round-robin across all eight of its parity costs <b>1.07–1.09×</b>. Each layer holds 12.54 MB of weights, all
+    16 hold 200.6 MB against 24 MB of L3, so the model streams <b>2.01 GB of weights per inference</b> to do
+    112.7 GFLOP. 235 × 1.08 ≈ 254, plus instrumentation and Python, gives the measured 270.6.
+  </p>
+
+  <h3>10.4 — NPU: where the 1127 ms goes</h3>
+  <p>
+    A 4× loss invites the assumption that it is overhead — too many dispatches, too much driver, too much host
+    glue. Profiling says otherwise.
+  </p>
+  <div class="stat-row">
+    <div class="stat"><div class="big-num">83%</div><div class="label">the chip actually<br>executing</div></div>
+    <div class="stat"><div class="big-num">9%</div><div class="label">host glue<br>(layout, mask folding)</div></div>
+    <div class="stat"><div class="big-num">8%</div><div class="label">driver + buffer<br>transfers</div></div>
+  </div>
+  <table>
+    <tr><th>Per denoise step</th><th>ms</th><th>share of wall</th></tr>
+    <tr style="background:#fef2f2"><td><b>NPU Run — the chip executing</b></td><td><b>93.4</b></td><td><b>82.8%</b></td></tr>
+    <tr><td>host glue outside the driver (GQA group stacking, K transpose, folding the mask into the score buffer)</td><td>10.2</td><td>9.0%</td></tr>
+    <tr><td>driver call overhead</td><td>4.8</td><td>4.2%</td></tr>
+    <tr><td>buffer writes to the device</td><td>3.5</td><td>3.1%</td></tr>
+    <tr><td>reading results back (zero-copy view construction)</td><td>0.9</td><td>0.8%</td></tr>
+    <tr><td colspan="1"><b>wall clock</b></td><td><b>112.7</b></td><td>100%</td></tr>
+  </table>
+  <p class="legend">
+    <b>Five sixths of the cost is the device doing the work.</b> This is not a dispatch-overhead problem and not a
+    driver problem — no amount of runtime engineering moves it. Weights are uploaded once at startup and stay
+    resident, which is why buffer traffic is 3% rather than the dominant term.
+  </p>
+  <table>
+    <tr><th>Compiled program</th><th>What is inside it</th><th>µs / dispatch</th><th>× / step</th><th>ms / inference</th></tr>
+    <tr style="background:#fefce8"><td><code>expert_o_ffn</code></td><td>o_proj + residual + RMSNorm + gate + up + SiLU-mul + down + residual</td><td>1670</td><td>16</td><td><b>267</b></td></tr>
+    <tr style="background:#fdf2f8"><td><code>qkt_cross</code></td><td>QK<sup>T</sup>, <span class="shape">(192,64)@(64,256)</span></td><td>300</td><td>40</td><td>120</td></tr>
+    <tr style="background:#fdf2f8"><td><code>pv_self</code></td><td>P@V, <span class="shape">(192,320)@(320,64)</span></td><td>300</td><td>40</td><td>120</td></tr>
+    <tr style="background:#fdf2f8"><td><code>pv_cross</code></td><td>P@V, <span class="shape">(192,256)@(256,64)</span></td><td>290</td><td>40</td><td>116</td></tr>
+    <tr style="background:#fefce8"><td><code>expert_rms_qkv_rope</code></td><td>RMSNorm + q/k/v proj + RoPE q + RoPE k</td><td>1180</td><td>8</td><td>94</td></tr>
+    <tr style="background:#fdf2f8"><td><code>qkt_self</code></td><td>QK<sup>T</sup>, <span class="shape">(192,64)@(64,320)</span></td><td>230</td><td>40</td><td>92</td></tr>
+    <tr style="background:#fefce8"><td><code>expert_rms_q_rope</code></td><td>RMSNorm + q proj + RoPE q</td><td>630</td><td>8</td><td>50</td></tr>
+    <tr style="background:#fdf2f8"><td><code>masked_softmax_self</code></td><td>all 15 heads at once, <span class="shape">(15,64,320)</span></td><td>490</td><td>8</td><td>39</td></tr>
+    <tr style="background:#fdf2f8"><td><code>masked_softmax_cross</code></td><td>all 15 heads at once, <span class="shape">(15,64,256)</span></td><td>450</td><td>8</td><td>36</td></tr>
+    <tr style="background:#f9fafb"><td colspan="3"><b>total device time</b></td><td><b>208</b></td><td><b>934</b></td></tr>
+  </table>
+  <p class="legend">
+    The 50 action tokens pad to <b>64</b> and the group-batched attention matmuls carry M = 3 × 64 = <b>192</b>;
+    K/V pads 291→320 (self) and 241→256 (cross). The cross-attention K/V re-projection does not appear in this
+    table because it is <b>hoisted out of the denoise loop</b> — it reads only the constant prefix cache, so it
+    runs 16 times per inference instead of 160, costing 1.8 ms in total.
+  </p>
+
+  <h3>10.5 — Head to head, by operation family</h3>
+  <p>
+    The NPU column expands the fused programs using each operation measured <em>standalone</em> on the same
+    hardware at the same shapes. Those are real measurements, not attributions — but of the operations run as
+    separate dispatches, which is why they do not sum to the fused total. That difference is the fusion penalty,
+    and it is listed as its own line rather than smeared across the others.
+  </p>
+  <table>
+    <tr><th>Family</th><th>CPU ms</th><th>NPU ms</th><th>NPU vs CPU</th><th>share of NPU</th></tr>
+    <tr style="background:#fef2f2"><td><b>attention</b> (QK<sup>T</sup>, P@V, softmax, mask, GQA expand)</td><td>41.5</td><td><b>523.2</b></td><td><b>12.6× slower</b></td><td><b>56%</b></td></tr>
+    <tr><td>matmul — the 7 projections</td><td>134.1</td><td>162.0</td><td>1.21× slower</td><td>17%</td></tr>
+    <tr style="background:#fffbeb"><td><em>fusion penalty</em></td><td>—</td><td>133.0</td><td>—</td><td>14%</td></tr>
+    <tr><td>RMSNorm</td><td>16.0</td><td>48.4</td><td>3.0×</td><td>5%</td></tr>
+    <tr><td>element-wise add (residuals)</td><td>3.5</td><td>27.7</td><td>7.9×</td><td>3%</td></tr>
+    <tr><td>RoPE</td><td>19.9</td><td>23.6</td><td>1.19× slower</td><td>3%</td></tr>
+    <tr><td>SiLU-and-Mul</td><td>5.2</td><td>19.5</td><td>3.8×</td><td>2%</td></tr>
+    <tr><td>layout / dtype churn</td><td>14.7</td><td>0 <span style="font-size:0.85em;color:#166534">(on-device)</span></td><td>—</td><td>—</td></tr>
+    <tr style="background:#f9fafb"><td><b>total</b></td><td><b>235.0</b></td><td><b>937</b></td><td><b>4.0×</b></td><td>100%</td></tr>
+  </table>
+  <p class="legend">
+    Σ standalone (804 ms) + fusion penalty (133 ms) = <b>937 ms</b> against <b>934 ms</b> of measured device time —
+    the two independent accountings close to <b>0.3%</b>.
+  </p>
+
+  <div class="callout" style="border-left-color:#dc2626;background:#fef2f2">
+    <b>The result is not "the expert is 4× slower". It is "attention is 12.6× slower, and everything else is
+    roughly a draw."</b> The seven projection matmuls lose only 1.21× and RoPE only 1.19× — on the NPU those are
+    essentially even with a 12-thread Zen 5. Attention is <b>17.7% of the work on the CPU and 56% on the NPU</b>,
+    and it alone is 523 of the 937 ms.
+  </div>
+
+  <h3>10.6 — Why attention specifically</h3>
+  <p>
+    FlashAttention would have been one dispatch per layer. It cannot be used here, for a reason that only appeared
+    when the real model was dumped rather than reconstructed: only <b>197 of the 241</b> prefix tokens are real —
+    the language block is padded to the tokenizer's maximum length — so <em>both</em> layer kinds carry a genuine
+    mask, and the registry FlashAttention kernel applies none. (It is additionally numerically broken below 256
+    query tokens, which would have forced a 5× padding waste even if the mask had fitted.)
+  </p>
+  <p>
+    So attention is decomposed into separate matmuls and a softmax, batched across each GQA group. That is
+    <b>11 dispatches per layer — 1760 of the inference's 2080 dispatches, 85% of them, for 56% of the time</b>.
+    Each one is tiny: a <span class="shape">(192,64)@(64,320)</span> matmul is 7.9 MFLOP and takes 230 µs, which is
+    <b>34 GFLOP/s</b> on a chip that reaches 5790 on the vision tower's shapes. Roughly 85 µs of every one of those
+    230 is the fixed cost of starting a launch at all.
+  </p>
+
+  <h3>10.7 — What would change the verdict, and by how much</h3>
+  <table>
+    <tr><th>Change</th><th>Saves</th><th>Result</th></tr>
+    <tr><td><b>Fix FlashAttention below 256 query tokens</b> — 160 attentions × ~900 µs instead of 1760 dispatches</td><td><b>−379 ms</b></td><td>~558 ms · <b>1.9× slower</b></td></tr>
+    <tr><td>Un-fuse the two big programs — the penalty is measured 1.40–1.71×</td><td>−133 ms</td><td>~984 ms · 3.4× slower</td></tr>
+    <tr><td>Both</td><td><b>−512 ms</b></td><td><b>~425 ms · 1.5× slower</b></td></tr>
+  </table>
+  <p class="legend">
+    The first row lands almost exactly on the feasibility study's original 526 ms projection — which is the
+    cleanest possible confirmation of what went wrong with it. <b>The projection's model was sound; one of its
+    inputs was false.</b> It assumed FlashAttention was available, and everything downstream of that assumption
+    followed correctly. Measuring the kernels carefully was not enough, because the error was not in a kernel.
+  </p>
+  <div class="callout">
+    <b>Even with both fixes the expert would still lose.</b> 50 tokens pad to 64, and 64 admits only a tiling that
+    occupies <b>half the 8×4 array</b> before a single instruction runs. Every launch costs ~85 µs regardless of
+    the work in it, and a denoise step issues 208 of them. And matmul is only 57% of the expert's CPU time to begin
+    with, so even a perfect matmul accelerator caps the achievable win. <b>The expert is the mirror image of the
+    vision tower</b> — vision wins because 1024 tokens and 3072-wide matmuls saturate the array; the expert loses
+    because 50 tokens cannot fill it, and it runs ten times per inference so it cannot amortise anything either.
+  </div>
+
+  <h3>What it costs end to end</h3>
   <table>
     <tr><th>Configuration</th><th>Whole chunk</th><th>Expert stage</th><th>vs CPU expert</th></tr>
     <tr><td>Pure CPU</td><td>988 ms</td><td><b>334 ms</b></td><td>1.00×</td></tr>
@@ -1247,67 +1502,6 @@ once per image:       (HOST) pixel-shuffle → [NPU elf:gemm_connector] 64×1228
     slower on a slightly busier machine — so the <em>ratios</em>, which are internal to the run, are the numbers to
     carry away.
   </p>
-
-  <h3>Where the time goes — and where it does not</h3>
-  <p>
-    A 4× loss invites the assumption that it is overhead: too many dispatches, too much driver, too much host glue.
-    Profiling says otherwise.
-  </p>
-  <table>
-    <tr><th>Per denoise step</th><th>ms</th><th>share</th></tr>
-    <tr><td>wall clock</td><td>112.7</td><td>100%</td></tr>
-    <tr style="background:#fef2f2"><td>&nbsp;&nbsp;└ <b>NPU actually executing</b></td><td><b>98.4</b></td><td><b>87%</b></td></tr>
-    <tr><td>&nbsp;&nbsp;└ buffer writes to the device</td><td>4.1</td><td>4%</td></tr>
-    <tr><td>&nbsp;&nbsp;└ reading results back</td><td>1.0</td><td>1%</td></tr>
-    <tr><td>&nbsp;&nbsp;└ host glue outside the driver</td><td>10.2</td><td>9%</td></tr>
-  </table>
-  <p class="legend">
-    <b>Nine tenths of the cost is the device doing the work.</b> This is not a dispatch-overhead problem and not a
-    driver problem — no amount of runtime engineering moves it. It is the same conclusion the vision study reached
-    from the opposite direction, where the win also turned out to be device-side rather than host-side.
-  </p>
-
-  <h3>Why the projection said 1.9× and reality said 4×</h3>
-  <p>
-    The gap is 601 ms and it resolves into exactly two causes. Neither is a flaw in the projection's reasoning;
-    both are inputs to it that turned out to be wrong.
-  </p>
-  <table>
-    <tr><th>Cause</th><th>Cost</th><th>Why it was missed</th></tr>
-    <tr>
-      <td><b>FlashAttention is unusable here</b> — attention costs 11 dispatches per layer, not 1</td>
-      <td><b>+378 ms</b></td>
-      <td>Only <b>197 of the 241</b> prefix tokens are real (the language block is padded), so <em>both</em> layer
-      kinds carry a mask the FlashAttention kernel cannot express. The projection — and this port's own first
-      plan — derived the mask from a synthetic all-ones input instead of dumping it from the real model.</td>
-    </tr>
-    <tr>
-      <td><b>The fusion penalty</b> — merging operations into one program costs device time</td>
-      <td><b>+143 ms</b></td>
-      <td>The projection assumed one dispatch per operation. This port fuses, following the pattern the vision and
-      backbone stages use. Measured penalty 1.48–1.71×, reproducing the 1.39–1.79× already measured on the
-      backbone's fused programs.</td>
-    </tr>
-    <tr><td colspan="3" style="background:#f9fafb"><b>440 ms projected device time + 378 + 143 ≈ 961 ms</b>, against <b>934 ms</b> measured. The model was sound.</td></tr>
-  </table>
-  <p class="legend">
-    Un-fusing would recover the 143 ms — 1127 → ~984 ms — and leave the expert <b>still 3.4× slower</b>. Worth
-    doing if this path is ever deployed; not worth doing to change the verdict.
-  </p>
-
-  <h3>The underlying reason, same as everywhere else in this document: shape</h3>
-  <p>
-    50 tokens pad to 64, and 64 admits only a tiling that occupies <b>half the 8×4 array</b> before a single
-    instruction runs. The same kernels that reach 2046–3366 GFLOP/s at the backbone's 256 tokens reach 25–1163 at
-    the expert's shapes. Every launch costs ~85 µs regardless of how little work is in it, and one denoise step
-    issues <b>208</b> of them. And matmul is only 57% of the expert's CPU time to begin with, so even a perfect
-    matmul accelerator caps the achievable win.
-  </p>
-  <div class="callout">
-    <b>The expert is the mirror image of the vision tower.</b> Vision wins because 1024 tokens and 768/3072-wide
-    matmuls saturate the array. The expert loses because 50 tokens cannot fill it — and it runs ten times per
-    inference, so it cannot amortise anything either.
-  </div>
 
   <h2 id="status">11. Current status and next steps</h2>
 

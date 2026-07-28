@@ -52,14 +52,14 @@ Profiled rather than assumed, per denoise step:
 | | ms | share |
 |---|---|---|
 | wall | 112.7 | 100% |
-| XRT calls | 102.5 | 91% |
-| ├ NPU Run (device) | 98.4 | **87%** |
-| ├ BO write | 4.1 | 4% |
-| └ BO read | 1.0 | 1% |
-| host glue outside XRT | 10.2 | 9% |
+| **NPU Run (device)** | **93.4** | **82.8%** |
+| host glue outside XRT | 10.2 | 9.0% |
+| XRT call overhead | 4.8 | 4.2% |
+| BO write | 3.5 | 3.1% |
+| BO read | 0.9 | 0.8% |
 
 **~91% of the cost is inside XRT and 96% of that is the device actually
-executing.** This is not dispatch overhead and not host glue. No amount of
+executing — 83% of the wall clock overall.** This is not dispatch overhead and not host glue. No amount of
 driver or runtime work moves it.
 
 Per-dispatch device time, and the count per denoise step:
@@ -92,17 +92,22 @@ This was not knowable at feasibility time — that study derived the mask from a
 synthetic all-ones `prefix_pad`, which is also the mistake this port initially
 repeated before dumping the real thing.
 
-**(b) The fusion penalty — +143 ms.** The projection's scenario A assumed one
+**(b) The fusion penalty — +133 ms.** The projection's scenario A assumed one
 dispatch per op, i.e. unfused. This port fuses, mirroring the backbone and
 vision ports. Measured against the same ops as standalone kernels
 (`expert_npu_feasibility.md` §2/§3):
 
 | fused ELF | fused | Σ standalone | penalty | cost/inference |
 |---|---|---|---|---|
-| `expert_o_ffn` | 1670 µs | 1131 µs | **1.48×** | 86.2 ms |
+| `expert_o_ffn` | 1670 µs | 1194 µs | **1.40×** | 76.1 ms |
 | `expert_rms_qkv_rope` | 1180 µs | 689 µs | **1.71×** | 39.3 ms |
 | `expert_rms_q_rope` | 630 µs | 416 µs | **1.52×** | 17.1 ms |
-| | | | | **143 ms** |
+| | | | | **133 ms** |
+
+(Corrected 2026-07-28: an earlier version of this table quoted 1.48× / 143 ms
+for `expert_o_ffn` by comparing against the **N-padded** o_proj and down_proj
+standalone figures. The fused ELF uses the **native N=720** variants, whose
+standalone costs are 165.9 and 212.3 µs rather than 135.6 and 179.5.)
 
 That reproduces the 1.39–1.79× the feasibility study measured for the
 *backbone's* fused ELFs, and it confirms that study's warning that "fusion
@@ -111,12 +116,12 @@ Fusing was still the right call for a correctness-first port — it is the patte
 both prior stages use, and it kept the per-layer glue on-device — but it is not
 free and the cost is now quantified rather than assumed.
 
-`440 ms projected device + 378 + 143 ≈ 961 ms`, against 934 ms measured. The
+`440 ms projected device + 378 + 133 ≈ 951 ms`, against 934 ms measured. The
 projection's model was sound; two of its inputs were wrong.
 
 ### What de-fusing would buy
 
-~143 ms, i.e. 1127 → ~984 ms, **still ~3.4× slower than CPU**. Worth doing if
+~133 ms, i.e. 1127 → ~994 ms, **still ~3.4× slower than CPU**. Worth doing if
 this path is ever deployed, not worth doing to change the verdict.
 
 ---
