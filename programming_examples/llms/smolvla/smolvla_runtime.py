@@ -1,58 +1,42 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
 
-"""SINGLE-PROCESS NPU runtime for SmolVLA — the subprocess bridge removed.
+"""Single-process NPU runtime for SmolVLA's vision encoder.
 
-Why this exists
----------------
-The original hybrid (`smolvla_inference.run_hybrid_forward(bridge=True)`) ran
-the NPU stages in a *second* Python process because the lerobot venv was assumed
-to lack `air`/`pyxrt`. That assumption is false on this machine: with the
-mlir-air env sourced (PYTHONPATH/LD_LIBRARY_PATH — the SessionStart hook, or
-`utils/env_setup.sh`), `~/Projects/smolvla_playground/.venv/bin/python` imports
-`torch`, `lerobot`, `air`, `aircc` AND `pyxrt`, and opens the real device. So
-everything fits in ONE process.
-
-That matters a lot: the bridge paid, on EVERY inference,
-  process spawn + interpreter/imports (~185 ms)
-  + safetensors weight (re)load (~320-390 ms)
-  + ELF/manifest load + XRT context (~34 ms)
-  + npz round-trip
-= ~596 ms for the backbone bridge and ~1163 ms for vision+backbone. None of that
-is NPU cost. Here the weights and the `KernelCache` (ELFs, XRT context, device
-BOs) are built ONCE per process and reused by every subsequent inference, which
-is what a real deployment does.
+Why single-process
+------------------
+An earlier design ran the NPU stage in a *second* Python process, on the
+assumption that the lerobot venv could not import `air`/`pyxrt`. It can, once
+the mlir-air environment is sourced (`utils/env_setup.sh`), so everything fits
+in one process. That matters: the two-process design paid, on EVERY inference,
+process spawn + interpreter import (~185 ms) + a safetensors weight reload
+(~320-390 ms) + ELF and XRT context load (~34 ms) + an npz round-trip. None of
+it is NPU cost. Here the weights and the `KernelCache` (ELFs, XRT context,
+device buffer objects) are built ONCE per process and reused, which is what a
+deployment does.
 
 Contents
 --------
-`VisionRuntime`   : SigLIP ViT (12L, seq 1024) + connector, `encode(images)` ->
-                    (N, 64, 960) RAW connector output (the quantity
-                    `vlm_with_expert.embed_image` returns; lerobot applies the
-                    sqrt(960) scale afterwards — do not pre-apply).
-`BackboneRuntime` : SmolLM2-360M 16-layer prefill, `prefill(...)` -> per-layer
-                    post-RoPE K + raw V, the tensors the action expert caches.
-`get_vision_runtime()` / `get_backbone_runtime()` : module-level singletons so
-                    repeated inferences in one process share weights + ELFs.
-`npu_thread_limits()` : see below.
+`VisionRuntime`       SigLIP ViT (12 layers, seq 1024) + connector.
+                      `encode(images)` -> (N, 64, 960), the RAW connector output
+                      that `vlm_with_expert.embed_image` returns. lerobot applies
+                      the sqrt(960) scale afterwards -- do not pre-apply it.
+`get_vision_runtime()` module-level singleton, so repeated inferences in one
+                      process share the weights and the compiled ELFs.
+`npu_thread_limits()`  see below.
 
-BLAS-thread contention (the in-process twist)
----------------------------------------------
-The NPU driver loop is HOST-BOUND (37 dispatches/image, ~1.7 ms of python+XRT
-each). OpenBLAS worker threads busy-spin after any host matmul in the same
-process and preempt the dispatch thread — measured 135 -> 178 ms/image on the
-vision encoder. In the *bridge* design the fix was trivial
-(`bridge_common.limit_blas_threads` sets OPENBLAS_NUM_THREADS=1 before numpy is
-imported, in a process that does nothing else).
-
-In ONE process that global switch is wrong: the CPU action expert (10 denoise
-steps of torch GEMMs) genuinely wants all cores. So the limit has to be
-*scoped*: clamp the thread pools only for the duration of the NPU call and
-restore afterwards. `npu_thread_limits()` does that at runtime (no env vars, no
-re-import) by calling `openblas_set_num_threads` / `mkl_set_num_threads` through
-ctypes on the already-loaded shared objects (a 40-line threadpoolctl; that
-package is not installed in the lerobot venv) plus `torch.set_num_threads`.
-Set SMOLVLA_NPU_BLAS_LIMIT=0 to disable it and measure the other side of the
-trade-off.
+BLAS-thread contention
+----------------------
+The NPU driver loop is host-bound (38 dispatches per image). OpenBLAS worker
+threads busy-spin after any host matmul in the same process and preempt the
+dispatch thread -- measured 135 -> 178 ms per image on the vision encoder.
+Clamping the pools globally would be wrong, because the CPU stages that run
+before and after this one genuinely want all cores. So the clamp is *scoped*:
+`npu_thread_limits()` reduces the pools for the duration of the NPU call and
+restores them afterwards, at runtime and without environment variables, by
+calling `openblas_set_num_threads` / `mkl_set_num_threads` through ctypes on the
+already-loaded shared objects, plus `torch.set_num_threads`.
+Set SMOLVLA_NPU_BLAS_LIMIT=0 to disable it and measure the other side.
 """
 
 from __future__ import annotations
@@ -75,7 +59,6 @@ _LLMS_DIR = _HERE.parent
 if str(_LLMS_DIR) not in sys.path:
     sys.path.insert(0, str(_LLMS_DIR))
 
-from bridge_common import ensure_kernels  # noqa: E402
 from shared.infra.cache import KernelCache, Profiler  # noqa: E402
 
 MODEL_ID = "lerobot/smolvla_base"
@@ -221,6 +204,34 @@ VISION_KERNELS = {
 }
 
 
+def ensure_kernels(cache, expected, compile_fn, tag="npu"):
+    """Load the cached ELFs if the on-disk cache is COMPLETE, else compile.
+
+    ELFs are build artifacts; recompiling them on every process start would
+    dominate any end-to-end measurement and is not what a deployment does. The
+    cache is reused only when its manifest resolves AND contains every kernel
+    name in `expected`, so a cache left over from an older or partial kernel set
+    still triggers a full rebuild rather than silently linking stale objects.
+
+    Set SMOLVLA_FORCE_COMPILE=1 to always rebuild -- necessary after editing any
+    kernel builder, since the manifest does not track source hashes.
+
+    Returns True if a compile was performed.
+    """
+    force = os.environ.get("SMOLVLA_FORCE_COMPILE", "0") == "1"
+    expected = set(expected)
+    if not force and cache.load_manifest() and expected <= set(cache.artifacts):
+        print(
+            f"[{tag}] reusing {len(cache.artifacts)} cached ELFs from "
+            f"{cache.cache_dir} (SMOLVLA_FORCE_COMPILE=1 to rebuild)",
+            flush=True,
+        )
+        return False
+    cache.artifacts.clear()
+    compile_fn()
+    return True
+
+
 def _to_chw_f32(img):
     """Accept a torch tensor (1,3,H,W) / (3,H,W) or a numpy array; return
     (3,H,W) float32 without importing torch here."""
@@ -244,8 +255,8 @@ class VisionRuntime:
     and is then reused for every later inference in this process."""
 
     def __init__(self, cache_dir=VISION_CACHE_DIR, model_id=MODEL_ID, verbose=False):
-        from vision_weights import load_vision_weights, SigLIPVisionConfig
-        from vision_prefill import compile_all_kernels
+        from smolvla_vision_weights import load_vision_weights, SigLIPVisionConfig
+        from smolvla_vision_npu import compile_all_kernels
 
         t0 = time.perf_counter()
         self.cfg = SigLIPVisionConfig()
@@ -273,9 +284,9 @@ class VisionRuntime:
         """images: sequence of N camera tensors/arrays, each (1,3,512,512) or
         (3,512,512), ALREADY lerobot-preprocessed (resize_with_pad + [-1,1]).
         Returns (N, 64, 960) f32 RAW connector output."""
-        from vision_prefill import run_vit_encoder
+        from smolvla_vision_npu import run_vit_encoder
 
-        from vision_cpu_helpers import im2col_patch_embed
+        from smolvla_cpu_helpers import im2col_patch_embed
 
         t0 = time.perf_counter()
         arrs = [_to_chw_f32(im) for im in images]
@@ -331,128 +342,7 @@ class VisionRuntime:
         return self
 
 
-# ---------------------------------------------------------------------------
-# Backbone (SmolLM2-360M prefill)
-# ---------------------------------------------------------------------------
-
-BACKBONE_CACHE_DIR = "smolvla_block_kernel_cache"
-NPU_SEQ_LEN = 256  # registry kernels validated at M=256
-BACKBONE_KERNELS = {
-    "gemm": {"rms_gemms_rope", "o_ffn", "qkt", "pv", "masked_softmax"},
-    "flash": {"rms_gemms_rope", "o_ffn", "flash_attn"},
-}
-
-
-class BackboneRuntime:
-    """16-layer SmolLM2-360M prefix prefill on NPU, loaded ONCE.
-
-    Kept for the "NPU vision + NPU backbone" config. NOTE (measured): the NPU
-    backbone is SLOWER than lerobot's torch CPU backbone at these shapes
-    (229 ms vs 91 ms, seq=256), so the production single-process config uses
-    the CPU backbone — see docs/TODO.md."""
-
-    def __init__(
-        self, cache_dir=BACKBONE_CACHE_DIR, model_id=MODEL_ID, attn_mode="gemm"
-    ):
-        from smolvla_backbone_weights import (
-            load_backbone_weights,
-            SmolVLABackboneConfig,
-        )
-        from smolvla_backbone_prefill import compile_all_kernels
-
-        assert attn_mode in BACKBONE_KERNELS, attn_mode
-        self.attn_mode = attn_mode
-        t0 = time.perf_counter()
-        self.cfg = SmolVLABackboneConfig()
-        self.weights = load_backbone_weights(model_id, config=self.cfg)
-        t_w = time.perf_counter()
-        self.cache = KernelCache(
-            str(_HERE / cache_dir), verbose=False, profiler=Profiler()
-        )
-        self.compiled = ensure_kernels(
-            self.cache,
-            BACKBONE_KERNELS[attn_mode],
-            lambda: compile_all_kernels(
-                self.cache, self.cfg, NPU_SEQ_LEN, cpu_attn=False, attn_mode=attn_mode
-            ),
-            tag="npu-backbone",
-        )
-        t_k = time.perf_counter()
-        self.setup_ms = {
-            "weight_load": (t_w - t0) * 1e3,
-            "kernels": (t_k - t_w) * 1e3,
-        }
-
-    def prefill(
-        self,
-        prefix_embed,
-        pad_mask,
-        position_ids=None,
-        timings=None,
-        limit_threads=None,
-    ):
-        """prefix_embed (L,960) f32, pad_mask (L,) bool -> (k, v) each
-        (n_layers, L, 5, 64) f32 — the post-RoPE K and raw V the action
-        expert's KV cache holds."""
-        from smolvla_backbone_weights import generate_rope_lut
-        from smolvla_cpu_helpers import build_padded_mask_and_positions
-        from smolvla_backbone_prefill import run_backbone_prefill
-
-        t0 = time.perf_counter()
-        prefix_embed = np.asarray(prefix_embed, np.float32)
-        oracle_len = prefix_embed.shape[0]
-        mask_256, positions_256 = build_padded_mask_and_positions(
-            np.asarray(pad_mask, bool), oracle_len, NPU_SEQ_LEN
-        )
-        if position_ids is not None:
-            recon = positions_256[:oracle_len]
-            lerobot_pos = np.asarray(position_ids, np.int64)
-            if not np.array_equal(recon, lerobot_pos):
-                diff = np.nonzero(recon != lerobot_pos)[0]
-                raise RuntimeError(
-                    f"reconstructed position_ids disagree with lerobot's at "
-                    f"{diff.tolist()[:20]}"
-                )
-        max_pos = int(positions_256.max()) + 1
-        rope_lut_bf16 = generate_rope_lut(self.cfg, seq_len=max_pos, dtype=bfloat16)[
-            positions_256
-        ]
-        x_f32 = np.zeros((NPU_SEQ_LEN, self.cfg.emb_dim), np.float32)
-        x_f32[:oracle_len] = prefix_embed
-
-        with npu_thread_limits(1, enabled=limit_threads):
-            t_p0 = time.perf_counter()
-            _final, _per_layer, kv_list = run_backbone_prefill(
-                x_f32.astype(bfloat16),
-                self.weights,
-                self.cfg,
-                self.cache,
-                mask_256,
-                positions_256,
-                rope_lut_bf16,
-                cpu_attn=False,
-                attn_mode=self.attn_mode,
-                verbose=False,
-                return_kv=True,
-            )
-            t_p = (time.perf_counter() - t_p0) * 1e3
-        k = np.stack([np.asarray(kk[:oracle_len], np.float32) for kk, _ in kv_list])
-        v = np.stack([np.asarray(vv[:oracle_len], np.float32) for _, vv in kv_list])
-        if timings is not None:
-            timings["backbone"] = {
-                "wall_ms": (time.perf_counter() - t0) * 1e3,
-                "t_prefill_ms": t_p,
-            }
-        return k, v
-
-
-# ---------------------------------------------------------------------------
-# Process-wide singletons
-# ---------------------------------------------------------------------------
-
 _vision_rt = None
-_backbone_rt = {}
-_expert_rt = None
 
 
 def get_vision_runtime(**kw):
@@ -462,33 +352,3 @@ def get_vision_runtime(**kw):
     if _vision_rt is None:
         _vision_rt = VisionRuntime(**kw)
     return _vision_rt
-
-
-def get_backbone_runtime(attn_mode="gemm", **kw):
-    if attn_mode not in _backbone_rt:
-        _backbone_rt[attn_mode] = BackboneRuntime(attn_mode=attn_mode, **kw)
-    return _backbone_rt[attn_mode]
-
-
-def get_expert_runtime(hoist_cross_kv=True, **kw):
-    """The action expert's runner: weights + 10 ELFs loaded once per process.
-
-    Matters more here than for the other two stages -- the expert runs its 16
-    layers TEN times per inference, so a per-call rebuild of the KernelCache
-    would dominate everything.
-    """
-    global _expert_rt
-    if _expert_rt is None:
-        from expert_denoise import ExpertRunner
-        from expert_weights import SmolVLAExpertConfig, load_expert_weights
-
-        cfg = SmolVLAExpertConfig()
-        rt = ExpertRunner(
-            weights=load_expert_weights(config=cfg),
-            config=cfg,
-            hoist_cross_kv=hoist_cross_kv,
-            **kw,
-        )
-        rt.ensure_kernels()
-        _expert_rt = rt
-    return _expert_rt

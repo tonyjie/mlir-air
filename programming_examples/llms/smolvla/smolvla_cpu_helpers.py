@@ -1,133 +1,190 @@
-"""CPU NumPy helpers for the SmolVLA backbone port (F32 reference math)."""
+# Copyright (C) 2026, Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+"""SmolVLA Vision-Encoder (SigLIP ViT) CPU reference math.
+
+F32 numpy references for every vision op, plus the two host-side reshape steps
+(im2col patch-embed, connector pixel-shuffle). Sibling of
+`smolvla_cpu_helpers.py`, but for the SigLIP ViT.
+
+`cpu_vit_forward` is the whole-encoder oracle used to de-risk the reshape/bias/
+norm/attention math BEFORE any NPU work: it must match the real lerobot vision
+output near-exactly (per-layer cosine > 0.999).
+
+All math mirrors HF `transformers/models/smolvlm/modeling_smolvlm.py`:
+  - pre-norm LayerNorm (affine gamma+beta, eps=1e-6)
+  - bidirectional MHA, 12 heads, head_dim 64, scale 1/8, softmax in fp32, biases
+  - GELU-tanh MLP (fc1 -> gelu_tanh -> fc2, both with bias)
+  - patch embed = im2col + linear (stride==kernel==16, non-overlapping)
+  - connector = pixel-shuffle (space-to-depth factor 4) + linear (no bias)
+"""
 
 import numpy as np
 
+# ---------------------------------------------------------------------------
+# Elementwise / norm references
+# ---------------------------------------------------------------------------
 
-def rms_norm(x, weight, eps=1e-5):
+
+def layer_norm(x, gamma, beta, eps=1e-6):
+    """Affine LayerNorm over the last axis (subtract mean, divide by std).
+
+    HF `nn.LayerNorm`: reductions in fp32, then affine. x: (..., N).
+    """
     x = x.astype(np.float32)
-    var = np.mean(x * x, axis=-1, keepdims=True)
-    return x / np.sqrt(var + eps) * weight.astype(np.float32)
+    mean = x.mean(axis=-1, keepdims=True)
+    var = x.var(axis=-1, keepdims=True)  # population variance (unbiased=False)
+    normed = (x - mean) / np.sqrt(var + eps)
+    return normed * gamma.astype(np.float32) + beta.astype(np.float32)
 
 
-def build_prefix_mask(n_prefix, n_state=1, pad_mask=None):
-    """Additive attention mask for SmolVLA's prefix-LM pattern.
-    Prefix tokens (image+language) attend bidirectionally among themselves but
-    NOT to the state token; the state token attends to everything before it.
-    Mirrors make_att_2d_masks (modeling_smolvla.py:101-131).
+def gelu_tanh(x):
+    """GELU tanh approximation (gelu_pytorch_tanh), matches the A3-2 kernel.
 
-    pad_mask: optional bool array of shape (n_prefix+n_state,), True where the
-    token is real and False where it is a tokenizer padding slot (SmolVLA's
-    language block is padded to a fixed tokenizer_max_length). Padding tokens
-    are excluded from attention both as queries and as keys, mirroring
-    make_att_2d_masks' `pad_masks[:,None,:] * pad_masks[:,:,None]` term.
-    When omitted (default), no tokens are treated as padding -- this preserves
-    the original prefix/state-only masking behavior."""
-    n = n_prefix + n_state
-    mask = np.zeros((n, n), np.float32)
-    # prefix rows cannot see the state column(s)
-    mask[:n_prefix, n_prefix:] = -np.inf
-    if pad_mask is not None:
-        pad_mask = np.asarray(pad_mask, dtype=bool)
-        assert pad_mask.shape == (n,), f"pad_mask shape {pad_mask.shape} != {(n,)}"
-        invalid = ~pad_mask
-        mask[invalid, :] = -np.inf
-        mask[:, invalid] = -np.inf
-    return mask
-
-
-def build_padded_mask_and_positions(pad_mask, oracle_len, npu_seq_len=256):
-    """Extend the prefix mask + RoPE positions from the real prefix length to
-    the NPU kernels' padded sequence length.
-
-    The registry kernels are validated at M=256 while lerobot's prefix is 241
-    tokens, so both the additive attention mask and the RoPE position array are
-    built at the oracle length and then padded. Padding rows/columns stay -inf
-    (fully masked) and padding positions freeze at the last real position via
-    `cumsum(pad_mask) - 1`, exactly like SmolVLA's own position_ids.
-
-    Single source of truth shared by the subprocess bridge
-    (`run_npu_backbone.py`) and the single-process runtime
-    (`smolvla_npu_runtime.BackboneRuntime`)."""
-    pad_mask = np.asarray(pad_mask, dtype=bool)
-    n_prefix = oracle_len - 1  # 240 visual+language, 1 state token
-    mask_o = build_prefix_mask(n_prefix, 1, pad_mask=pad_mask)
-    mask_p = np.full((npu_seq_len, npu_seq_len), -np.inf, dtype=np.float32)
-    mask_p[:oracle_len, :oracle_len] = mask_o
-
-    pad_mask_p = np.zeros((npu_seq_len,), dtype=bool)
-    pad_mask_p[:oracle_len] = pad_mask
-    positions_p = np.cumsum(pad_mask_p.astype(np.int64)) - 1
-    positions_p = np.clip(positions_p, 0, None)
-    return mask_p, positions_p
+    GELU(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+    """
+    x = x.astype(np.float32)
+    c = np.sqrt(2.0 / np.pi).astype(np.float32)
+    return 0.5 * x * (1.0 + np.tanh(c * (x + 0.044715 * x**3)))
 
 
 def _softmax(x, axis=-1):
-    """Softmax with HF-eager-attention semantics for fully-masked rows.
-    Real SmolVLA masking (smolvlm_with_expert.py eager_attention_forward) uses
-    `torch.where(mask, weights, finfo.min)` rather than an additive -inf, so a
-    row that is masked out everywhere (e.g. a padding query token, whose whole
-    row of pad_2d_masks is False) still gets a well-defined *uniform*
-    distribution instead of 0/0 NaN. Reproduce that here for additive -inf
-    masks: detect all-(-inf) rows and force uniform probabilities for them."""
-    x = np.asarray(x, dtype=np.float32)
-    all_masked = np.all(np.isneginf(x), axis=axis, keepdims=True)
-    safe_x = np.where(all_masked, 0.0, x)
-    m = np.max(safe_x, axis=axis, keepdims=True)
-    e = np.exp(safe_x - m)
-    p = e / np.sum(e, axis=axis, keepdims=True)
-    uniform = np.full_like(x, 1.0 / x.shape[axis])
-    return np.where(all_masked, uniform, p)
+    x = x.astype(np.float32)
+    x = x - x.max(axis=axis, keepdims=True)
+    e = np.exp(x)
+    return e / e.sum(axis=axis, keepdims=True)
 
 
-def noncausal_attention_reference(q, k, v, mask, n_heads, n_kv_heads):
-    """q:(L,H,D) k,v:(L,Hkv,D) mask:(L,L) additive. GQA repeat, F32."""
-    L, H, D = q.shape
-    group = n_heads // n_kv_heads
-    out = np.empty((L, H, D), np.float32)
-    scale = 1.0 / np.sqrt(D)
-    for h in range(H):
-        kv = h // group
-        s = (q[:, h, :].astype(np.float32) @ k[:, kv, :].astype(np.float32).T) * scale
-        s = s + mask
-        p = _softmax(s, axis=-1)
-        out[:, h, :] = p @ v[:, kv, :].astype(np.float32)
-    return out
+# ---------------------------------------------------------------------------
+# Attention reference (bidirectional MHA, no mask, no GQA)
+# ---------------------------------------------------------------------------
 
 
-def _rope_half_split(x, positions, base, head_dim):
-    # x:(L,H,D). Non-interleaved (half-split) RoPE.
-    half = head_dim // 2
-    inv = 1.0 / (base ** (np.arange(0, half, dtype=np.float32) / half))
-    ang = positions[:, None].astype(np.float32) * inv[None, :]  # (L,half)
-    cos = np.concatenate([np.cos(ang), np.cos(ang)], -1)[:, None, :]
-    sin = np.concatenate([np.sin(ang), np.sin(ang)], -1)[:, None, :]
-    x1, x2 = x[..., :half], x[..., half:]
-    rot = np.concatenate([-x2, x1], -1)
-    return x * cos + rot * sin
+def mha_bidirectional(q, k, v, n_heads, head_dim, scale):
+    """Standard bidirectional multi-head attention, no mask, no GQA.
+
+    q, k, v: (seq, n_heads*head_dim). Returns (seq, n_heads*head_dim).
+    Softmax in fp32. scale = head_dim^-0.5 applied to the QK^T scores.
+    """
+    seq = q.shape[0]
+    q = q.astype(np.float32).reshape(seq, n_heads, head_dim)
+    k = k.astype(np.float32).reshape(seq, n_heads, head_dim)
+    v = v.astype(np.float32).reshape(seq, n_heads, head_dim)
+    out = np.empty((seq, n_heads, head_dim), dtype=np.float32)
+    for h in range(n_heads):
+        scores = (q[:, h, :] @ k[:, h, :].T) * scale  # (seq, seq)
+        probs = _softmax(scores, axis=-1)
+        out[:, h, :] = probs @ v[:, h, :]
+    return out.reshape(seq, n_heads * head_dim)
 
 
-def cpu_backbone_forward(prefix_embed, w, cfg, mask, rope_base, positions=None):
-    """positions: optional per-token RoPE position array of shape (L,). SmolVLA
-    computes `position_ids = cumsum(pad_masks) - 1` (modeling_smolvla.py), so
-    padding tokens freeze at the last real position and the state token's
-    position is the count of real prefix tokens, NOT its raw sequence index.
-    Defaults to plain arange(L) (no padding) when omitted."""
-    x = prefix_embed.astype(np.float32)  # (241,960)
-    L = x.shape[0]
-    pos = np.arange(L) if positions is None else np.asarray(positions)
-    for lw in w.layers:
-        h = rms_norm(x, lw.attn_norm, cfg.rms_norm_eps)
-        q = (h @ lw.wq.astype(np.float32)).reshape(L, cfg.n_heads, cfg.head_dim)
-        k = (h @ lw.wk.astype(np.float32)).reshape(L, cfg.n_kv_heads, cfg.head_dim)
-        v = (h @ lw.wv.astype(np.float32)).reshape(L, cfg.n_kv_heads, cfg.head_dim)
-        q = _rope_half_split(q, pos, rope_base, cfg.head_dim)
-        k = _rope_half_split(k, pos, rope_base, cfg.head_dim)
-        a = noncausal_attention_reference(q, k, v, mask, cfg.n_heads, cfg.n_kv_heads)
-        a = a.reshape(L, cfg.n_heads * cfg.head_dim) @ lw.wo.astype(np.float32)
-        x = x + a
-        h = rms_norm(x, lw.ffn_norm, cfg.rms_norm_eps)
-        g = h @ lw.w_gate.astype(np.float32)
-        u = h @ lw.w_up.astype(np.float32)
-        silu = g / (1.0 + np.exp(-g))
-        x = x + (silu * u) @ lw.w_down.astype(np.float32)
-    return rms_norm(x, w.final_norm, cfg.rms_norm_eps)
+# ---------------------------------------------------------------------------
+# Host reshape glue (correctness-critical)
+# ---------------------------------------------------------------------------
+
+
+def im2col_patch_embed(pixel_values, patch_w, patch_b, pos_embed, patch_size=16):
+    """Patch embedding as im2col + linear + position embedding.
+
+    pixel_values: (3, H, W) with H=W=512. patch_w: (C*ph*pw, out)=(768,768).
+    patch_b: (out,). pos_embed: (num_patches, out)=(1024,768).
+
+    Non-overlapping patches (stride==kernel==patch_size). Patch pixels are
+    extracted in (c, kh, kw) order to match the HF conv weight reshape
+    (out, C, kh, kw) -> (out, C*kh*kw). Token index = ph*grid + pw (row-major).
+    For a full 512x512 image the position_ids collapse to arange(1024), so the
+    full pos_embed matrix is added directly.
+    """
+    C, H, W = pixel_values.shape
+    grid = H // patch_size  # 32
+    num_patches = grid * grid  # 1024
+    x = pixel_values.astype(np.float32)
+    cols = np.empty((num_patches, C * patch_size * patch_size), dtype=np.float32)
+    for ph in range(grid):
+        for pw in range(grid):
+            patch = x[
+                :,
+                ph * patch_size : (ph + 1) * patch_size,
+                pw * patch_size : (pw + 1) * patch_size,
+            ]  # (C, ph, pw)
+            cols[ph * grid + pw] = patch.reshape(-1)  # (c, kh, kw) order
+    out = cols @ patch_w.astype(np.float32) + patch_b.astype(np.float32)
+    return out + pos_embed.astype(np.float32)  # (1024, 768)
+
+
+def pixel_shuffle(x, scale_factor=4):
+    """Connector pixel-shuffle (space-to-depth), verified bit-exact vs HF.
+
+    x: (num_patches, emb) = (1024, 768). Returns (64, 12288).
+    1024 = 32x32 spatial; factor 4 -> 8x8 = 64 tokens, 768*16 = 12288 channels.
+    """
+    x = x.astype(np.float32)
+    n, emb = x.shape
+    grid = int(round(np.sqrt(n)))  # 32
+    s = scale_factor
+    h2 = grid // s  # 8
+    x = x.reshape(grid, grid, emb)  # (h, w, c)
+    x = x.reshape(h2, s, h2, s, emb)  # (h2, dh, w2, dw, c)
+    x = x.transpose(0, 2, 1, 3, 4)  # (h2, w2, dh, dw, c)
+    return x.reshape(h2 * h2, s * s * emb)  # (64, 12288)
+
+
+# ---------------------------------------------------------------------------
+# Whole-encoder oracle
+# ---------------------------------------------------------------------------
+
+
+def cpu_vit_layer(x, lw, cfg):
+    """One SigLIP encoder layer (pre-norm), F32 reference.
+
+    x: (seq, emb). lw: VisionLayerWeights. Returns (seq, emb).
+    """
+    # --- attention block ---
+    h = layer_norm(x, lw.ln1_w, lw.ln1_b, cfg.layer_norm_eps)
+    q = h @ lw.wq.astype(np.float32) + lw.bq.astype(np.float32)
+    k = h @ lw.wk.astype(np.float32) + lw.bk.astype(np.float32)
+    v = h @ lw.wv.astype(np.float32) + lw.bv.astype(np.float32)
+    attn = mha_bidirectional(q, k, v, cfg.n_heads, cfg.head_dim, cfg.attn_scale)
+    attn = attn @ lw.wo.astype(np.float32) + lw.bo.astype(np.float32)
+    x = x.astype(np.float32) + attn
+    # --- MLP block ---
+    h = layer_norm(x, lw.ln2_w, lw.ln2_b, cfg.layer_norm_eps)
+    h = h @ lw.w_fc1.astype(np.float32) + lw.b_fc1.astype(np.float32)
+    h = gelu_tanh(h)
+    h = h @ lw.w_fc2.astype(np.float32) + lw.b_fc2.astype(np.float32)
+    return x + h
+
+
+def cpu_vit_forward(
+    pixel_values, weights, cfg, return_per_layer=False, do_connector=True
+):
+    """Full SigLIP ViT + optional connector, F32 reference (the oracle).
+
+    pixel_values: (3, 512, 512). Returns a dict with:
+        patch_embed: (1024, 768)
+        layer_hidden: list of 12 (1024, 768) [if return_per_layer]
+        post_ln: (1024, 768)
+        connector: (64, 960) [if do_connector]
+    """
+    x = im2col_patch_embed(
+        pixel_values,
+        weights.patch_w,
+        weights.patch_b,
+        weights.pos_embed,
+        cfg.patch_size,
+    )
+    per_layer = []
+    for lw in weights.layers:
+        x = cpu_vit_layer(x, lw, cfg)
+        if return_per_layer:
+            per_layer.append(x.copy())
+    post_ln = layer_norm(x, weights.post_ln_w, weights.post_ln_b, cfg.layer_norm_eps)
+    result = {"patch_embed": None, "post_ln": post_ln}
+    if return_per_layer:
+        result["layer_hidden"] = per_layer
+    if do_connector:
+        shuffled = pixel_shuffle(post_ln)  # (64, 12288)
+        result["connector"] = shuffled @ weights.connector_w.astype(
+            np.float32
+        )  # (64, 960)
+    return result

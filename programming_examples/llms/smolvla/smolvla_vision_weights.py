@@ -5,7 +5,7 @@
 
 Loads the SmolVLA (`lerobot/smolvla_base`) vision-tower weights from
 HuggingFace safetensors and provides them as numpy arrays for MLIR-AIR kernel
-invocations. Sibling of `smolvla_backbone_weights.py`, but for the SigLIP ViT
+invocations. Loads the SigLIP ViT weights
 (12-layer bidirectional encoder) + the connector, not the language backbone.
 
 The vision tower lives nested under the VLM submodule:

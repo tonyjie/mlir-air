@@ -3,7 +3,7 @@
 
 """SmolVLA Vision-Encoder (SigLIP ViT) 12-layer prefill on MLIR-AIR (NPU2).
 
-Sibling of `smolvla_backbone_prefill.py`, but for the SigLIP ViT (bidirectional
+The NPU driver for the SigLIP ViT (bidirectional
 12-layer encoder) instead of the causal language backbone. Correctness-first
 (A3-5 Step 2-3): the four heavy ops run on NPU — projection/MLP GEMMs, affine
 LayerNorm, GELU-tanh, and non-causal FlashAttention — while the cheap glue
@@ -46,8 +46,8 @@ _LLMS_DIR = str(Path(__file__).resolve().parent.parent)
 if _LLMS_DIR not in sys.path:
     sys.path.insert(0, _LLMS_DIR)
 
-from vision_weights import SigLIPVisionConfig
-from vision_cpu_helpers import im2col_patch_embed
+from smolvla_vision_weights import SigLIPVisionConfig
+from smolvla_cpu_helpers import im2col_patch_embed
 from shared.infra.cache import KernelCache, Profiler  # noqa: F401 (re-exported)
 
 # ---------------------------------------------------------------------------
@@ -143,7 +143,7 @@ _GEMM_SHAPES = {
 # m % (tile_m*herd_m) == 0). tile_m=16 also differs from the _m32 drain default,
 # so this ELF links its OWN symbol-suffixed microkernel (mm_m16_n240.o) and can
 # never collide with the encoder's mm_m32_n{96,128}.o (see the fused-ELF mm.o
-# gotcha in vit_fused_builders._force_tile_n_suffix).
+# gotcha in smolvla_vision_builders._force_tile_n_suffix).
 #
 # tile_n=240 (was 80): measured on NPU2 2026-07-27, the tile_n sweep at herd 4x4
 # is strongly non-flat — 16:3352us, 48:1347us, 80:890us, 240:667-713us. 240 is
@@ -276,14 +276,14 @@ def _compile_fused_kernels(cache, config, seq_len, fa_bfp16, with_connector=True
     then compile_and_cache -> prepare_air_project stages the current CWD .o's into
     air_project/. Both ELFs use tile_n-keyed drain objects (mm_m32_n96 for
     qkvo/o/fc2, mm_m32_n128 for fc1); compile every distinct one first so both
-    ELFs link the correctly-baked objects (see vit_fused_builders._force_tile_n_suffix).
+    ELFs link the correctly-baked objects (see smolvla_vision_builders._force_tile_n_suffix).
     """
     from shared.infra.external_kernels import compile_gemm_mm
     from shared.builders.gemm_builder import (
         gemm_registry_config,
         disambiguate_by_tile_n,
     )
-    from vit_fused_builders import build_vit_ln_qkv_module, build_vit_o_ffn_module
+    from smolvla_vision_builders import build_vit_ln_qkv_module, build_vit_o_ffn_module
 
     emb_dim = config.emb_dim
     hidden_dim = config.hidden_dim
@@ -375,7 +375,7 @@ def compile_all_kernels(
     `mm.o` into CWD, then `compile_and_cache` → `prepare_air_project` wipes
     air_project/ fresh and copies the current mm.o into it. So each GEMM ELF's
     mm.o is compiled immediately before its compile_and_cache (mirrors
-    smolvla_backbone_prefill._compile_npu_attention_kernels). The LayerNorm /
+    the backbone port's attention compile path). The LayerNorm /
     GELU / FA ELFs don't link mm.o (a stale copy staged into their air_project
     is harmless).
     """
@@ -576,7 +576,7 @@ def _run_connector(cache, post_ln, connector_w, config, bo_key="gemm_connector")
     sqrt(960) AFTER `embed_image` returns, so this must NOT pre-apply that scale
     (the oracle keeps both: `connector` raw and `connector_scaled`).
     """
-    from vision_cpu_helpers import pixel_shuffle
+    from smolvla_cpu_helpers import pixel_shuffle
 
     shuffled = pixel_shuffle(
         np.asarray(post_ln, dtype=np.float32), scale_factor=_PIXEL_SHUFFLE_FACTOR
@@ -627,7 +627,7 @@ def run_vit_block_fused(
     static_input_indices + bo_key=f"...L{layer_idx}" and skipped on re-upload;
     every scratch/output buffer is intermediate (kernel-overwritten, no host
     upload). ALL bias-adds + both residuals run on-device inside the ELFs — no
-    host f32 glue. Mirrors smolvla_backbone_prefill.run_transformer_block.
+    host f32 glue. Mirrors the per-layer runner the sibling LLM ports use.
 
     attn_mode: "flash" (default) = FlashAttention ELF. "cpu" = host MHA (diag).
     """
@@ -685,7 +685,7 @@ def run_vit_block_fused(
 
     # ---- 2. Attention ----
     if attn_mode == "cpu":
-        from vision_cpu_helpers import mha_bidirectional
+        from smolvla_cpu_helpers import mha_bidirectional
 
         attn = mha_bidirectional(
             q.astype(np.float32),
@@ -779,7 +779,7 @@ def run_vit_block(
     v = (v.astype(np.float32) + lw.bv.astype(np.float32)).astype(bfloat16)
 
     if attn_mode == "cpu":
-        from vision_cpu_helpers import mha_bidirectional
+        from smolvla_cpu_helpers import mha_bidirectional
 
         attn = mha_bidirectional(
             q.astype(np.float32),
