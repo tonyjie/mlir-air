@@ -943,7 +943,7 @@ def main() -> int:
     cache = KernelCache(args.cache_dir, verbose=False, profiler=Profiler())
     print(f"Compiling SmolVLA vision kernels into {args.cache_dir}/ ...")
     compile_all_kernels(
-        cache, cfg, seq_len=cfg.seq_len, fused=True, with_connector=True
+        cache, cfg, seq_len=cfg.num_patches, fused=True, with_connector=True
     )
     cache._save_manifest()
     print(f"Compiled {len(cache.artifacts)} ELFs: {sorted(cache.artifacts)}")
