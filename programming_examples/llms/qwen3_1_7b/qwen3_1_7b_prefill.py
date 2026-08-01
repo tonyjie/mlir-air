@@ -476,10 +476,10 @@ def compile_all_kernels(cache, config, seq_len, verbose=False, cpu_attn=False):
 
     # mm.o variants for GEMM co-linking; rope.o (head_dim=128) for the rope ELFs.
     compile_gemm_mm(
-        tile_m=32, tile_n=128, tile_k_l1=32, sym_suffix="_m32", out_name="mm_m32.o"
+        tile_m=32, tile_n=128, tile_k_l1=32, sym_suffix="_m32_k32_n128", out_name="mm_m32_k32_n128.o"
     )
     compile_gemm_mm(
-        tile_m=64, tile_n=128, tile_k_l1=32, sym_suffix="_m64", out_name="mm_m64.o"
+        tile_m=64, tile_n=128, tile_k_l1=32, sym_suffix="_m64_k32_n128", out_name="mm_m64_k32_n128.o"
     )
     compile_rope()
 

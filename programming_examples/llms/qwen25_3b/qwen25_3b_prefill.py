@@ -800,10 +800,10 @@ def compile_all_kernels(cache, config, seq_len, verbose=False, cpu_attn=False):
     #   _m64 fused    tile_n=128 (Q, O, Down projections)
     # Gate/Up direct-codegen needs NO external .o. rope.o for head_dim=128.
     compile_gemm_mm(
-        tile_m=32, tile_n=64, tile_k_l1=32, sym_suffix="_m32", out_name="mm_m32.o"
+        tile_m=32, tile_n=64, tile_k_l1=32, sym_suffix="_m32_k32_n64", out_name="mm_m32_k32_n64.o"
     )
     compile_gemm_mm(
-        tile_m=64, tile_n=128, tile_k_l1=32, sym_suffix="_m64", out_name="mm_m64.o"
+        tile_m=64, tile_n=128, tile_k_l1=32, sym_suffix="_m64_k32_n128", out_name="mm_m64_k32_n128.o"
     )
     compile_rope()
     from shared.infra.external_kernels import compile_silu_and_mul

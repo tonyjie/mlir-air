@@ -237,3 +237,45 @@ def _build_gemm_module(
         "(llama GEMM is always the external high-precision path; tiles+method come from "
         "the registry via gemm_registry_config)."
     )
+
+
+def compile_gemm_objects(specs):
+    """Compile exactly the external mm.o objects `specs` reference — once each.
+
+    The alternative, which every model did until now, is to hardcode the
+    compile calls next to the build calls:
+
+        compile_gemm_mm(tile_m=32, tile_n=128, tile_k_l1=32,
+                        sym_suffix="_m32", out_name="mm_m32.o")
+
+    That writes the object's identity in two places — here, and in whatever the
+    registry resolves for each GEMM's shape — and nothing keeps them in step.
+    Qwen2.5-0.5B is a live example of the drift: its Q/O projection resolves to
+    tile_n=32 while the hardcoded call built tile_n=128, so under the old
+    method-keyed naming (`mm_m32.o` for both) that GEMM linked a microkernel
+    compiled for the wrong DIM_N, silently.
+
+    Deriving the compile list from the same specs the IR is built from makes
+    that class of drift impossible. Pass the specs you will actually build with.
+    """
+    from shared.infra.external_kernels import compile_gemm_mm
+
+    by_obj = {}
+    for s in specs:
+        prev = by_obj.setdefault(s["obj"], s)
+        for dim in ("tile_m", "tile_k_l1", "tile_n"):
+            if prev[dim] != s[dim]:
+                raise ValueError(
+                    f"two specs claim {s['obj']} with different {dim} "
+                    f"({prev[dim]} vs {s[dim]}) — object names must encode every "
+                    f"dimension compile_gemm_mm bakes in; see _spec_with_tiles"
+                )
+    for obj, s in sorted(by_obj.items()):
+        compile_gemm_mm(
+            tile_m=s["tile_m"],
+            tile_n=s["tile_n"],
+            tile_k_l1=s["tile_k_l1"],
+            sym_suffix=s["sym_suffix"],
+            out_name=obj,
+        )
+    return sorted(by_obj)
