@@ -115,6 +115,14 @@
     all shapes measured on the real checkpoint, all timings on real hardware
   </div>
 
+  <div class="callout" style="border-left-color:#7c3aed;background:#faf5ff">
+    <b>Scope note.</b> This document records the <em>whole</em> investigation: all three SmolVLA stages were ported
+    to the NPU and verified. The example in this directory ships only the <b>vision encoder</b>, which is the one
+    stage measurably faster there. Sections 6, 8 and 10 are the measurements behind that decision — they are the
+    justification for the example's scope, not a description of code you will find beside it. The backbone and
+    action-expert ports live in this repository's history and can land as their own contributions.
+  </div>
+
   <div class="toc">
     <b>Contents</b>
     <div class="grp">Part A — The SmolVLA model (no NPU yet)</div>

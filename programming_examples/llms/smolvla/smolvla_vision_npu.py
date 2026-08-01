@@ -913,3 +913,43 @@ def run_vit_encoder(
             cache, post_ln, weights.connector_w, config
         )
     return result
+
+
+# ---------------------------------------------------------------------------
+# CLI: compile-only, for `make compile` and the compile lit test
+# ---------------------------------------------------------------------------
+def main() -> int:
+    """Build every vision ELF through AIR -> AIE -> aiecc -> Peano.
+
+    No NPU dispatch and no HuggingFace download: this is the compile smoke test
+    the CI lit file drives, so it must not need the device or the network.
+    """
+    import argparse
+
+    from smolvla_vision_weights import SigLIPVisionConfig
+
+    ap = argparse.ArgumentParser(description=main.__doc__)
+    ap.add_argument(
+        "--compile-only",
+        action="store_true",
+        help="accepted for parity with the sibling examples; this CLI only compiles",
+    )
+    ap.add_argument("--cache-dir", default="vision_kernel_cache")
+    args = ap.parse_args()
+
+    from shared.infra.cache import KernelCache, Profiler
+
+    cfg = SigLIPVisionConfig()
+    cache = KernelCache(args.cache_dir, verbose=False, profiler=Profiler())
+    print(f"Compiling SmolVLA vision kernels into {args.cache_dir}/ ...")
+    compile_all_kernels(
+        cache, cfg, seq_len=cfg.seq_len, fused=True, with_connector=True
+    )
+    cache._save_manifest()
+    print(f"Compiled {len(cache.artifacts)} ELFs: {sorted(cache.artifacts)}")
+    print("Compilation passed.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
