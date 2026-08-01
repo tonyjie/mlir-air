@@ -205,25 +205,6 @@ def _bcast(vec_ty, xrt_dtype, val):
 # ---------------------------------------------------------------------------
 
 
-def _force_tile_n_suffix(spec):
-    """Rewrite a drain spec's sym_suffix/obj/build_kwargs to key off tile_n
-    (`_m32_n{tile_n}` / `mm_m32_n{tile_n}.o`), matching disambiguate_by_tile_n's
-    naming. Ensures an ELF whose GEMM is built in isolation still links the
-    SAME compiled object as another ELF that resolved the same (method, tile_n)
-    via disambiguation — avoids colliding on the generic `mm_m32.o` whose baked
-    DIM_N could belong to a different shape."""
-    s = dict(spec)
-    tag = "m32" if s["method"] == "drain" else "m64"
-    suffix = f"_{tag}_n{s['tile_n']}"
-    obj = f"mm_{tag}_n{s['tile_n']}.o"
-    s["sym_suffix"] = suffix
-    s["obj"] = obj
-    s["build_kwargs"] = dict(s["build_kwargs"])
-    s["build_kwargs"]["sym_suffix"] = suffix
-    s["build_kwargs"]["link_with_name"] = obj
-    return s
-
-
 def _gemm_externs(spec):
     sfx = spec["sym_suffix"]
     return {
@@ -275,7 +256,10 @@ def build_vit_ln_qkv_module(seq_len, emb_dim, n_heads, head_dim, herd_m=8, herd_
     # correctly-compiled object as vit_o_ffn's O GEMM (both tile_n=96 drain),
     # NOT the generic `mm_m32.o` (whose baked DIM_N may be stale from another
     # model's build). Mirrors disambiguate_by_tile_n's naming.
-    spec = _force_tile_n_suffix(spec)
+    # No name fix-up needed: gemm_registry_config names every object from all
+    # three dimensions compile_gemm_mm bakes in (see _spec_with_tiles), so an
+    # ELF built in isolation already links the same object as one that reaches
+    # the same tiling inside a fused build.
 
     print("  [ln_qkv 1/7] LN1 (affine)...")
     ln_ir = _wrap_ir_in_launch(

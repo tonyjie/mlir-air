@@ -44,17 +44,46 @@ def gemm_registry_config(m, k, n, output_dtype="bf16", precision="high"):
 
 def _spec_with_tiles(method, tile):
     """Merge a method's build spec with the registry tile (a named dict
-    {tile_m, tile_k_l2, tile_k_l1, tile_n}). tile_m is dictated by the method
-    (drain=32 / fused=64) and matches spec['tile_m'] (asserted for safety).
+    {tile_m, tile_k_l2, tile_k_l1, tile_n}).
+
+    This is the single funnel every `gemm_registry_config` call passes through,
+    so it is where the external object gets its name.
+
+    **The name must encode every dimension baked into that object.**
+    `compile_gemm_mm` bakes THREE compile-time macros into mm.o --
+    `DIM_M=tile_m`, `DIM_N=tile_n` and `DIM_K=tile_k_l1`
+    (infra/external_kernels.py) -- and it writes with force=True, so two GEMMs
+    that resolve to the same filename but need different macros will silently
+    overwrite each other. The loser links a microkernel built for someone else's
+    reduction chunk: no compile error, no runtime error, wrong numbers.
+
+    Naming from the method alone (the old `_m32` / `_m64`) encoded only a proxy
+    for tile_m and nothing else. That was safe only by accident -- every model
+    shipped so far happens to use tile_k_l1=32 throughout, with tile_m equal to
+    the method default. Registry rows added for SmolVLA's small shapes break
+    both assumptions (tile_m=16, tile_k_l1=48), so the name now carries all
+    three: `mm_m{tile_m}_k{tile_k_l1}_n{tile_n}.o`.
+
+    Consequence: two GEMMs share an object if and only if they need an identical
+    microkernel, which is the invariant we actually want. The registry's
+    per-shape tile_m is also honoured now rather than asserted away, so shapes
+    whose best tiling is not the method default become usable through the
+    generic path.
     """
     spec = dict(gemm_method_spec(method))
-    assert (
-        tile["tile_m"] == spec["tile_m"]
-    ), f"registry tile_m={tile['tile_m']} != method '{method}' tile_m={spec['tile_m']}"
     spec["method"] = method
+    spec["tile_m"] = tile["tile_m"]  # registry wins; it measured this shape
     spec["tile_k_l2"] = tile["tile_k_l2"]
     spec["tile_k_l1"] = tile["tile_k_l1"]
     spec["tile_n"] = tile["tile_n"]
+
+    sfx = f"_m{tile['tile_m']}_k{tile['tile_k_l1']}_n{tile['tile_n']}"
+    obj = f"mm{sfx}.o"
+    spec["sym_suffix"] = sfx
+    spec["obj"] = obj
+    spec["build_kwargs"] = dict(spec["build_kwargs"])
+    spec["build_kwargs"]["sym_suffix"] = sfx
+    spec["build_kwargs"]["link_with_name"] = obj
     return spec
 
 
@@ -102,52 +131,36 @@ def gemm_method_spec(method):
 
 
 def disambiguate_by_tile_n(specs):
-    """Fix up a list of gemm_registry_config() specs that will be co-linked into
-    ONE fused ELF, so GEMMs sharing a method but resolving to DIFFERENT tile_n
-    don't collide.
+    """Assert that co-linked GEMM specs cannot collide on their mm.o filename.
 
-    Why this is needed: `compile_gemm_mm` bakes DIM_N=tile_n as a compile-time
-    C macro into the external mm.o object, and gemm_method_spec()'s sym_suffix
-    (_m32 / _m64) is keyed ONLY on method, not on tile_n. Every existing
-    fused-ELF caller (llama32_1b, rms_gemms_rope for all current models, etc.)
-    happens to have uniform tile_n per method across its GEMMs, so this never
-    mattered before. SmolVLA's o_ffn ELF is the first case where two "drain"
-    GEMMs in the SAME ELF resolve to different tile_n (e.g. O/Down -> 80,
-    Gate/Up -> 128): sharing "_m32"/mm_m32.o for both means the second one's
-    call sites disagree with the first's compiled object -> MLIR verifier
-    rejects the stitched module (operand shape mismatch on the shared cast
-    symbol, since its tile shape is derived from tile_m*tile_n).
+    Retained as an explicit guard at the point where several GEMMs are about to
+    be stitched into ONE fused ELF. It used to *perform* the disambiguation, by
+    appending tile_n to the object name whenever two GEMMs of the same method
+    resolved to different tile_n. That was an incomplete fix: `compile_gemm_mm`
+    bakes DIM_M, DIM_N **and DIM_K=tile_k_l1** into the object, so two GEMMs
+    could still share a filename while needing different reduction chunks --
+    silently, since the symbols match and nothing errors.
 
-    For each method, if all given specs using it share one tile_n, they are
-    left untouched (identical suffix/obj as gemm_method_spec, so no existing
-    caller's compiled artifacts need to change name). Only when a method has
-    >1 distinct tile_n among the given specs are those specs' sym_suffix/obj/
-    build_kwargs rewritten to also key off tile_n, so each distinct (method,
-    tile_n) pair gets its own non-colliding symbol suffix + mm.o name.
+    `_spec_with_tiles` now names every object from all three baked dimensions,
+    which makes collisions impossible by construction, so there is nothing left
+    to fix up here. What remains is worth keeping as a check: it catches a
+    hand-built spec, or a future edit that reintroduces method-keyed naming,
+    at the moment it would otherwise produce a wrong microkernel.
 
-    Returns a NEW list of spec dicts (same order/length as `specs`); inputs
-    are not mutated. Callers must compile_gemm_mm(...) using the RETURNED
-    specs' tile_m/tile_n/tile_k_l1/sym_suffix/obj (not the pre-disambiguation
-    ones) so the compiled objects match what the stitched IR expects.
+    Returns the specs unchanged. Raises ValueError if any name is not derived
+    from (tile_m, tile_k_l1, tile_n).
     """
-    tile_n_by_method = {}
     for s in specs:
-        tile_n_by_method.setdefault(s["method"], set()).add(s["tile_n"])
-
-    out = []
-    for s in specs:
-        if len(tile_n_by_method[s["method"]]) > 1:
-            s = dict(s)
-            tag = "m32" if s["method"] == "drain" else "m64"
-            suffix = f"_{tag}_n{s['tile_n']}"
-            obj = f"mm_{tag}_n{s['tile_n']}.o"
-            s["sym_suffix"] = suffix
-            s["obj"] = obj
-            s["build_kwargs"] = dict(s["build_kwargs"])
-            s["build_kwargs"]["sym_suffix"] = suffix
-            s["build_kwargs"]["link_with_name"] = obj
-        out.append(s)
-    return out
+        expected = f"_m{s['tile_m']}_k{s['tile_k_l1']}_n{s['tile_n']}"
+        if s.get("sym_suffix") != expected:
+            raise ValueError(
+                f"spec for a {s['method']} GEMM carries sym_suffix "
+                f"{s.get('sym_suffix')!r}, expected {expected!r}. Object names "
+                f"must encode every dimension compile_gemm_mm bakes in "
+                f"(DIM_M, DIM_K, DIM_N) — see _spec_with_tiles. Build the spec "
+                f"through gemm_registry_config rather than by hand."
+            )
+    return list(specs)
 
 
 def _build_gemm_module(

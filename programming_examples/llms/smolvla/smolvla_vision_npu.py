@@ -143,7 +143,7 @@ _GEMM_SHAPES = {
 # m % (tile_m*herd_m) == 0). tile_m=16 also differs from the _m32 drain default,
 # so this ELF links its OWN symbol-suffixed microkernel (mm_m16_n240.o) and can
 # never collide with the encoder's mm_m32_n{96,128}.o (see the fused-ELF mm.o
-# gotcha in smolvla_vision_builders._force_tile_n_suffix).
+# gotcha that shared/builders/gemm_builder._spec_with_tiles now prevents).
 #
 # tile_n=240 (was 80): measured on NPU2 2026-07-27, the tile_n sweep at herd 4x4
 # is strongly non-flat — 16:3352us, 48:1347us, 80:890us, 240:667-713us. 240 is
@@ -276,7 +276,7 @@ def _compile_fused_kernels(cache, config, seq_len, fa_bfp16, with_connector=True
     then compile_and_cache -> prepare_air_project stages the current CWD .o's into
     air_project/. Both ELFs use tile_n-keyed drain objects (mm_m32_n96 for
     qkvo/o/fc2, mm_m32_n128 for fc1); compile every distinct one first so both
-    ELFs link the correctly-baked objects (see smolvla_vision_builders._force_tile_n_suffix).
+    ELFs link the correctly-baked objects.
     """
     from shared.infra.external_kernels import compile_gemm_mm
     from shared.builders.gemm_builder import (
