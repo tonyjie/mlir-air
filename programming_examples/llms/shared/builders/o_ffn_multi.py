@@ -614,7 +614,7 @@ if __name__ == "__main__":
     # The 4 GEMMs are fused-cast (tile_m=64) per the registry → mm_m64.o.
     print("Compiling external kernels (mm_m64.o, silu_and_mul.o)...")
     compile_gemm_mm(
-        tile_m=64, tile_n=128, tile_k_l1=32, sym_suffix="_m64_k32_n128", out_name="mm_m64_k32_n128.o"
+        tile_m=64, tile_n=128, tile_k_l1=32, sym_suffix="_m64", out_name="mm_m64.o"
     )
     compile_silu_and_mul()
 

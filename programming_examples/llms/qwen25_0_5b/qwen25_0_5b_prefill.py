@@ -896,21 +896,15 @@ def compile_all_kernels(cache, config, seq_len, verbose=False, cpu_attn=True):
         f"\n{'='*60}\nCompiling Qwen2.5 prefill kernels (seq_len={seq_len})...\n{'='*60}\n"
     )
 
-    from shared.infra.external_kernels import compile_rope
-    from shared.builders.gemm_builder import compile_gemm_objects
+    from shared.infra.external_kernels import compile_gemm_mm, compile_rope
 
-    # Compile exactly the mm.o objects this model's GEMMs resolve to, derived
-    # from the same registry lookup the IR is built from. Hardcoding the list
-    # here is what let Q/O (which resolves to tile_n=32) silently link an object
-    # built at tile_n=128. Gate/Up is direct-codegen and needs no external .o;
-    # rope.o is for head_dim=64.
-    compile_gemm_objects(
-        [
-            _gemm_spec(seq_len, emb_dim, q_dim, "high"),  # Q proj
-            _gemm_spec(seq_len, emb_dim, kv_dim, "high"),  # K/V proj
-            _gemm_spec(seq_len, emb_dim, emb_dim, "high"),  # O proj
-            _gemm_spec(seq_len, hidden_dim, emb_dim, "high"),  # Down proj
-        ]
+    # mm.o variants for the external GEMMs (drain _m32, fused-cast _m64).
+    # Gate/Up direct-codegen needs NO external .o. rope.o for head_dim=64.
+    compile_gemm_mm(
+        tile_m=32, tile_n=128, tile_k_l1=32, sym_suffix="_m32", out_name="mm_m32.o"
+    )
+    compile_gemm_mm(
+        tile_m=64, tile_n=128, tile_k_l1=32, sym_suffix="_m64", out_name="mm_m64.o"
     )
     compile_rope()
 
