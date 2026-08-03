@@ -138,30 +138,49 @@ nmse     = 0.003023     (门槛 0.04)
         图像
           │
           ▼
- ① smolvla_inference.py   210 行  ★★★ 接缝，唯一碰 lerobot 的地方
-          │
+ ① smolvla_inference.py   274 行  ★★★ 接缝 + 唯一的 CLI 入口
+          │                            （--compile-only 也在这里）
           ▼
- ② smolvla_runtime.py     354 行  ★★  进程级单例
+ ② smolvla_runtime.py     243 行  ★★  进程级单例
           │                            （权重/ELF/XRT 只建一次）
           ├─→ smolvla_vision_weights.py   345  HF 权重 → NPU 布局
           ├─→ smolvla_vision_builders.py  514  18 个 launch → 3 个 ELF
-          └─→ smolvla_vision_npu.py       955  逐层 dispatch（最大）
+          └─→ smolvla_vision_npu.py       919  逐层 dispatch（最大）
                     │
                     └─→ smolvla_cpu_helpers.py  95  故意留在 host 的部分
           │
           ▼
  ③ verify_adapter.py      131 行  ★★★ gate
- ④ smolvla_prefix.py      233 行  ★   生成 CPU oracle
+ ④ smolvla_prefix.py      234 行  ★   生成 CPU oracle
 ```
+
+`smolvla_runtime.py` 从上到下就是它实现的生命周期，可以顺着读：
+
+```
+1. ensure_kernels       编译 ELF，或复用磁盘上的 cache
+2. VisionRuntime        权重 + ELF + XRT context，只建一次
+   .encode(images)      → (N, 64, 960)
+3. get_vision_runtime   让第 2 步每进程只发生一次的单例
+```
+
+（主机 BLAS 线程钳制那 125 行 ctypes 已经挪去
+`shared/infra/thread_limits.py`，它和 vision 无关。）
 
 ### 只想花 30 分钟？读这三个，约 700 行
 
-**① `smolvla_inference.py`（210 行）** — 接缝。读完你就懂了整个集成机制。
-重点看 `_wrapped_embed_prefix`，以及 `served["i"]` 这个计数器（它假设
-lerobot 请求图像的顺序和 runtime 编码的顺序一致，这个假设目前没有断言
-钉住，是我认为最该被质疑的一处）。
+**① `smolvla_inference.py`（274 行）** — 接缝。读完你就懂了整个集成机制。
 
-**② `smolvla_runtime.py`（354 行）** — 为什么要单例：权重加载、ELF 载入、
+重点看 `_wrapped_embed_prefix`。它是**双层**替换，看起来比必要的复杂，
+但外层是为了**性能**而不是正确性：所有图必须在一次 runtime 调用里编码完，
+好让主机线程钳制覆盖整段 dispatch 循环。拆成单层（每张图各自编码）确实更
+简洁、门禁也照样过，但实测 818 → 920 ms，而纯 CPU 是 913 ms——整个收益
+没了。代码里记了这个测量，就是为了让下一个想"顺手简化"的人先重测。
+
+里面那个 `served["i"]` 计数器假设 lerobot 按顺序消费 `images`。这是对别人
+循环的假设，所以**用断言钉住了**：越界会报错，少消费一张也会报错（意味着
+某个相机静默退回了 CPU）。
+
+**② `smolvla_runtime.py`（243 行）** — 为什么要单例：权重加载、ELF 载入、
 XRT context 创建加起来约 585 ms，每次推理都做一遍就全亏光了。所以做成
 进程级的，建一次反复用。
 
@@ -176,7 +195,7 @@ baseline，应该正好是 1.0。如果不是，说明 harness 本身有问题�
 |---|---|---|
 | `smolvla_vision_weights.py` 345 | HF checkpoint → NPU 布局 | 每个 Linear 有没有转置（HF 存 `[out,in]`，GEMM 要 `[in,out]`） |
 | `smolvla_vision_builders.py` 514 | 拼 3 个融合 ELF | `_force_tile_n_suffix`，见第 7 节 |
-| `smolvla_vision_npu.py` 955 | 逐层 dispatch | 最大的文件，里面有个 attention backend 的 A/B 开关（`"cpu"` 走主机），是它偏大的原因之一 |
+| `smolvla_vision_npu.py` 919 | 逐层 dispatch | 最大的文件，里面有个 attention backend 的 A/B 开关（`"cpu"` 走主机），是它偏大的原因之一 |
 | `smolvla_cpu_helpers.py` 95 | 3 个留在 host 的函数 | 见下 |
 
 ### 为什么有两步故意留在 CPU
