@@ -230,61 +230,21 @@ more cameras raises the share of the workload that runs on the NPU. See §7.
 
 ## 6. Datasets
 
-**SmolVLA pretraining:** 481 Hugging Face community datasets, 22.9K
-trajectories / 10.6M frames, mostly the SO-100 arm. Task strings normalised
-with Qwen2.5-VL-3B-Instruct.
+Covered in depth in **[`datasets.md`](datasets.md)**: what SmolVLA was trained
+and evaluated on, what this repository actually feeds the model (a synthetic
+all-zero batch) and why that is right for a numerical gate, what the gate can
+and cannot claim, the LIBERO data cached on this machine, and the options for
+measuring task fidelity.
 
-**Published evaluation:** LIBERO 87.3%, Meta-World, real SO-100 78.3%, SO-101
-cross-embodiment transfer. Ablation: 51.7% without community pretraining vs
-78.3% with. Note that the existence of official metaworld / robocasa /
-robotwin / vlabench / robocerebra checkpoints implies broader benchmark
-coverage than the blog post describes.
+The two facts from there that bear on the family:
 
-**What this repo actually feeds the model:** a synthetic fixed batch. Both
-`smolvla_prefix.py:50-64` and `smolvla_inference.py:76-88` build it the same
-way — every entry of `cfg.input_features` is `torch.zeros` (all three camera
-images and the state), the only non-zero input is the prompt `"pick up the
-cube"` padded to 48 tokens, and the flow-matching noise is pinned to zero.
-
-That is the right choice for a numerical gate: determinism is what makes the
-NPU-vs-CPU comparison attributable to arithmetic alone. It is worth recording
-one consequence, though — all-zero images mean SigLIP encodes a constant image,
-so the activation dynamic range is not representative. Since the BFP16 bias we
-characterised is driven by outlier-heavy activations, **the 0.9990 cosine is
-not guaranteed to reproduce on real imagery.**
-
-### Already on this machine
-
-`~/.cache/huggingface/lerobot/HuggingFaceVLA/libero/` — LeRobot v3.0 format:
-
-```
-codebase_version = v3.0     robot_type = panda      fps = 10
-total_episodes   = 1693     total_frames = 273465   total_tasks = 40
-observation.images.image   [256,256,3]
-observation.images.image2  [256,256,3]      <- 2 cameras
-observation.state          [8]
-action                     [7]
-```
-
-40 real LIBERO instructions ("put the bowl on the plate", "turn on the stove
-and put the moka pot on it", ...).
-
-Note the mismatch: this dataset is 2-camera / 8-dim state, matching
-`HuggingFaceVLA/smolvla_libero` (prefix 177), not the `smolvla_base` we ported
-(3-camera / 6-dim state / prefix 241).
-
-### Other datasets, for reference
-
-| Dataset | Size | Format | Note |
-|---|---|---|---|
-| `lerobot/svla_so101_pickplace` | 50 ep / 11939 frames | LeRobot v3.0 | Streamable without download; closest to base's SO-100 distribution |
-| `physical-intelligence/libero` | 37001 downloads | — | Most-downloaded LIBERO copy |
-| `IPEC-COMMUNITY/libero_{goal,spatial,object,90,10}_no_noops_*_lerobot` | ~6-8K each | LeRobot | **Split per suite** — use when running one suite only |
-| `lerobot/libero-assets` | — | — | Simulator assets, needed for rollouts |
-| Open X-Embodiment | ~1M+ ep, ~8964 GB | RLDS | Apache-2.0 / CC-BY-4.0 |
-| DROID | 76000 demos, 350 h | TFDS + HF, LeRobot-compatible | MIT + CC-BY-4.0 |
-| BridgeData V2 | 60096 traj | RLDS | CC-BY-4.0. Use the RAIL Berkeley copy; the OXE bucket one is stale |
-| RoboMIND | 55000 traj, 4 embodiments | RGB-D | License unverified |
+- **Pretraining:** 481 community datasets, 22.9K trajectories / 10.6M frames,
+  mostly SO-100. Published results: LIBERO 87.3%, real SO-100 78.3%; the
+  pretraining ablation is 51.7% -> 78.3%.
+- **The cached LIBERO data is 2-camera / 8-dim state**, which matches
+  `HuggingFaceVLA/smolvla_libero` (prefix ~177), not the `smolvla_base` we
+  ported (prefix 241). Choosing between them is an architecture decision, not
+  just a data one — see `datasets.md` §4.
 
 ---
 
