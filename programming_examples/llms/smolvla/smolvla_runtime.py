@@ -3,6 +3,17 @@
 
 """Single-process NPU runtime for SmolVLA's vision encoder.
 
+Reads top to bottom as the lifecycle it implements:
+
+  1. `ensure_kernels`      compile the ELFs, or reuse the on-disk cache
+  2. `VisionRuntime`       weights + ELFs + XRT context, built ONCE
+     `.encode(images)`     -> (N, 64, 960) raw connector output
+  3. `get_vision_runtime`  the process-wide singleton that makes (2) once-only
+
+`encode` returns exactly what `vlm_with_expert.embed_image` returns: the RAW
+connector output. lerobot applies the sqrt(960) scale afterwards -- do not
+pre-apply it.
+
 Why single-process
 ------------------
 An earlier design ran the NPU stage in a *second* Python process, on the
@@ -15,38 +26,15 @@ it is NPU cost. Here the weights and the `KernelCache` (ELFs, XRT context,
 device buffer objects) are built ONCE per process and reused, which is what a
 deployment does.
 
-Contents
---------
-`VisionRuntime`       SigLIP ViT (12 layers, seq 1024) + connector.
-                      `encode(images)` -> (N, 64, 960), the RAW connector output
-                      that `vlm_with_expert.embed_image` returns. lerobot applies
-                      the sqrt(960) scale afterwards -- do not pre-apply it.
-`get_vision_runtime()` module-level singleton, so repeated inferences in one
-                      process share the weights and the compiled ELFs.
-`npu_thread_limits()`  see below.
-
-BLAS-thread contention
-----------------------
-The NPU driver loop is host-bound (38 dispatches per image). OpenBLAS worker
-threads busy-spin after any host matmul in the same process and preempt the
-dispatch thread -- measured 135 -> 178 ms per image on the vision encoder.
-Clamping the pools globally would be wrong, because the CPU stages that run
-before and after this one genuinely want all cores. So the clamp is *scoped*:
-`npu_thread_limits()` reduces the pools for the duration of the NPU call and
-restores them afterwards, at runtime and without environment variables, by
-calling `openblas_set_num_threads` / `mkl_set_num_threads` through ctypes on the
-already-loaded shared objects, plus `torch.set_num_threads`.
-Set SMOLVLA_NPU_BLAS_LIMIT=0 to disable it and measure the other side.
+The host thread-pool clamp around the dispatch loop lives in
+`shared/infra/thread_limits.py`; see `npu_thread_limits` below for the knob.
 """
 
 from __future__ import annotations
 
-import ctypes
 import os
-import re
 import sys
 import time
-from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
@@ -60,138 +48,9 @@ if str(_LLMS_DIR) not in sys.path:
     sys.path.insert(0, str(_LLMS_DIR))
 
 from shared.infra.cache import KernelCache, Profiler  # noqa: E402
+from shared.infra.thread_limits import host_thread_limits  # noqa: E402
 
 MODEL_ID = "lerobot/smolvla_base"
-
-# ---------------------------------------------------------------------------
-# Scoped thread-pool limiting
-# ---------------------------------------------------------------------------
-
-# Symbol spellings seen in the wild. numpy>=2 wheels bundle scipy-openblas64,
-# whose setter is `scipy_openblas_set_num_threads64_`; conda/pip OpenBLAS uses
-# the plain name; MKL builds export MKL_Set_Num_Threads.
-_SET_SYMBOLS = (
-    "scipy_openblas_set_num_threads64_",
-    "scipy_openblas_set_num_threads_64_",
-    "scipy_openblas_set_num_threads",
-    "openblas_set_num_threads64_",
-    "openblas_set_num_threads",
-    "MKL_Set_Num_Threads",
-    "mkl_set_num_threads",
-)
-_GET_SYMBOLS = (
-    "scipy_openblas_get_num_threads64_",
-    "scipy_openblas_get_num_threads_64_",
-    "scipy_openblas_get_num_threads",
-    "openblas_get_num_threads64_",
-    "openblas_get_num_threads",
-    "MKL_Get_Max_Threads",
-    "mkl_get_max_threads",
-)
-_LIB_PATTERN = re.compile(r"(openblas|mkl_rt|libmkl_core)", re.IGNORECASE)
-
-_blas_controllers = None  # lazily discovered [(handle, set_fn, get_fn_or_None)]
-
-
-def _discover_blas_controllers():
-    """Find the BLAS shared objects already mapped into this process and grab
-    their thread-count setter/getter. Mirrors what threadpoolctl does, without
-    the dependency (threadpoolctl is not installed in the lerobot venv)."""
-    global _blas_controllers
-    if _blas_controllers is not None:
-        return _blas_controllers
-    ctrls = []
-    seen = set()
-    try:
-        with open("/proc/self/maps") as f:
-            lines = f.readlines()
-    except OSError:
-        lines = []
-    for line in lines:
-        m = re.search(r"(/\S+\.so[^\s]*)", line)
-        if not m:
-            continue
-        path = m.group(1)
-        if path in seen or not _LIB_PATTERN.search(path):
-            continue
-        seen.add(path)
-        try:
-            # RTLD_NOLOAD: bind to the ALREADY-mapped library (the one numpy is
-            # actually using); never dlopen a second copy.
-            h = ctypes.CDLL(path, mode=getattr(os, "RTLD_NOLOAD", 0))
-        except OSError:
-            continue
-        set_fn = next(
-            (getattr(h, s) for s in _SET_SYMBOLS if hasattr(h, s)),
-            None,
-        )
-        if set_fn is None:
-            continue
-        get_fn = next((getattr(h, s) for s in _GET_SYMBOLS if hasattr(h, s)), None)
-        ctrls.append((path, set_fn, get_fn))
-    _blas_controllers = ctrls
-    return ctrls
-
-
-def _set_blas_threads(n):
-    """-> list of (set_fn, previous_n) so the caller can restore."""
-    prev = []
-    for _path, set_fn, get_fn in _discover_blas_controllers():
-        try:
-            old = int(get_fn()) if get_fn is not None else (os.cpu_count() or 1)
-            set_fn(ctypes.c_int(int(n)))
-            prev.append((set_fn, old))
-        except Exception:  # never let a thread knob break inference
-            continue
-    return prev
-
-
-@contextmanager
-def npu_thread_limits(n=1, enabled=None):
-    """Clamp BLAS + torch intra-op threads to `n` for the duration of the NPU
-    dispatch loop, then restore. Scoped, so the CPU action expert outside this
-    block keeps every core.
-
-    enabled=None -> honour SMOLVLA_NPU_BLAS_LIMIT (default "1"; "0" disables,
-    which is the A/B arm reported in docs/TODO.md)."""
-    if enabled is None:
-        enabled = os.environ.get("SMOLVLA_NPU_BLAS_LIMIT", "1") != "0"
-    if not enabled:
-        yield
-        return
-    prev = _set_blas_threads(n)
-    torch_prev = None
-    torch_mod = sys.modules.get("torch")
-    if torch_mod is not None:
-        try:
-            torch_prev = torch_mod.get_num_threads()
-            torch_mod.set_num_threads(int(n))
-        except Exception:
-            torch_prev = None
-    try:
-        yield
-    finally:
-        for set_fn, old in prev:
-            try:
-                set_fn(ctypes.c_int(int(old)))
-            except Exception:
-                pass
-        if torch_prev is not None:
-            try:
-                torch_mod.set_num_threads(torch_prev)
-            except Exception:
-                pass
-
-
-def blas_limiter_available():
-    """True if we actually found a BLAS thread knob (else the limiter only
-    affects torch). Reported by the bench so the trade-off is auditable."""
-    return len(_discover_blas_controllers()) > 0
-
-
-# ---------------------------------------------------------------------------
-# Vision (SigLIP ViT + connector)
-# ---------------------------------------------------------------------------
 
 VISION_CACHE_DIR = "vision_kernel_cache"
 VISION_SEQ_LEN = 1024
@@ -202,6 +61,27 @@ VISION_KERNELS = {
     "layer_norm",
     "gemm_connector",
 }
+
+
+def npu_thread_limits(n=1, enabled=None):
+    """`host_thread_limits` with SmolVLA's env-var knob bound.
+
+    The NPU driver loop is host-bound (38 dispatches per image) and OpenBLAS
+    workers busy-spin after any host matmul, preempting it -- measured
+    135 -> 178 ms per image. Clamping globally would starve the CPU backbone
+    and action expert, so the clamp is scoped to the dispatch loop.
+
+    SMOLVLA_NPU_BLAS_LIMIT=0 disables it, which is the A/B arm reported in
+    docs/explain.md.
+    """
+    if enabled is None:
+        enabled = os.environ.get("SMOLVLA_NPU_BLAS_LIMIT", "1") != "0"
+    return host_thread_limits(n, enabled=enabled)
+
+
+# ---------------------------------------------------------------------------
+# 1. Kernel cache policy: compile once, then reuse
+# ---------------------------------------------------------------------------
 
 
 def ensure_kernels(cache, expected, compile_fn, tag="npu"):
@@ -230,6 +110,11 @@ def ensure_kernels(cache, expected, compile_fn, tag="npu"):
     cache.artifacts.clear()
     compile_fn()
     return True
+
+
+# ---------------------------------------------------------------------------
+# 2. The runtime: weights + ELFs + XRT context, built once
+# ---------------------------------------------------------------------------
 
 
 def _to_chw_f32(img):
@@ -341,6 +226,10 @@ class VisionRuntime:
             self.encode([np.zeros((3, 512, 512), np.float32)])
         return self
 
+
+# ---------------------------------------------------------------------------
+# 3. The singleton that makes step 2 happen exactly once per process
+# ---------------------------------------------------------------------------
 
 _vision_rt = None
 
