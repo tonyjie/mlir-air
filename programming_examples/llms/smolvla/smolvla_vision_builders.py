@@ -81,7 +81,7 @@ from shared.builders.rms_qkv_bias_rope_multi import _build_bias_add_2d
 from shared.builders.o_ffn_multi import _build_add_2d_to_2d
 from layer_norm.layer_norm import build_module as build_layer_norm
 
-# GELU-tanh constants (match gelu/gelu.py kernel + smolvla_cpu_helpers.gelu_tanh).
+# GELU-tanh constants (match the gelu/gelu.py registry kernel).
 _GELU_BETA = 0.044715
 _SQRT_2_OVER_PI = 0.7978845608028654
 
