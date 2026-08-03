@@ -13,15 +13,21 @@ This example needs **one** interpreter that has both sides:
 - `torch` + `lerobot` — to run the real SmolVLA policy
 - `air` + `pyxrt` — to drive the NPU
 
-That combination is what makes the single-process path work. A lerobot venv
-qualifies once the mlir-air environment is sourced, because the mlir-air
-`PYTHONPATH` / `LD_LIBRARY_PATH` make `air` and `pyxrt` importable from it.
+That combination is what makes the single-process path work. Install the
+example's dependencies into the interpreter that already has `air` + `pyxrt`
+(the mlir-air environment):
 
 ```bash
 pip install -r requirements.txt
 ```
 
-Point the Makefile at it if it is not at the default location:
+`lerobot` is one of them — it IS the CPU baseline this example verifies
+against, so nothing else needs to be fetched by hand.
+
+The Makefile defaults to `python3`. If your lerobot install lives in a
+separate venv instead, point the Makefile at it — that venv qualifies once the
+mlir-air environment is sourced, because the mlir-air `PYTHONPATH` /
+`LD_LIBRARY_PATH` make `air` and `pyxrt` importable from it:
 
 ```bash
 make verify LEROBOT_PYTHON=/path/to/venv/bin/python

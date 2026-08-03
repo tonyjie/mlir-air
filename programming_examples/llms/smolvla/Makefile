@@ -12,16 +12,22 @@
 # chunk against the unmodified CPU model — not the token-set gate the
 # autoregressive LLM siblings use, because SmolVLA does not emit tokens.
 #
-# One process: with the mlir-air environment sourced, LEROBOT_PYTHON has torch +
-# lerobot AND air + pyxrt, so the NPU stage runs in-process through
-# smolvla_runtime, with weights, ELFs and the XRT context loaded once.
+# One process: with the mlir-air environment sourced and requirements.txt
+# installed, one interpreter has torch + lerobot AND air + pyxrt, so the NPU
+# stage runs in-process through smolvla_runtime, with weights, ELFs and the XRT
+# context loaded once.
 #
 # NOTE: every recipe here already self-locks the NPU (NPU_LOCK). Do NOT wrap
 # `make ...` in an outer flock on the same file — it self-deadlocks.
 
 srcdir := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
 
-LEROBOT_PYTHON ?= $(HOME)/Projects/smolvla_playground/.venv/bin/python
+# The interpreter that runs the model. It needs torch + lerobot (installed by
+# requirements.txt) AND air + pyxrt (from the sourced mlir-air environment) in
+# ONE process, which is what makes the in-process NPU path work. Defaults to
+# the environment's python3; override if your lerobot install lives elsewhere:
+#     make verify LEROBOT_PYTHON=/path/to/venv/bin/python
+LEROBOT_PYTHON ?= python3
 NPU_PYTHON     ?= python3
 NPU_LOCK       := flock -x -w 1800 /tmp/mlir-air-npu.lock
 BUILD_DIR      ?= build

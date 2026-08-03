@@ -1,8 +1,35 @@
-# SmolVLA backbone NPU2 port — mirrors sibling smollm2_1_7b deps.
-# The CPU oracle (lerobot) lives in ~/Projects/smolvla_playground/.venv and is
-# NOT installed here; this file covers the mlir-air-side verify deps only.
-transformers>=5.3.0
-numpy
-ml_dtypes
+# Additional Python packages for the SmolVLA example.
+#
+# These are *on top of* the mlir-air base environment (which already provides
+# numpy, ml_dtypes, filelock, pyxrt, etc.).
+#
+# Install with:
+#     pip install -r requirements.txt
+#
+# Install them into the SAME interpreter that has air + pyxrt. This example
+# splices the NPU vision stage into the lerobot model in ONE process, so a
+# single interpreter must have both sides. See docs/usage.md.
+#
+# After this, you still need a one-time HuggingFace setup:
+#   1. Create a read token at https://huggingface.co/settings/tokens
+#   2. `huggingface-cli login`  (or export HF_TOKEN=<token>)
+# The example downloads lerobot/smolvla_base (450M params) on first use.
+# See README.md / docs/usage.md for details.
+
+# Weight loading
 safetensors
 huggingface_hub
+
+# The SmolVLA policy itself. This IS the CPU baseline that `make verify`
+# compares against: the example splices the NPU vision encoder into this
+# unmodified model, so the reference is upstream lerobot rather than a
+# reimplementation living in this repo.
+lerobot
+torch
+
+# Tokenizer + the SigLIP/SmolVLM config the vision weights are read from
+transformers>=5.3.0
+
+# Host-side reference math and bf16 handling
+numpy
+ml_dtypes

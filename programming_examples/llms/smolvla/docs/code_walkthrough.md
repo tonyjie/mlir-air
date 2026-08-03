@@ -41,13 +41,18 @@
 
 这是最容易困惑的一点。
 
-**CPU baseline 就是官方的 lerobot 包本身**，是 pip 装的第三方库，
-不是我们写的代码：
+**CPU baseline 就是官方的 lerobot 包本身**，是 pip 装的第三方库
+（`requirements.txt` 里声明），不是我们写的代码：
 
 ```
-/home/jiajli/Projects/smolvla_playground/lerobot/src/lerobot/policies/smolvla/
+<site-packages>/lerobot/policies/smolvla/
     modeling_smolvla.py      ← 903 行，官方实现，我们一个字没改
 ```
+
+想找到它：`python3 -c "import lerobot.policies.smolvla.modeling_smolvla as m; print(m.__file__)"`
+
+这和兄弟模型的做法一致——`llama32_1b` 的 CPU 参照是 HF `transformers`
+里的 Llama 实现，同样是 pip 依赖，同样没有 vendor 进本仓库。
 
 我们的代码里三处都是直接加载它：
 

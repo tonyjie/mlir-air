@@ -1,5 +1,6 @@
-"""Dump SmolVLA backbone oracle fixtures from the real CPU model.
-Run with the lerobot venv:  ~/Projects/smolvla_playground/.venv/bin/python
+"""Dump SmolVLA oracle fixtures from the real CPU model (`make oracle`).
+
+Needs torch + lerobot (see requirements.txt); no NPU.
 Writes smolvla_oracle.npz with: prefix_embed (241,960), per-layer hidden
 (16 x (241,960)), final_norm_hidden (241,960), and the (50,6) action chunk.
 
