@@ -54,7 +54,7 @@ help:
 ## toolchain is installed.
 compile:
 	@mkdir -p $(BUILD_DIR)
-	cd $(BUILD_DIR) && $(NPU_PYTHON) $(srcdir)/smolvla_vision_npu.py --compile-only
+	cd $(BUILD_DIR) && $(NPU_PYTHON) $(srcdir)/smolvla_inference.py --compile-only
 
 ## Regenerate the pure-CPU reference the gate compares against.
 ## CPU only — no NPU, so no lock.

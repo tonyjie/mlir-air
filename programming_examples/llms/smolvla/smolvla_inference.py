@@ -33,10 +33,12 @@ import time
 from pathlib import Path
 
 import numpy as np
-import torch
 
-from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
-from lerobot.utils.constants import OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS
+# torch and lerobot are imported lazily, inside the functions that need them, so
+# that `--compile-only` (and the compile lit test) runs with only the mlir-air
+# toolchain installed -- no torch, no lerobot, no HuggingFace download. This
+# mirrors the siblings, whose inference entry points are numpy-only at module
+# scope for the same reason.
 
 _HERE = Path(__file__).resolve().parent
 
@@ -71,6 +73,12 @@ def build_config(npu_vision: bool = True) -> dict:
 def build_oracle_batch(policy, prompt: str = DEFAULT_PROMPT):
     """The same synthetic batch the oracle dumper uses: zero images and state,
     tokenized prompt. Deterministic, so the gate is reproducible."""
+    import torch
+    from lerobot.utils.constants import (
+        OBS_LANGUAGE_ATTENTION_MASK,
+        OBS_LANGUAGE_TOKENS,
+    )
+
     cfg = policy.config
     b = {}
     for k, f in cfg.input_features.items():
@@ -93,6 +101,8 @@ def fixed_noise(policy):
     The action expert is a flow-matching denoiser seeded from noise, so a
     reproducible gate needs the noise pinned.
     """
+    import torch
+
     return torch.zeros(
         (1, policy.config.chunk_size, policy.config.max_action_dim),
         dtype=torch.float32,
@@ -125,6 +135,9 @@ def run_hybrid_forward(
         unmodified, which is the baseline the gate compares against.
     timings    : optional dict, filled with the NPU stage's phase timings.
     """
+    import torch
+    from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
+
     if policy is None:
         policy = SmolVLAPolicy.from_pretrained(DEFAULT_MODEL).eval()
 
@@ -171,14 +184,49 @@ def run_hybrid_forward(
     return chunk.detach().float().numpy()  # (1, chunk_size, action_dim)
 
 
+def compile_only(cache_dir: str = "vision_kernel_cache") -> int:
+    """Build every vision ELF through AIR -> AIE -> aiecc -> Peano.
+
+    No NPU dispatch and no HuggingFace download, so this runs anywhere the
+    toolchain is installed -- it is the compile smoke test the CI lit file
+    drives, and it must not need the device, the network, torch or lerobot.
+    """
+    # smolvla_vision_npu puts programming_examples/ and llms/ on sys.path at
+    # import time, so it has to come before anything under `shared.`.
+    from smolvla_vision_npu import compile_all_kernels
+    from smolvla_vision_weights import SigLIPVisionConfig
+    from shared.infra.cache import KernelCache, Profiler
+
+    cfg = SigLIPVisionConfig()
+    cache = KernelCache(cache_dir, verbose=False, profiler=Profiler())
+    print(f"Compiling SmolVLA vision kernels into {cache_dir}/ ...")
+    compile_all_kernels(
+        cache, cfg, seq_len=cfg.num_patches, fused=True, with_connector=True
+    )
+    cache._save_manifest()
+    print(f"Compiled {len(cache.artifacts)} ELFs: {sorted(cache.artifacts)}")
+    print("Compilation passed.")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
         "--cpu", action="store_true", help="run the unmodified CPU model instead"
     )
     ap.add_argument("--prompt", default=DEFAULT_PROMPT)
+    ap.add_argument(
+        "--compile-only",
+        action="store_true",
+        help="build every vision ELF and exit; no NPU dispatch, no download",
+    )
     args = ap.parse_args()
     npu_vision = not args.cpu
+
+    if args.compile_only:
+        return compile_only()
+
+    from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 
     policy = SmolVLAPolicy.from_pretrained(DEFAULT_MODEL).eval()
     batch = build_oracle_batch(policy, args.prompt)
