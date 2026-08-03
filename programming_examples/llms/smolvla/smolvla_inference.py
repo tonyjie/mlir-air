@@ -144,32 +144,48 @@ def run_hybrid_forward(
     vwe = policy.model.vlm_with_expert
     orig_embed_prefix = policy.model.embed_prefix
     orig_embed_image = vwe.embed_image
+    ref_dtype = next(policy.parameters()).dtype
 
     def _wrapped_embed_prefix(*a, **kw):
-        # `images` is embed_prefix's first positional arg: a list of N camera
-        # tensors. Encode them ALL up front in one call, then let the untouched
-        # embed_prefix pull them one at a time through the swapped embed_image
-        # -- so the sqrt(960) scale, the pad/attention masks and the prefix
-        # assembly all remain lerobot's own code.
+        # Two swaps, not one, and the outer one is load-bearing for SPEED, not
+        # for correctness: all N images are encoded in ONE runtime call so the
+        # host thread clamp spans the whole dispatch loop. Encoding them one at
+        # a time from embed_image alone is simpler and passes the gate, but it
+        # enters/exits the clamp per image and lets the BLAS pool spin back up
+        # in between -- measured 818 -> 920 ms end to end, which is the entire
+        # 1.07x win. Do not "simplify" this without re-measuring.
         from smolvla_runtime import get_vision_runtime
 
         images = kw["images"] if "images" in kw else a[0]
         conn = get_vision_runtime().encode(images, timings=timings)
-        ref_dtype = next(policy.parameters()).dtype
         served = {"i": 0}
 
         def _npu_embed_image(image):
+            # lerobot's embed_prefix iterates `images` in order, so the i-th
+            # call corresponds to conn[i]. That is an assumption about someone
+            # else's loop, so it is checked rather than trusted: a reordering
+            # or an extra call raises here instead of silently pairing an
+            # image with another camera's embedding.
             i = served["i"]
+            assert i < len(conn), (
+                f"embed_image called {i + 1}x but only {len(conn)} images were "
+                "encoded -- lerobot's embed_prefix no longer consumes `images` "
+                "one-for-one in order"
+            )
             served["i"] += 1
-            bsize = image.shape[0]
             emb = torch.from_numpy(np.ascontiguousarray(conn[i])).to(ref_dtype)
-            return emb[None, ...].expand(bsize, -1, -1)
+            return emb[None, ...].expand(image.shape[0], -1, -1)
 
         vwe.embed_image = _npu_embed_image
         try:
-            return orig_embed_prefix(*a, **kw)
+            out = orig_embed_prefix(*a, **kw)
         finally:
             vwe.embed_image = orig_embed_image
+        assert served["i"] == len(conn), (
+            f"encoded {len(conn)} images on the NPU but embed_prefix consumed "
+            f"{served['i']} -- some camera fell back to the CPU tower silently"
+        )
+        return out
 
     if npu_vision:
         policy.model.embed_prefix = _wrapped_embed_prefix
