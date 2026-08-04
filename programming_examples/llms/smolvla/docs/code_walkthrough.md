@@ -84,6 +84,104 @@ make oracle      # 用纯 CPU 跑一遍，把结果存进 smolvla_oracle.npz
 
 ---
 
+## 2b. 一次 CPU 推理具体在跑什么
+
+下面每个 shape 都是**在真机上 instrument 一次真实推理测出来的**，不是从
+代码推的。看懂这一节，第 3 节的替换就是显然的。
+
+### 入口
+
+```
+predict_action_chunk(batch, noise)
+  ├─ _prepare_batch(batch)                     归一化
+  └─ _get_action_chunk
+       └─ VLAFlowMatching.sample_actions(...)  ← 真正的流程在这
+```
+
+### 输入
+
+```
+observation.images.camera1/2/3     (1, 3, 256, 256) f32   3 台相机
+observation.language.tokens        (1, 48)          i64   补齐到 48
+observation.language.attention_mask(1, 48)          bool
+observation.state                  (1, 6)           f32   机器人关节
+```
+
+### 中间步骤
+
+```
+① embed_prefix ─────────────────────────────────────────────────
+     embed_image (1,3,512,512) → (1,64,960)   ×3   ← SigLIP，本 PR 换这里
+        （注意 512：lerobot 预处理把 256 resize_with_pad 到 512）
+     img_emb *= sqrt(960)                          ← 缩放在替换点之后！
+     + 语言 token + state，拼接
+   ⇒ prefix_embs   (1, 241, 960)
+     pad_masks     (1, 241)   其中真 token = 197  ← 44 个语言 padding
+     position_ids  = cumsum(pad_masks) - 1        ← padding 不推进 position
+
+② vlm_with_expert.forward(use_cache=True) ─────────────────────
+     attn_mask (1, 241, 241)  双向
+   ⇒ DynamicCache: 16 层 × k (1, 5, 241, 64)      ← GQA 5 个 KV 头
+     只要这份 KV，输出直接丢掉（源码里就是 `_,`）
+
+③ euler_integrate(denoise_step, ×10) ──────────────────────────
+     每一步：
+       embed_suffix(x_t)  (1,50,32) → (1,50,720)  ← 动作+时间步，expert 宽度 720
+       attn_mask (1, 50, 291)                     ← 291 = 241 prefix + 50 suffix
+       vlm_with_expert.forward(past_key_values=…)
+       past_key_values.crop(241)                  ← 裁掉本步追加的 suffix K/V
+       action_out_proj → v_t                      速度场
+     x ← x + Δt·v_t
+```
+
+实测调用次数：`embed_image` **3 次**，backbone forward **1 次**，
+denoise forward **10 次**。
+
+### 输出
+
+```
+action_chunk (1, 50, 6) f32     未来 50 步、每步 6 个关节
+```
+
+### prefix 和 suffix
+
+模型内部只有**一条序列**，由两段拼成：
+
+```
+[  prefix 241 token  |  suffix 50 token  ]
+    观测，算一次就固定      正在去噪的动作，每步都变
+```
+
+注意力是**单向隔开**的（`embed_suffix` 里 `att_masks += [1]*chunk_size`
+标记块边界）：suffix 能看 prefix，**prefix 看不见 suffix**。
+
+**这正是 prefix 的 KV 能缓存的原因**——它和 suffix 无关，所以 backbone 算
+一次、10 步去噪反复读同一份。
+
+### 这对换 NPU 意味着什么
+
+三段的边界恰好都是干净的函数边界，所以每一段都能独立替换，不用改
+lerobot 一行代码：
+
+| 段 | 边界函数 | 每次推理调用 | seq |
+|---|---|---|---|
+| ① SigLIP | `embed_image` | **3** | 1024 |
+| ② backbone | `vlm_with_expert.forward` | **1** | 241→256 |
+| ③ expert | `denoise_step` | **10** | 50 |
+
+调用次数和 seq 直接决定了哪一段值得搬：① 形状填得满阵列、启动开销摊得
+薄；③ 只有 50 个 token 却要跑 10 遍，两头都吃亏。详见第 6 节。
+
+> **`VLAFlowMatching.forward()` 是训练路径，推理不走它。** 它返回
+> `F.mse_loss(...)`，且 `use_cache=False`、prefix 和 suffix 一起喂。读代码
+> 时容易和 `sample_actions` 混。
+
+> **lerobot 0.6.1 起 `past_key_values` 是 `DynamicCache`，不能 `pkv[i]`
+> 下标访问。** 0.5.0 的写法在新版会 `TypeError`。要重做 backbone 移植
+> （它靠覆写 KV cache）的话，这是第一个会踩到的地方。
+
+---
+
 ## 3. 我们改了什么 —— 只有一个函数
 
 整个 NPU 集成，机制上只有一件事：
