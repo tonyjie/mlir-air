@@ -46,15 +46,22 @@
 
 ```
 <site-packages>/lerobot/policies/smolvla/
-    modeling_smolvla.py      ← 903 行，官方实现，我们一个字没改
+    modeling_smolvla.py      ← 官方实现，我们一个字没改
 ```
 
-想找到它：`python3 -c "import lerobot.policies.smolvla.modeling_smolvla as m; print(m.__file__)"`
+想找到它：
+
+```bash
+python3 -c "import lerobot.policies.smolvla.modeling_smolvla as m; print(m.__file__)"
+```
+
+（`requirements.txt` 装好后，这在 mlir-air 环境里直接可用。）
 
 这和兄弟模型的做法一致——`llama32_1b` 的 CPU 参照是 HF `transformers`
 里的 Llama 实现，同样是 pip 依赖，同样没有 vendor 进本仓库。
 
-我们的代码里三处都是直接加载它：
+我们的代码里四处都是直接加载它 —— `smolvla_inference.py` 两处、
+`verify_adapter.py`、`smolvla_cpu_baseline.py`：
 
 ```python
 from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
