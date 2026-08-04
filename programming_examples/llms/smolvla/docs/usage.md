@@ -17,25 +17,29 @@ That combination is what makes the single-process path work. `lerobot` is in
 `requirements.txt` — it IS the CPU baseline this example verifies against, so
 nothing needs to be fetched by hand.
 
-**Use a separate venv, not the mlir-air environment.** Sourcing the mlir-air
-environment puts `air` and `pyxrt` on `PYTHONPATH` / `LD_LIBRARY_PATH`, so they
-import fine from any venv — you get both sides without touching the shared one:
+Install into the environment that already has `air` + `pyxrt`:
+
+```bash
+pip install -r requirements.txt
+make verify                      # default LEROBOT_PYTHON=python3
+```
+
+**One caveat.** lerobot requires `numpy>=2.0,<2.3`, and `utils/requirements.txt`
+leaves numpy unpinned, so an older mlir-air environment may still be on 1.x —
+installing will upgrade it across a major version in the interpreter every
+other example shares. That upgrade was tested here (1.26.4 → 2.2.6, with
+`qwen25_0_5b` and `qwen3_1_7b` `make verify` PASSing identically before and
+after), but check your own models rather than taking that on faith.
+
+To leave the shared environment untouched, use a separate venv instead.
+Sourcing the mlir-air environment puts `air` and `pyxrt` on `PYTHONPATH` /
+`LD_LIBRARY_PATH`, so they import from any venv:
 
 ```bash
 python3 -m venv ~/smolvla-venv
 ~/smolvla-venv/bin/pip install -r requirements.txt
-source utils/env_setup.sh ...                       # air + pyxrt become importable
 make verify LEROBOT_PYTHON=~/smolvla-venv/bin/python
 ```
-
-The reason is a real conflict, not caution: `pip install lerobot` resolves
-`numpy` to 2.x. `utils/requirements.txt` leaves `numpy` unpinned, so an
-mlir-air environment can be on 1.x (measured here: 1.26.4) — installing in
-place would upgrade numpy across a major version in the interpreter that every
-other example and the `air`/`pyxrt` C extensions share.
-
-If your mlir-air environment is already on numpy 2.x, installing in place is
-fine and the Makefile's default `LEROBOT_PYTHON=python3` just works.
 
 ### Model access
 `HF_TOKEN` must be set; the example downloads `lerobot/smolvla_base` (450M
