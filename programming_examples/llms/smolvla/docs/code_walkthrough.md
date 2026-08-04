@@ -116,11 +116,11 @@ observation.state                  (1, 6)           f32   机器人关节
      img_emb *= sqrt(960)                          ← 缩放在替换点之后！
      + 语言 token + state，拼接
    ⇒ prefix_embs   (1, 241, 960)
-     pad_masks     (1, 241)   其中真 token = 197  ← 44 个语言 padding
+     pad_masks     (1, 241)   其中真 token = 197  ← 见下面「241 从哪来」
      position_ids  = cumsum(pad_masks) - 1        ← padding 不推进 position
 
 ② vlm_with_expert.forward(use_cache=True) ─────────────────────
-     attn_mask (1, 241, 241)  双向
+     attn_mask (1, 241, 241)  非因果，但 state 前有一道块边界（见下）
    ⇒ DynamicCache: 16 层 × k (1, 5, 241, 64)      ← GQA 5 个 KV 头
      只要这份 KV，输出直接丢掉（源码里就是 `_,`）
 
@@ -143,7 +143,53 @@ denoise forward **10 次**。
 action_chunk (1, 50, 6) f32     未来 50 步、每步 6 个关节
 ```
 
-### prefix 和 suffix
+### 241 从哪来，197 又从哪来
+
+prefix 是三部分拼接：
+
+```
+  3 台相机 × 64 token  =  192      全部是真的
+  语言槽               =   48      本例只有 4 个真，44 个 padding
+  state                =    1      真的
+  ──────────────────────────────
+                          241      真 token = 192 + 4 + 1 = 197
+```
+
+**44 个 padding 全部来自语言。** tokenizer 是这样调的：
+
+```python
+padding="max_length", max_length=cfg.tokenizer_max_length   # 48
+```
+
+不管指令多长都补齐到 48 个槽，这样张量形状固定、不随 prompt 变。本例的
+`"pick up the cube"` 只 tokenize 成 4 个 id（`[18188, 614, 260, 20636]`）。
+
+所以 **197 不是常数**，是这个 prompt 的属性：换一句更长的指令，真 token 变
+多、padding 变少。图像和 state 永远是真的，只有语言段会有 padding。
+
+### 三种模态，三条编码路径
+
+| | 输入 | 怎么编码 | 输出 |
+|---|---|---|---|
+| **图像** | (3,512,512) ×3 | **SigLIP ViT 12 层 + connector** | 各 64×960 |
+| **语言** | 48 个 token id | `embed_language_tokens` —— **查 embedding 表** | 48×960 |
+| **state** | (1,6)，补到 32 | `state_proj` —— **一层 `Linear(32→960)`** | 1×960 |
+
+计算量差几个数量级：图像是一整个 12 层 Transformer（每张图 1024 个 patch
+token 跑完再压成 64）；语言就是查表，**没有任何 Transformer**；state 字面
+意义上只有一层全连接。
+
+**这直接支撑了「只搬 vision」这个决定**——另外两条路径的算力可以忽略。
+
+两个容易漏的细节：
+
+```python
+img_emb  = img_emb  * sqrt(960)        # 图像：有缩放
+lang_emb = lang_emb * math.sqrt(960)   # 语言：有缩放
+state_emb = self.state_proj(state)     # state：没有，直接 append
+```
+
+### prefix 和 suffix，以及真实的注意力结构
 
 模型内部只有**一条序列**，由两段拼成：
 
@@ -152,11 +198,24 @@ action_chunk (1, 50, 6) f32     未来 50 步、每步 6 个关节
     观测，算一次就固定      正在去噪的动作，每步都变
 ```
 
-注意力是**单向隔开**的（`embed_suffix` 里 `att_masks += [1]*chunk_size`
-标记块边界）：suffix 能看 prefix，**prefix 看不见 suffix**。
+`att_masks` 里的 `1` 标记块边界，而它出现了**两次**——所以不是简单的
+「prefix 内部双向」，是三段递进：
 
-**这正是 prefix 的 KV 能缓存的原因**——它和 suffix 无关，所以 backbone 算
-一次、10 步去噪反复读同一份。
+```python
+att_masks += [0] * num_img_embs      # 图像
+att_masks += [0] * num_lang_embs     # 语言
+att_masks += [1] * states_seq_len    # state ← 边界一
+att_masks += [1] * chunk_size        # suffix ← 边界二（在 embed_suffix 里）
+```
+
+```
+[图像 + 语言]  ←→  互相双向
+    state       →   能看图像和语言，图像/语言看不见它
+    suffix      →   能看前面全部，前面全部看不见它
+```
+
+**第二道边界正是 prefix 的 KV 能缓存的原因**——prefix 看不见 suffix，所以
+prefix 的 K/V 与 suffix 无关，backbone 算一次、10 步去噪反复读同一份。
 
 ### 这对换 NPU 意味着什么
 
