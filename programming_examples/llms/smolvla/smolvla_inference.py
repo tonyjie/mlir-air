@@ -148,12 +148,22 @@ def run_hybrid_forward(
 
     def _wrapped_embed_prefix(*a, **kw):
         # Two swaps, not one, and the outer one is load-bearing for SPEED, not
-        # for correctness: all N images are encoded in ONE runtime call so the
-        # host thread clamp spans the whole dispatch loop. Encoding them one at
-        # a time from embed_image alone is simpler and passes the gate, but it
-        # enters/exits the clamp per image and lets the BLAS pool spin back up
-        # in between -- measured 818 -> 920 ms end to end, which is the entire
-        # 1.07x win. Do not "simplify" this without re-measuring.
+        # for correctness: all N images are encoded in ONE runtime call.
+        # Encoding them one at a time from embed_image alone is simpler -- one
+        # swap, no counter, no ordering assumption -- and holds the gate at
+        # cosine 0.99900. It also costs the entire win: 818/834/838 ms batched
+        # vs 882/914/963 ms lazy, against a 913 ms pure-CPU baseline.
+        #
+        # WHY it costs that is NOT established. The obvious suspect, the host
+        # thread clamp being entered per image instead of once, is ruled out:
+        # SMOLVLA_NPU_BLAS_LIMIT=0 vs 1 is 441.1 vs 442.5 ms encode over three
+        # runs each, i.e. the clamp does nothing on this machine. The largest
+        # single delta is im2col, 20 -> 47 ms, which would fit a cache-locality
+        # story (batched, patch_w stays hot; interleaved, a 12-layer ViT pass
+        # evicts it) -- but that is a guess, not a measurement.
+        #
+        # So: keep the batching because the number is real, and do not trust
+        # any explanation of it, including this comment, without re-measuring.
         from smolvla_runtime import get_vision_runtime
 
         images = kw["images"] if "images" in kw else a[0]
