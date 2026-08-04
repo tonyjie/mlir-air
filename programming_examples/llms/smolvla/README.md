@@ -118,7 +118,7 @@ the same file — it self-deadlocks.
 | `smolvla_cpu_helpers.py` | fp32 numpy reference for every vision operation |
 | `smolvla_runtime.py` | process-wide `VisionRuntime` singleton; scoped BLAS-thread clamp |
 | `smolvla_inference.py` | splices the NPU vision result into lerobot's own `embed_prefix` |
-| `smolvla_prefix.py` | dumps the pure-CPU baseline fixture (`make oracle`) |
+| `smolvla_cpu_baseline.py` | runs the unmodified CPU model, saves the action chunk `make verify` compares against (`make oracle`) |
 | `verify_adapter.py` | the regression gate |
 | `ARCHITECTURE.md` | design notes: layout conventions, kernel choices, the traps |
 | `docs/` | measured performance breakdown, and an illustrated walkthrough |

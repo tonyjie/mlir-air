@@ -314,7 +314,7 @@ checkpoints. Config values: `config.json` pulled from the Hub per repo.
 Mechanisms: `smolvlm_with_expert.py:88-106` (family knobs),
 `modeling_smolvla.py:434-438` (empty cameras), `:474-480` and `:570-574`
 (state/action padding), `:296` (output slicing). Batch construction:
-`smolvla_prefix.py:50-64`, `smolvla_inference.py:76-96`. Local dataset:
+`smolvla_inference.py:build_oracle_batch`. Local dataset:
 `~/.cache/huggingface/lerobot/HuggingFaceVLA/libero/meta/`. Training/eval
 figures: [SmolVLA blog](https://huggingface.co/blog/smolvla),
 [arXiv:2506.01844](https://arxiv.org/abs/2506.01844). Download counts: HF Hub

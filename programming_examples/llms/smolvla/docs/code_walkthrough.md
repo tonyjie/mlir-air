@@ -150,8 +150,8 @@ nmse     = 0.003023     (门槛 0.04)
                     └─→ smolvla_cpu_helpers.py  95  故意留在 host 的部分
           │
           ▼
- ③ verify_adapter.py      131 行  ★★★ gate
- ④ smolvla_prefix.py      234 行  ★   生成 CPU oracle
+ ③ verify_adapter.py       131 行  ★★★ gate
+ ④ smolvla_cpu_baseline.py  54 行  ★   生成 CPU oracle
 ```
 
 `smolvla_runtime.py` 从上到下就是它实现的生命周期，可以顺着读：
@@ -165,6 +165,62 @@ nmse     = 0.003023     (门槛 0.04)
 
 （主机 BLAS 线程钳制那 125 行 ctypes 已经挪去
 `shared/infra/thread_limits.py`，它和 vision 无关。）
+
+---
+
+## 4b. 要把另一个 stage 搬上 NPU 该怎么开始
+
+三个 stage 都 port 过。它们的接缝是**三种不同的机制**，不是同一个模式的
+三份拷贝——知道这点，将来做 backbone 或 expert 时不会走弯路。
+
+```
+lerobot 的推理流程                     替换点
+────────────────────────────────────────────────────────
+embed_prefix(images, lang, state)
+   │
+   ├─ embed_image(img) ×3       ←──① Vision：换掉这个函数，
+   │                                  直接返回 NPU 算好的 (64,960)
+   ▼
+vlm_with_expert.forward(fill_kv_cache=True)
+   │  CPU 跑完 16 层，产出 KV cache
+   │                            ←──② Backbone：不拦截，等它算完，
+   │                                  再整个覆写 pkv[i]["key_states"]
+   ▼
+denoise_step(...) ×10           ←──③ Expert：换掉整个函数，
+   │                                  10 步去噪全在 NPU
+   ▼
+action_out_proj → action chunk
+```
+
+| Stage | 换什么 | 时机 |
+|---|---|---|
+| Vision | `vwe.embed_image` | **之前** —— 换掉输入的生产者 |
+| Backbone | `vwe.forward` | **之后** —— 先让 CPU 算，再覆写结果 |
+| Expert | `m.denoise_step` | **整体** —— 换掉一整步 |
+
+② 的代价值得注意：它是"先在 CPU 上算一遍再扔掉"。这是 backbone 在 NPU 上
+不划算的原因之一，但不是全部（主要还是 seq=256 填不满阵列，见第 6 节）。
+
+共同点只有一条：**都用 `try/finally` 恢复**，任何异常都不会污染后续推理。
+
+### 两个值得先知道的坑
+
+**坑 1：hook 挂在 decoder layer 上不会触发。** lerobot 不调用整个
+`LlamaDecoderLayer`，而是手动调它的子模块（`input_layernorm`、
+`self_attn.{q,k,v,o}_proj`、`mlp`）再自己做残差加。所以
+`layers[i].register_forward_hook(...)` **永远不触发**，你会拿到空 list。
+正确做法是挂三个子模块，再按它的顺序重建：
+`hidden_in + o_proj_out + mlp_out`。
+
+**坑 2：不要用合成输入推导结构。** 前缀有 241 个 token，但**只有 197 个是
+真的**——语言部分按 `max_length=48` 补齐，而 prompt 只有 4 个真 token。
+这决定了 attention mask 和 RoPE 的起始 position。我当初用合成的
+`ones(241)` 推导，得出了错误的架构结论；从真模型 dump 才发现。
+**结构性事实必须从真模型读，不能靠推。**
+
+`smolvla_cpu_baseline.py` 现在只 dump 门禁需要的 `action_chunk`。backbone
+和 expert 需要的逐层 hidden、KV cache、pad mask、position ids 的抓取代码，
+连同它们的 NPU 实现，都在 **`smolvla` 分支**上（100 个文件的完整研究树）。
 
 ### 只想花 30 分钟？读这三个，约 700 行
 

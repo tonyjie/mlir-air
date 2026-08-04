@@ -59,7 +59,7 @@ compile:
 ## Regenerate the pure-CPU reference the gate compares against.
 ## CPU only — no NPU, so no lock.
 oracle:
-	cd $(srcdir) && $(LEROBOT_PYTHON) smolvla_prefix.py
+	cd $(srcdir) && $(LEROBOT_PYTHON) smolvla_cpu_baseline.py
 
 ## One end-to-end forward in the shipping configuration.
 run:

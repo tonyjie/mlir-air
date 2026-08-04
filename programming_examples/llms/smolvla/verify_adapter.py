@@ -11,7 +11,7 @@ and applies the continuous-output `regression_gate` from `verify.comparators` to
 the (1, 50, 6) action chunk.
 
 The reference is the **unmodified lerobot model running on CPU**, captured once
-by `smolvla_prefix.py` into `smolvla_oracle.npz['action_chunk']` with fixed zero
+by `smolvla_cpu_baseline.py` into `smolvla_oracle.npz['action_chunk']` with fixed zero
 noise. Running the NPU path against that measures the full NPU-induced deviation
 end to end, on the tensor the robot would actually execute -- not on an
 intermediate activation, and not against a reimplementation.

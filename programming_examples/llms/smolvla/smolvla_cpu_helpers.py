@@ -13,7 +13,7 @@ The parts of the vision path that do NOT run on the NPU:
     backend (the shipping path uses the registry FlashAttention ELF).
 
 The CPU reference this example verifies against is the unmodified lerobot
-model itself (see `smolvla_prefix.py`), not a reimplementation here.
+model itself (see `smolvla_cpu_baseline.py`), not a reimplementation here.
 
 Math mirrors HF `transformers/models/smolvlm/modeling_smolvlm.py`:
   - bidirectional MHA, 12 heads, head_dim 64, scale 1/8, softmax in fp32

@@ -48,7 +48,7 @@ like OpenVLA.
 ## 2. What this repository actually feeds the model
 
 **A synthetic fixed batch.** Confirmed by reading the code, not by trusting a
-summary. Both the oracle path (`smolvla_prefix.py:50-64`) and the inference
+summary. Both the oracle path (`smolvla_cpu_baseline.py`) and the inference
 path (`smolvla_inference.py:76-88`) call the same `build_batch`:
 
 ```python
@@ -298,7 +298,7 @@ conclusion is easier to attack, and what it measures is softer than 2b's.
 
 Local data: `~/.cache/huggingface/lerobot/HuggingFaceVLA/libero/` — parquet
 schema, row counts, decoded PNG statistics, and episode metadata read directly.
-Batch construction: `smolvla_prefix.py:50-64`, `smolvla_inference.py:76-96`.
+Batch construction: `smolvla_cpu_baseline.py`, `smolvla_inference.py:76-96`.
 Padding-mask mechanism: `modeling_smolvla.py` / `make_att_2d_masks`, and this
 example's own measurements (see `docs/profile.md`). Training and evaluation
 figures: [SmolVLA blog](https://huggingface.co/blog/smolvla),
