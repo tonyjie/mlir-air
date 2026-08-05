@@ -114,7 +114,7 @@ the same file — it self-deadlocks.
 |---|---|
 | `smolvla_vision_weights.py` | SigLIP config + weight loading from the checkpoint |
 | `smolvla_vision_builders.py` | the two fused multi-launch ELF builders (`vit_ln_qkv`, `vit_o_ffn`) |
-| `smolvla_vision_npu.py` | the NPU driver: compile the kernels, run the 12 layers; also the `--compile-only` CLI |
+| `smolvla_vision_encoder.py` | the NPU driver: compile the kernels, run the 12 layers; also the `--compile-only` CLI |
 | `smolvla_cpu_helpers.py` | fp32 numpy reference for every vision operation |
 | `smolvla_runtime.py` | process-wide `VisionRuntime` singleton; scoped BLAS-thread clamp |
 | `smolvla_inference.py` | splices the NPU vision result into lerobot's own `embed_prefix` |

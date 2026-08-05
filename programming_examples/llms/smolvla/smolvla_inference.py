@@ -217,9 +217,9 @@ def compile_only(cache_dir: str = "vision_kernel_cache") -> int:
     toolchain is installed -- it is the compile smoke test the CI lit file
     drives, and it must not need the device, the network, torch or lerobot.
     """
-    # smolvla_vision_npu puts programming_examples/ and llms/ on sys.path at
+    # smolvla_vision_encoder puts programming_examples/ and llms/ on sys.path at
     # import time, so it has to come before anything under `shared.`.
-    from smolvla_vision_npu import compile_all_kernels
+    from smolvla_vision_encoder import compile_all_kernels
     from smolvla_vision_weights import SigLIPVisionConfig
     from shared.infra.cache import KernelCache, Profiler
 

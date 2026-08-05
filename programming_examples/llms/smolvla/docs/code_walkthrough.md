@@ -392,7 +392,7 @@ nmse     = 0.003023     (门槛 0.04)
           │                            （权重/ELF/XRT 只建一次）
           ├─→ smolvla_vision_weights.py   345  HF 权重 → NPU 布局
           ├─→ smolvla_vision_builders.py  514  18 个 launch → 3 个 ELF
-          └─→ smolvla_vision_npu.py       919  逐层 dispatch（最大）
+          └─→ smolvla_vision_encoder.py       919  逐层 dispatch（最大）
                     │
                     └─→ smolvla_cpu_helpers.py  95  故意留在 host 的部分
           │
@@ -498,7 +498,7 @@ baseline，应该正好是 1.0。如果不是，说明 harness 本身有问题�
 |---|---|---|
 | `smolvla_vision_weights.py` 345 | HF checkpoint → NPU 布局 | 每个 Linear 有没有转置（HF 存 `[out,in]`，GEMM 要 `[in,out]`） |
 | `smolvla_vision_builders.py` 514 | 拼 3 个融合 ELF | `_force_tile_n_suffix`，见第 7 节 |
-| `smolvla_vision_npu.py` 919 | 逐层 dispatch | 最大的文件，里面有个 attention backend 的 A/B 开关（`"cpu"` 走主机），是它偏大的原因之一 |
+| `smolvla_vision_encoder.py` 919 | 逐层 dispatch | 最大的文件，里面有个 attention backend 的 A/B 开关（`"cpu"` 走主机），是它偏大的原因之一 |
 | `smolvla_cpu_helpers.py` 95 | 3 个留在 host 的函数 | 见下 |
 
 ### 为什么有两步故意留在 CPU

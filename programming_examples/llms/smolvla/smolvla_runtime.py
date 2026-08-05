@@ -141,7 +141,7 @@ class VisionRuntime:
 
     def __init__(self, cache_dir=VISION_CACHE_DIR, model_id=MODEL_ID, verbose=False):
         from smolvla_vision_weights import load_vision_weights, SigLIPVisionConfig
-        from smolvla_vision_npu import compile_all_kernels
+        from smolvla_vision_encoder import compile_all_kernels
 
         t0 = time.perf_counter()
         self.cfg = SigLIPVisionConfig()
@@ -169,7 +169,7 @@ class VisionRuntime:
         """images: sequence of N camera tensors/arrays, each (1,3,512,512) or
         (3,512,512), ALREADY lerobot-preprocessed (resize_with_pad + [-1,1]).
         Returns (N, 64, 960) f32 RAW connector output."""
-        from smolvla_vision_npu import run_vit_encoder
+        from smolvla_vision_encoder import run_vit_encoder
 
         from smolvla_cpu_helpers import im2col_patch_embed
 
