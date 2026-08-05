@@ -76,11 +76,16 @@ baseline，只有官方的。** 这是有意的设计——参照物是官方模
 
 ```bash
 cd programming_examples/llms/smolvla
-make oracle      # 用纯 CPU 跑一遍，把结果存进 smolvla_oracle.npz
+make cpu-baseline   # 用纯 CPU 跑一遍，把结果存进 smolvla_oracle.npz
 ```
 
-它固定噪声（去噪过程本来是随机的，固定了才可复现），跑完整的官方模
-型，存下 `action_chunk` (1,50,6)。这就是"正确答案"。
+它固定噪声（去噪过程本来是随机的，固定了才可复现），跑完整的官方模型，
+存下 `action_chunk` (1,50,6)。
+
+**注意：`make verify` 不读这个文件。** 门禁在同一个进程里**现算**参照——存盘
+的 fixture 会在 checkpoint 或 lerobot 升级后悄悄过期，而且它被 gitignore 忽略，
+曾导致干净 checkout 上的 verify lit test 必然失败。这个目标存在纯粹是为了让你
+能单独跑一遍 baseline 看看它长什么样。
 
 ---
 
@@ -385,20 +390,20 @@ nmse     = 0.003023     (门槛 0.04)
         图像
           │
           ▼
- ① smolvla_inference.py   274 行  ★★★ 接缝 + 唯一的 CLI 入口
+ ① smolvla_inference.py   284 行  ★★★ 接缝 + 唯一的 CLI 入口
           │                            （--compile-only 也在这里）
           ▼
  ② smolvla_runtime.py     243 行  ★★  进程级单例
           │                            （权重/ELF/XRT 只建一次）
           ├─→ smolvla_vision_weights.py   345  HF 权重 → NPU 布局
           ├─→ smolvla_vision_builders.py  514  18 个 launch → 3 个 ELF
-          └─→ smolvla_vision_encoder.py       919  逐层 dispatch（最大）
+          └─→ smolvla_vision_encoder.py   919  逐层 dispatch（最大）
                     │
                     └─→ smolvla_cpu_helpers.py  95  故意留在 host 的部分
           │
           ▼
- ③ verify_adapter.py       131 行  ★★★ gate
- ④ smolvla_cpu_baseline.py  54 行  ★   生成 CPU oracle
+ ③ verify_adapter.py       143 行  ★★★ gate（现算参照）
+ ④ smolvla_cpu_baseline.py  61 行  ★   单独跑 CPU baseline，供人工查看
 ```
 
 `smolvla_runtime.py` 从上到下就是它实现的生命周期，可以顺着读：
@@ -471,7 +476,7 @@ action_out_proj → action chunk
 
 ### 只想花 30 分钟？读这三个，约 700 行
 
-**① `smolvla_inference.py`（274 行）** — 接缝。读完你就懂了整个集成机制。
+**① `smolvla_inference.py`（284 行）** — 接缝。读完你就懂了整个集成机制。
 
 重点看 `_wrapped_embed_prefix`。它是**双层**替换，看起来比必要的复杂，
 但外层是为了**性能**而不是正确性：所有图必须在一次 runtime 调用里编码完，
@@ -487,7 +492,7 @@ action_out_proj → action chunk
 XRT context 创建加起来约 585 ms，每次推理都做一遍就全亏光了。所以做成
 进程级的，建一次反复用。
 
-**③ `verify_adapter.py`（131 行）** — gate 本身。它只比一样东西：
+**③ `verify_adapter.py`（143 行）** — gate 本身。它只比一样东西：
 `oracle["action_chunk"]`，也就是机器人真正会执行的那个张量。
 建议你**亲自跑一次 `make verify --cpu-vision`**：拿未改的模型跑自己的
 baseline，应该正好是 1.0。如果不是，说明 harness 本身有问题。
@@ -634,7 +639,7 @@ cd programming_examples/llms/smolvla
 
 make help      # 目标清单
 make compile   # 建所有 ELF（不碰 NPU、不下载）
-make oracle    # 纯 CPU baseline
+make cpu-baseline  # 单独跑一遍纯 CPU baseline
 make verify    # 门禁
 make profile   # NPU vs CPU 分段墙钟
 ```

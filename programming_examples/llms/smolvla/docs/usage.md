@@ -52,7 +52,7 @@ parameters) on first use.
 ```bash
 make help      # this list
 make compile   # build every vision ELF — no NPU dispatch, no download
-make oracle    # regenerate smolvla_oracle.npz, the pure-CPU baseline (no NPU)
+make cpu-baseline  # run the unmodified CPU model on its own, for inspection (no NPU)
 make run       # one end-to-end forward; prints the action chunk
 make verify    # THE GATE — action chunk vs the pure-CPU model (PASS/FAIL)
 make profile   # per-stage wall clock, NPU vision vs pure CPU
@@ -75,8 +75,7 @@ flock -x -w 1800 /tmp/mlir-air-npu.lock python3 smolvla_inference.py
 
 ```bash
 make compile        # a few minutes; produces vision_kernel_cache/
-make oracle         # CPU only; produces smolvla_oracle.npz
-make verify
+make verify         # no fixture needed — the gate computes its CPU reference live
 ```
 
 Expected:

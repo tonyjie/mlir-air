@@ -98,11 +98,11 @@ tokens, 10 denoise steps.
 ## Usage
 
 ```bash
-make compile   # build every vision ELF — no NPU dispatch, no download
-make oracle    # regenerate the CPU baseline the gate compares against
-make verify    # THE GATE — action chunk vs the pure-CPU model
-make run       # one end-to-end forward, prints the action chunk
-make profile   # per-stage wall clock, NPU vision vs pure CPU
+make compile       # build every vision ELF — no NPU dispatch, no download
+make verify        # THE GATE — action chunk vs the pure-CPU model
+make run           # one end-to-end forward, prints the action chunk
+make profile       # per-stage wall clock, NPU vision vs pure CPU
+make cpu-baseline  # run the unmodified CPU model on its own, for inspection
 ```
 
 Every recipe self-locks the NPU. Do **not** wrap `make` in an outer `flock` on
@@ -110,18 +110,23 @@ the same file — it self-deadlocks.
 
 ## Files
 
+The `smolvla_vision_*` trio is the whole NPU-mapped stage. Adding another stage
+later means `smolvla_backbone_*` beside it, so the file names say which stages
+are on the NPU.
+
 | File | Role |
 |---|---|
 | `smolvla_vision_weights.py` | SigLIP config + weight loading from the checkpoint |
 | `smolvla_vision_builders.py` | the two fused multi-launch ELF builders (`vit_ln_qkv`, `vit_o_ffn`) |
-| `smolvla_vision_encoder.py` | the NPU driver: compile the kernels, run the 12 layers; also the `--compile-only` CLI |
+| `smolvla_vision_encoder.py` | the NPU driver: compiles the kernels, runs the 12 layers |
 | `smolvla_cpu_helpers.py` | fp32 numpy reference for every vision operation |
 | `smolvla_runtime.py` | process-wide `VisionRuntime` singleton; scoped BLAS-thread clamp |
-| `smolvla_inference.py` | splices the NPU vision result into lerobot's own `embed_prefix` |
-| `smolvla_cpu_baseline.py` | runs the unmodified CPU model, saves the action chunk `make verify` compares against (`make oracle`) |
+| `smolvla_inference.py` | splices the NPU vision result into lerobot's own `embed_prefix`; the single CLI entry point, including `--compile-only` |
+| `smolvla_cpu_baseline.py` | runs the unmodified CPU model on its own and dumps the action chunk, for inspection (`make cpu-baseline`). `make verify` does not read it — it computes its reference live |
 | `verify_adapter.py` | the regression gate |
-| `ARCHITECTURE.md` | design notes: layout conventions, kernel choices, the traps |
-| `docs/` | measured performance breakdown, and an illustrated walkthrough |
+| `ARCHITECTURE.md` | design notes: kernel sequence, fused ELFs, runtime flow, the traps |
+| `docs/code_walkthrough.md` | start here if you have not read this code before |
+| `docs/` | `explain.md`, `profile.md`, `usage.md` — implementation, measurements, commands |
 
 ## Kernels
 
