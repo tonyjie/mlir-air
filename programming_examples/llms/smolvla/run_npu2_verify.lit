@@ -10,12 +10,21 @@
 // MSE <= 0.04) rather than the top-k token-set gate the autoregressive LLM
 // siblings use.
 //
-// Needs torch + lerobot (see requirements.txt) with the mlir-air environment
-// sourced, so that air/pyxrt are importable in the same process. That is a
-// heavier dependency set than the other LLM examples need, and CI installs
-// only llama32_1b's requirements, so this REQUIRES the `lerobot` feature and
-// skips cleanly where the package is absent rather than failing on an
-// ImportError. The compile test needs none of it and has no such REQUIRES.
+// This example needs a heavier dependency set than the other LLM examples:
+// torch + lerobot[dataset] + num2words, because it verifies against the
+// upstream lerobot policy itself. To enable this test:
+//
+//   pip install -r programming_examples/llms/smolvla/requirements.txt
+//
+// installed into the interpreter that also has air + pyxrt, so the NPU stage
+// runs in the same process as the model. Note that lerobot requires
+// numpy>=2.0, which may upgrade numpy across a major version in a shared
+// environment — see that requirements.txt for the caveat.
+//
+// CI installs only llama32_1b's requirements, so without the above this test
+// REQUIRES the `lerobot` feature and reports UNSUPPORTED rather than failing
+// on an ImportError. The compile test needs none of this and carries no such
+// REQUIRES.
 //
 // No fixture required: the gate computes its pure-CPU reference live,
 // in-process, from the same policy object.
