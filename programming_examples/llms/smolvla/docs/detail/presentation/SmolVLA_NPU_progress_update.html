@@ -140,11 +140,8 @@
     <div class="grp">Part B — Running it on the NPU</div>
     <ol start="4">
       <li><a href="#why">Do we have the kernels?</a></li>
-      <li><a href="#mapping"><b>What ships today</b></a> — the mapping, all three stages</li>
-      <li><a href="#correct"><b>Correctness</b></a> — does it still produce the right actions?</li>
-      <li><a href="#perf"><b>Performance</b></a> — the measured numbers</li>
+      <li><a href="#mapping"><b>What ships today</b></a> — the mapping, the measured performance, and does it still work</li>
       <li><a href="#whyperf"><b>Why performance looks like this</b></a></li>
-      <li><a href="#expert"><b>The action expert</b></a> — ported, and why it's still slower</li>
       <li><a href="#status">Status &amp; next steps</a></li>
     </ol>
   </div>
@@ -290,7 +287,7 @@
   <div class="legend">
     Legend: <span class="shape">(tensor shape)</span> · <span class="op">operation</span> = the kind of
     math a step performs · a <b>module</b> is a named sub-network. Shapes matter later — they're the
-    setup for why NPU performance varies so much between stages (Section 8).
+    setup for why NPU performance varies so much between stages (Section 6).
   </div>
 
   <div class="stage-h v">① Vision encoder: SigLIP + connector</div>
@@ -410,7 +407,7 @@
   </table>
   <p class="legend">→ the final action chunk is <span class="shape">(1,50,6)</span>. The expert runs
     <b>10 times</b> per inference; the backbone runs only <b>once</b>. Notice the shapes shrinking stage
-    to stage — 1024 → 241 → 50 — that's the setup for Section 8.</p>
+    to stage — 1024 → 241 → 50 — that's the setup for Section 6.</p>
 
   <h2 id="profile">3. Where CPU time goes today</h2>
 
@@ -435,22 +432,39 @@
   <h2 id="why">4. Do we have the kernels?</h2>
 
   <p class="lead">An NPU2 is a grid of compute tiles; <code>mlir-air</code> compiles to it. The
-    <code>kernel_registry</code> holds kernels already validated for LLM-shaped deployment — here's
-    what closing the gap for SmolVLA took.</p>
+    <code>kernel_registry</code> holds kernels already validated for LLM-shaped deployment — but
+    "do we have the kernel" isn't yes/no. Every operation SmolVLA needs falls into one of three
+    buckets, and the buckets are what cost very different amounts of effort.</p>
 
-  <table>
-    <tr><th>Gap</th><th>Resolution</th></tr>
-    <tr><td>Backbone's prefix-LM mask doesn't fit FlashAttention's causal on/off switch</td>
-        <td><span class="knl">masked-softmax</span> — built from scratch</td></tr>
-    <tr><td>Vision needs affine LayerNorm and GELU-tanh</td>
-        <td>promoted into the shared registry</td></tr>
-    <tr><td>Conv2d patch-embed, pixel-shuffle</td>
-        <td>solved as im2col + existing GEMM / host reshape — no new kernel</td></tr>
+  <div class="legend">
+    <span class="knl">✓ in registry</span> = already validated for LLM deployment — reused as-is, no extra work ·
+    <span class="knl adapt">◐ existing example</span> = a kernel already existed in <code>programming_examples/</code>, but at a different shape, dtype, or feature set — needed re-validating (sometimes extending) before it could be trusted at SmolVLA's own numbers ·
+    <span class="knl miss">✗ truly new</span> = no implementation existed anywhere — built from scratch for this project.
+  </div>
+
+  <table class="arch">
+    <tr><th>Operation SmolVLA needs</th><th>Status</th><th>What it took</th></tr>
+    <tr><td>matmul / Linear (GEMM, prefill)</td><td><span class="knl">✓ in registry</span></td><td>direct reuse — <span class="shape">256×960×960</span> (Q/O), <span class="shape">256×960×320</span> (K/V), <span class="shape">256×960×2560</span> (MLP) are all shapes the registry already covers</td></tr>
+    <tr><td>RMSNorm</td><td><span class="knl">✓ in registry</span></td><td>direct reuse, <span class="shape">256×960</span></td></tr>
+    <tr><td>RoPE</td><td><span class="knl">✓ in registry</span></td><td>direct reuse, head_dim=64, θ=10000</td></tr>
+    <tr><td>SiLU-and-Mul (SwiGLU)</td><td><span class="knl">✓ in registry</span></td><td>direct reuse, <span class="shape">256×2560</span></td></tr>
+    <tr><td>element-wise add (residual)</td><td><span class="knl">✓ in registry</span></td><td>direct reuse, <span class="shape">256×960</span></td></tr>
+    <tr><td>conv2d (patch embed)</td><td><span class="knl">✓ solved as reshape</span></td><td>stride = kernel = 16 (non-overlapping) ⇒ im2col + the existing GEMM kernel — no conv kernel needed at all</td></tr>
+    <tr><td>pixel-shuffle (space-to-depth)</td><td><span class="knl">✓ solved as reshape</span></td><td>pure index remap, done on the host — no kernel needed</td></tr>
+    <tr><td>bidirectional attention (vision)</td><td><span class="knl">✓ in registry</span></td><td>direct reuse of the registry FlashAttention's non-causal mode at a new shape (<span class="shape">1024×1024</span>, 12/12 heads) — validated, no code changes</td></tr>
+    <tr style="background:#fffbeb"><td><b>FlashAttention for the backbone</b></td><td><span class="knl adapt">◐ needs adjustment</span></td><td>the kernel itself is in the registry, but its mask is a binary causal on/off switch, and the backbone's prefix-LM mask is neither — so it can't be reused as-is. The fix was to <b>not</b> force-fit it, and instead decompose attention into GEMM + a new masked-softmax + GEMM (below)</td></tr>
+    <tr style="background:#fef2f2"><td><b>masked softmax</b> (arbitrary host mask)</td><td><span class="knl miss">✗ truly new</span></td><td>built from scratch this project — <span class="shape">(15,256,256)</span> scores, batched over heads</td></tr>
+    <tr style="background:#fffbeb"><td>GELU-tanh</td><td><span class="knl adapt">◐ existing example, promoted</span></td><td>existed in <code>programming_examples/gelu</code> but hadn't been validated at an LLM-deployment shape; validated at <span class="shape">(1,1024,3072)</span> (24.1 GB/s) and promoted into the registry</td></tr>
+    <tr style="background:#fffbeb"><td>LayerNorm (affine γ,β)</td><td><span class="knl adapt">◐ existing example, promoted</span></td><td><code>layer_norm/</code> existed but without the affine parameters or multi-tile support SmolVLA needs; extended, validated at <span class="shape">(1,1024,768)</span> (rel. error 4.4e-3), and promoted into the registry</td></tr>
   </table>
 
   <div class="callout">
-    Net result: <b>every kernel both stages need is now validated on real NPU2.</b> Progress since has
-    been gated by integration and measurement effort, not by missing kernels.
+    <b>Net result: every kernel both the vision and backbone stages need is now validated on real NPU2.</b>
+    Of the two "new work" rows, one was a genuine gap (masked-softmax) and one was recognizing that an
+    existing kernel's assumptions didn't hold and needed a different decomposition, not a rewrite
+    (FlashAttention). Everything else was already in the registry, or was an existing example that just
+    needed validating at SmolVLA's own shapes. Progress since has been gated by integration and
+    measurement effort, not by missing kernels.
   </div>
 
   <h2 id="mapping">5. What ships today</h2>
@@ -495,7 +509,7 @@
     <text x="72" y="267" font-size="12" font-weight="700" fill="#92400e">CPU</text>
     <text x="430" y="269" text-anchor="middle" font-size="13" font-weight="700" fill="#78350f">② Language backbone — SmolLM2-360M, 16 layers</text>
     <text x="430" y="289" text-anchor="middle" font-size="11" fill="#78350f">per layer: RMSNorm → Q/K/V → RoPE → masked attention → O → residual → SwiGLU MLP</text>
-    <text x="430" y="305" text-anchor="middle" font-size="10.5" fill="#92400e">ported to the NPU and verified, but ~3× slower there → kept on CPU (Section 8)</text>
+    <text x="430" y="305" text-anchor="middle" font-size="10.5" fill="#92400e">ported to the NPU and verified, but ~3× slower there → kept on CPU (Section 6)</text>
     <line x1="430" y1="311" x2="430" y2="331" stroke="#6b7280" stroke-width="2" marker-end="url(#ar2)"/>
 
     <rect x="20" y="334" width="820" height="24" rx="8" fill="#fef3c7" stroke="#d97706" stroke-width="1.5" stroke-dasharray="4 3"/>
@@ -506,8 +520,53 @@
   backbone's NPU port exists and is verified, but is slower there.</figcaption>
   </div>
 
+  <h3>The bottom line: how fast, and is it still correct</h3>
+
+  <div class="stat-row">
+    <div class="stat"><div class="big-num">851 ms</div><div class="label">NPU vision + CPU rest</div></div>
+    <div class="stat"><div class="big-num" style="color:var(--muted)">913 ms</div><div class="label">pure CPU baseline</div></div>
+    <div class="stat"><div class="big-num">1.07×</div><div class="label">end to end</div></div>
+  </div>
+
+  <p class="legend">Independently re-verified via <code>make profile</code>, N=10 interleaved runs:
+    <b>925.9 → 856.5 ms</b>, <b>1.081×</b> — confirms the headline number.</p>
+
+  <table>
+    <tr><th>Stage</th><th>CPU</th><th>NPU</th><th>Verdict</th></tr>
+    <tr><td><b>① Vision</b></td><td>546 ms</td><td>465 ms</td><td><span class="pill done">1.19× — ships</span></td></tr>
+    <tr><td>② Backbone</td><td>77 ms</td><td>229 ms</td><td><span class="pill cpu">~3× slower — CPU</span></td></tr>
+    <tr><td>③ Action expert</td><td>285 ms</td><td>—</td><td><span class="pill cpu">~4× slower — CPU</span></td></tr>
+  </table>
+
+  <p class="legend">Vision re-measured: <b>550.7 → 462.5 ms</b>, consistent with the headline 1.19×.</p>
+
+  <div class="callout">
+    <b>91%</b> of the vision segment's latency is device time (422 / 462 ms) — it's NPU-bound, not
+    host-bound.
+  </div>
+
+  <div class="callout honest">
+    <b>Honest ceiling.</b> Vision is only 54% of the runtime an NPU could touch today — so even in
+    the best case, the end-to-end ceiling is <b>~1.85×</b>, not higher.
+  </div>
+
+  <div class="stat-row">
+    <div class="stat"><div class="big-num">0.998996</div><div class="label">cosine similarity<br>vs. real CPU model</div></div>
+    <div class="stat"><div class="big-num">0.003023</div><div class="label">normalized MSE<br>vs. real CPU model</div></div>
+    <div class="stat"><div class="big-num" style="font-size:1.4rem;color:var(--muted)">≥0.99 / ≤0.04</div><div class="label">gate thresholds</div></div>
+  </div>
+
+  <div class="callout honest">
+    <b>And is it still correct?</b> Yes — with one honesty caveat. The gate's input is all-zero,
+    an easy case; read naively that would suggest a ~10×/13× margin over threshold. Computed
+    honestly, the real margin is <b>~2.6× on cosine</b> and <b>~4× on nMSE</b> — still comfortably
+    passing, just not as padded as the naive number implies. (Bonus: flow matching is
+    self-correcting — the small bf16 deviation introduced per layer does not compound over the 10
+    denoise steps; similarity actually rises across the loop.)
+  </div>
+
   <h3>Which original operator each NPU kernel replaces</h3>
-  <p style="margin-bottom:0.3rem"><b>① Vision (SigLIP)</b> — seq = 1024 patch tokens, hidden 768, 12 heads (plain MHA), no mask</p>
+  <p style="margin-bottom:0.3rem"><b>① Vision (SigLIP)</b> — seq = 1024 patch tokens, hidden 768, 12 heads (plain MHA), no mask — <span class="pill npu">ships on NPU</span></p>
   <table class="arch">
     <tr><th>Original operator</th><th>NPU kernel</th><th>Shape</th></tr>
     <tr><td><code>Conv2d</code> patch embed</td><td><span class="knl adapt">host numpy</span> — im2col reshape and its matmul both run on CPU</td><td><span class="shape">1024×768×768</span></td></tr>
@@ -519,7 +578,15 @@
     <tr><td>connector projection</td><td><span class="knl">GEMM</span></td><td><span class="shape">64×12288×960</span></td></tr>
   </table>
 
-  <p style="margin-bottom:0.3rem"><b>② Backbone (SmolLM2)</b> — seq = 241 (padded 256), hidden 960, GQA 15 Q / 5 KV heads, prefix-LM mask</p>
+  <div class="callout warn">
+    <b>The backbone table below is tested, not shipped.</b> Every kernel in it runs correctly on
+    NPU2 and was independently verified — but it's shown here only to make the <i>reason</i> it's
+    slower concrete (small shapes that don't fill the compute array, detailed in Section 6), not to
+    suggest that today's fastest, shipping build also runs the backbone on-chip. It doesn't — per
+    the stage table above, the backbone stays on CPU.
+  </div>
+
+  <p style="margin-bottom:0.3rem"><b>② Backbone (SmolLM2)</b> — seq = 241 (padded 256), hidden 960, GQA 15 Q / 5 KV heads, prefix-LM mask — <span class="pill cpu">tested, not shipped</span></p>
   <table class="arch">
     <tr><th>Original operator</th><th>NPU kernel</th><th>Shape</th></tr>
     <tr><td><code>LlamaRMSNorm</code> ×2/layer</td><td><span class="knl">RMSNorm</span></td><td><span class="shape">256×960</span></td></tr>
@@ -569,58 +636,124 @@ once per image:       (HOST) pixel-shuffle → [NPU elf:gemm_connector] 64×1228
     (<b>368 → 141.6 ms</b>).
   </div>
 
-  <h2 id="correct">6. Correctness</h2>
-
-  <div class="stat-row">
-    <div class="stat"><div class="big-num">0.998996</div><div class="label">cosine similarity<br>vs. real CPU model</div></div>
-    <div class="stat"><div class="big-num">0.003023</div><div class="label">normalized MSE<br>vs. real CPU model</div></div>
-    <div class="stat"><div class="big-num" style="font-size:1.4rem;color:var(--muted)">≥0.99 / ≤0.04</div><div class="label">gate thresholds</div></div>
-  </div>
-
-  <div class="callout honest">
-    <b>Honesty check.</b> The gate's input is all-zero, which is an easy case. Read plainly, that
-    would suggest a ~10×/13× margin over threshold — computed honestly, the real margin is
-    <b>~2.6× on cosine</b> and <b>~4× on nMSE</b>. Still comfortably passing, just not as padded as
-    the naive number implies.
-  </div>
-
-  <p class="legend">Bonus: flow matching is self-correcting — the small bf16 deviation introduced
-    per layer does not compound over the 10 denoise steps. Similarity actually rises across the loop.</p>
-
-  <h2 id="perf">7. Performance</h2>
-
-  <div class="stat-row">
-    <div class="stat"><div class="big-num">851 ms</div><div class="label">NPU vision + CPU rest</div></div>
-    <div class="stat"><div class="big-num" style="color:var(--muted)">913 ms</div><div class="label">pure CPU baseline</div></div>
-    <div class="stat"><div class="big-num">1.07×</div><div class="label">end to end</div></div>
-  </div>
-
-  <p class="legend">Independently re-verified via <code>make profile</code>, N=10 interleaved runs:
-    <b>925.9 → 856.5 ms</b>, <b>1.081×</b> — confirms the headline number.</p>
-
-  <table>
-    <tr><th>Stage</th><th>CPU</th><th>NPU</th><th>Verdict</th></tr>
-    <tr><td><b>① Vision</b></td><td>546 ms</td><td>465 ms</td><td><span class="pill done">1.19× — ships</span></td></tr>
-    <tr><td>② Backbone</td><td>77 ms</td><td>229 ms</td><td><span class="pill cpu">~3× slower — CPU</span></td></tr>
-    <tr><td>③ Action expert</td><td>285 ms</td><td>—</td><td><span class="pill cpu">~4× slower — CPU</span></td></tr>
-  </table>
-
-  <p class="legend">Vision re-measured: <b>550.7 → 462.5 ms</b>, consistent with the headline 1.19×.</p>
-
-  <div class="callout">
-    <b>91%</b> of the vision segment's latency is device time (422 / 462 ms) — it's NPU-bound, not
-    host-bound.
-  </div>
-
-  <div class="callout honest">
-    <b>Honest ceiling.</b> Vision is only 54% of the runtime an NPU could touch today — so even in
-    the best case, the end-to-end ceiling is <b>~1.85×</b>, not higher.
-  </div>
-
-  <h2 id="whyperf">8. Why performance looks like this</h2>
+  <h2 id="whyperf">6. Why performance looks like this</h2>
 
   <p class="lead">An NPU2 is a grid of compute tiles. An operation only wins if it's big enough to
     fill it — same kernel, same silicon, only the shape changes.</p>
+
+  <h3>Inside one SigLIP layer, operation by operation</h3>
+  <p>Both sides profiled at the same granularity, on the same machine, both at maximum power mode —
+    this is the layer-level detail behind vision's 1.19× headline.</p>
+
+  <div class="fig">
+  <svg viewBox="0 0 900 424" xmlns="http://www.w3.org/2000/svg" font-family="system-ui, sans-serif">
+    <style>
+      .t{font-size:12.5px;font-weight:700;fill:#111827}
+      .n{font-size:10.5px;fill:#1f2937}
+      .s{font-size:9px;fill:#6b7280}
+      .w{font-size:9.5px;font-weight:700;fill:#166534}
+      .l{font-size:9.5px;font-weight:700;fill:#991b1b}
+      .v{font-size:9px;fill:#fff;font-weight:600}
+    </style>
+    <text x="8" y="18" class="t">The same SigLIP layer, operation by operation: CPU vs NPU</text>
+    <text x="8" y="32" class="s">Measured per layer, both at maximum power mode. Bar length ∝ time (same scale for both processors).</text>
+
+    <rect x="178" y="42" width="10" height="9" fill="#f59e0b"/><text x="193" y="50" class="s">CPU (lerobot, 12 threads)</text>
+    <rect x="330" y="42" width="10" height="9" fill="#2563eb"/><text x="345" y="50" class="s">NPU2</text>
+    <text x="620" y="50" class="s">who wins this operation</text>
+
+    <!-- rows: name | CPU bar | NPU bar | verdict -->
+    <!-- 1 LayerNorm -->
+    <text x="168" y="70" text-anchor="end" class="n">LayerNorm ×2</text>
+    <rect x="178" y="62" width="10.0" height="11" fill="#f59e0b"/><text x="194" y="71" class="s">136 µs</text>
+    <rect x="178" y="75" width="57.3" height="11" fill="#2563eb"/><text x="241" y="84" class="s">775 µs</text>
+    <text x="620" y="77" class="l">NPU 5.7× SLOWER</text>
+    <!-- 2 QKV -->
+    <text x="168" y="106" text-anchor="end" class="n">Q / K / V projections ×3</text>
+    <rect x="178" y="98" width="148.5" height="11" fill="#f59e0b"/><text x="332" y="107" class="s">2008 µs</text>
+    <rect x="178" y="111" width="161.0" height="11" fill="#2563eb"/><text x="345" y="120" class="s">2177 µs</text>
+    <text x="620" y="113" class="l">NPU 1.08× slower</text>
+    <!-- 3 attention -->
+    <text x="168" y="142" text-anchor="end" class="n">attention</text>
+    <rect x="178" y="134" width="420.0" height="11" fill="#f59e0b"/><text x="393" y="143" class="v">5680 µs — 39% of the CPU layer</text>
+    <rect x="178" y="147" width="206.9" height="11" fill="#2563eb"/><text x="281" y="156" class="v">2798 µs</text>
+    <text x="620" y="149" class="w">NPU 2.03× faster ★</text>
+    <!-- 4 out proj -->
+    <text x="168" y="178" text-anchor="end" class="n">output projection</text>
+    <rect x="178" y="170" width="54.7" height="11" fill="#f59e0b"/><text x="238" y="179" class="s">740 µs</text>
+    <rect x="178" y="183" width="53.7" height="11" fill="#2563eb"/><text x="237" y="192" class="s">726 µs</text>
+    <text x="620" y="185" class="s">parity (1.02×)</text>
+    <!-- 5 fc1 -->
+    <text x="168" y="214" text-anchor="end" class="n">MLP fc1 (768→3072)</text>
+    <rect x="178" y="206" width="188.5" height="11" fill="#f59e0b"/><text x="372" y="215" class="s">2549 µs</text>
+    <rect x="178" y="219" width="134.9" height="11" fill="#2563eb"/><text x="318" y="228" class="s">1825 µs</text>
+    <text x="620" y="221" class="w">NPU 1.40× faster</text>
+    <!-- 6 GELU -->
+    <text x="168" y="250" text-anchor="end" class="n">GELU-tanh</text>
+    <rect x="178" y="242" width="53.8" height="11" fill="#f59e0b"/><text x="237" y="251" class="s">728 µs</text>
+    <rect x="178" y="255" width="42.6" height="11" fill="#2563eb"/><text x="226" y="264" class="s">576 µs</text>
+    <text x="620" y="257" class="w">NPU 1.26× faster</text>
+    <!-- 7 fc2 -->
+    <text x="168" y="286" text-anchor="end" class="n">MLP fc2 (3072→768)</text>
+    <rect x="178" y="278" width="183.9" height="11" fill="#f59e0b"/><text x="367" y="287" class="s">2487 µs</text>
+    <rect x="178" y="291" width="95.4" height="11" fill="#2563eb"/><text x="279" y="300" class="s">1290 µs</text>
+    <text x="620" y="293" class="w">NPU 1.93× faster ★</text>
+    <!-- 8 residual -->
+    <text x="168" y="322" text-anchor="end" class="n">residual adds ×2</text>
+    <rect x="178" y="314" width="10.9" height="11" fill="#f59e0b"/><text x="195" y="323" class="s">147 µs</text>
+    <rect x="178" y="327" width="25.9" height="11" fill="#2563eb"/><text x="210" y="336" class="s">350 µs</text>
+    <text x="620" y="329" class="l">NPU 2.37× SLOWER</text>
+
+    <line x1="178" y1="348" x2="880" y2="348" stroke="#d1d5db"/>
+    <text x="168" y="366" text-anchor="end" class="t">whole layer</text>
+    <text x="178" y="366" class="n"><tspan fill="#b45309" font-weight="700">CPU 14.5 ms</tspan>  vs  <tspan fill="#1d4ed8" font-weight="700">NPU 10.5 ms</tspan>   →   <tspan font-weight="700">NPU 1.38× faster</tspan>   (×12 layers = 174 ms vs 126 ms per image)</text>
+
+    <rect x="8" y="378" width="884" height="40" rx="6" fill="#eff6ff" stroke="#93c5fd"/>
+    <text x="20" y="393" class="n"><tspan font-weight="700">The whole win comes from three operations.</tspan> Attention alone saves 2.9 ms of the 4.0 ms the NPU gains per layer (73% of it); fc2 and fc1 give another 1.9 ms.</text>
+    <text x="20" y="408" class="n">Everything memory-bound goes the other way — <tspan font-weight="700">LayerNorm hands back 0.64 ms</tspan> and the residual adds 0.20 ms, which is where the remaining headroom is.</text>
+  </svg>
+  <figcaption>Per-operation comparison of one of the 12 SigLIP encoder layers, measured on the same machine with both processors at maximum performance.</figcaption>
+  </div>
+
+  <table style="font-size:0.86rem">
+    <tr>
+      <th>Step in the layer</th><th>Shape</th>
+      <th>CPU operator</th><th style="text-align:right">µs</th>
+      <th>NPU kernel(s)</th><th style="text-align:right">µs</th><th style="text-align:right">NPU/CPU</th>
+    </tr>
+    <tr><td>LayerNorm 1</td><td><span class="shape">1024×768</span></td><td><code>nn.LayerNorm</code></td><td style="text-align:right">74</td><td><code>layer_norm</code> (affine)</td><td style="text-align:right">388</td><td style="text-align:right;color:#991b1b">5.23×</td></tr>
+    <tr><td>Q projection</td><td><span class="shape">1024×768×768</span></td><td><code>nn.Linear</code></td><td style="text-align:right">693</td><td><code>GEMM</code> 578 &nbsp;+&nbsp; <code>eltwise bias</code> 147</td><td style="text-align:right">726</td><td style="text-align:right">1.05×</td></tr>
+    <tr><td>K projection</td><td><span class="shape">1024×768×768</span></td><td><code>nn.Linear</code></td><td style="text-align:right">657</td><td><code>GEMM</code> 578 &nbsp;+&nbsp; <code>eltwise bias</code> 147</td><td style="text-align:right">726</td><td style="text-align:right">1.10×</td></tr>
+    <tr><td>V projection</td><td><span class="shape">1024×768×768</span></td><td><code>nn.Linear</code></td><td style="text-align:right">658</td><td><code>GEMM</code> 578 &nbsp;+&nbsp; <code>eltwise bias</code> 147</td><td style="text-align:right">726</td><td style="text-align:right">1.10×</td></tr>
+    <tr style="background:#f0fdf4"><td><b>attention</b></td><td><span class="shape">1024×1024</span>, 12 heads, d<sub>k</sub> 64</td><td><code>scaled_dot_product_attention</code></td><td style="text-align:right"><b>5680</b></td><td><code>flash_attn</code> (non-causal)</td><td style="text-align:right"><b>2798</b></td><td style="text-align:right;color:#166534"><b>0.49×</b></td></tr>
+    <tr><td>output projection</td><td><span class="shape">1024×768×768</span></td><td><code>nn.Linear</code></td><td style="text-align:right">740</td><td><code>GEMM</code> 578 &nbsp;+&nbsp; <code>eltwise bias</code> 147</td><td style="text-align:right">726</td><td style="text-align:right">0.98×</td></tr>
+    <tr><td>residual add 1</td><td><span class="shape">1024×768</span></td><td><code>torch.add</code></td><td style="text-align:right">73</td><td><code>eltwise add</code></td><td style="text-align:right">175</td><td style="text-align:right;color:#991b1b">2.40×</td></tr>
+    <tr><td>LayerNorm 2</td><td><span class="shape">1024×768</span></td><td><code>nn.LayerNorm</code></td><td style="text-align:right">62</td><td><code>layer_norm</code> (affine)</td><td style="text-align:right">388</td><td style="text-align:right;color:#991b1b">6.30×</td></tr>
+    <tr style="background:#f0fdf4"><td><b>MLP fc1</b></td><td><span class="shape">1024×768×3072</span></td><td><code>nn.Linear</code></td><td style="text-align:right"><b>2549</b></td><td><code>GEMM</code> 1461 &nbsp;+&nbsp; <code>eltwise bias</code> 363</td><td style="text-align:right"><b>1825</b></td><td style="text-align:right;color:#166534"><b>0.72×</b></td></tr>
+    <tr><td>GELU-tanh</td><td><span class="shape">1024×3072</span></td><td><code>GELUTanh</code></td><td style="text-align:right">728</td><td><code>gelu</code></td><td style="text-align:right">576</td><td style="text-align:right;color:#166534">0.79×</td></tr>
+    <tr style="background:#f0fdf4"><td><b>MLP fc2</b></td><td><span class="shape">1024×3072×768</span></td><td><code>nn.Linear</code></td><td style="text-align:right"><b>2487</b></td><td><code>GEMM</code> 1143 &nbsp;+&nbsp; <code>eltwise bias</code> 147</td><td style="text-align:right"><b>1290</b></td><td style="text-align:right;color:#166534"><b>0.52×</b></td></tr>
+    <tr><td>residual add 2</td><td><span class="shape">1024×768</span></td><td><code>torch.add</code></td><td style="text-align:right">74</td><td><code>eltwise add</code></td><td style="text-align:right">175</td><td style="text-align:right;color:#991b1b">2.35×</td></tr>
+    <tr style="border-top:2px solid #9ca3af"><td colspan="3"><b>whole layer</b></td><td style="text-align:right"><b>14476</b></td><td></td><td style="text-align:right"><b>10517</b></td><td style="text-align:right"><b>0.73×</b></td></tr>
+  </table>
+
+  <div class="callout">
+    <b>Three operations carry the whole win — and five kernels quietly give part of it back.</b>
+    Attention alone saves 2.9 ms of the 4.0 ms gained per layer, fc2 and fc1 another 1.9 ms — that's
+    the entire per-layer speedup. Against that, everything memory-bound (LayerNorm, the residual
+    adds) runs the wrong way; and because PyTorch folds bias into <code>nn.Linear</code> while the
+    NPU launches a separate kernel for each, those bias kernels alone cost <b>1100 µs per layer
+    (10.5%)</b> against a CPU counterpart of zero. Scaled up: 10.5 ms × 12 layers = 126.2 ms vs.
+    134.5 ms deployed — the 8.3 ms gap is the cost of switching between the layer's three fused
+    programs.
+  </div>
+
+  <p class="legend">Note the Q/K/V rows: the <em>same</em> <span class="shape">1024×768×768</span>
+    matmul as fc1/fc2 in kind, yet they lose while fc1/fc2 win. The difference is width — fc1 writes
+    3072 values and fc2 reduces over 3072, filling the compute array; 768×768 does not. "Matmuls are
+    fast on an NPU" holds only once they are big enough — which is exactly the story the shape chart
+    below tells at the whole-stage level.</p>
+
+  <h3>The underlying reason: shape</h3>
 
   <div class="card">
     <div class="bar-row">
@@ -649,30 +782,8 @@ once per image:       (HOST) pixel-shuffle → [NPU elf:gemm_connector] 64×1228
     small.
   </div>
 
-  <h2 id="expert">9. The action expert</h2>
 
-  <p class="lead">The expert isn't uniformly "4× slower" — <b>attention</b> is.</p>
-
-  <table>
-    <tr><th>Operation family</th><th>NPU vs CPU</th><th>Share of NPU time</th></tr>
-    <tr><td><b>attention</b> (QK<sup>T</sup>, P@V, softmax, mask, GQA expand)</td><td><b>12.6× slower</b></td><td><b>56%</b></td></tr>
-    <tr><td>matmul — the 7 projections</td><td>1.21× slower</td><td>17%</td></tr>
-    <tr><td>RMSNorm</td><td>3.0× slower</td><td>5%</td></tr>
-    <tr><td>RoPE</td><td>1.19× slower</td><td>3%</td></tr>
-    <tr><td>element-wise add / SiLU-and-Mul</td><td>~4–8× slower</td><td>5%</td></tr>
-  </table>
-
-  <div class="callout warn">
-    <b>Why attention specifically:</b> only 197 of 241 prefix tokens are real — the rest is padding —
-    so both self- and cross-attention need a genuine mask. FlashAttention can't apply one, so
-    attention decomposes into 11 tiny dispatches per layer at <span class="shape">seq=50</span>,
-    which can't fill the array either.
-  </div>
-
-  <p class="legend">Even fixing that, the expert would still lose: 50 tokens pad to 64, filling only
-    half the compute array, and every launch pays ~85 µs of fixed cost regardless of size.</p>
-
-  <h2 id="status">10. Status &amp; next steps</h2>
+  <h2 id="status">7. Status &amp; next steps</h2>
 
   <ul class="clean">
     <li><span class="pill done">✅</span> Complete policy is faster on NPU than CPU — <b>1.07×</b>, both processors at max performance</li>
@@ -685,6 +796,24 @@ once per image:       (HOST) pixel-shuffle → [NPU elf:gemm_connector] 64×1228
   <div class="lesson"><b class="tag">Lesson 1</b>Maximum NPU coverage ≠ maximum speed. We ship the stage that wins, not every stage we ported.</div>
   <div class="lesson"><b class="tag">Lesson 2</b>A rigorous projection is still not a measurement. The expert's per-kernel estimate landed 2.5× off because two of its inputs — an assumed-usable FlashAttention, no fusion penalty — turned out false.</div>
 
+  <h3>What's next: generalizing beyond SmolVLA</h3>
+  <p class="lead">The bigger opportunity isn't squeezing more out of this one 450M-parameter model —
+    it's applying the same mapping to other, larger VLA models. A bigger backbone or a bigger expert
+    means bigger matmuls, and bigger matmuls are exactly what an NPU2 rewards; the case for the NPU
+    should only get stronger as these policies scale up.</p>
+
+  <div class="callout warn">
+    <b>Why VLA is harder than a plain LLM, though.</b> A VLA policy has more, and more heterogeneous,
+    moving parts than a language model alone — a vision encoder, a connector, a language backbone,
+    and a flow-matching expert, stitched together with host-side glue like concatenating
+    vision/language/state tokens into one prefix. Two consequences follow from that: (1) some of
+    today's kernels aren't general enough to carry those seam operations efficiently on-chip — they
+    were built for the block computation, not the glue between blocks — and (2) those same seams
+    raise the bar for fully fusing a whole stage into one dispatch, which is exactly the lever that
+    made vision win here.
+  </div>
+
+  <p class="legend">Closer to home, incremental headroom also remains in today's mapping:</p>
   <table>
     <tr><th>#</th><th>What's next</th><th>Expected payoff</th></tr>
     <tr><td>1</td><td>Split the 3 cameras across CPU and NPU in parallel</td><td>largest remaining headroom → <b>~1.35×</b> end to end</td></tr>
