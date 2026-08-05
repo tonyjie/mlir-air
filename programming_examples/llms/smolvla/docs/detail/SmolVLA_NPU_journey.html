@@ -953,7 +953,8 @@ once per image:       (HOST) pixel-shuffle → [NPU elf:gemm_connector] 64×1228
     <b>Note the "how often" column — it is where the end-to-end arithmetic comes from.</b> The vision encoder is
     1.19× faster <em>per image</em>, but the model runs it <b>three times, once per camera</b>, so the saving is
     3 × 29 ms ≈ 87 ms of the 913 ms chunk. The chunk actually improves by 62 ms, not 87: the backbone costs 6 ms
-    more once the NPU has run (a thread-pool re-entry effect, Section 9), and roughly 19 ms of new host-side cost
+    more once the NPU has run (attributed at the time to a thread-pool re-entry effect; that
+    mechanism was later re-measured and did not reproduce, so the cause is open), and roughly 19 ms of new host-side cost
     appears handing tensors between torch and the NPU runtime. 87 − 6 − 19 ≈ 62 ms is the whole 1.07×.
     Conversely the expert's ×10 is why it is 31% of the chunk despite being the smallest network in the model.
   </p>
@@ -1212,7 +1213,7 @@ once per image:       (HOST) pixel-shuffle → [NPU elf:gemm_connector] 64×1228
   <h3>Level 4 — the to-do list</h3>
   <table>
     <tr><th>#</th><th>Opportunity</th><th>Worth</th><th>Effort</th></tr>
-    <tr><td>1</td><td>Extend the thread-capping over the host patch reshaping — the first image costs 37.9 ms more than the second and third because the numerical library's idle workers preempt the dispatch thread</td><td><b>−32.6 ms</b> <span style="font-size:0.85em;color:#166534">measured</span></td><td>one line</td></tr>
+    <tr style="opacity:.7"><td>1</td><td><s>Extend the thread-capping over the host patch reshaping — the first image costs 37.9 ms more than the second and third because the numerical library's idle workers preempt the dispatch thread</s><br><b style="color:#b91c1c">Retracted (2026-08-05).</b> The thread cap this builds on was re-measured ten times across two harnesses and makes no difference: 442.5 ms clamped vs 441.1 ms unclamped, vision stage 450.9/458.0 vs 453.7/453.9. It has been deleted from the example. The first-image penalty is real; attributing it to BLAS worker contention is not established, so this is unverified rather than measured.</td><td><s>−32.6 ms</s> <span style="font-size:0.85em;color:#b91c1c">retracted</span></td><td>—</td></tr>
     <tr><td>2</td><td>Fix the patch embedding (three causes above)</td><td><b>−12 ms</b> <em>est.</em></td><td>small, all host-side</td></tr>
     <tr><td>3</td><td>Close the deployment-format matmul gap</td><td>−64.6 ms <em>est.</em></td><td>compiler/runtime</td></tr>
     <tr><td>4</td><td>Fold the bias and residual adds into the matmul's own output stage — 13% of all NPU time is these, and they are pure launch plus memory traffic</td><td>−52.2 ms <em>est.</em></td><td>medium</td></tr>
@@ -1668,7 +1669,7 @@ once per image:       (HOST) pixel-shuffle → [NPU elf:gemm_connector] 64×1228
   <div class="callout">
     <b>The lesson we would carry to the next model.</b> Maximum NPU coverage and maximum speed are not the same
     goal. Three of the four things standing between us and a win were <em>not</em> hardware limits — a process
-    bridge, a duplicated computation, and thread contention — and the fourth (small shapes) is best answered by
+    bridge, a duplicated computation, and what looked like thread contention — and the fourth (small shapes) is best answered by
     choosing <em>which</em> stages to move, not by moving everything. Measuring each stage on both processors, and
     being willing to leave one on the CPU, is what produced the speedup.
   </div>
@@ -1694,9 +1695,9 @@ once per image:       (HOST) pixel-shuffle → [NPU elf:gemm_connector] 64×1228
     <tr>
       <td><b>2</b></td>
       <td>Work the ranked list from the encoder breakdown (Section 9)</td>
-      <td>Two of them are measured and nearly free: extending the thread-cap over the host patch reshaping
-          (<b>−32.6 ms</b>, one line) and re-tiling the two MLP matmuls (<b>−3.8 ms</b>, two constants) — together
-          ~7.8%. Beyond that the estimates point at the deployment-format matmul gap (−64.6 ms) and folding the
+      <td>One of them is measured and nearly free: re-tiling the two MLP matmuls
+          (<b>−3.8 ms</b>, two constants). The thread-cap item that used to head this list
+          was retracted — see the table above. Beyond that the estimates point at the deployment-format matmul gap (−64.6 ms) and folding the
           bias/residual adds into the matmul epilogue (−52.2 ms).</td>
     </tr>
     <tr>
