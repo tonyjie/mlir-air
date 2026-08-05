@@ -29,6 +29,7 @@ Run standalone:
 from __future__ import annotations
 
 import argparse
+import sys
 import time
 from pathlib import Path
 
@@ -41,6 +42,12 @@ import numpy as np
 # scope for the same reason.
 
 _HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+
+# numpy/ml_dtypes/shared only at module scope -- no torch, no lerobot, so this
+# stays importable for --compile-only.
+from smolvla_runtime import VISION_CACHE_DIR  # noqa: E402
 
 DEFAULT_MODEL = "lerobot/smolvla_base"
 DEFAULT_PROMPT = "pick up the cube"
@@ -210,12 +217,19 @@ def run_hybrid_forward(
     return chunk.detach().float().numpy()  # (1, chunk_size, action_dim)
 
 
-def compile_only(cache_dir: str = "vision_kernel_cache") -> int:
+def compile_only(cache_dir: str = VISION_CACHE_DIR) -> int:
     """Build every vision ELF through AIR -> AIE -> aiecc -> Peano.
 
     No NPU dispatch and no HuggingFace download, so this runs anywhere the
     toolchain is installed -- it is the compile smoke test the CI lit file
     drives, and it must not need the device, the network, torch or lerobot.
+
+    The cache path is resolved against THIS FILE, not the cwd, and so is
+    VisionRuntime's. That is what makes `make compile` and `make run` share
+    one cache: `make compile` runs from BUILD_DIR so that aircc's intermediates
+    (air_project/, *.mlir, *.o) land there, while `make run` runs from the
+    source dir -- a relative cache path would give them a directory each and
+    `make run` would rebuild everything `make compile` just built.
     """
     # smolvla_vision_encoder puts programming_examples/ and llms/ on sys.path at
     # import time, so it has to come before anything under `shared.`.
@@ -224,8 +238,9 @@ def compile_only(cache_dir: str = "vision_kernel_cache") -> int:
     from shared.infra.cache import KernelCache, Profiler
 
     cfg = SigLIPVisionConfig()
-    cache = KernelCache(cache_dir, verbose=False, profiler=Profiler())
-    print(f"Compiling SmolVLA vision kernels into {cache_dir}/ ...")
+    cache_path = str(_HERE / cache_dir)
+    cache = KernelCache(cache_path, verbose=False, profiler=Profiler())
+    print(f"Compiling SmolVLA vision kernels into {cache_path}/ ...")
     compile_all_kernels(
         cache, cfg, seq_len=cfg.num_patches, fused=True, with_connector=True
     )
