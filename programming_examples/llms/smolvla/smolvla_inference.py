@@ -272,59 +272,120 @@ def run_profile(prompt: str = DEFAULT_PROMPT, reps: int = 5) -> int:
     rt = get_vision_runtime(profile=True)
     rt.warmup()
 
-    def once(npu: bool) -> float:
+    # Stage timers. `vlm_with_expert.forward` is the boundary for both CPU
+    # stages: the fill call (past_key_values=None) is the backbone, the ten
+    # later calls are the action expert. It is never swapped, so one hook
+    # serves both arms. `embed_image` is the vision boundary, but the NPU arm
+    # replaces it, so that arm reads its time from the runtime's own timings.
+    vwe = policy.model.vlm_with_expert
+    acc = {"cpu_vision": [], "backbone": [], "expert": []}
+    orig_embed_image, orig_fwd = vwe.embed_image, vwe.forward
+    cur: dict = {}
+
+    def timed_embed_image(img):
         t = time.perf_counter()
-        run_hybrid_forward(batch, policy=policy, noise=noise, npu_vision=npu)
-        return (time.perf_counter() - t) * 1e3
+        r = orig_embed_image(img)
+        cur["vision"] = cur.get("vision", 0.0) + (time.perf_counter() - t) * 1e3
+        return r
 
-    once(False)
-    once(True)  # warm both arms, discard
-    rt.cache.profiler.kernel_times.clear()  # drop the warmup dispatches
+    def timed_forward(*a, **kw):
+        t = time.perf_counter()
+        r = orig_fwd(*a, **kw)
+        d = (time.perf_counter() - t) * 1e3
+        key = "backbone" if kw.get("past_key_values") is None else "expert"
+        cur[key] = cur.get(key, 0.0) + d
+        return r
 
-    cpu, npu, vis = [], [], []
-    for _ in range(reps):
-        cpu.append(once(False))
+    vwe.embed_image, vwe.forward = timed_embed_image, timed_forward
+
+    def once(npu: bool) -> tuple:
+        cur.clear()
         t: dict = {}
-        tn = time.perf_counter()
-        run_hybrid_forward(
-            batch, policy=policy, noise=noise, npu_vision=True, timings=t
-        )
-        npu.append((time.perf_counter() - tn) * 1e3)
-        vis.append(t["vision"]["wall_ms"])
+        t0 = time.perf_counter()
+        run_hybrid_forward(batch, policy=policy, noise=noise, npu_vision=npu, timings=t)
+        wall = (time.perf_counter() - t0) * 1e3
+        vision = t["vision"]["wall_ms"] if npu else cur.get("vision", 0.0)
+        return wall, vision, cur.get("backbone", 0.0), cur.get("expert", 0.0)
+
+    try:
+        once(False)
+        once(True)  # warm both arms, discard
+        rt.cache.profiler.kernel_times.clear()  # drop the warmup dispatches
+
+        cpu, npu, vis, cvis, bb, ex = [], [], [], [], [], []
+        for _ in range(reps):
+            w, v, b, e = once(False)
+            cpu.append(w)
+            cvis.append(v)
+            bb.append(b)
+            ex.append(e)
+            w, v, _, _ = once(True)
+            npu.append(w)
+            vis.append(v)
+    finally:
+        vwe.embed_image, vwe.forward = orig_embed_image, orig_fwd
 
     med = lambda v: float(np.median(v))  # noqa: E731
+    n_cam = sum(1 for k in batch if "images" in k)
+    W = 36
     print()
-    print("=" * 68)
+    print("=" * 74)
     print(f"SmolVLA profile — {reps} interleaved reps, both arms warmed, one process")
-    print("=" * 68)
-    print(f"  {'configuration':34s} {'median':>9s} {'min':>9s} {'max':>9s}")
-    print(f"  {'-' * 34} {'-' * 9} {'-' * 9} {'-' * 9}")
+    print("=" * 74)
+
+    print(f"  {'end to end':{W}s} {'median':>9s} {'min':>9s} {'max':>9s}")
+    print(f"  {'-' * W} {'-' * 9} {'-' * 9} {'-' * 9}")
     print(
-        f"  {'pure CPU (unmodified lerobot)':34s} "
+        f"  {'pure CPU (unmodified lerobot)':{W}s} "
         f"{med(cpu):9.1f} {min(cpu):9.1f} {max(cpu):9.1f}"
     )
     print(
-        f"  {'NPU vision + CPU backbone/expert':34s} "
+        f"  {'NPU vision + CPU backbone/expert':{W}s} "
         f"{med(npu):9.1f} {min(npu):9.1f} {max(npu):9.1f}"
     )
-    print(f"  {'  of which: vision stage':34s} {med(vis):9.1f}")
-    print()
-    print(f"  end-to-end speedup (median)      {med(cpu) / med(npu):.3f}x")
-    print(f"  vision stage share of NPU run    {med(vis) / med(npu) * 100:.1f}%")
+    print(f"\n  speedup (median)  {med(cpu) / med(npu):.3f}x\n")
+
+    # Per stage, both arms. Only the vision row differs -- the backbone and the
+    # expert are the same unmodified CPU code in both, so their times are
+    # carried across and the table shows what the swap did and did not touch.
+    print(f"  {'per stage':{W}s} {'CPU':>9s} {'NPU run':>9s} {'speedup':>9s}")
+    print(f"  {'-' * W} {'-' * 9} {'-' * 9} {'-' * 9}")
+    print(
+        f"  {f'vision: SigLIP + connector (x{n_cam})':{W}s} "
+        f"{med(cvis):9.1f} {med(vis):9.1f} {med(cvis) / med(vis):8.2f}x"
+    )
+    print(
+        f"  {'backbone: SmolLM2-360M (x1)':{W}s} {med(bb):9.1f} {med(bb):9.1f}"
+        f"{'  CPU both':>10s}"
+    )
+    print(
+        f"  {'action expert (x10 denoise steps)':{W}s} {med(ex):9.1f} {med(ex):9.1f}"
+        f"{'  CPU both':>10s}"
+    )
 
     kt = rt.cache.profiler.kernel_times
     if kt:
+        n_img = reps * n_cam
         print()
-        print(f"  {'NPU dispatch (per image)':34s} {'calls':>7s} {'total ms':>10s}")
-        print(f"  {'-' * 34} {'-' * 7} {'-' * 10}")
-        n_img = reps * 3
+        print(
+            f"  {f'NPU device time, per image (of {n_cam})':{W}s} "
+            f"{'calls':>9s} {'ms/image':>9s}"
+        )
+        print(f"  {'-' * W} {'-' * 9} {'-' * 9}")
         total = 0.0
         for name in sorted(kt, key=lambda k: -sum(kt[k])):
             ms = sum(kt[name]) * 1e3 / n_img
             total += ms
-            print(f"  {name:34s} {len(kt[name]) // n_img:7d} {ms:10.2f}")
-        print(f"  {'TOTAL device':34s} {'':7s} {total:10.2f}")
-    print("=" * 68)
+            print(f"  {name:{W}s} {len(kt[name]) // n_img:9d} {ms:9.2f}")
+        print(f"  {'TOTAL device / image':{W}s} {'':9s} {total:9.2f}")
+        print()
+        print(
+            f"  x{n_cam} images = {total * n_cam:.1f} ms device, "
+            f"of the {med(vis):.1f} ms vision stage "
+            f"({total * n_cam / med(vis) * 100:.0f}% device, "
+            f"{med(vis) - total * n_cam:.1f} ms host)"
+        )
+    print("=" * 74)
     return 0
 
 
