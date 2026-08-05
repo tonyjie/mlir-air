@@ -224,12 +224,9 @@ def compile_only(cache_dir: str = VISION_CACHE_DIR) -> int:
     toolchain is installed -- it is the compile smoke test the CI lit file
     drives, and it must not need the device, the network, torch or lerobot.
 
-    The cache path is resolved against THIS FILE, not the cwd, and so is
-    VisionRuntime's. That is what makes `make compile` and `make run` share
-    one cache: `make compile` runs from BUILD_DIR so that aircc's intermediates
-    (air_project/, *.mlir, *.o) land there, while `make run` runs from the
-    source dir -- a relative cache path would give them a directory each and
-    `make run` would rebuild everything `make compile` just built.
+    Writes to VISION_CACHE_DIR, which smolvla_runtime resolves against its own
+    __file__ rather than the cwd -- that is what lets `make compile` and
+    `make run` share one cache no matter which directory each runs from.
     """
     # smolvla_vision_encoder puts programming_examples/ and llms/ on sys.path at
     # import time, so it has to come before anything under `shared.`.
@@ -238,9 +235,8 @@ def compile_only(cache_dir: str = VISION_CACHE_DIR) -> int:
     from shared.infra.cache import KernelCache, Profiler
 
     cfg = SigLIPVisionConfig()
-    cache_path = str(_HERE / cache_dir)
-    cache = KernelCache(cache_path, verbose=False, profiler=Profiler())
-    print(f"Compiling SmolVLA vision kernels into {cache_path}/ ...")
+    cache = KernelCache(cache_dir, verbose=False, profiler=Profiler())
+    print(f"Compiling SmolVLA vision kernels into {cache_dir}/ ...")
     compile_all_kernels(
         cache, cfg, seq_len=cfg.num_patches, fused=True, with_connector=True
     )

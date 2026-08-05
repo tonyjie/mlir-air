@@ -1,18 +1,5 @@
-smolvla_oracle.npz
-vision_oracle.npz
-expert_oracle.npz
-vision_kernel_cache/
-# kernel caches + compiled ELF/obj artifacts (rebuilt by compile_all_kernels)
-*_kernel_cache/
-bench_vision_cache/
-bench_vision_fused_cache/
-vit_fused_test_cache/
-air_project/
-*.elf
-*.o
-*.xclbin
-*.insts.bin
-air.mlir
-_prof_*.py
-bench_expert_dispatch_cache/
-bench_kernel_cache_flash/
+# Everything this example produces lands in build/ (kernel cache, compiled
+# ELFs, aircc intermediates, the cpu-baseline dump), so `make clean` is
+# `rm -rf build/`.
+build/
+__pycache__/

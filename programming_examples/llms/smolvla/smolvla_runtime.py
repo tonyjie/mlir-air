@@ -52,7 +52,10 @@ from shared.infra.thread_limits import host_thread_limits  # noqa: E402
 
 MODEL_ID = "lerobot/smolvla_base"
 
-VISION_CACHE_DIR = "vision_kernel_cache"
+# Resolved against THIS FILE, not the cwd: VisionRuntime is imported into
+# lerobot's process, so where it finds its ELFs must not depend on who called
+# it. Under build/ so that `make clean` is `rm -rf build/` and nothing else.
+VISION_CACHE_DIR = str(_HERE / "build" / "vision_kernel_cache")
 VISION_SEQ_LEN = 1024
 VISION_KERNELS = {
     "vit_ln_qkv",
@@ -147,9 +150,7 @@ class VisionRuntime:
         self.cfg = SigLIPVisionConfig()
         self.weights = load_vision_weights(model_id, dtype=bfloat16, config=self.cfg)
         t_w = time.perf_counter()
-        self.cache = KernelCache(
-            str(_HERE / cache_dir), verbose=verbose, profiler=Profiler()
-        )
+        self.cache = KernelCache(cache_dir, verbose=verbose, profiler=Profiler())
         self.compiled = ensure_kernels(
             self.cache,
             VISION_KERNELS,

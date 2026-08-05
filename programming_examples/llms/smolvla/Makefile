@@ -61,26 +61,29 @@ compile:
 ## does NOT read this file, it computes its reference live.
 ## CPU only — no NPU, so no lock.
 cpu-baseline:
-	cd $(srcdir) && $(LEROBOT_PYTHON) smolvla_cpu_baseline.py
+	@mkdir -p $(BUILD_DIR)
+	cd $(BUILD_DIR) && $(LEROBOT_PYTHON) $(srcdir)/smolvla_cpu_baseline.py
 
 ## One end-to-end forward in the shipping configuration.
 run:
-	cd $(srcdir) && $(NPU_LOCK) $(LEROBOT_PYTHON) smolvla_inference.py
+	@mkdir -p $(BUILD_DIR)
+	cd $(BUILD_DIR) && $(NPU_LOCK) $(LEROBOT_PYTHON) $(srcdir)/smolvla_inference.py
 
 ## THE GATE. Action chunk vs the unmodified CPU model: cosine >= 0.99 and
 ## normalized MSE <= 0.04. Exits non-zero on FAIL.
 verify:
-	cd $(srcdir) && $(NPU_LOCK) $(LEROBOT_PYTHON) verify_adapter.py
+	@mkdir -p $(BUILD_DIR)
+	cd $(BUILD_DIR) && $(NPU_LOCK) $(LEROBOT_PYTHON) $(srcdir)/verify_adapter.py
 
 ## Per-stage wall clock, NPU vision against pure CPU, same input and fixed
 ## noise. Run back to back under one lock so the two are comparable.
 profile:
-	cd $(srcdir) && $(NPU_LOCK) sh -c '\
-	  $(LEROBOT_PYTHON) smolvla_inference.py --cpu; \
-	  $(LEROBOT_PYTHON) smolvla_inference.py'
+	@mkdir -p $(BUILD_DIR)
+	cd $(BUILD_DIR) && $(NPU_LOCK) sh -c '\
+	  $(LEROBOT_PYTHON) $(srcdir)/smolvla_inference.py --cpu; \
+	  $(LEROBOT_PYTHON) $(srcdir)/smolvla_inference.py'
 
 clean:
-	rm -rf $(srcdir)/$(BUILD_DIR) $(srcdir)/vision_kernel_cache \
-	       $(srcdir)/air_project $(srcdir)/__pycache__ \
-	       $(srcdir)/*.elf $(srcdir)/*.xclbin $(srcdir)/*.o $(srcdir)/*.mlir \
-	       $(srcdir)/*.insts.bin
+	rm -rf $(srcdir)/$(BUILD_DIR) $(srcdir)/__pycache__
+	rm -rf $(srcdir)/../verify/reports
+	@echo "$(BUILD_DIR)/ and verify/reports/ removed. Run 'make compile' to rebuild."
