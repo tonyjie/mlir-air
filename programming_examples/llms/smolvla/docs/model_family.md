@@ -145,9 +145,9 @@ length: 241 / 305 / 369.**
 | vision | 12 layers, 768/3072 | **identical** |
 | VLM base | SmolVLM2-500M-**Video**-Instruct | SmolVLM2-500M-Instruct |
 
-This is the checkpoint with real LIBERO ground truth — the one
-`eval_vs_groundtruth.py` in the playground measured at 85.9% action-MSE
-improvement. Its dataset is already on this machine (see §6).
+This is the checkpoint with real LIBERO ground truth, measured at 85.9%
+action-MSE improvement by a one-off evaluation script that is not part of this
+example (it lives outside the repo, in the SmolVLA playground). Its dataset is already on this machine (see §6).
 
 ### Group C — community
 

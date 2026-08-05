@@ -26,6 +26,17 @@ Every number below was measured on real NPU2 hardware in one session
 (2026-07-27/28). Nothing is carried over from a previous run or from the kernel
 registry, except where a registry row is explicitly quoted for contrast.
 
+> **Where the measurement code lives.** This study used a set of one-off
+> harnesses under `scripts/`, cited by name throughout. Those are development
+> tools, not part of the shipping example, and were dropped when this directory
+> was trimmed to the sibling models' shape — **they are on the `smolvla`
+> branch**, together with the backbone and action-expert ports.
+>
+> What ships here reproduces the *end-to-end* numbers: `make profile` runs the
+> CPU and NPU configurations back to back, and `make run` prints the per-image
+> vision timings. The per-ELF and per-kernel decompositions below need the
+> `smolvla` branch. See §9.
+
 ---
 
 ## 0. Machine state
@@ -99,7 +110,7 @@ on every invocation after that.** Reproducer:
 artifact (reproduced with every buffer re-uploaded and with the `xrt.run` object
 reused), and it is *not* `stack_size`.
 
-**The shipping deployment is NOT affected** — `test_full_vit.py` re-run this
+**The shipping deployment is NOT affected** — the full-encoder check re-run this
 session PASSes, per-layer cosine 0.9954–0.9995, **final gate 0.990635 > 0.99**.
 The shipping ELFs are *multi-launch* (7 and 10 launches) and correct; the
 replicated multi-launch ELFs used below verify at `mean_rel_L1 = 9.56e-3`. Only
@@ -305,7 +316,7 @@ deployment is already at (slightly below) the kernel's standalone speed and
 *(Caveat: that standalone FA run's correctness gate failed — the harness builds
 its own `attn_npu2.o` and its reference did not match; the number is quoted only
 as an instruction-stream timing. The deployed FA is validated by
-`test_full_vit.py`.)*
+the full-encoder check on the `smolvla` branch.)*
 
 ---
 
@@ -423,49 +434,33 @@ both trivial — is **≈36.4 ms (7.8%)** for a few lines of code.
 
 ## 9. Reproduce
 
+### What this branch reproduces
+
 ```bash
 cd programming_examples/llms/smolvla
 
-# (1) per-ELF device breakdown + wall reconciliation
-flock -x -w 1800 /tmp/mlir-air-npu.lock python3 scripts/vision_profile_run.py --images 3 --reps 5
-
-# (2) in-situ per-launch cost of every sub-kernel (2- and 4-copy ELFs)
-for op in gemm_qkvo gemm_fc1 gemm_fc2 ln bias768 bias3072 add768 gelu; do
-  python3 scripts/vision_replicate_bench.py --op $op --build-only
-  flock -x -w 1800 /tmp/mlir-air-npu.lock python3 scripts/vision_replicate_bench.py --op $op
-done
-
-# (2.3) fused ELF measured isolated (full-length prefix)
-python3 scripts/vision_prefix_bench.py --build-only
-flock -x -w 1800 /tmp/mlir-air-npu.lock python3 scripts/vision_prefix_bench.py --single vit_o_ffn_p10
-
-# (3) host accounting (no NPU)
-python3 scripts/vision_host_bench.py
-
-# (5) ELF vs xclbin, same module, one format per process
-for f in elf xclbin; do
-  flock -x -w 1800 /tmp/mlir-air-npu.lock python3 scripts/vision_elf_vs_xclbin.py --fmt $f
-done
-
-# (6) tile_n A/B, interleaved
-flock -x -w 1800 /tmp/mlir-air-npu.lock python3 scripts/vision_tile_ab.py --op gemm_fc1 --tile-ns 128,192,256,64
-
-# (8.1) the first-image penalty
-flock -x -w 1800 /tmp/mlir-air-npu.lock python3 scripts/vision_first_image_ab.py
-
-# single-launch ELF corruption reproducer
-flock -x -w 1800 /tmp/mlir-air-npu.lock python3 scripts/repro_single_launch_elf_corruption.py
-
-# deployment correctness (unchanged by this study)
-flock -x -w 1800 /tmp/mlir-air-npu.lock python3 test_full_vit.py
+make profile   # CPU and NPU configurations back to back under one lock
+make run       # one forward; prints t_im2col / t_encode / per-image timings
+make verify    # the correctness gate (cosine >= 0.99, nMSE <= 0.04)
 ```
 
-Raw data: `results/vision_profile.json`, `results/vision_replicate.json`,
-`results/vision_prefix.json`, `results/vision_host.json`,
-`results/vision_tile_ab.json`, `results/vision_elf_vs_xclbin.json`,
-`results/vision_first_image_ab.json`.
+`make profile` covers the headline end-to-end comparison. Note its limits: it
+times **one** inference per configuration, and only the NPU arm is warmed
+(`warmup_npu()` runs under `if npu_vision`), so a single reading can land
+anywhere in the ~±10% process-to-process spread quoted above.
 
----
+### What needs the `smolvla` branch
+
+Everything in §1–§8 — the per-ELF device breakdown, the in-situ per-launch
+costs, the ELF-vs-xclbin comparison, the `tile_n` A/B, the first-image penalty,
+and the single-launch corruption reproducer — was produced by harnesses under
+`scripts/` that are not part of this example. They live on the `smolvla`
+research branch, whose `docs/profile.md` carries the same commands with the
+scripts present:
+
+```bash
+git checkout smolvla -- programming_examples/llms/smolvla/scripts
+```
 
 ## Appendix — traps found while measuring
 
