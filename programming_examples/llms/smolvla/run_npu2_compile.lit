@@ -8,11 +8,14 @@
 // Covers the three fused multi-launch ELFs (vit_ln_qkv, flash_attn,
 // vit_o_ffn), the post-LayerNorm and the connector projection.
 //
-// NOT CI-triggered by design: the filename OMITS "peano", so the CI peano suite
-// (`lit --filter "peano"`) does not collect it — llama32_1b's compile lit is the
-// bf16 CI signal and this example shares the same shared/builders + shared/infra
-// assembly. Run on demand:
-//   lit -v programming_examples/llms/smolvla/run_npu2_compile.lit
+// CI collects this through `check-programming-examples-llms-compile`, whose
+// filter is the path `llms/.*/run_npu2_compile` — no filename suffix needed.
+// That target runs only when HF_TOKEN is available (pushes to main /
+// workflow_dispatch); the per-PR gate is llama32_1b's compile lit alone.
+//
+// Needs no lerobot: the entry point imports torch and lerobot lazily, so this
+// runs with only the mlir-air toolchain plus llama32_1b's requirements.txt,
+// which is what CI installs.
 //
 // REQUIRES: ryzen_ai_npu2, peano
 //

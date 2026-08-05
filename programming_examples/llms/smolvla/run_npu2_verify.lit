@@ -10,11 +10,17 @@
 // MSE <= 0.04) rather than the top-k token-set gate the autoregressive LLM
 // siblings use.
 //
-// Needs torch + lerobot with the mlir-air environment sourced, so that
-// air/pyxrt are importable in the same process. No fixture required: the gate
-// computes its pure-CPU reference live, in-process, from the same policy.
+// Needs torch + lerobot (see requirements.txt) with the mlir-air environment
+// sourced, so that air/pyxrt are importable in the same process. That is a
+// heavier dependency set than the other LLM examples need, and CI installs
+// only llama32_1b's requirements, so this REQUIRES the `lerobot` feature and
+// skips cleanly where the package is absent rather than failing on an
+// ImportError. The compile test needs none of it and has no such REQUIRES.
 //
-// REQUIRES: ryzen_ai_npu2, peano, hf_token
+// No fixture required: the gate computes its pure-CPU reference live,
+// in-process, from the same policy object.
+//
+// REQUIRES: ryzen_ai_npu2, peano, hf_token, lerobot
 //
 // RUN: mkdir -p test_peano_verify
 // RUN: cd test_peano_verify
