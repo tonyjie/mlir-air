@@ -32,14 +32,14 @@ NPU_PYTHON     ?= python3
 NPU_LOCK       := flock -x -w 1800 /tmp/mlir-air-npu.lock
 BUILD_DIR      ?= build
 
-.PHONY: help compile oracle run verify profile clean
+.PHONY: help compile cpu-baseline run verify profile clean
 
 help:
 	@echo "=================================================================="
 	@echo " SmolVLA on NPU2 — SigLIP vision encoder on the NPU, one process"
 	@echo "=================================================================="
 	@echo "  make compile   Build every vision ELF (no NPU dispatch, no download)"
-	@echo "  make oracle    Regenerate smolvla_oracle.npz, the CPU baseline (no NPU)"
+	@echo "  make cpu-baseline  Run the unmodified CPU model; dumps it for inspection"
 	@echo "  make run       One end-to-end forward; prints the action chunk"
 	@echo "  make verify    THE GATE: action chunk vs the pure-CPU model (PASS/FAIL)"
 	@echo "  make profile   Per-stage wall clock, NPU vision vs pure CPU"
@@ -56,9 +56,11 @@ compile:
 	@mkdir -p $(BUILD_DIR)
 	cd $(BUILD_DIR) && $(NPU_PYTHON) $(srcdir)/smolvla_inference.py --compile-only
 
-## Regenerate the pure-CPU reference the gate compares against.
+## Run the unmodified lerobot model on CPU and dump the action chunk to
+## smolvla_oracle.npz. For inspecting what the baseline does -- `make verify`
+## does NOT read this file, it computes its reference live.
 ## CPU only — no NPU, so no lock.
-oracle:
+cpu-baseline:
 	cd $(srcdir) && $(LEROBOT_PYTHON) smolvla_cpu_baseline.py
 
 ## One end-to-end forward in the shipping configuration.
