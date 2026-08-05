@@ -246,6 +246,88 @@ def compile_only(cache_dir: str = VISION_CACHE_DIR) -> int:
     return 0
 
 
+def run_profile(prompt: str = DEFAULT_PROMPT, reps: int = 5) -> int:
+    """Pure CPU vs NPU vision, measured so the comparison is worth reporting.
+
+    Four things the naive "run one, then run the other" does wrong, and what
+    this does instead:
+
+      one process        both arms share the loaded policy, so neither pays a
+                         model load inside its timed region
+      both warmed        a discarded forward per arm first. Timing the CPU arm
+                         cold while the NPU arm is warm is not a comparison;
+                         measured, the first CPU forward is 1.07x the warm one
+      interleaved        CPU, NPU, CPU, NPU... so thermal or scheduler drift
+                         hits both arms equally instead of whichever ran last
+      median of N        process-to-process spread on this machine is ~10-15%;
+                         a single reading lands anywhere in it
+    """
+    from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
+
+    from smolvla_runtime import get_vision_runtime
+
+    policy = SmolVLAPolicy.from_pretrained(DEFAULT_MODEL).eval()
+    batch = build_oracle_batch(policy, prompt)
+    noise = fixed_noise(policy)
+    rt = get_vision_runtime(profile=True)
+    rt.warmup()
+
+    def once(npu: bool) -> float:
+        t = time.perf_counter()
+        run_hybrid_forward(batch, policy=policy, noise=noise, npu_vision=npu)
+        return (time.perf_counter() - t) * 1e3
+
+    once(False)
+    once(True)  # warm both arms, discard
+    rt.cache.profiler.kernel_times.clear()  # drop the warmup dispatches
+
+    cpu, npu, vis = [], [], []
+    for _ in range(reps):
+        cpu.append(once(False))
+        t: dict = {}
+        tn = time.perf_counter()
+        run_hybrid_forward(
+            batch, policy=policy, noise=noise, npu_vision=True, timings=t
+        )
+        npu.append((time.perf_counter() - tn) * 1e3)
+        vis.append(t["vision"]["wall_ms"])
+
+    med = lambda v: float(np.median(v))  # noqa: E731
+    print()
+    print("=" * 68)
+    print(f"SmolVLA profile — {reps} interleaved reps, both arms warmed, one process")
+    print("=" * 68)
+    print(f"  {'configuration':34s} {'median':>9s} {'min':>9s} {'max':>9s}")
+    print(f"  {'-' * 34} {'-' * 9} {'-' * 9} {'-' * 9}")
+    print(
+        f"  {'pure CPU (unmodified lerobot)':34s} "
+        f"{med(cpu):9.1f} {min(cpu):9.1f} {max(cpu):9.1f}"
+    )
+    print(
+        f"  {'NPU vision + CPU backbone/expert':34s} "
+        f"{med(npu):9.1f} {min(npu):9.1f} {max(npu):9.1f}"
+    )
+    print(f"  {'  of which: vision stage':34s} {med(vis):9.1f}")
+    print()
+    print(f"  end-to-end speedup (median)      {med(cpu) / med(npu):.3f}x")
+    print(f"  vision stage share of NPU run    {med(vis) / med(npu) * 100:.1f}%")
+
+    kt = rt.cache.profiler.kernel_times
+    if kt:
+        print()
+        print(f"  {'NPU dispatch (per image)':34s} {'calls':>7s} {'total ms':>10s}")
+        print(f"  {'-' * 34} {'-' * 7} {'-' * 10}")
+        n_img = reps * 3
+        total = 0.0
+        for name in sorted(kt, key=lambda k: -sum(kt[k])):
+            ms = sum(kt[name]) * 1e3 / n_img
+            total += ms
+            print(f"  {name:34s} {len(kt[name]) // n_img:7d} {ms:10.2f}")
+        print(f"  {'TOTAL device':34s} {'':7s} {total:10.2f}")
+    print("=" * 68)
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
@@ -257,11 +339,19 @@ def main() -> int:
         action="store_true",
         help="build every vision ELF and exit; no NPU dispatch, no download",
     )
+    ap.add_argument(
+        "--profile",
+        action="store_true",
+        help="CPU vs NPU, interleaved and warmed, with the per-ELF breakdown",
+    )
+    ap.add_argument("--reps", type=int, default=5, help="reps per arm for --profile")
     args = ap.parse_args()
     npu_vision = not args.cpu
 
     if args.compile_only:
         return compile_only()
+    if args.profile:
+        return run_profile(args.prompt, args.reps)
 
     from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 

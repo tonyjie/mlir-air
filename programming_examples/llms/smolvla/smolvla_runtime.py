@@ -142,7 +142,9 @@ class VisionRuntime:
     per-layer static weight BOs — happens in `__init__` / the first `encode`
     and is then reused for every later inference in this process."""
 
-    def __init__(self, cache_dir=VISION_CACHE_DIR, model_id=MODEL_ID, verbose=False):
+    def __init__(
+        self, cache_dir=VISION_CACHE_DIR, model_id=MODEL_ID, verbose=False, profile=False
+    ):
         from smolvla_vision_weights import load_vision_weights, SigLIPVisionConfig
         from smolvla_vision_encoder import compile_all_kernels
 
@@ -150,7 +152,11 @@ class VisionRuntime:
         self.cfg = SigLIPVisionConfig()
         self.weights = load_vision_weights(model_id, dtype=bfloat16, config=self.cfg)
         t_w = time.perf_counter()
-        self.cache = KernelCache(cache_dir, verbose=verbose, profiler=Profiler())
+        # profile=True records per-ELF XRT times into cache.profiler.kernel_times;
+        # off by default so `make run` and `make verify` measure the shipping path.
+        self.cache = KernelCache(
+            cache_dir, verbose=verbose, profiler=Profiler(enabled=profile)
+        )
         self.compiled = ensure_kernels(
             self.cache,
             VISION_KERNELS,

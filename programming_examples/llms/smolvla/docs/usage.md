@@ -55,19 +55,27 @@ make compile   # build every vision ELF — no NPU dispatch, no download
 make cpu-baseline  # run the unmodified CPU model on its own, for inspection (no NPU)
 make run       # one end-to-end forward; prints the action chunk
 make verify    # THE GATE — action chunk vs the pure-CPU model (PASS/FAIL)
-make profile   # per-stage wall clock, NPU vision vs pure CPU
+make profile   # CPU vs NPU, interleaved and warmed, with the per-ELF breakdown
 make clean     # remove the kernel cache and build artifacts
 ```
 
 ### The NPU lock
-Every recipe that touches the device already wraps itself in
-`flock /tmp/mlir-air-npu.lock`. **Do not** wrap `make` in an outer `flock` on
-the same file — it self-deadlocks. If you invoke the Python entry points
-directly, add the lock yourself:
+On a machine where several sessions share one NPU, take the project's lock
+around anything that touches the device — the same convention the sibling
+examples use:
 
 ```bash
-flock -x -w 1800 /tmp/mlir-air-npu.lock python3 smolvla_inference.py
+flock -x -w 1800 /tmp/mlir-air-npu.lock make verify
+flock -x -w 1800 /tmp/mlir-air-npu.lock make profile
 ```
+
+The recipes deliberately do **not** take that lock themselves; if they did,
+the command above would deadlock against itself.
+
+Correctness does not depend on it: `shared/infra/cache.py` holds
+`/tmp/npu.lock` around every dispatch, so concurrent runs interleave safely.
+The outer lock matters for *timing* — it stops someone else's dispatches from
+landing in the middle of your 38.
 
 ---
 

@@ -105,8 +105,12 @@ make profile       # per-stage wall clock, NPU vision vs pure CPU
 make cpu-baseline  # run the unmodified CPU model on its own, for inspection
 ```
 
-Every recipe self-locks the NPU. Do **not** wrap `make` in an outer `flock` on
-the same file — it self-deadlocks.
+On a machine where several sessions share one NPU, wrap the device-touching
+targets the way the siblings are wrapped:
+
+```bash
+flock -x -w 1800 /tmp/mlir-air-npu.lock make verify
+```
 
 ## Files
 
