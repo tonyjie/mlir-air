@@ -143,5 +143,45 @@ Two things will corrupt a timing run on a shared machine:
    `balanced` machine reads very differently, and the CPU baseline moves more
    than the NPU stage does — which changes the *ratio*, not just the absolutes.
 
-`make profile` runs the CPU and NPU configurations back to back under one lock
-so the two are comparable.
+### What `make profile` reports
+
+One process, both arms warmed with a discarded forward, then `REPS`
+CPU/NPU pairs interleaved so drift hits both equally. `make profile REPS=10`
+for a tighter estimate:
+
+```
+  end to end                              median       min       max
+  pure CPU (unmodified lerobot)            925.9     908.5    1015.3
+  NPU vision + CPU backbone/expert         856.5     820.2     918.1
+
+  speedup (median)  1.081x
+
+  per stage                                  CPU   NPU run   speedup
+  vision: SigLIP + connector (x3)          550.7     462.5     1.19x
+  backbone: SmolLM2-360M (x1)               80.3      80.3  CPU both
+  action expert (x10 denoise steps)        283.6     283.6  CPU both
+
+  NPU device time, per image (of 3)        calls  ms/image
+  vit_o_ffn                                   12     65.52
+  flash_attn                                  12     37.01
+  vit_ln_qkv                                  12     36.34
+  gemm_connector                               1      1.14
+  layer_norm                                   1      0.73
+  TOTAL device / image                              140.74
+
+  x3 images = 422.2 ms device, of the 462.5 ms vision stage
+  (91% device, 40.3 ms host)
+```
+
+Two things worth reading off it:
+
+- **Vision is 54% of the NPU run** (462.5 / 856.5). Even an infinitely fast
+  vision stage would only reach 1.85x end to end; the CPU backbone and expert
+  are the ceiling. That is why a 1.19x stage win shows up as 1.08x overall.
+- **Vision is 91% device time** (422.2 / 462.5). Fusion has squeezed host glue
+  down to 40 ms, so further gains have to come from the kernels — and
+  `vit_o_ffn` alone is 47% of device time.
+
+The backbone and expert columns carry the same number across both arms on
+purpose: they are the same unmodified CPU code either way, and showing them
+makes it visible that one stage moved and two did not.

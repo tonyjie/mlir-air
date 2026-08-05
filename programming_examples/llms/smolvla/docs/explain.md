@@ -115,10 +115,18 @@ ELFs, the XRT context and the device buffer objects are created once and reused
 by every inference. An earlier two-process design paid ~585 ms per inference in
 process spawn, weight reload and ELF load — none of it NPU cost.
 
-One subtlety of being in-process: the NPU driver loop is host-bound, and
-OpenBLAS worker threads busy-spin after any host matmul and preempt the dispatch
-thread (measured 135 → 178 ms per image). Clamping the thread pools globally
-would be wrong, because the CPU stages before and after genuinely want all
-cores. `npu_thread_limits()` therefore clamps only for the duration of the NPU
-call and restores afterwards, at runtime through ctypes rather than by
-environment variable. `SMOLVLA_NPU_BLAS_LIMIT=0` disables it.
+One subtlety of being in-process: the NPU dispatch loop is host-bound and
+shares the process with numpy/torch, whose BLAS pool keeps a worker per core.
+`npu_thread_limits()` clamps those pools for the duration of the NPU call and
+restores them afterwards — scoped, because the CPU backbone and expert before
+and after genuinely want every core. It works at runtime through ctypes on the
+already-loaded shared objects, since `OMP_NUM_THREADS` only has effect before
+numpy is imported. The mechanism lives in `shared/infra/thread_limits.py`;
+`SMOLVLA_NPU_BLAS_LIMIT=0` disables it.
+
+**On this machine it currently makes no measurable difference.** The comment it
+was added under cites 135 → 178 ms per image, which does not reproduce; an A/B
+on the knob, three runs each, gives 442.5 ms with the clamp and 441.1 ms
+without. It is kept because the contention it guards against is real on
+machines where the BLAS pool is larger or busier, but nobody should assume it
+is buying anything here without re-measuring.

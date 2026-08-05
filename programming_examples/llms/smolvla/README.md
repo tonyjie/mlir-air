@@ -41,6 +41,12 @@ configurations interleaved.
 | Pure CPU (unmodified lerobot) | 913 ms | 1.00× |
 | **NPU vision + connector** | **851 ms** | **1.07×** |
 
+Reproduce with `make profile` (one process, both arms warmed, interleaved,
+median of 10): 925.9 ms CPU against 856.5 ms, **1.081×**, with the vision stage
+itself at 550.7 → 462.5 ms (**1.19×**) — the same numbers the table reports,
+measured a second time through a different harness. See
+[`docs/usage.md`](docs/usage.md) for the full output and what to read off it.
+
 Vision alone is 1.19× per image (155 ms vs 184 ms). The end-to-end figure is
 smaller because vision is 60% of the chunk: the ~87 ms saved is partly offset by
 ~6 ms of thread-pool re-entry on the CPU work that follows the NPU stage and
@@ -101,7 +107,7 @@ tokens, 10 denoise steps.
 make compile       # build every vision ELF — no NPU dispatch, no download
 make verify        # THE GATE — action chunk vs the pure-CPU model
 make run           # one end-to-end forward, prints the action chunk
-make profile       # per-stage wall clock, NPU vision vs pure CPU
+make profile       # CPU vs NPU, interleaved and warmed, with the per-ELF breakdown
 make cpu-baseline  # run the unmodified CPU model on its own, for inspection
 ```
 
