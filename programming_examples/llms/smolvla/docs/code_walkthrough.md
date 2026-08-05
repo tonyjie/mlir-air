@@ -241,34 +241,117 @@ lerobot 一行代码：
 
 ---
 
-## 3. 我们改了什么 —— 只有一个函数
+## 3. 我们改了什么 —— 只有 `embed_image`
 
-整个 NPU 集成，机制上只有一件事：
+### 先分清两个名字，否则后面全看不懂
 
-```
-                原版 lerobot 完整跑一遍推理
-                            │
-    ┌───────────────────────┴────────────────────────┐
-    │  只在 embed_image 这一个函数上做临时替换        │
-    │      原版：CPU 跑 SigLIP                        │
-    │      我们：直接返回 NPU 已经算好的结果          │
-    │  算完立刻恢复（finally 保证，异常也恢复）       │
-    └────────────────────────────────────────────────┘
-                            │
-              backbone / action expert / prefix 组装 /
-              mask / 采样 / 去噪循环 —— 全是 lerobot
-              自己的代码，一行没动
-```
-
-代码在 `smolvla_inference.py`，核心就这几行：
+**`embed_prefix` 不是 SigLIP，它是组装函数。SigLIP 是它内部的一步。**
 
 ```python
-vwe.embed_image = _npu_embed_image     # 换掉
-try:
-    return orig_embed_prefix(*a, **kw)  # 调原版 lerobot
-finally:
-    vwe.embed_image = orig_embed_image  # 换回来
+def embed_prefix(images, lang_tokens, state):     # ← lerobot 的组装函数
+    for img in images:
+        img_emb = self.vlm_with_expert.embed_image(img)   # ★ 只有这行是 SigLIP
+        img_emb = img_emb * sqrt(960)                     # ① 缩放
+    lang_emb = self.embed_language_tokens(lang_tokens)     # ② 语言查表
+    lang_emb = lang_emb * sqrt(960)
+    state_emb = self.state_proj(state)                     # ③ state 投影
+    return cat([...]), pad_masks, att_masks                # ④ 拼接 + 造 mask
 ```
+
+我们只换 ★ 那一行。①②③④ 原样跑 lerobot 的 CPU 代码。
+
+```
+┌──────────────────────────────────────────────┐
+│ embed_prefix（组装函数，lerobot 的）          │
+│                                              │
+│   ┌──────────────┐                           │
+│   │ embed_image  │ ← ★ 换成 NPU 结果          │
+│   └──────────────┘                           │
+│   × sqrt(960)         ← 原版 CPU              │
+│   语言查表             ← 原版 CPU              │
+│   state 投影           ← 原版 CPU              │
+│   拼接 + 造 mask       ← 原版 CPU              │
+└──────────────────────────────────────────────┘
+
+再往后：backbone、10 步去噪、采样 —— 全是 lerobot，一行没动
+```
+
+**CPU 版 SigLIP 一次都不会跑**，因为它唯一的入口 `embed_image` 已经被换掉了。
+我们调用 `embed_prefix`，是为了复用它另外四件事——自己重写就等于分叉了
+lerobot，门禁也就失去意义。
+
+### 骨架：两层，每层都是「记住 → 装上 → 跑 → 拆掉」
+
+外层（`run_hybrid_forward` 里）：
+
+```python
+orig_embed_prefix = policy.model.embed_prefix         # ① 记住原来的
+policy.model.embed_prefix = _wrapped_embed_prefix     # ② 装上去
+try:
+    chunk = policy.predict_action_chunk(batch, noise) # ③ 跑
+finally:
+    policy.model.embed_prefix = orig_embed_prefix     # ④ 一定拆掉
+```
+
+内层（`_wrapped_embed_prefix` 里）：
+
+```python
+conn = runtime.encode(images)          # ★ NPU 在这里算，3 张图一次算完
+
+def _npu_embed_image(image):           # 取货窗口 —— 不做任何计算
+    return conn[i]                     # 按顺序把算好的第 i 张发出去
+
+vwe.embed_image = _npu_embed_image     # 装
+try:
+    out = orig_embed_prefix(*a, **kw)  # 调组装函数（它内部取货，其余照常）
+finally:
+    vwe.embed_image = orig_embed_image # 拆
+```
+
+### 执行顺序（这一点从代码上很难看出来）
+
+```
+warmup_npu()                      ← 计时之外：建 runtime + 一次丢弃的 encode
+policy.predict_action_chunk(...)
+  └→ sample_actions()                        lerobot 的代码
+       └→ embed_prefix(...)                  已被换成我们的
+            ├→ runtime.encode(images)   ★ NPU 真正在这里跑，3 张一次
+            ├→ 装取货窗口
+            └→ orig_embed_prefix(...)        lerobot 原版组装
+                 └→ embed_image ×3           从取货窗口拿，不计算
+       └→ backbone、10 步去噪                 全 CPU，没动过
+```
+
+**NPU 计算发生在 lerobot 原版组装开始之前**，`embed_image` 那层只负责发货。
+
+### 为什么 `try/finally` 不能省
+
+`policy.model.embed_prefix = ...` 是**永久修改一个活对象**。没有 `finally`
+的话，推理中途抛异常就永远执行不到恢复那行，这个 policy 对象就一直带着我们
+的 wrapper——而它引用的 `conn` 是上一次的旧数据，后续会**静默返回错误的图像
+编码**。`verify_adapter.py` 正好在同一进程里连跑两次（NPU 一次、CPU 一次），
+所以这不是假想。
+
+`finally` 的语义是：无论正常结束、`return`、还是抛异常，都一定执行。
+
+### 为什么要两层，而不是只换 `embed_image`
+
+只换一层是可以的，而且更简洁——没有外层 wrapper，没有取货计数器：
+
+```python
+def _npu_embed_image(image):
+    return runtime.encode([image])[0]     # 按需算，一层搞定
+```
+
+**门禁照过**（cosine 0.99900）。但实测慢 100 ms：
+
+```
+批量（现在这样）  818 / 834 / 838 ms
+惰性（每张各算）  882 / 914 / 963 ms      纯 CPU 是 913 ms
+```
+
+整个 1.07× 的收益没了，所以保留了两层。**这是纯性能妥协，不是设计需要**，
+原因也没查清（`smolvla_inference.py` 的注释里如实记了排除掉的假设）。
 
 **这就是为什么 `make verify` 有说服力**：比的是同一个官方模型，换掉
 SigLIP 前后的差别。不是"我的实现 vs 我的另一个实现"。
