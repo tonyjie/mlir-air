@@ -65,6 +65,7 @@
   .pill.future { background: #f3f4f6; color: #6b7280; border: 1px solid #d1d5db; }
   .fig { text-align: center; margin: 1.8rem 0; }
   .fig img { max-width: 100%; width: 640px; border-radius: 8px; border: 1px solid var(--card-border); box-shadow: 0 2px 10px rgba(0,0,0,0.06); }
+  .fig svg { max-width: 100%; height: auto; }
   .fig figcaption { color: var(--muted); font-size: 0.85rem; margin-top: 0.6rem; }
   .big-num { font-size: 2.2rem; font-weight: 700; color: var(--accent); line-height: 1; }
   .stat-row { display: flex; flex-wrap: wrap; gap: 1rem; margin: 1.5rem 0; }
@@ -82,12 +83,22 @@
   .toc ol { margin: 0.5rem 0; padding-left: 1.4rem; }
   .toc .grp { font-weight: 700; color: #3730a3; margin-top: 0.6rem; }
   .shape { font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 0.82rem; background: #eef2ff; color: #3730a3; padding: 0.05rem 0.35rem; border-radius: 4px; white-space: nowrap; }
+  .op { display:inline-block; font-family:"SF Mono",Menlo,Consolas,monospace; font-size:0.76rem; background:#f3f4f6; color:#374151; border:1px solid #d1d5db; border-radius:4px; padding:0.02rem 0.3rem; }
   .knl { display:inline-block; font-family:"SF Mono",Menlo,Consolas,monospace; font-size:0.76rem; background:#ecfdf5; color:#065f46; border:1px solid #6ee7b7; border-radius:4px; padding:0.02rem 0.3rem; }
+  .knl.miss { background:#fef2f2; color:#991b1b; border-color:#fca5a5; }
+  .knl.adapt { background:#fffbeb; color:#92400e; border-color:#fcd34d; }
+  table.arch { font-size: 0.85rem; }
+  table.arch td { vertical-align: top; }
+  table.arch th { background:#eff6ff; }
   .stage-h { font-size:1.2rem; margin-top:2.2rem; padding:0.5rem 0.9rem; border-radius:6px; font-weight:700; }
   .stage-h.v { background:#fdf2f8; border-left:5px solid #be185d; color:#9d174d; }
   .stage-h.b { background:#dbeafe; border-left:5px solid #2563eb; color:#1e40af; }
   .stage-h.e { background:#f0fdf4; border-left:5px solid #15803d; color:#166534; }
   .legend { font-size:0.85rem; color:var(--muted); margin:0.6rem 0; }
+  .hier { font-size:0.9rem; margin:0.4rem 0 1rem; }
+  .hier .mod { font-weight:600; color:#1e40af; }
+  .hier .sub { padding-left:1.4rem; color:#374151; position:relative; }
+  .hier .sub::before { content:"└─"; position:absolute; left:0.2rem; color:#9ca3af; }
   .bar-row { display: grid; grid-template-columns: 130px 1fr 190px; align-items: center; gap: 0.8rem; margin: 1.1rem 0; font-size: 0.9rem; }
   .bar-track { background: #f3f4f6; border-radius: 5px; height: 20px; position: relative; }
   .bar-fill { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 5px; }
@@ -172,12 +183,11 @@
 
   <p>SmolVLA is three blocks chained like a pipeline: a frozen <b>vision encoder</b>, a compact
     <b>language backbone</b> that fuses everything into one understanding, and an <b>action expert</b>
-    that denoises that understanding into motion. The official diagram below shows how they connect —
-    we use it instead of a wall of architecture text.</p>
+    that denoises that understanding into motion.</p>
 
   <div class="fig">
     <img src="smolvla-modelarch.png" alt="SmolVLA architecture diagram (Hugging Face)">
-    <figcaption>Official SmolVLA architecture diagram (Hugging Face).</figcaption>
+    <figcaption>Official SmolVLA architecture diagram (Hugging Face) — the high-level picture.</figcaption>
   </div>
 
   <div class="card">
@@ -192,6 +202,215 @@
         model, by design.</li>
     </ul>
   </div>
+
+  <h3>Full architecture — every module, and the shape on every wire</h3>
+  <p>The HF diagram is the official summary; this is our own, more detailed map of the same
+    pipeline — every module and the tensor shape flowing between them (measured on the real
+    checkpoint, batch = 1).</p>
+
+  <div class="fig">
+  <svg viewBox="0 0 880 440" xmlns="http://www.w3.org/2000/svg" font-family="system-ui, sans-serif">
+    <defs><marker id="aa" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#4b5563"/></marker></defs>
+
+    <!-- inputs -->
+    <rect x="10" y="20" width="150" height="42" rx="6" fill="#f3f4f6" stroke="#9ca3af"/>
+    <text x="85" y="38" text-anchor="middle" font-size="11.5" fill="#374151">3 camera images</text>
+    <text x="85" y="53" text-anchor="middle" font-size="10" fill="#6b7280">(3,3,512,512)</text>
+    <rect x="10" y="120" width="150" height="42" rx="6" fill="#f3f4f6" stroke="#9ca3af"/>
+    <text x="85" y="138" text-anchor="middle" font-size="11.5" fill="#374151">instruction text</text>
+    <text x="85" y="153" text-anchor="middle" font-size="10" fill="#6b7280">"pick up the cube"</text>
+    <rect x="10" y="210" width="150" height="42" rx="6" fill="#f3f4f6" stroke="#9ca3af"/>
+    <text x="85" y="228" text-anchor="middle" font-size="11.5" fill="#374151">robot state</text>
+    <text x="85" y="243" text-anchor="middle" font-size="10" fill="#6b7280">(1,32)</text>
+    <rect x="10" y="330" width="150" height="42" rx="6" fill="#f3f4f6" stroke="#9ca3af"/>
+    <text x="85" y="348" text-anchor="middle" font-size="11.5" fill="#374151">random noise</text>
+    <text x="85" y="363" text-anchor="middle" font-size="10" fill="#6b7280">(1,50,32)</text>
+
+    <!-- embed modules -->
+    <rect x="195" y="16" width="140" height="50" rx="6" fill="#fdf2f8" stroke="#be185d"/>
+    <text x="265" y="35" text-anchor="middle" font-size="11" font-weight="600" fill="#9d174d">① SigLIP + connector</text>
+    <text x="265" y="52" text-anchor="middle" font-size="10" fill="#9d174d">→ 64 tokens/img</text>
+    <rect x="195" y="118" width="140" height="46" rx="6" fill="#eef2ff" stroke="#6366f1"/>
+    <text x="265" y="136" text-anchor="middle" font-size="10.5" font-weight="600" fill="#3730a3">token embedding</text>
+    <text x="265" y="152" text-anchor="middle" font-size="10" fill="#3730a3">lookup</text>
+    <rect x="195" y="208" width="140" height="46" rx="6" fill="#eef2ff" stroke="#6366f1"/>
+    <text x="265" y="226" text-anchor="middle" font-size="10.5" font-weight="600" fill="#3730a3">state_proj</text>
+    <text x="265" y="242" text-anchor="middle" font-size="10" fill="#3730a3">Linear</text>
+
+    <line x1="160" y1="41" x2="193" y2="41" stroke="#4b5563" stroke-width="1.5" marker-end="url(#aa)"/>
+    <line x1="160" y1="141" x2="193" y2="141" stroke="#4b5563" stroke-width="1.5" marker-end="url(#aa)"/>
+    <line x1="160" y1="231" x2="193" y2="231" stroke="#4b5563" stroke-width="1.5" marker-end="url(#aa)"/>
+
+    <!-- concat / prefix -->
+    <rect x="360" y="80" width="70" height="130" rx="6" fill="#fff" stroke="#6366f1" stroke-dasharray="3 2"/>
+    <text x="395" y="130" text-anchor="middle" font-size="11" font-weight="600" fill="#3730a3" transform="rotate(-90 395 145)">concat → prefix</text>
+    <line x1="335" y1="41" x2="358" y2="110" stroke="#4b5563" stroke-width="1.3" marker-end="url(#aa)"/>
+    <text x="330" y="80" font-size="9.5" fill="#6b7280">(192,960)</text>
+    <line x1="335" y1="141" x2="358" y2="145" stroke="#4b5563" stroke-width="1.3" marker-end="url(#aa)"/>
+    <text x="336" y="128" font-size="9.5" fill="#6b7280">(48,960)</text>
+    <line x1="335" y1="231" x2="358" y2="180" stroke="#4b5563" stroke-width="1.3" marker-end="url(#aa)"/>
+    <text x="332" y="210" font-size="9.5" fill="#6b7280">(1,960)</text>
+
+    <!-- backbone (NPU-neutral in Part A) -->
+    <rect x="470" y="70" width="150" height="150" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="2"/>
+    <text x="545" y="98" text-anchor="middle" font-size="12" font-weight="700" fill="#1e40af">② backbone</text>
+    <text x="545" y="115" text-anchor="middle" font-size="10" fill="#1e3a8a">SmolLM2-360M</text>
+    <text x="545" y="130" text-anchor="middle" font-size="10" fill="#1e3a8a">16 layers, runs 1×</text>
+    <text x="545" y="182" text-anchor="middle" font-size="9.5" fill="#6b7280">outputs per-layer</text>
+    <text x="545" y="196" text-anchor="middle" font-size="9.5" fill="#6b7280">K/V cache</text>
+    <line x1="430" y1="145" x2="468" y2="145" stroke="#4b5563" stroke-width="2" marker-end="url(#aa)"/>
+    <text x="432" y="138" font-size="9.5" fill="#6b7280">(1,241,960)</text>
+
+    <!-- action expert -->
+    <rect x="660" y="70" width="160" height="180" rx="8" fill="#f0fdf4" stroke="#15803d" stroke-width="2"/>
+    <text x="740" y="94" text-anchor="middle" font-size="12" font-weight="700" fill="#15803d">③ action expert</text>
+    <text x="740" y="111" text-anchor="middle" font-size="10" fill="#166534">16 layers, width 720</text>
+    <text x="740" y="128" text-anchor="middle" font-size="10" font-weight="700" fill="#166534">runs 10× (denoise)</text>
+    <text x="740" y="150" text-anchor="middle" font-size="9.5" fill="#166534">even layer: self-attn</text>
+    <text x="740" y="164" text-anchor="middle" font-size="9.5" fill="#166534">odd layer: cross-attn ↓</text>
+    <text x="740" y="182" text-anchor="middle" font-size="9" fill="#6b7280">(reads backbone K/V)</text>
+    <line x1="620" y1="175" x2="658" y2="160" stroke="#15803d" stroke-width="2" stroke-dasharray="4 2" marker-end="url(#aa)"/>
+    <text x="600" y="238" font-size="9.5" fill="#15803d" font-weight="600">K/V cache (1,241,320)/layer</text>
+    <line x1="160" y1="351" x2="655" y2="240" stroke="#4b5563" stroke-width="1.3" marker-end="url(#aa)"/>
+    <text x="300" y="330" font-size="9.5" fill="#6b7280">noise (1,50,32) → action_in_proj</text>
+
+    <path d="M 740 250 q 40 40 0 60 q -40 20 -80 0" fill="none" stroke="#15803d" stroke-width="1.5" stroke-dasharray="3 2" marker-end="url(#aa)"/>
+    <text x="700" y="330" font-size="9.5" fill="#15803d">× 10 steps</text>
+
+    <rect x="670" y="360" width="150" height="42" rx="6" fill="#f3f4f6" stroke="#9ca3af"/>
+    <text x="745" y="378" text-anchor="middle" font-size="11.5" fill="#374151">action chunk</text>
+    <text x="745" y="393" text-anchor="middle" font-size="10" fill="#6b7280">(1,50,6)</text>
+    <line x1="740" y1="250" x2="745" y2="358" stroke="#4b5563" stroke-width="1.5" marker-end="url(#aa)"/>
+  </svg>
+  <figcaption>End-to-end architecture. Solid arrows = data flow (with shapes); the green dashed arrow is the
+  key interaction — the backbone computes a K/V cache <b>once</b>, and the action expert reads it on every
+  one of its 10 denoise iterations.</figcaption>
+  </div>
+
+  <div class="legend">
+    Legend: <span class="shape">(tensor shape)</span> · <span class="op">operation</span> = the kind of
+    math a step performs · a <b>module</b> is a named sub-network. Shapes matter later — they're the
+    setup for why NPU performance varies so much between stages (Section 8).
+  </div>
+
+  <div class="stage-h v">① Vision encoder: SigLIP + connector</div>
+  <p>A 12-layer ViT turns each camera image into 64 tokens.</p>
+  <div class="hier">
+    <div class="mod">Module: SigLIP ViT (repeats its encoder block ×12)</div>
+    <div class="sub">LayerNorm → self-attention (QKV, softmax, O) → LayerNorm → MLP (fc1, GELU, fc2)</div>
+  </div>
+  <table class="arch">
+    <tr><th>Step</th><th>Input → output shape</th><th>Operation</th></tr>
+    <tr><td>patch embedding — a Conv2d, 16×16 patches</td><td><span class="shape">(1,3,512,512)</span> → <span class="shape">(1,768,32,32)</span></td><td><span class="op">conv2d</span></td></tr>
+    <tr><td>flatten + position embedding → 1024 patch tokens</td><td>→ <span class="shape">(1,1024,768)</span></td><td><span class="op">embedding</span></td></tr>
+    <tr><td colspan="3" style="background:#fdf2f8;font-weight:600">↓ repeats inside each of the 12 ViT blocks</td></tr>
+    <tr><td>LayerNorm (before attention)</td><td><span class="shape">(1,1024,768)</span></td><td><span class="op">LayerNorm</span></td></tr>
+    <tr><td>self-attn Q/K/V projections → 12 heads (head_dim=64)</td><td>Q,K,V each <span class="shape">(1,1024,768)</span> → <span class="shape">(1,12,1024,64)</span></td><td><span class="op">matmul</span></td></tr>
+    <tr><td>self-attention, no mask (all patches visible): Q 1024 × K 1024</td><td>scores <span class="shape">(1,12,1024,1024)</span> → softmax → ×V → <span class="shape">(1,12,1024,64)</span></td><td><span class="op">matmul</span>+<span class="op">softmax</span>+<span class="op">matmul</span></td></tr>
+    <tr><td>concat heads + O projection</td><td><span class="shape">(1,1024,768)</span> → <span class="shape">(1,1024,768)</span></td><td><span class="op">matmul</span></td></tr>
+    <tr><td>LayerNorm (before MLP)</td><td><span class="shape">(1,1024,768)</span></td><td><span class="op">LayerNorm</span></td></tr>
+    <tr><td>MLP: fc1 → GELU → fc2</td><td><span class="shape">(1,1024,768)</span> → <span class="shape">(1,1024,3072)</span> → <span class="shape">(1,1024,768)</span></td><td><span class="op">matmul</span> + <span class="op">GELU-tanh</span></td></tr>
+  </table>
+  <div class="hier" style="margin-top:1.2rem">
+    <div class="mod">Module: connector (vision → language dimension)</div>
+    <div class="sub">pixel-shuffle (space-to-depth) → Linear projection</div>
+  </div>
+  <table class="arch">
+    <tr><th>Step</th><th>Input → output shape</th><th>Operation</th></tr>
+    <tr><td>pixel-shuffle — groups 4×4 neighboring patches (pure reshape)</td><td><span class="shape">(1,1024,768)</span> → <span class="shape">(1,64,12288)</span></td><td><span class="op">pixel-shuffle</span></td></tr>
+    <tr><td>projection Linear</td><td><span class="shape">(1,64,12288)</span> → <span class="shape">(1,64,960)</span></td><td><span class="op">matmul</span></td></tr>
+  </table>
+  <p class="legend">→ <b>64 vision tokens</b> (960-dim) per image — note the 1024×1024 attention matrix, the largest in the model.</p>
+
+  <div class="stage-h b">② Language backbone: SmolLM2-360M (16 layers)</div>
+  <p>Reads a 241-token prefix (vision + language + state tokens, concatenated) once, and produces a
+    K/V cache for every layer — a Llama-style decoder with a non-causal, prefix-LM mask.</p>
+  <div class="hier">
+    <div class="mod">Module: transformer layer (repeats ×16)</div>
+    <div class="sub">RMSNorm → attention (Q/K/V, RoPE, scores+softmax, O) → residual → RMSNorm → SwiGLU MLP → residual</div>
+  </div>
+  <table class="arch">
+    <tr><th>Step (per layer)</th><th>Input → output shape</th><th>Operation</th></tr>
+    <tr><td>1. input RMSNorm</td><td><span class="shape">(1,241,960)</span></td><td><span class="op">RMSNorm</span></td></tr>
+    <tr><td>2. Q projection → 15 heads (head_dim=64)</td><td><span class="shape">(1,241,960)</span> → <span class="shape">(1,15,241,64)</span></td><td><span class="op">matmul</span></td></tr>
+    <tr><td>&nbsp;&nbsp;&nbsp;K / V projection → GQA, 5 heads (shared by 3 Q heads each)</td><td><span class="shape">(1,241,960)</span> → <span class="shape">(1,5,241,64)</span></td><td><span class="op">matmul</span></td></tr>
+    <tr><td>3. RoPE positional encoding (on Q, K)</td><td>head_dim=64, θ=10000</td><td><span class="op">RoPE</span></td></tr>
+    <tr><td>4. self-attention, prefix-LM mask: Q 241 × K 241</td><td>scores <span class="shape">(1,15,241,241)</span> → +mask → softmax → ×V → <span class="shape">(1,15,241,64)</span></td><td><span class="op">matmul</span>+<span class="op">softmax</span>+<span class="op">matmul</span></td></tr>
+    <tr><td>5. O projection</td><td><span class="shape">(1,241,960)</span> → <span class="shape">(1,241,960)</span></td><td><span class="op">matmul</span></td></tr>
+    <tr><td>6. residual add + post-attention RMSNorm</td><td><span class="shape">(1,241,960)</span></td><td><span class="op">add</span>+<span class="op">RMSNorm</span></td></tr>
+    <tr><td>7. SwiGLU MLP: gate/up → SiLU → down</td><td><span class="shape">(1,241,960)</span> → <span class="shape">(1,241,2560)</span> → <span class="shape">(1,241,960)</span></td><td><span class="op">matmul</span>+<span class="op">SiLU</span>+<span class="op">matmul</span></td></tr>
+    <tr><td>(after all 16 layers) final RMSNorm</td><td><span class="shape">(1,241,960)</span></td><td><span class="op">RMSNorm</span></td></tr>
+  </table>
+  <p class="legend">→ produces a 16-layer K/V cache (each layer <span class="shape">(241,5,64)</span>), computed <b>once</b> and reused by the action expert on all 10 of its steps.</p>
+
+  <div class="stage-h e">③ Action expert (16 layers, ×10 denoise loop)</div>
+  <p>Starting from random noise, runs this 16-layer expert once per denoise step, gradually turning
+    noise into actions.</p>
+  <div class="hier">
+    <div class="mod">Module: suffix embedding (action + timestep → 50 action tokens)</div>
+    <div class="sub">action_in_proj (Linear) · sinusoidal time embedding · concat(action, time) → action_time_mlp (Linear → SiLU → Linear)</div>
+  </div>
+  <table class="arch">
+    <tr><th>Step</th><th>Input → output shape</th><th>Operation</th></tr>
+    <tr><td>action_in_proj</td><td><span class="shape">(1,50,32)</span> → <span class="shape">(1,50,720)</span></td><td><span class="op">matmul</span></td></tr>
+    <tr><td>time embedding (sine/cosine) + concat with action</td><td>→ <span class="shape">(1,50,1440)</span></td><td><span class="op">sin/cos</span></td></tr>
+    <tr><td>action_time_mlp: in → SiLU → out</td><td><span class="shape">(1,50,1440)</span> → <span class="shape">(1,50,720)</span> → <span class="shape">(1,50,720)</span></td><td><span class="op">matmul</span>+<span class="op">SiLU</span></td></tr>
+  </table>
+  <div class="hier" style="margin-top:1.2rem">
+    <div class="mod">Module: expert transformer layer (repeats ×16, width 720)</div>
+    <div class="sub">attention alternates by layer: even = self-attention among action tokens; odd = cross-attention into the backbone's K/V cache</div>
+  </div>
+
+  <p>The alternation is easier to see visually — what changes is <b>where K and V come from</b>:</p>
+  <div class="fig">
+  <svg viewBox="0 0 820 300" xmlns="http://www.w3.org/2000/svg" font-family="system-ui, sans-serif">
+    <defs><marker id="ae" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#4b5563"/></marker></defs>
+    <text x="200" y="24" text-anchor="middle" font-size="13" font-weight="700" fill="#15803d">EVEN layers (0,2,4…): self-attention</text>
+    <rect x="60" y="45" width="120" height="46" rx="6" fill="#f0fdf4" stroke="#15803d"/>
+    <text x="120" y="64" text-anchor="middle" font-size="10.5" fill="#166534">50 action tokens</text>
+    <text x="120" y="80" text-anchor="middle" font-size="9.5" fill="#6b7280">(1,50,720)</text>
+    <rect x="250" y="45" width="110" height="46" rx="6" fill="#ecfdf5" stroke="#059669"/>
+    <text x="305" y="66" text-anchor="middle" font-size="10.5" font-weight="600" fill="#065f46">attention</text>
+    <text x="305" y="82" text-anchor="middle" font-size="9" fill="#065f46">Q,K,V all from actions</text>
+    <line x1="180" y1="60" x2="248" y2="60" stroke="#15803d" stroke-width="1.5" marker-end="url(#ae)"/>
+    <text x="195" y="54" font-size="9" fill="#166534">Q</text>
+    <path d="M 120 91 q 0 40 90 40 q 40 0 60 -30" fill="none" stroke="#15803d" stroke-width="1.5" marker-end="url(#ae)"/>
+    <text x="150" y="145" font-size="9" fill="#166534">K, V (also from the 50 action tokens)</text>
+    <text x="120" y="185" text-anchor="middle" font-size="9.5" fill="#6b7280">→ action tokens mix among themselves</text>
+
+    <line x1="410" y1="35" x2="410" y2="270" stroke="#e5e7eb" stroke-width="1.5"/>
+
+    <text x="620" y="24" text-anchor="middle" font-size="13" font-weight="700" fill="#2563eb">ODD layers (1,3,5…): cross-attention</text>
+    <rect x="470" y="45" width="120" height="46" rx="6" fill="#f0fdf4" stroke="#15803d"/>
+    <text x="530" y="64" text-anchor="middle" font-size="10.5" fill="#166534">50 action tokens</text>
+    <text x="530" y="80" text-anchor="middle" font-size="9.5" fill="#6b7280">(1,50,720)</text>
+    <rect x="660" y="45" width="110" height="46" rx="6" fill="#ecfdf5" stroke="#059669"/>
+    <text x="715" y="66" text-anchor="middle" font-size="10.5" font-weight="600" fill="#065f46">attention</text>
+    <text x="715" y="82" text-anchor="middle" font-size="9" fill="#065f46">Q from actions</text>
+    <line x1="590" y1="60" x2="658" y2="60" stroke="#2563eb" stroke-width="1.5" marker-end="url(#ae)"/>
+    <text x="605" y="54" font-size="9" fill="#1e40af">Q</text>
+    <rect x="600" y="150" width="200" height="60" rx="6" fill="#dbeafe" stroke="#2563eb" stroke-width="2"/>
+    <text x="700" y="172" text-anchor="middle" font-size="10.5" font-weight="700" fill="#1e40af">② backbone K/V cache</text>
+    <text x="700" y="189" text-anchor="middle" font-size="9.5" fill="#1e3a8a">computed ONCE, (1,241,320)/layer</text>
+    <text x="700" y="203" text-anchor="middle" font-size="9" fill="#6b7280">frozen across all 10 denoise steps</text>
+    <path d="M 700 148 q 0 -30 15 -55" fill="none" stroke="#2563eb" stroke-width="1.8" stroke-dasharray="4 2" marker-end="url(#ae)"/>
+    <text x="600" y="130" font-size="9.5" fill="#1e40af" font-weight="600">K, V come from the backbone, NOT the actions</text>
+    <text x="530" y="240" text-anchor="middle" font-size="9.5" fill="#6b7280">→ action tokens absorb the vision/language context</text>
+  </svg>
+  <figcaption>Both layer types run the same attention operation; only the <b>source of K and V</b> differs —
+  self-attention uses the action tokens' own K/V, cross-attention reuses the backbone's frozen K/V cache.</figcaption>
+  </div>
+
+  <table class="arch">
+    <tr><th>Step</th><th>Input → output shape</th><th>Operation / interaction</th></tr>
+    <tr><td>Even layers — self-attention, causal: Q 50 × K 50 (K/V from the action tokens)</td><td>Q <span class="shape">(1,15,50,64)</span>, K/V <span class="shape">(1,5,50,64)</span> → scores <span class="shape">(1,15,50,50)</span> → ×V → <span class="shape">(1,15,50,64)</span></td><td><span class="op">matmul</span>+<span class="op">softmax</span>+<span class="op">matmul</span></td></tr>
+    <tr><td>Odd layers — cross-attention, no mask: Q 50 × K 241 (K/V from the backbone cache)</td><td>Q <span class="shape">(1,15,50,64)</span>, K/V <span class="shape">(1,5,241,64)</span> → scores <span class="shape">(1,15,50,241)</span> → ×V → <span class="shape">(1,15,50,64)</span></td><td><span class="op">matmul</span>+<span class="op">softmax</span>+<span class="op">matmul</span></td></tr>
+    <tr><td>SwiGLU MLP (each layer)</td><td><span class="shape">(1,50,720)</span> → <span class="shape">(1,50,2048)</span> → <span class="shape">(1,50,720)</span></td><td><span class="op">matmul</span>+<span class="op">SiLU</span></td></tr>
+    <tr><td>action_out_proj (final)</td><td><span class="shape">(1,50,720)</span> → <span class="shape">(1,50,32)</span></td><td><span class="op">matmul</span></td></tr>
+  </table>
+  <p class="legend">→ the final action chunk is <span class="shape">(1,50,6)</span>. The expert runs
+    <b>10 times</b> per inference; the backbone runs only <b>once</b>. Notice the shapes shrinking stage
+    to stage — 1024 → 241 → 50 — that's the setup for Section 8.</p>
 
   <h2 id="profile">3. Where CPU time goes today</h2>
 
@@ -249,9 +468,106 @@
     maximum NPU coverage, is the whole strategy.
   </div>
 
-  <p>Fusion is what made vision cheap enough to win: per image, kernel launches collapse
-    <b>121 → 38 dispatches</b> (<b>368 → 141.6 ms</b>). Each dispatch pays roughly the same fixed
-    overhead regardless of the work inside it, so fewer, fatter dispatches is a direct win.</p>
+  <div class="fig">
+  <svg viewBox="0 0 860 360" xmlns="http://www.w3.org/2000/svg" font-family="system-ui, sans-serif">
+    <defs><marker id="ar2" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#6b7280"/></marker></defs>
+
+    <rect x="20" y="14" width="820" height="44" rx="8" fill="#fef3c7" stroke="#d97706" stroke-width="1.5" stroke-dasharray="4 3"/>
+    <text x="32" y="32" font-size="12" font-weight="700" fill="#92400e">CPU</text>
+    <text x="140" y="32" font-size="12" fill="#78350f">3 camera images · instruction text · robot state</text>
+    <text x="140" y="50" font-size="11.5" fill="#92400e">(image resize/pad, tokenize — cheap preprocessing)</text>
+    <line x1="430" y1="58" x2="430" y2="80" stroke="#6b7280" stroke-width="2" marker-end="url(#ar2)"/>
+
+    <rect x="60" y="83" width="740" height="86" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="3"/>
+    <text x="72" y="101" font-size="12" font-weight="700" fill="#1e40af">NPU2 ★</text>
+    <text x="430" y="103" text-anchor="middle" font-size="13" font-weight="700" fill="#1e3a8a">① Vision encoder — SigLIP, 12 layers, ×3 cameras</text>
+    <text x="430" y="124" text-anchor="middle" font-size="11" fill="#1e3a8a">per layer: LayerNorm → Q/K/V → bidirectional attention → O → residual → LayerNorm → GELU MLP</text>
+    <text x="430" y="142" text-anchor="middle" font-size="11" fill="#1e3a8a">then ①b connector: pixel-shuffle → projection → 64 tokens per image</text>
+    <text x="430" y="160" text-anchor="middle" font-size="10.5" fill="#6b7280">3 dispatches per layer · 38 per image</text>
+    <line x1="430" y1="169" x2="430" y2="189" stroke="#6b7280" stroke-width="2" marker-end="url(#ar2)"/>
+
+    <rect x="20" y="192" width="820" height="34" rx="8" fill="#fef3c7" stroke="#d97706" stroke-width="1.5" stroke-dasharray="4 3"/>
+    <text x="32" y="213" font-size="12" font-weight="700" fill="#92400e">CPU</text>
+    <text x="430" y="213" text-anchor="middle" font-size="12" fill="#78350f">assemble the prefix: 192 vision + 48 language + 1 state = 241 tokens</text>
+    <line x1="430" y1="226" x2="430" y2="246" stroke="#6b7280" stroke-width="2" marker-end="url(#ar2)"/>
+
+    <rect x="60" y="249" width="740" height="62" rx="8" fill="#fef3c7" stroke="#d97706" stroke-width="2" stroke-dasharray="4 3"/>
+    <text x="72" y="267" font-size="12" font-weight="700" fill="#92400e">CPU</text>
+    <text x="430" y="269" text-anchor="middle" font-size="13" font-weight="700" fill="#78350f">② Language backbone — SmolLM2-360M, 16 layers</text>
+    <text x="430" y="289" text-anchor="middle" font-size="11" fill="#78350f">per layer: RMSNorm → Q/K/V → RoPE → masked attention → O → residual → SwiGLU MLP</text>
+    <text x="430" y="305" text-anchor="middle" font-size="10.5" fill="#92400e">ported to the NPU and verified, but ~3× slower there → kept on CPU (Section 8)</text>
+    <line x1="430" y1="311" x2="430" y2="331" stroke="#6b7280" stroke-width="2" marker-end="url(#ar2)"/>
+
+    <rect x="20" y="334" width="820" height="24" rx="8" fill="#fef3c7" stroke="#d97706" stroke-width="1.5" stroke-dasharray="4 3"/>
+    <text x="32" y="351" font-size="12" font-weight="700" fill="#92400e">CPU</text>
+    <text x="430" y="351" text-anchor="middle" font-size="12" fill="#78350f">③ action expert · 10-step denoise → (50, 6) action chunk</text>
+  </svg>
+  <figcaption>The shipping configuration: the vision encoder on the NPU, everything else on the CPU. The
+  backbone's NPU port exists and is verified, but is slower there.</figcaption>
+  </div>
+
+  <h3>Which original operator each NPU kernel replaces</h3>
+  <p style="margin-bottom:0.3rem"><b>① Vision (SigLIP)</b> — seq = 1024 patch tokens, hidden 768, 12 heads (plain MHA), no mask</p>
+  <table class="arch">
+    <tr><th>Original operator</th><th>NPU kernel</th><th>Shape</th></tr>
+    <tr><td><code>Conv2d</code> patch embed</td><td><span class="knl adapt">host numpy</span> — im2col reshape and its matmul both run on CPU</td><td><span class="shape">1024×768×768</span></td></tr>
+    <tr><td><code>nn.LayerNorm</code> ×2/layer + final</td><td><span class="knl">LayerNorm</span> (affine γ,β)</td><td><span class="shape">1024×768</span></td></tr>
+    <tr><td><code>q/k/v/out_proj</code> (+bias)</td><td><span class="knl">GEMM</span> (bias folded in)</td><td><span class="shape">1024×768×768</span></td></tr>
+    <tr><td><code>eager_attention</code> (bidirectional)</td><td><span class="knl">FlashAttention</span> (non-causal)</td><td><span class="shape">1024×1024</span>, 12/12</td></tr>
+    <tr><td><code>gelu_pytorch_tanh</code></td><td><span class="knl">GELU-tanh</span></td><td><span class="shape">1024×3072</span></td></tr>
+    <tr><td><code>fc1 / fc2</code> (+bias)</td><td><span class="knl">GEMM</span></td><td><span class="shape">1024×768×3072</span> / <span class="shape">1024×3072×768</span></td></tr>
+    <tr><td>connector projection</td><td><span class="knl">GEMM</span></td><td><span class="shape">64×12288×960</span></td></tr>
+  </table>
+
+  <p style="margin-bottom:0.3rem"><b>② Backbone (SmolLM2)</b> — seq = 241 (padded 256), hidden 960, GQA 15 Q / 5 KV heads, prefix-LM mask</p>
+  <table class="arch">
+    <tr><th>Original operator</th><th>NPU kernel</th><th>Shape</th></tr>
+    <tr><td><code>LlamaRMSNorm</code> ×2/layer</td><td><span class="knl">RMSNorm</span></td><td><span class="shape">256×960</span></td></tr>
+    <tr><td><code>q/k/v_proj</code></td><td><span class="knl">GEMM</span></td><td><span class="shape">256×960×960</span> / <span class="shape">256×960×320</span></td></tr>
+    <tr><td><code>apply_rotary_pos_emb</code></td><td><span class="knl">RoPE</span> (half-split)</td><td>head_dim 64</td></tr>
+    <tr><td><code>eager_attention</code> (prefix-LM mask)</td><td><span class="knl">GEMM</span> + <span class="knl">masked-softmax</span> + <span class="knl">GEMM</span></td><td>scores <span class="shape">15×256×256</span></td></tr>
+    <tr><td><code>o_proj</code> + residual</td><td><span class="knl">GEMM</span> + <span class="knl">EltwiseAdd</span></td><td><span class="shape">256×960×960</span></td></tr>
+    <tr><td><code>LlamaMLP</code> (SwiGLU)</td><td><span class="knl">GEMM</span> + <span class="knl">SiLU-Mul</span> + <span class="knl">GEMM</span></td><td><span class="shape">256×960×2560</span> / <span class="shape">256×2560×960</span></td></tr>
+  </table>
+  <p class="legend">Every kernel above comes from the shared <b>kernel_registry</b>, reused at SmolVLA's
+    shapes — except <code>masked-softmax</code> (written for this project) and <b>LayerNorm</b> /
+    <b>GELU-tanh</b> (extended and promoted for the vision work).</p>
+
+  <h3>What one layer actually dispatches</h3>
+  <p><span style="color:#1e40af;font-weight:600">[NPU elf:…]</span> = one compiled program = one dispatch
+    to the chip; <b>FUSED</b> means several operations were merged into that single program.
+    <b>(HOST)</b> = runs on CPU.</p>
+  <div class="card" style="font-family:'SF Mono',Menlo,Consolas,monospace;font-size:0.82rem;line-height:1.7;white-space:pre-wrap">
+<b style="font-family:inherit">① VISION — one of 12 layers</b>   <span class="knl">3 dispatches/layer</span>
+<span style="color:#6b7280">once per image, before layer 0: (HOST) im2col patch-embed + position-embedding → x [1024,768]</span>
+ ─<span style="color:#1e40af;font-weight:700">[NPU elf:vit_ln_qkv]</span>  <span class="knl">FUSED, 7 launches</span>  { LayerNorm1 + Q + K + V GEMM + biases }
+ ─<span style="color:#1e40af;font-weight:700">[NPU elf:flash_attn]</span>  bidirectional MHA  [1024,1024], 12 heads, scale 1/8
+ ─<span style="color:#1e40af;font-weight:700">[NPU elf:vit_o_ffn]</span>   <span class="knl">FUSED, 10 launches</span> { O + residual + LayerNorm2 + fc1 + GELU + fc2 + residual }
+     → layer_out [1024,768]
+<span style="color:#6b7280">once after 12 layers: [NPU elf:layer_norm] post_layernorm
+once per image:       (HOST) pixel-shuffle → [NPU elf:gemm_connector] 64×12288×960</span>
+<b style="font-family:inherit">→ 38 dispatches per image · 114 for all 3 cameras</b>
+
+<b style="font-family:inherit">② BACKBONE — one of 16 layers</b>   <span class="knl miss">13 dispatches/layer</span>
+<span style="color:#374151">x [256,960]</span>
+ ─<span style="color:#1e40af;font-weight:700">[NPU elf:rms_gemms_rope]</span>  <span class="knl">FUSED, 6 launches</span> { RMSNorm + Q/K/V GEMM + RoPE-Q + RoPE-K }
+ ─<b style="font-family:inherit">attention</b>  <span class="knl miss">NOT fused — 11 dispatches</span>
+     (HOST) reshape to heads, transpose Kᵀ, fold in the prefix-LM mask
+     5× <span style="color:#1e40af;font-weight:700">[NPU elf:qkt]</span> · 1× <span style="color:#1e40af;font-weight:700">[NPU elf:masked_softmax]</span> · 5× <span style="color:#1e40af;font-weight:700">[NPU elf:pv]</span>
+ ─<span style="color:#1e40af;font-weight:700">[NPU elf:o_ffn]</span>  <span class="knl">FUSED, 8 launches</span> { O + Add + RMSNorm + Gate + Up + SwiGLU + Down + Add }
+     → layer_out [256,960]
+<span style="color:#6b7280">once after 16 layers: (HOST) final RMSNorm</span>
+<b style="font-family:inherit">→ 208 dispatches per inference</b>
+  </div>
+
+  <div class="callout">
+    <b>Fusion, not just kernel choice, decided the winner.</b> Vision was fused: 12 layers cost only
+    <b>38 dispatches</b>. The backbone's attention wasn't: its 11 unfused dispatches/layer make
+    <b>208 in total</b>, on a stage 8× smaller than vision. Since each dispatch costs roughly the same
+    fixed overhead regardless of how much work it carries, the backbone pays that toll ~5× more often
+    for far less compute. Per image, fusion collapsed vision's launches <b>121 → 38 dispatches</b>
+    (<b>368 → 141.6 ms</b>).
+  </div>
 
   <h2 id="correct">6. Correctness</h2>
 
