@@ -145,6 +145,21 @@ jobs:
           # huggingface_hub). Required by all LLM compile and verify targets.
           pip install -r ../programming_examples/llms/llama32_1b/requirements.txt
 
+          # SmolVLA additionally needs lerobot: its verify gate compares against
+          # the upstream lerobot policy running on CPU, so the package IS the
+          # reference. Without this, llms/smolvla/run_npu2_verify.lit reports
+          # UNSUPPORTED (it REQUIRES the `lerobot` feature) and the model gets no
+          # verify coverage; its compile test runs either way.
+          #
+          # NOTE: lerobot pins numpy>=2.0,<2.3, so this upgrades numpy across a
+          # major version for every test in this job, not just SmolVLA's. That
+          # was checked on NPU2 hardware before enabling it here: numpy 1.26.4 ->
+          # 2.2.6 with qwen25_0_5b and qwen3_1_7b `make verify` PASSing
+          # identically before and after, and air/pyxrt unaffected. If a
+          # numpy-2 incompatibility ever surfaces elsewhere in this job, drop
+          # this line first — SmolVLA's verify will skip cleanly again.
+          pip install -r ../programming_examples/llms/smolvla/requirements.txt
+
           # Programming examples: non-LLM peano tests.
           # LLM tests are excluded here (--filter-out "llms/") and handled by
           # the dedicated targets below, which run sequentially (-j1) to avoid
