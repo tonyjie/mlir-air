@@ -12,475 +12,384 @@
     --npu: #dbeafe; --npu-border: #2563eb;
     --good: #dcfce7; --good-border: #16a34a;
     --warn: #fef9c3; --warn-border: #ca8a04;
-    --bad: #fee2e2; --bad-border: #dc2626;
     --code-bg: #f3f4f6;
-    --vision: #be185d; --vision-bg: #fdf2f8; --vision-border: #f9a8d4;
-    --backbone: #1e40af; --backbone-bg: #dbeafe; --backbone-border: #93c5fd;
-    --expert: #15803d; --expert-bg: #f0fdf4; --expert-border: #86efac;
   }
   * { box-sizing: border-box; }
-  html { scroll-behavior: smooth; }
   body {
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
-    background: var(--bg); color: var(--fg); line-height: 1.6;
-    margin: 0;
-    background-image:
-      radial-gradient(circle at 1px 1px, #00000009 1px, transparent 0);
-    background-size: 28px 28px;
+    background: var(--bg); color: var(--fg); line-height: 1.7;
+    margin: 0; padding: 2rem 1rem;
   }
-  .slide {
-    min-height: 100vh;
-    scroll-snap-align: start;
-    padding: 6.5vh 7vw 7vh;
-    display: flex;
-    align-items: center;
-    border-top: 6px solid var(--slide-color, var(--card-border));
-    position: relative;
+  .wrap { max-width: 980px; margin: 0 auto; }
+  h1 { font-size: 2.1rem; margin-bottom: 0.2rem; color: #111827; }
+  .subtitle { color: var(--muted); font-size: 1.1rem; margin-bottom: 0.5rem; }
+  .meta { color: var(--muted); font-size: 0.85rem; margin-bottom: 2.5rem; border-bottom: 1px solid var(--card-border); padding-bottom: 1rem; }
+  .meta a { color: var(--accent); }
+  .part-banner {
+    margin-top: 3.5rem; padding: 1rem 1.4rem; border-radius: 10px; font-size: 1.35rem; font-weight: 700;
   }
-  .slide.neutral { --slide-color: #c7d2fe; }
-  .slide.vision  { --slide-color: var(--vision); }
-  .slide.backbone{ --slide-color: var(--backbone); }
-  .slide.expert  { --slide-color: var(--expert); }
-  .slide.mix     { --slide-color: #7c3aed; }
-  .inner { max-width: 980px; margin: 0 auto; width: 100%; }
-  .slide-num {
-    position: absolute; top: 1.6rem; right: 2.2rem; font-size: 0.78rem; color: var(--muted);
-    font-family: "SF Mono", Menlo, Consolas, monospace; letter-spacing: 0.04em;
+  .part-banner.a { background: linear-gradient(90deg,#eef2ff,#f5f3ff); border:1px solid #c7d2fe; color:#3730a3; }
+  .part-banner.b { background: linear-gradient(90deg,#dbeafe,#eff6ff); border:1px solid #93c5fd; color:#1e40af; }
+  .part-banner .sub { display:block; font-size:0.92rem; font-weight:400; color:var(--muted); margin-top:0.3rem; }
+  h2 {
+    font-size: 1.5rem; margin-top: 2.8rem; padding: 0.5rem 0 0.5rem 0.9rem;
+    border-left: 5px solid var(--accent); color: #111827; background: linear-gradient(90deg, #eff6ff, transparent);
   }
-  .eyebrow {
-    text-transform: uppercase; letter-spacing: 0.12em; font-size: 0.78rem; font-weight: 700;
-    color: var(--slide-color, var(--accent)); margin-bottom: 0.6rem;
-  }
-  h1 { font-size: 2.6rem; margin: 0 0 0.3rem; color: #111827; letter-spacing: -0.01em; }
-  h2 { font-size: 1.9rem; margin: 0 0 1.4rem; color: #111827; letter-spacing: -0.01em; }
-  h2 .n { color: var(--slide-color, var(--accent)); font-weight: 800; margin-right: 0.5rem; }
-  .subtitle { color: var(--muted); font-size: 1.15rem; margin-bottom: 1.2rem; max-width: 640px; }
-  p { margin: 0.7rem 0; }
-  .lead { font-size: 1.05rem; }
+  h3 { font-size: 1.2rem; margin-top: 2rem; color: #1f2937; }
+  p { margin: 0.8rem 0; }
+  .lead { font-size: 1.08rem; }
   .card {
     background: var(--card-bg); border: 1px solid var(--card-border); border-radius: 10px;
-    padding: 1.1rem 1.4rem; margin: 1rem 0; box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+    padding: 1.2rem 1.4rem; margin: 1.2rem 0; box-shadow: 0 1px 3px rgba(0,0,0,0.04);
   }
   .analogy {
     background: #f5f3ff; border-left: 4px solid #7c3aed; border-radius: 6px;
-    padding: 0.9rem 1.2rem; margin: 1rem 0;
+    padding: 0.9rem 1.2rem; margin: 1.2rem 0;
   }
   .analogy b { color: #6d28d9; }
   .callout {
     background: var(--good); border-left: 4px solid var(--good-border); border-radius: 6px;
-    padding: 0.9rem 1.2rem; margin: 1rem 0; font-size: 0.97rem;
+    padding: 0.9rem 1.2rem; margin: 1.2rem 0;
   }
   .callout.warn { background: var(--warn); border-left-color: var(--warn-border); }
-  .callout.bad { background: var(--bad); border-left-color: var(--bad-border); }
   .callout.honest { background: #faf5ff; border-left-color: #7c3aed; }
   code { background: var(--code-bg); padding: 0.1rem 0.4rem; border-radius: 4px; font-size: 0.9em; font-family: "SF Mono", Menlo, Consolas, monospace; }
-  table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: 0.92rem; }
-  th, td { border: 1px solid var(--card-border); padding: 0.5rem 0.7rem; text-align: left; }
+  table { border-collapse: collapse; width: 100%; margin: 1.2rem 0; font-size: 0.92rem; }
+  th, td { border: 1px solid var(--card-border); padding: 0.55rem 0.75rem; text-align: left; }
   th { background: #f9fafb; font-weight: 600; }
   tr:nth-child(even) td { background: #fcfcfc; }
   .pill { display: inline-block; padding: 0.1rem 0.6rem; border-radius: 999px; font-size: 0.78rem; font-weight: 600; }
   .pill.cpu { background: var(--cpu); color: #92400e; border: 1px solid var(--cpu-border); }
   .pill.npu { background: var(--npu); color: #1e40af; border: 1px solid var(--npu-border); }
   .pill.done { background: var(--good); color: #166534; border: 1px solid var(--good-border); }
-  .pill.slow { background: var(--bad); color: #991b1b; border: 1px solid #fca5a5; }
-  .big-num { font-size: 2.6rem; font-weight: 800; color: var(--slide-color, var(--accent)); line-height: 1; }
-  .stat-row { display: flex; flex-wrap: wrap; gap: 1rem; margin: 1.2rem 0; }
+  .pill.future { background: #f3f4f6; color: #6b7280; border: 1px solid #d1d5db; }
+  .fig { text-align: center; margin: 1.8rem 0; }
+  .fig img { max-width: 100%; width: 640px; border-radius: 8px; border: 1px solid var(--card-border); box-shadow: 0 2px 10px rgba(0,0,0,0.06); }
+  .fig figcaption { color: var(--muted); font-size: 0.85rem; margin-top: 0.6rem; }
+  .big-num { font-size: 2.2rem; font-weight: 700; color: var(--accent); line-height: 1; }
+  .stat-row { display: flex; flex-wrap: wrap; gap: 1rem; margin: 1.5rem 0; }
   .stat {
-    flex: 1; min-width: 160px; background: var(--card-bg); border: 1px solid var(--card-border);
+    flex: 1; min-width: 150px; background: var(--card-bg); border: 1px solid var(--card-border);
     border-radius: 10px; padding: 1.1rem; text-align: center;
   }
-  .stat .label { color: var(--muted); font-size: 0.8rem; margin-top: 0.4rem; }
-  ul.clean { list-style: none; padding-left: 0; margin: 0.6rem 0; }
-  ul.clean li { padding: 0.3rem 0 0.3rem 1.5rem; position: relative; }
-  ul.clean li::before { content: "▸"; position: absolute; left: 0.2rem; color: var(--slide-color, var(--accent)); }
+  .stat .label { color: var(--muted); font-size: 0.82rem; margin-top: 0.4rem; }
+  ul.clean { list-style: none; padding-left: 0; }
+  ul.clean li { padding: 0.35rem 0 0.35rem 1.6rem; position: relative; }
+  ul.clean li::before { content: "▸"; position: absolute; left: 0.3rem; color: var(--accent); }
+  .toc { background: var(--card-bg); border: 1px solid var(--card-border); border-radius: 10px; padding: 1rem 1.5rem; margin: 2rem 0; }
+  .toc a { color: var(--accent); text-decoration: none; }
+  .toc a:hover { text-decoration: underline; }
+  .toc ol { margin: 0.5rem 0; padding-left: 1.4rem; }
+  .toc .grp { font-weight: 700; color: #3730a3; margin-top: 0.6rem; }
   .shape { font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 0.82rem; background: #eef2ff; color: #3730a3; padding: 0.05rem 0.35rem; border-radius: 4px; white-space: nowrap; }
-  .legend { font-size: 0.85rem; color: var(--muted); margin: 0.6rem 0; }
-  .cols2 { display: grid; grid-template-columns: 1fr 1fr; gap: 1.4rem; align-items: start; }
-  .cols3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 1rem; }
-  .arch-fig { text-align: center; }
-  .arch-fig img { max-width: 100%; width: 620px; border-radius: 8px; border: 1px solid var(--card-border); box-shadow: 0 2px 10px rgba(0,0,0,0.06); }
-  .arch-fig figcaption { color: var(--muted); font-size: 0.8rem; margin-top: 0.5rem; }
-  .legend-box { display:flex; align-items:flex-start; gap:0.6rem; margin: 0.5rem 0; font-size: 0.9rem; }
-  .swatch { width: 0.85rem; height: 0.85rem; border-radius: 3px; margin-top: 0.25rem; flex-shrink: 0; }
-  .bar-chart { margin: 1rem 0; }
-  .bar-row { display: grid; grid-template-columns: 110px 1fr 190px; align-items: center; gap: 0.7rem; margin: 1.1rem 0; font-size: 0.88rem; }
+  .knl { display:inline-block; font-family:"SF Mono",Menlo,Consolas,monospace; font-size:0.76rem; background:#ecfdf5; color:#065f46; border:1px solid #6ee7b7; border-radius:4px; padding:0.02rem 0.3rem; }
+  .stage-h { font-size:1.2rem; margin-top:2.2rem; padding:0.5rem 0.9rem; border-radius:6px; font-weight:700; }
+  .stage-h.v { background:#fdf2f8; border-left:5px solid #be185d; color:#9d174d; }
+  .stage-h.b { background:#dbeafe; border-left:5px solid #2563eb; color:#1e40af; }
+  .stage-h.e { background:#f0fdf4; border-left:5px solid #15803d; color:#166534; }
+  .legend { font-size:0.85rem; color:var(--muted); margin:0.6rem 0; }
+  .bar-row { display: grid; grid-template-columns: 130px 1fr 190px; align-items: center; gap: 0.8rem; margin: 1.1rem 0; font-size: 0.9rem; }
   .bar-track { background: #f3f4f6; border-radius: 5px; height: 20px; position: relative; }
-  .bar-fill { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 5px; overflow: hidden; }
-  .bar-fill.vision { background: linear-gradient(90deg, var(--vision), #ec4899); }
-  .bar-fill.backbone { background: linear-gradient(90deg, var(--backbone), #3b82f6); }
-  .bar-fill.expert { background: linear-gradient(90deg, var(--expert), #22c55e); }
+  .bar-fill { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 5px; }
+  .bar-fill.vision { background: linear-gradient(90deg, #be185d, #ec4899); }
+  .bar-fill.backbone { background: linear-gradient(90deg, #1e40af, #3b82f6); }
+  .bar-fill.expert { background: linear-gradient(90deg, #15803d, #22c55e); }
   .peak-line { position: absolute; top: -3px; bottom: -3px; width: 2px; background: #9ca3af; }
-  .peak-label { position: absolute; top: -1.15rem; font-size: 0.72rem; color: var(--muted); transform: translateX(-50%); white-space: nowrap; }
-  .checklist li { margin: 0.4rem 0; }
-  .lesson { border-left: 4px solid #7c3aed; background: #faf5ff; border-radius: 6px; padding: 0.8rem 1.1rem; margin: 0.8rem 0; font-size: 0.93rem; }
-  .lesson b.tag { color: #6d28d9; display:block; font-size:0.75rem; text-transform:uppercase; letter-spacing:0.08em; margin-bottom:0.2rem; }
-
-  /* nav */
-  #dots {
-    position: fixed; right: 1.1rem; top: 50%; transform: translateY(-50%);
-    display: flex; flex-direction: column; gap: 0.55rem; z-index: 50;
-  }
-  #dots button {
-    width: 9px; height: 9px; border-radius: 50%; border: none; background: #d1d5db;
-    cursor: pointer; padding: 0; transition: all 0.2s;
-  }
-  #dots button.active { background: var(--accent); transform: scale(1.4); }
-  #counter {
-    position: fixed; right: 1.1rem; bottom: 1.1rem; font-family: "SF Mono", Menlo, Consolas, monospace;
-    font-size: 0.78rem; color: var(--muted); background: rgba(255,255,255,0.85); padding: 0.2rem 0.55rem;
-    border-radius: 999px; border: 1px solid var(--card-border); z-index: 50;
-  }
-  @media (max-width: 800px) {
-    .cols2, .cols3 { grid-template-columns: 1fr; }
-    #dots { display: none; }
-    h1 { font-size: 1.9rem; } h2 { font-size: 1.5rem; }
-  }
-
-  /* title-slide entrance */
-  .reveal { opacity: 0; animation: rise 0.7s ease forwards; }
-  @keyframes rise { from { opacity: 0; transform: translateY(14px); } to { opacity: 1; transform: translateY(0); } }
+  .peak-label { position: absolute; top: -1.15rem; font-size: 0.72rem; color: var(--muted); transform: translateX(-100%); padding-right: 4px; white-space: nowrap; }
+  .lesson { border-left: 4px solid #7c3aed; background: #faf5ff; border-radius: 6px; padding: 0.9rem 1.2rem; margin: 1rem 0; }
+  .lesson b.tag { color: #6d28d9; display:block; font-size:0.78rem; text-transform:uppercase; letter-spacing:0.06em; margin-bottom:0.25rem; }
 </style>
 </head>
 <body>
+<div class="wrap">
 
-<div id="dots"></div>
-<div id="counter">1 / 12</div>
-
-<!-- ================= 0. TITLE ================= -->
-<section class="slide mix" id="s0">
-  <div class="inner">
-    <div class="slide-num">00</div>
-    <div class="eyebrow reveal" style="animation-delay:.05s">Progress update · mlir-air / AMD NPU2</div>
-    <h1 class="reveal" style="animation-delay:.15s;font-size:3.2rem">SmolVLA on NPU2</h1>
-    <div class="subtitle reveal" style="animation-delay:.28s;font-size:1.3rem">
-      Porting a vision-language-action robot policy to the AMD NPU2 — what got ported,
-      what actually ships, and the honest reasons why.
-    </div>
-    <div class="stat-row reveal" style="animation-delay:.42s">
-      <div class="stat"><div class="big-num" style="color:var(--vision)">1.07×</div><div class="label">faster than CPU<br>end to end</div></div>
-      <div class="stat"><div class="big-num" style="color:#7c3aed">0.9990</div><div class="label">action-chunk similarity<br>vs. the real CPU model</div></div>
-      <div class="stat"><div class="big-num" style="color:var(--expert)">3 / 3</div><div class="label">stages ported &amp; verified<br>(only 1 ships on-chip)</div></div>
-    </div>
-    <p class="legend reveal" style="animation-delay:.55s">
-      20-minute walkthrough · for engineers across the NPU/compiler and non-NPU spectrum · 2026-08
-    </p>
+  <h1>SmolVLA on NPU2</h1>
+  <div class="subtitle">Progress update — what's ported, what ships, and why</div>
+  <div class="meta">
+    A 20-minute walkthrough for engineers across the NPU/compiler and non-NPU spectrum · mlir-air / AMD NPU2 (Strix, AIE2P) ·
+    2026-08 · condensed from the full <a href="../SmolVLA_NPU_journey.html">SmolVLA_NPU_journey.html</a>, which has every
+    table, shape, and measurement behind this summary
   </div>
-</section>
 
-<!-- ================= 1. WHAT IS SMOLVLA ================= -->
-<section class="slide neutral" id="s1">
-  <div class="inner">
-    <div class="slide-num">01 / 11</div>
-    <h2><span class="n">1</span>What is SmolVLA?</h2>
-    <div class="analogy">
-      <b>In one sentence:</b> tell a robot arm "pick up the cube," show it a few camera views, and
-      SmolVLA outputs <b>the next 50 steps of motion</b> — joint angles, gripper open/close. It fuses
-      "see + understand + decide how to move" into one model.
-    </div>
-    <div class="cols3">
-      <div class="card"><b>450M</b><div class="legend">params · <code>lerobot/smolvla_base</code></div></div>
-      <div class="card"><b>3 cameras + text + state</b><div class="legend">the three inputs, fused into one sequence</div></div>
-      <div class="card"><b>flow matching</b><div class="legend">10 denoise steps, noise → actions</div></div>
-    </div>
-    <p class="legend">From Hugging Face's LeRobot ecosystem — think of it as a compact robot brain.</p>
+  <div class="callout honest">
+    <b>Scope note.</b> All three SmolVLA stages — vision, backbone, action expert — were ported to the NPU and
+    independently verified. Only the <b>vision encoder</b> is measurably faster there, so only vision ships on-chip
+    in the current example. This document is the condensed case for that decision: what we tried, what we measured,
+    and the honest reasons the other two stages stay on CPU for now.
   </div>
-</section>
 
-<!-- ================= 2. ARCHITECTURE ================= -->
-<section class="slide neutral" id="s2">
-  <div class="inner">
-    <div class="slide-num">02 / 11</div>
-    <h2><span class="n">2</span>Three parts, one pipeline</h2>
-    <div class="cols2">
-      <div class="arch-fig">
-        <img src="smolvla-modelarch.png" alt="SmolVLA architecture diagram (Hugging Face)">
-        <figcaption>Official SmolVLA architecture diagram (Hugging Face)</figcaption>
-      </div>
-      <div>
-        <div class="legend-box"><div class="swatch" style="background:#fde68a"></div>
-          <div><b>Vision-Language Model</b> (left) = our ① SigLIP vision encoder + ② SmolLM2-360M backbone.
-          Both are self-attention, non-causal, and run <b>once</b>.</div></div>
-        <div class="legend-box"><div class="swatch" style="background:#d97706"></div>
-          <div><b>Action Expert</b> (right) = ③ 16 layers alternating self-/cross-attention — this is
-          <code>self_attn_every_n_layers=2</code> in the config, and it reads the VLM's frozen K/V
-          on <b>every one</b> of its 10 denoise steps.</div></div>
-        <div class="legend-box"><div class="swatch" style="background:#111827"></div>
-          <div><b>✂ the scissors</b> mark where SmolVLA truncates a full VLM down to
-          <b>SmolLM2's first 16 layers</b> — the language stack we ship is a fraction of a full model,
-          by design.</div></div>
-      </div>
-    </div>
+  <div class="toc">
+    <b>Contents</b>
+    <div class="grp">Part A — The model</div>
+    <ol>
+      <li><a href="#what">What is SmolVLA?</a></li>
+      <li><a href="#arch">Architecture, at a glance</a></li>
+      <li><a href="#profile">Where CPU time goes today</a></li>
+    </ol>
+    <div class="grp">Part B — Running it on the NPU</div>
+    <ol start="4">
+      <li><a href="#why">Do we have the kernels?</a></li>
+      <li><a href="#mapping"><b>What ships today</b></a> — the mapping, all three stages</li>
+      <li><a href="#correct"><b>Correctness</b></a> — does it still produce the right actions?</li>
+      <li><a href="#perf"><b>Performance</b></a> — the measured numbers</li>
+      <li><a href="#whyperf"><b>Why performance looks like this</b></a></li>
+      <li><a href="#expert"><b>The action expert</b></a> — ported, and why it's still slower</li>
+      <li><a href="#status">Status &amp; next steps</a></li>
+    </ol>
   </div>
-</section>
 
-<!-- ================= 3. CPU PROFILE ================= -->
-<section class="slide neutral" id="s3">
-  <div class="inner">
-    <div class="slide-num">03 / 11</div>
-    <h2><span class="n">3</span>Where the 913 ms goes today</h2>
-    <table>
-      <tr><th>Stage</th><th>CPU time / chunk</th><th>Share</th><th>Runs per chunk</th></tr>
-      <tr><td><b>① Vision (SigLIP)</b></td><td><b>546 ms</b></td><td><b>59.8%</b></td><td><b>×3</b> — once per camera, serially</td></tr>
-      <tr><td>② Backbone</td><td>77 ms</td><td>8.5%</td><td>×1</td></tr>
-      <tr><td><b>③ Action expert</b></td><td><b>285 ms</b></td><td><b>31.2%</b></td><td>×10 (denoise loop)</td></tr>
-      <tr><td><b>total</b></td><td><b>913 ms</b></td><td>100%</td><td></td></tr>
-    </table>
-    <div class="callout warn">
-      <b>Vision dominates because it runs three times</b> — once per camera, and each image costs the
-      same regardless. That's what told us where NPU work should start.
-    </div>
+  <!-- ####################  PART A  #################### -->
+  <div class="part-banner a">Part A — The SmolVLA model
+    <span class="sub">A quick recap before we get to the NPU.</span>
   </div>
-</section>
 
-<!-- ================= 4. KERNEL READINESS ================= -->
-<section class="slide backbone" id="s4">
-  <div class="inner">
-    <div class="slide-num">04 / 11</div>
-    <h2><span class="n">4</span>Do we have the kernels?</h2>
-    <p class="lead">An NPU is a grid built for matmul; <code>mlir-air</code> compiles to it. The
-      <code>kernel_registry</code> holds kernels already validated for LLM-shaped deployment.</p>
-    <table>
-      <tr><th>Gap</th><th>Resolution</th></tr>
-      <tr><td>Backbone's prefix-LM mask doesn't fit FlashAttention's causal on/off switch</td><td><span class="knl" style="background:#ecfdf5;border:1px solid #6ee7b7;color:#065f46;border-radius:4px;padding:0 .3rem;font-family:monospace;font-size:.85em">masked-softmax</span> — built from scratch</td></tr>
-      <tr><td>Vision needs affine LayerNorm and GELU-tanh</td><td>promoted into the shared registry</td></tr>
-      <tr><td>Conv2d patch-embed, pixel-shuffle</td><td>solved as im2col + existing GEMM / host reshape — no new kernel</td></tr>
-    </table>
-    <div class="callout">
-      Net result: <b>every kernel both stages need is now validated on real NPU2.</b> Progress since has
-      been gated by integration and validation effort, not by missing kernels.
-    </div>
+  <h2 id="what">1. What is SmolVLA?</h2>
+
+  <p class="lead"><b>SmolVLA is a Vision-Language-Action model (VLA)</b> — think of it as a
+    <b>robot's brain</b>, from Hugging Face's LeRobot ecosystem.</p>
+
+  <div class="analogy">
+    <b>In one sentence:</b> tell a robot arm "pick up the cube" and show it a few camera views.
+    SmolVLA reads the <b>images + that sentence + the robot's current pose</b>, and outputs
+    <b>the next 50 steps of motion</b> (joint angles, gripper open/close). It fuses
+    "see + understand + decide how to move" into one model.
   </div>
-</section>
 
-<!-- ================= 5. WHAT SHIPS ================= -->
-<section class="slide vision" id="s5">
-  <div class="inner">
-    <div class="slide-num">05 / 11</div>
-    <h2><span class="n">5</span>What ships — and what's just verified</h2>
-    <table>
-      <tr><th>Stage</th><th>Share of CPU runtime</th><th>On the NPU?</th></tr>
-      <tr style="background:#fdf2f8"><td><b>① Vision</b></td><td>59.8%</td><td><span class="pill npu">✅ ships on NPU</span></td></tr>
-      <tr><td>② Backbone</td><td>8.5%</td><td><span class="pill cpu">ported + verified</span> — 3× slower on NPU, stays on CPU</td></tr>
-      <tr><td>③ Action expert</td><td>31.2%</td><td><span class="pill cpu">ported + verified</span> — 4× slower on NPU, stays on CPU</td></tr>
-    </table>
-    <div class="callout" style="border-left-color:var(--vision);background:var(--vision-bg)">
-      <b>All three stages were ported to the NPU and independently verified.</b> Only vision is
-      measurably faster there — that is the only stage that ships on-chip. Shipping the winner, not
-      maximum NPU coverage, is the whole strategy.
-    </div>
-    <p class="legend">
-      Fusion made vision cheap enough to win: per image, kernel launches collapse
-      <b>121 → 38 dispatches</b> (<b>368 → 141.6 ms</b>). Each dispatch costs roughly the same fixed
-      overhead regardless of the work inside it — fewer, fatter dispatches is what let vision come out ahead.
-    </p>
-  </div>
-</section>
-
-<!-- ================= 6. CORRECTNESS ================= -->
-<section class="slide vision" id="s6">
-  <div class="inner">
-    <div class="slide-num">06 / 11</div>
-    <h2><span class="n">6</span>Does it still produce the right actions?</h2>
-    <div class="stat-row">
-      <div class="stat"><div class="big-num" style="color:var(--vision)">0.998996</div><div class="label">cosine similarity<br>vs. real CPU model</div></div>
-      <div class="stat"><div class="big-num" style="color:var(--vision)">0.003023</div><div class="label">normalized MSE<br>vs. real CPU model</div></div>
-      <div class="stat"><div class="big-num" style="color:var(--muted);font-size:1.5rem">≥0.99 / ≤0.04</div><div class="label">gate thresholds</div></div>
-    </div>
-    <div class="callout honest">
-      <b>Honesty check.</b> The gate runs on an all-zero input, which is an easy case. Read plainly,
-      that would suggest a ~10×/13× margin over threshold — but computed honestly, the real margin is
-      <b>~2.6× on cosine</b> and <b>~4× on nMSE</b>. Still comfortably passing, just not as padded as the
-      naive number implies.
-    </div>
-    <p class="legend">
-      Bonus: flow matching is self-correcting. The small bf16 deviation introduced per layer does not
-      compound over the 10 denoise steps — similarity actually <em>rises</em> across the loop.
-    </p>
-  </div>
-</section>
-
-<!-- ================= 7. PERFORMANCE ================= -->
-<section class="slide vision" id="s7">
-  <div class="inner">
-    <div class="slide-num">07 / 11</div>
-    <h2><span class="n">7</span>How fast is it, really?</h2>
-    <div class="stat-row">
-      <div class="stat"><div class="big-num" style="color:var(--vision)">851 ms</div><div class="label">NPU vision + CPU rest</div></div>
-      <div class="stat"><div class="big-num" style="color:var(--muted)">913 ms</div><div class="label">pure CPU baseline</div></div>
-      <div class="stat"><div class="big-num" style="color:var(--vision)">1.07×</div><div class="label">end to end</div></div>
-    </div>
-    <p class="legend">
-      Independently re-verified via <code>make profile</code>, N=10 interleaved runs:
-      <b>925.9 → 856.5 ms</b>, <b>1.081×</b> — confirms the headline number.
-    </p>
-    <table>
-      <tr><th>Stage</th><th>CPU</th><th>NPU</th><th>Verdict</th></tr>
-      <tr style="background:#fdf2f8"><td><b>① Vision</b></td><td>546 ms</td><td>465 ms</td><td><span class="pill done">1.19× — ships</span></td></tr>
-      <tr><td>② Backbone</td><td>77 ms</td><td>229 ms</td><td><span class="pill slow">~3× slower — CPU</span></td></tr>
-      <tr><td>③ Action expert</td><td>285 ms</td><td>—</td><td><span class="pill slow">~4× slower — CPU</span></td></tr>
-    </table>
-    <p class="legend">Vision re-measured: <b>550.7 → 462.5 ms</b>, consistent with the headline 1.19×.</p>
-    <div class="cols2">
-      <div class="callout" style="border-left-color:var(--vision);background:var(--vision-bg)">
-        <b>91%</b> of the vision segment's latency is device time (422 / 462 ms) — it's NPU-bound, not
-        host-bound.
-      </div>
-      <div class="callout honest">
-        <b>Honest ceiling.</b> Vision is only 54% of the runtime an NPU could touch today — so even in
-        the best case, the end-to-end ceiling is <b>~1.85×</b>, not higher.
-      </div>
-    </div>
-  </div>
-</section>
-
-<!-- ================= 8. WHY: SHAPE ================= -->
-<section class="slide backbone" id="s8">
-  <div class="inner">
-    <div class="slide-num">08 / 11</div>
-    <h2><span class="n">8</span>Why: it comes down to shape</h2>
-    <p class="lead">An NPU is a grid of compute tiles. An operation only wins if it's big enough to
-      fill it — same kernel, same silicon, only the shape changes.</p>
-    <div class="bar-chart">
-      <div class="bar-row">
-        <div><b>Vision</b><br><span class="legend">seq 1024</span></div>
-        <div class="bar-track">
-          <div class="peak-line" style="left:100%"></div><div class="peak-label" style="left:100%">peak 8898</div>
-          <div class="bar-fill vision" style="width:53%"></div>
-        </div>
-        <div>3798–5790 GFLOP/s <span class="pill done">beats CPU</span></div>
-      </div>
-      <div class="bar-row">
-        <div><b>Backbone</b><br><span class="legend">seq 256</span></div>
-        <div class="bar-track">
-          <div class="bar-fill backbone" style="width:30%"></div>
-        </div>
-        <div>2046–3366 GFLOP/s <span class="pill slow">loses ~3×</span></div>
-      </div>
-      <div class="bar-row">
-        <div><b>Action expert</b><br><span class="legend">seq 50</span></div>
-        <div class="bar-track">
-          <div class="bar-fill expert" style="width:7%"></div>
-        </div>
-        <div>25–1163 GFLOP/s <span class="pill slow">loses ~4×</span></div>
-      </div>
-    </div>
-    <div class="callout" style="border-left-color:var(--backbone);background:var(--backbone-bg)">
-      Vision's 1024-token sequences and 3072-wide MLPs saturate the array. The backbone's 256 tokens and
-      the expert's 50 don't — no amount of scheduling or fusion rescues a matmul that's just too small.
-    </div>
-  </div>
-</section>
-
-<!-- ================= 9. THE ACTION EXPERT ================= -->
-<section class="slide expert" id="s9">
-  <div class="inner">
-    <div class="slide-num">09 / 11</div>
-    <h2><span class="n">9</span>The expert isn't "4× slower" — attention is</h2>
-    <table>
-      <tr><th>Operation family</th><th>NPU vs CPU</th><th>Share of NPU time</th></tr>
-      <tr style="background:#fef2f2"><td><b>attention</b> (QKᵀ, P@V, softmax, mask, GQA expand)</td><td><b>12.6× slower</b></td><td><b>56%</b></td></tr>
-      <tr><td>matmul — the 7 projections</td><td>1.21× slower</td><td>17%</td></tr>
-      <tr><td>RMSNorm</td><td>3.0× slower</td><td>5%</td></tr>
-      <tr><td>RoPE</td><td>1.19× slower</td><td>3%</td></tr>
-      <tr><td>element-wise add / SiLU-and-Mul</td><td>~4–8× slower</td><td>5%</td></tr>
-    </table>
-    <div class="callout bad">
-      <b>Why attention specifically:</b> only 197 of 241 prefix tokens are real — the rest is padding —
-      so both self- and cross-attention need a genuine mask. FlashAttention can't apply one, so attention
-      decomposes into 11 tiny dispatches per layer at <b>seq=50</b>, which can't fill the array either.
-    </div>
-    <p class="legend">
-      Even fixing that, the expert would still lose: 50 tokens pad to 64, filling only half the compute
-      array, and every launch pays ~85 µs of fixed cost regardless of size.
-    </p>
-  </div>
-</section>
-
-<!-- ================= 10. STATUS & LESSONS ================= -->
-<section class="slide mix" id="s10">
-  <div class="inner">
-    <div class="slide-num">10 / 11</div>
-    <h2><span class="n">10</span>Where we are, and two lessons</h2>
-    <ul class="clean checklist">
-      <li><span class="pill done">✅</span> Complete policy is faster on NPU than CPU — <b>1.07×</b>, both processors at max performance</li>
-      <li><span class="pill done">✅</span> Same actions — cosine <b>0.9990</b>, nMSE <b>0.0030</b> vs. the real CPU model</li>
-      <li><span class="pill done">✅</span> All three stages ported and verified; only vision ships (the honest, measured choice)</li>
-      <li><span class="pill done">✅</span> Vision is now NPU-bound (91% device time), not host-bound</li>
-      <li><span class="pill done">✅</span> 2 kernels promoted into the shared registry, 1 written from scratch, dozens of new (kernel, shape) rows validated on real NPU2</li>
+  <div class="card">
+    <b>Inputs / outputs (the <code>lerobot/smolvla_base</code> checkpoint, 450M params):</b>
+    <ul class="clean">
+      <li><b>Inputs</b>: 3 camera images + one natural-language instruction + a robot-state vector</li>
+      <li><b>Output</b>: an "action chunk" — the next <b>50 steps</b> of actions, predicted at once</li>
     </ul>
-    <div class="cols2">
-      <div class="lesson"><b class="tag">Lesson 1</b>Maximum NPU coverage ≠ maximum speed. We ship the stage that wins, not every stage we ported.</div>
-      <div class="lesson"><b class="tag">Lesson 2</b>A rigorous projection is still not a measurement. The expert's per-kernel estimate landed 2.5× off because two of its inputs — an assumed-usable FlashAttention, no fusion penalty — turned out false.</div>
-    </div>
-    <table style="margin-top:1rem">
-      <tr><th>#</th><th>What's next</th><th>Expected payoff</th></tr>
-      <tr><td>1</td><td>Split the 3 cameras across CPU and NPU in parallel</td><td>largest remaining headroom → <b>~1.35×</b> end to end</td></tr>
-      <tr><td>2</td><td>Work the encoder's ranked list (deployment-format matmul gap, bias/residual fusion)</td><td>up to ~117 ms, est.</td></tr>
-      <tr><td>3</td><td>Batch the 3 cameras into one encoder pass</td><td>~17–20% on vision matmuls</td></tr>
-    </table>
-  </div>
-</section>
-
-<!-- ================= 11. CLOSING ================= -->
-<section class="slide mix" id="s11">
-  <div class="inner">
-    <div class="slide-num">11 / 11</div>
-    <h2><span class="n">·</span>In one sentence</h2>
-    <div class="card" style="background:#f0f9ff;border-color:#7dd3fc;font-size:1.1rem">
-      SmolVLA's vision encoder — the largest block of compute in a vision-language-action robot
-      policy — now runs entirely on the AMD NPU2, making the complete policy <b>1.07× faster than the
-      pure-CPU model, with both processors at maximum performance, while producing the same actions</b>
-      (0.9990 similarity). The backbone and action expert are ported and verified too, and stay on the
-      CPU for the honest reason that they're faster there — a decision we could only make because every
-      stage was measured on both.
-    </div>
-    <p class="legend" style="margin-top:2rem">
-      Full technical detail: <code>docs/detail/SmolVLA_NPU_journey.html</code> ·
-      design notes: <code>ARCHITECTURE.md</code> · reproduce: <code>README.md</code>
+    <p style="margin-bottom:0;color:var(--muted);font-size:0.9rem">
+      Actions come from <b>flow matching</b>: starting from random noise, the model iteratively
+      "denoises" over <b>10 steps</b> into a coherent set of actions — the same idea as diffusion
+      image generators, except what's being "drawn" here is robot motion.
     </p>
-    <p class="lead" style="margin-top:2rem;color:var(--muted)">Questions?</p>
   </div>
-</section>
 
-<script>
-  const slides = Array.from(document.querySelectorAll('.slide'));
-  const dotsWrap = document.getElementById('dots');
-  const counter = document.getElementById('counter');
-  slides.forEach((s, i) => {
-    const b = document.createElement('button');
-    b.setAttribute('aria-label', 'Go to slide ' + (i + 1));
-    b.addEventListener('click', () => s.scrollIntoView({ behavior: 'smooth' }));
-    dotsWrap.appendChild(b);
-  });
-  const dots = Array.from(dotsWrap.children);
-  const io = new IntersectionObserver((entries) => {
-    entries.forEach(e => {
-      if (e.isIntersecting) {
-        const idx = slides.indexOf(e.target);
-        dots.forEach(d => d.classList.remove('active'));
-        dots[idx].classList.add('active');
-        counter.textContent = (idx + 1) + ' / ' + slides.length;
-      }
-    });
-  }, { threshold: 0.55 });
-  slides.forEach(s => io.observe(s));
+  <h2 id="arch">2. Architecture, at a glance</h2>
 
-  document.addEventListener('keydown', (e) => {
-    const current = slides.findIndex(s => {
-      const r = s.getBoundingClientRect();
-      return r.top <= window.innerHeight / 2 && r.bottom >= window.innerHeight / 2;
-    });
-    if (['ArrowDown', 'ArrowRight', 'PageDown', ' '].includes(e.key)) {
-      e.preventDefault();
-      const next = slides[Math.min(current + 1, slides.length - 1)];
-      next && next.scrollIntoView({ behavior: 'smooth' });
-    } else if (['ArrowUp', 'ArrowLeft', 'PageUp'].includes(e.key)) {
-      e.preventDefault();
-      const prev = slides[Math.max(current - 1, 0)];
-      prev && prev.scrollIntoView({ behavior: 'smooth' });
-    }
-  });
-</script>
+  <p>SmolVLA is three blocks chained like a pipeline: a frozen <b>vision encoder</b>, a compact
+    <b>language backbone</b> that fuses everything into one understanding, and an <b>action expert</b>
+    that denoises that understanding into motion. The official diagram below shows how they connect —
+    we use it instead of a wall of architecture text.</p>
 
+  <div class="fig">
+    <img src="smolvla-modelarch.png" alt="SmolVLA architecture diagram (Hugging Face)">
+    <figcaption>Official SmolVLA architecture diagram (Hugging Face).</figcaption>
+  </div>
+
+  <div class="card">
+    <ul class="clean">
+      <li><b>Vision-Language Model</b> (left box) = our ① SigLIP vision encoder + ② SmolLM2-360M
+        backbone. Both are self-attention, non-causal, and run <b>once</b> per inference.</li>
+      <li><b>Action Expert</b> (right box) = ③ 16 layers alternating self-/cross-attention — this is
+        <code>self_attn_every_n_layers=2</code> in the config, and it reads the VLM's frozen K/V on
+        <b>every one</b> of its 10 denoise steps.</li>
+      <li><b>✂ the scissors</b> in the diagram mark where SmolVLA truncates a full VLM down to
+        <b>SmolLM2's first 16 layers only</b> — the language stack we ship is a fraction of a full
+        model, by design.</li>
+    </ul>
+  </div>
+
+  <h2 id="profile">3. Where CPU time goes today</h2>
+
+  <table>
+    <tr><th>Stage</th><th>CPU time / chunk</th><th>Share</th><th>Runs per chunk</th></tr>
+    <tr><td><b>① Vision (SigLIP)</b></td><td><b>546 ms</b></td><td><b>59.8%</b></td><td><b>×3</b> — once per camera, serially</td></tr>
+    <tr><td>② Backbone</td><td>77 ms</td><td>8.5%</td><td>×1</td></tr>
+    <tr><td><b>③ Action expert</b></td><td><b>285 ms</b></td><td><b>31.2%</b></td><td>×10 (denoise loop)</td></tr>
+    <tr><td><b>Total</b></td><td><b>913 ms</b></td><td>100%</td><td></td></tr>
+  </table>
+
+  <div class="callout warn">
+    <b>Vision dominates because it runs three times</b> — once per camera, and each image costs the
+    same regardless. That's what told us where NPU work should start.
+  </div>
+
+  <!-- ####################  PART B  #################### -->
+  <div class="part-banner b">Part B — Running it on the NPU
+    <span class="sub">What we ported, what we measured, and the reasoning behind what ships.</span>
+  </div>
+
+  <h2 id="why">4. Do we have the kernels?</h2>
+
+  <p class="lead">An NPU2 is a grid of compute tiles; <code>mlir-air</code> compiles to it. The
+    <code>kernel_registry</code> holds kernels already validated for LLM-shaped deployment — here's
+    what closing the gap for SmolVLA took.</p>
+
+  <table>
+    <tr><th>Gap</th><th>Resolution</th></tr>
+    <tr><td>Backbone's prefix-LM mask doesn't fit FlashAttention's causal on/off switch</td>
+        <td><span class="knl">masked-softmax</span> — built from scratch</td></tr>
+    <tr><td>Vision needs affine LayerNorm and GELU-tanh</td>
+        <td>promoted into the shared registry</td></tr>
+    <tr><td>Conv2d patch-embed, pixel-shuffle</td>
+        <td>solved as im2col + existing GEMM / host reshape — no new kernel</td></tr>
+  </table>
+
+  <div class="callout">
+    Net result: <b>every kernel both stages need is now validated on real NPU2.</b> Progress since has
+    been gated by integration and measurement effort, not by missing kernels.
+  </div>
+
+  <h2 id="mapping">5. What ships today</h2>
+
+  <table>
+    <tr><th>Stage</th><th>Share of CPU runtime</th><th>On the NPU?</th></tr>
+    <tr><td><b>① Vision</b></td><td>59.8%</td><td><span class="pill npu">✅ ships on NPU</span></td></tr>
+    <tr><td>② Backbone</td><td>8.5%</td><td><span class="pill cpu">ported + verified</span> — 3× slower on NPU, stays on CPU</td></tr>
+    <tr><td>③ Action expert</td><td>31.2%</td><td><span class="pill cpu">ported + verified</span> — 4× slower on NPU, stays on CPU</td></tr>
+  </table>
+
+  <div class="callout">
+    <b>All three stages were ported to the NPU and independently verified.</b> Only vision is
+    measurably faster there — that is the only stage that ships on-chip. Shipping the winner, not
+    maximum NPU coverage, is the whole strategy.
+  </div>
+
+  <p>Fusion is what made vision cheap enough to win: per image, kernel launches collapse
+    <b>121 → 38 dispatches</b> (<b>368 → 141.6 ms</b>). Each dispatch pays roughly the same fixed
+    overhead regardless of the work inside it, so fewer, fatter dispatches is a direct win.</p>
+
+  <h2 id="correct">6. Correctness</h2>
+
+  <div class="stat-row">
+    <div class="stat"><div class="big-num">0.998996</div><div class="label">cosine similarity<br>vs. real CPU model</div></div>
+    <div class="stat"><div class="big-num">0.003023</div><div class="label">normalized MSE<br>vs. real CPU model</div></div>
+    <div class="stat"><div class="big-num" style="font-size:1.4rem;color:var(--muted)">≥0.99 / ≤0.04</div><div class="label">gate thresholds</div></div>
+  </div>
+
+  <div class="callout honest">
+    <b>Honesty check.</b> The gate's input is all-zero, which is an easy case. Read plainly, that
+    would suggest a ~10×/13× margin over threshold — computed honestly, the real margin is
+    <b>~2.6× on cosine</b> and <b>~4× on nMSE</b>. Still comfortably passing, just not as padded as
+    the naive number implies.
+  </div>
+
+  <p class="legend">Bonus: flow matching is self-correcting — the small bf16 deviation introduced
+    per layer does not compound over the 10 denoise steps. Similarity actually rises across the loop.</p>
+
+  <h2 id="perf">7. Performance</h2>
+
+  <div class="stat-row">
+    <div class="stat"><div class="big-num">851 ms</div><div class="label">NPU vision + CPU rest</div></div>
+    <div class="stat"><div class="big-num" style="color:var(--muted)">913 ms</div><div class="label">pure CPU baseline</div></div>
+    <div class="stat"><div class="big-num">1.07×</div><div class="label">end to end</div></div>
+  </div>
+
+  <p class="legend">Independently re-verified via <code>make profile</code>, N=10 interleaved runs:
+    <b>925.9 → 856.5 ms</b>, <b>1.081×</b> — confirms the headline number.</p>
+
+  <table>
+    <tr><th>Stage</th><th>CPU</th><th>NPU</th><th>Verdict</th></tr>
+    <tr><td><b>① Vision</b></td><td>546 ms</td><td>465 ms</td><td><span class="pill done">1.19× — ships</span></td></tr>
+    <tr><td>② Backbone</td><td>77 ms</td><td>229 ms</td><td><span class="pill cpu">~3× slower — CPU</span></td></tr>
+    <tr><td>③ Action expert</td><td>285 ms</td><td>—</td><td><span class="pill cpu">~4× slower — CPU</span></td></tr>
+  </table>
+
+  <p class="legend">Vision re-measured: <b>550.7 → 462.5 ms</b>, consistent with the headline 1.19×.</p>
+
+  <div class="callout">
+    <b>91%</b> of the vision segment's latency is device time (422 / 462 ms) — it's NPU-bound, not
+    host-bound.
+  </div>
+
+  <div class="callout honest">
+    <b>Honest ceiling.</b> Vision is only 54% of the runtime an NPU could touch today — so even in
+    the best case, the end-to-end ceiling is <b>~1.85×</b>, not higher.
+  </div>
+
+  <h2 id="whyperf">8. Why performance looks like this</h2>
+
+  <p class="lead">An NPU2 is a grid of compute tiles. An operation only wins if it's big enough to
+    fill it — same kernel, same silicon, only the shape changes.</p>
+
+  <div class="card">
+    <div class="bar-row">
+      <div><b>Vision</b><br><span class="legend">seq 1024</span></div>
+      <div class="bar-track">
+        <div class="peak-line" style="left:100%"></div><div class="peak-label" style="left:100%">peak 8898</div>
+        <div class="bar-fill vision" style="width:53%"></div>
+      </div>
+      <div>3798–5790 GFLOP/s <span class="pill done">beats CPU</span></div>
+    </div>
+    <div class="bar-row">
+      <div><b>Backbone</b><br><span class="legend">seq 256</span></div>
+      <div class="bar-track"><div class="bar-fill backbone" style="width:30%"></div></div>
+      <div>2046–3366 GFLOP/s <span class="pill cpu">loses ~3×</span></div>
+    </div>
+    <div class="bar-row">
+      <div><b>Action expert</b><br><span class="legend">seq 50</span></div>
+      <div class="bar-track"><div class="bar-fill expert" style="width:7%"></div></div>
+      <div>25–1163 GFLOP/s <span class="pill cpu">loses ~4×</span></div>
+    </div>
+  </div>
+
+  <div class="callout">
+    Vision's 1024-token sequences and 3072-wide MLPs saturate the array. The backbone's 256 tokens
+    and the expert's 50 don't — no amount of scheduling or fusion rescues a matmul that's just too
+    small.
+  </div>
+
+  <h2 id="expert">9. The action expert</h2>
+
+  <p class="lead">The expert isn't uniformly "4× slower" — <b>attention</b> is.</p>
+
+  <table>
+    <tr><th>Operation family</th><th>NPU vs CPU</th><th>Share of NPU time</th></tr>
+    <tr><td><b>attention</b> (QK<sup>T</sup>, P@V, softmax, mask, GQA expand)</td><td><b>12.6× slower</b></td><td><b>56%</b></td></tr>
+    <tr><td>matmul — the 7 projections</td><td>1.21× slower</td><td>17%</td></tr>
+    <tr><td>RMSNorm</td><td>3.0× slower</td><td>5%</td></tr>
+    <tr><td>RoPE</td><td>1.19× slower</td><td>3%</td></tr>
+    <tr><td>element-wise add / SiLU-and-Mul</td><td>~4–8× slower</td><td>5%</td></tr>
+  </table>
+
+  <div class="callout warn">
+    <b>Why attention specifically:</b> only 197 of 241 prefix tokens are real — the rest is padding —
+    so both self- and cross-attention need a genuine mask. FlashAttention can't apply one, so
+    attention decomposes into 11 tiny dispatches per layer at <span class="shape">seq=50</span>,
+    which can't fill the array either.
+  </div>
+
+  <p class="legend">Even fixing that, the expert would still lose: 50 tokens pad to 64, filling only
+    half the compute array, and every launch pays ~85 µs of fixed cost regardless of size.</p>
+
+  <h2 id="status">10. Status &amp; next steps</h2>
+
+  <ul class="clean">
+    <li><span class="pill done">✅</span> Complete policy is faster on NPU than CPU — <b>1.07×</b>, both processors at max performance</li>
+    <li><span class="pill done">✅</span> Same actions — cosine <b>0.9990</b>, nMSE <b>0.0030</b> vs. the real CPU model</li>
+    <li><span class="pill done">✅</span> All three stages ported and verified; only vision ships (the honest, measured choice)</li>
+    <li><span class="pill done">✅</span> Vision is now NPU-bound (91% device time), not host-bound</li>
+    <li><span class="pill done">✅</span> 2 kernels promoted into the shared registry, 1 written from scratch, dozens of new (kernel, shape) rows validated on real NPU2</li>
+  </ul>
+
+  <div class="lesson"><b class="tag">Lesson 1</b>Maximum NPU coverage ≠ maximum speed. We ship the stage that wins, not every stage we ported.</div>
+  <div class="lesson"><b class="tag">Lesson 2</b>A rigorous projection is still not a measurement. The expert's per-kernel estimate landed 2.5× off because two of its inputs — an assumed-usable FlashAttention, no fusion penalty — turned out false.</div>
+
+  <table>
+    <tr><th>#</th><th>What's next</th><th>Expected payoff</th></tr>
+    <tr><td>1</td><td>Split the 3 cameras across CPU and NPU in parallel</td><td>largest remaining headroom → <b>~1.35×</b> end to end</td></tr>
+    <tr><td>2</td><td>Work the encoder's ranked list (deployment-format matmul gap, bias/residual fusion)</td><td>up to ~117 ms, est.</td></tr>
+    <tr><td>3</td><td>Batch the 3 cameras into one encoder pass</td><td>~17–20% on vision matmuls</td></tr>
+  </table>
+
+  <div class="card" style="background:#f0f9ff;border-color:#7dd3fc;font-size:1.05rem;margin-top:2rem">
+    <b>In one sentence:</b> SmolVLA's vision encoder — the largest block of compute in a
+    vision-language-action robot policy — now runs entirely on the AMD NPU2, making the complete
+    policy <b>1.07× faster than the pure-CPU model, with both processors at maximum performance,
+    while producing the same actions</b> (0.9990 similarity). The backbone and action expert are
+    ported and verified too, and stay on the CPU for the honest reason that they're faster there —
+    a decision we could only make because every stage was measured on both.
+  </div>
+
+  <p class="legend" style="margin-top:2rem">
+    Full technical detail: <code>docs/detail/SmolVLA_NPU_journey.html</code> ·
+    design notes: <code>ARCHITECTURE.md</code> · reproduce: <code>README.md</code>
+  </p>
+
+</div>
 </body>
 </html>
