@@ -415,8 +415,8 @@ nmse     = 0.003023     (门槛 0.04)
 3. get_vision_runtime   让第 2 步每进程只发生一次的单例
 ```
 
-（主机 BLAS 线程钳制那 125 行 ctypes 已经挪去
-`shared/infra/thread_limits.py`，它和 vision 无关。）
+（早先这里还有 125 行 ctypes 做主机 BLAS 线程钳制，十次实测显示它没有任何
+效果，已删除；详见 [`explain.md`](explain.md) §6。）
 
 ---
 

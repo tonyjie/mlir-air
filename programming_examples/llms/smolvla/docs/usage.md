@@ -127,7 +127,6 @@ SMOLVLA_FORCE_COMPILE=1 make verify
 | `LEROBOT_PYTHON` | interpreter with torch + lerobot + air + pyxrt |
 | `HF_TOKEN` | required for the checkpoint download |
 | `SMOLVLA_FORCE_COMPILE=1` | rebuild every ELF instead of reusing the cache |
-| `SMOLVLA_NPU_BLAS_LIMIT=0` | disable the scoped BLAS-thread clamp around the NPU call (costs ~25–70 ms per inference; see `explain.md` §6) |
 
 ---
 

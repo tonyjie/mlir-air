@@ -108,25 +108,23 @@ the backbone and the action expert as untouched LeRobot code — which is what
 makes the comparison against the pure-CPU baseline meaningful. The wrapper is
 always restored in a `finally`.
 
-## 6. One process, and a scoped thread clamp
+## 6. One process
 
 `smolvla_runtime.py` holds a process-wide `VisionRuntime`: weights, compiled
 ELFs, the XRT context and the device buffer objects are created once and reused
 by every inference. An earlier two-process design paid ~585 ms per inference in
 process spawn, weight reload and ELF load — none of it NPU cost.
 
-One subtlety of being in-process: the NPU dispatch loop is host-bound and
-shares the process with numpy/torch, whose BLAS pool keeps a worker per core.
-`npu_thread_limits()` clamps those pools for the duration of the NPU call and
-restores them afterwards — scoped, because the CPU backbone and expert before
-and after genuinely want every core. It works at runtime through ctypes on the
-already-loaded shared objects, since `OMP_NUM_THREADS` only has effect before
-numpy is imported. The mechanism lives in `shared/infra/thread_limits.py`;
-`SMOLVLA_NPU_BLAS_LIMIT=0` disables it.
+This example used to clamp the host BLAS thread pools to 1 for the duration of
+the dispatch loop, on the theory that OpenBLAS workers busy-spinning after a
+host matmul preempt the host-bound driver loop. **That was removed**, because
+it never showed up in a measurement here. The comment it shipped under cited
+135 -> 178 ms per image; ten runs across two harnesses found no difference
+either way (442.5 vs 441.1 ms encode; 450.9/458.0 vs 453.7/453.9 ms vision
+stage). It also single-threaded the host work inside the loop -- the bf16
+casts, the connector's pixel-shuffle -- for no measured return.
 
-**On this machine it currently makes no measurable difference.** The comment it
-was added under cites 135 → 178 ms per image, which does not reproduce; an A/B
-on the knob, three runs each, gives 442.5 ms with the clamp and 441.1 ms
-without. It is kept because the contention it guards against is real on
-machines where the BLAS pool is larger or busier, but nobody should assume it
-is buying anything here without re-measuring.
+If you port a stage to a machine where that contention is real, the mechanism
+is a scoped ctypes call to `openblas_set_num_threads` on the already-loaded
+shared object; environment variables are too late once numpy is imported. The
+version this example carried is on the `smolvla` branch.

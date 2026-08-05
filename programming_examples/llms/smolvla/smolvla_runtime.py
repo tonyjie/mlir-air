@@ -25,9 +25,6 @@ process spawn + interpreter import (~185 ms) + a safetensors weight reload
 it is NPU cost. Here the weights and the `KernelCache` (ELFs, XRT context,
 device buffer objects) are built ONCE per process and reused, which is what a
 deployment does.
-
-The host thread-pool clamp around the dispatch loop lives in
-`shared/infra/thread_limits.py`; see `npu_thread_limits` below for the knob.
 """
 
 from __future__ import annotations
@@ -48,7 +45,6 @@ if str(_LLMS_DIR) not in sys.path:
     sys.path.insert(0, str(_LLMS_DIR))
 
 from shared.infra.cache import KernelCache, Profiler  # noqa: E402
-from shared.infra.thread_limits import host_thread_limits  # noqa: E402
 
 MODEL_ID = "lerobot/smolvla_base"
 
@@ -64,22 +60,6 @@ VISION_KERNELS = {
     "layer_norm",
     "gemm_connector",
 }
-
-
-def npu_thread_limits(n=1, enabled=None):
-    """`host_thread_limits` with SmolVLA's env-var knob bound.
-
-    The NPU driver loop is host-bound (38 dispatches per image) and OpenBLAS
-    workers busy-spin after any host matmul, preempting it -- measured
-    135 -> 178 ms per image. Clamping globally would starve the CPU backbone
-    and action expert, so the clamp is scoped to the dispatch loop.
-
-    SMOLVLA_NPU_BLAS_LIMIT=0 disables it, which is the A/B arm reported in
-    docs/explain.md.
-    """
-    if enabled is None:
-        enabled = os.environ.get("SMOLVLA_NPU_BLAS_LIMIT", "1") != "0"
-    return host_thread_limits(n, enabled=enabled)
 
 
 # ---------------------------------------------------------------------------
@@ -172,7 +152,7 @@ class VisionRuntime:
         }
         self.warmed = False
 
-    def encode(self, images, attn_mode="flash", timings=None, limit_threads=None):
+    def encode(self, images, attn_mode="flash", timings=None):
         """images: sequence of N camera tensors/arrays, each (1,3,512,512) or
         (3,512,512), ALREADY lerobot-preprocessed (resize_with_pad + [-1,1]).
         Returns (N, 64, 960) f32 RAW connector output."""
@@ -182,9 +162,8 @@ class VisionRuntime:
 
         t0 = time.perf_counter()
         arrs = [_to_chw_f32(im) for im in images]
-        # The im2col patch-embed is a ONE-TIME host matmul per image, not part
-        # of the dispatch loop, so it runs BEFORE the clamp with all threads
-        # (measured 4.6 ms multi-threaded vs 9.6 ms at 1 thread, per image).
+        # The im2col patch-embed is a ONE-TIME host matmul per image, done
+        # up front rather than inside the dispatch loop.
         patch_embeds = [
             im2col_patch_embed(
                 a,
@@ -198,23 +177,22 @@ class VisionRuntime:
         t_im2col = (time.perf_counter() - t0) * 1e3
         out = np.empty((len(arrs), 64, self.cfg.connector_out), np.float32)
         per_image_ms = []
-        with npu_thread_limits(1, enabled=limit_threads):
-            t_enc0 = time.perf_counter()
-            for i, a in enumerate(patch_embeds):
-                ti = time.perf_counter()
-                res = run_vit_encoder(
-                    a,
-                    self.weights,
-                    self.cfg,
-                    self.cache,
-                    return_per_layer=False,
-                    do_connector=True,
-                    verbose=False,
-                    attn_mode=attn_mode,
-                )
-                out[i] = res["connector"]
-                per_image_ms.append((time.perf_counter() - ti) * 1e3)
-            t_enc = (time.perf_counter() - t_enc0) * 1e3
+        t_enc0 = time.perf_counter()
+        for i, a in enumerate(patch_embeds):
+            ti = time.perf_counter()
+            res = run_vit_encoder(
+                a,
+                self.weights,
+                self.cfg,
+                self.cache,
+                return_per_layer=False,
+                do_connector=True,
+                verbose=False,
+                attn_mode=attn_mode,
+            )
+            out[i] = res["connector"]
+            per_image_ms.append((time.perf_counter() - ti) * 1e3)
+        t_enc = (time.perf_counter() - t_enc0) * 1e3
         self.warmed = True
         if timings is not None:
             timings["vision"] = {

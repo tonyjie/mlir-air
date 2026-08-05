@@ -205,7 +205,6 @@ path uses, median of 30 (15 for im2col), machine idle.
 | `_to_chw_f32` (torch 1×3×512×512) | 0.003 ms | 3 | 0.01 ms |
 | LN param `np.concatenate` (2×768) | 0.001 ms | 3 | <0.01 ms |
 | connector B `ascontiguousarray` (12288,960) | <0.001 ms | 3 | <0.01 ms |
-| `npu_thread_limits` enter+exit | 0.002 ms | 1 | <0.01 ms |
 | **TOTAL itemised host** | | | **14.84 ms** |
 
 For reference: `im2col_patch_embed` at **1 thread** costs 9.455 ms instead of
