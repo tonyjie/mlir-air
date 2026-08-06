@@ -111,7 +111,7 @@ expert MLP 2048, `state_proj=[960,32]`, `action_in_proj=[720,32]`.
 |---|---|---|---|---|---|
 | **`lerobot/smolvla_base`** | 69408 | 3 | **241** | SO-100 (6->6) | 481 community datasets — **what we ported** |
 | `lerobot/smolvla_libero` | 17282 | 3 | 241 | Franka (6->7) | LIBERO |
-| `lerobot/smolvla_libero_plus` | 501 | **5** (3 real + 2 empty) | **369** | Franka (6->7) | LIBERO-Plus |
+| `lerobot/smolvla_libero_plus` | 501 | **3 real + 2 empty** | **369** (305 if fed 2) | Franka (6->7) | LIBERO-Plus |
 | `lerobot/smolvla_metaworld` | 839 | 3 | 241 | (6->4) | Meta-World |
 | `lerobot/smolvla_robocasa` | 532 | 3 | 241 | mobile manip (6->12) | RoboCasa |
 | `lerobot/smolvla_robotwin` | 327 | 3 | 241 | **bimanual** (6->14) | RoboTwin |
@@ -221,11 +221,24 @@ for num_empty_cameras in range(len(missing_img_keys)):
 ```
 
 The image is masked out of attention, but all 12 ViT layers still execute on
-it. So `libero_plus` runs vision **five** times per inference, not three, and
-`robocerebra` four.
+it.
 
-This matters to us: vision is the only stage we win on, so a checkpoint with
-more cameras raises the share of the workload that runs on the NPU. See §7.
+**How many passes that adds depends on how many real cameras the batch
+supplies**, because the loop fills the *missing* keys, capped at
+`empty_cameras`. Measured on `lerobot/smolvla_libero_plus` (3 real slots +
+`empty_cameras=2`):
+
+| Real cameras fed | SigLIP passes | masks | prefix |
+|---|---|---|---|
+| 2 | **4** | `[1,1,0,0]` | 305 |
+| 3 | **5** | `[1,1,1,0,0]` | 369 |
+
+So "libero_plus runs vision five times" holds only when all three real cameras
+are supplied. Its own dataset (`lerobot/libero_plus`) has just **two** cameras
+(`front`, `wrist`), which yields four passes and prefix 305 — not five and 369.
+
+This matters to us: vision is the only stage we win on, so more camera passes
+raise the share of the workload that runs on the NPU. See §7.
 
 ---
 
@@ -254,13 +267,20 @@ The two facts from there that bear on the family:
 | | vision (NPU, 1.19x/image) | backbone (CPU) | expert (CPU) |
 |---|---|---|---|
 | **base** | 12 layers 768/3072, seq 1024, **x3** | 16 layers, seq 241 | 16 layers, 720/2048 |
-| 7 official finetunes | **identical**, x3 (libero_plus x5, robocerebra x4) | 16 layers, seq 241/305/369 | **identical** |
+| 7 official finetunes | **identical**, x3 (libero_plus up to x5, robocerebra up to x4) | 16 layers, seq 241/305/369 | **identical** |
 | HFVLA/libero | **identical**, x2 | **32 layers**, seq 177 | **32 layers, 480/1280** |
 
 **1. The vision work transfers to the whole family at zero cost.** 12 layers /
 768 / 3072 / seq 1024 / 12 MHA is constant across all nine checkpoints, and
 across the eight official ones the weights are identical too. The fused ELFs do
 not change by a byte.
+
+**1b. Nor does the camera count reach the device.** Every ELF is built for a
+single 512x512 image (seq 1024) and the host loops over however many images it
+is given, so 1, 2, 3 (or libero_plus's 5) cameras all run on the ELFs already
+compiled — the count only changes the host loop trip count. The prefix is
+assembled after vision, on the CPU. Verified end to end at 1/2/3 cameras; see
+[`datasets.md`](datasets.md) §4.3.
 
 **2. No family member changes the backbone/expert verdict.** Backbone width is
 permanently 960 / 2560 and prefix seq tops out at 369 — far from the 1024 where
@@ -274,10 +294,12 @@ single-layer GEMM FLOP yardstick against our measured points (vision fc2
 | libero_plus (seq 369) | 4.83 G (win) | 1.81 G (+44%) | 0.15 G |
 | HFVLA/libero (seq 177) | 4.83 G (win) | 0.87 G (worse) | **0.06 G (worse)** |
 
-**3. `smolvla_libero_plus` is the family's best showcase target.** Same
-architecture, so no recompilation, but five vision forwards per inference
-instead of three — the stage we win on carries a larger share of the workload,
-which should yield a better end-to-end speedup than base's 1.07x.
+**3. `smolvla_libero_plus` is the family's best showcase target — with a
+caveat.** Same architecture, so no recompilation, and up to five vision
+forwards per inference instead of three, which puts a larger share of the
+workload on the stage we win. The caveat is that five requires feeding three
+real cameras; its own dataset supplies only two, giving four passes (§5). Four
+is still more than base's three.
 
 **4. Correction to a prior note.** An earlier record said the LIBERO checkpoint
 reuses base's kernels and fused ELFs for free. That holds for

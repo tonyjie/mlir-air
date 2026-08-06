@@ -171,35 +171,243 @@ in the microwave and close it".
 **843 real frames with std ~41 is more than enough to answer the question in
 §2's limit 1**, which needs tens of frames, not thousands.
 
-### The embodiment mismatch
+### Why this copy is not the one to evaluate on
 
-This dataset is 2-camera / 8-dim state, matching `HuggingFaceVLA/smolvla_libero`
-(prefix ~177, 32 layers, expert 480/1280) — **not** the `smolvla_base` we
-ported (3-camera / 6-dim state / prefix 241). Two ways around it, §4.
+It is 2-camera / 8-dim state, whose keys (`image`, `image2`) match
+`HuggingFaceVLA/smolvla_libero` rather than the `smolvla_base` we ported. Since
+`base` accepts any camera count (§4.3) that alone is not disqualifying — but a
+2-camera source puts the prefix at 177 instead of 241, which is not what the
+published numbers were measured at. §4.5 recommends a 3-camera dataset instead.
+
+These 843 frames remain the fastest way to sanity-check image plumbing without
+downloading anything.
 
 ---
 
-## 4. Closing the cheapest gap
+## 4. Evaluating on real data — the plan
 
-The lowest-cost improvement to the gate — no simulator, no robot, no GPU, and
-now no download either.
+> **This section is the handoff.** It is written for whoever implements the
+> real-input evaluation. Everything in it was verified by running the model,
+> not by reading code — the verification commands are in §4.7 so they can be
+> re-run.
 
-**What:** replace `build_batch`'s `torch.zeros` images with real frames from the
-local parquet, keep the noise pinned to zero, run ~20 frames, and report the
-**distribution** of NPU-vs-CPU cosine (median and worst) plus **per-dimension**
-error with the worst dimension named.
+### 4.1 What we are and are not doing
 
-**Handling the embodiment mismatch** — two options:
+**Doing:** a numerical check. Feed real recorded observations instead of zeros,
+compare the NPU action chunk against the CPU action chunk, and report how much
+worse (or not) the agreement gets.
 
-| Option | What it costs | What it buys |
-|---|---|---|
-| **(a) Borrow images only.** Feed the two real camera images into base's first two camera slots, third slot zero or a duplicate; keep state zero. | ~10 lines. Nothing recompiles. | Not a physically meaningful observation, but it puts **real natural-image activation statistics** through SigLIP — which is the entire question. |
-| **(b) Switch to `HuggingFaceVLA/smolvla_libero`.** | Physically coherent, but prefix 241 -> 177 forces an ELF rebuild, and the 32-layer / 480-width expert invalidates the registry's expert GEMM rows. | A genuinely valid observation. |
+**Not doing:** measuring whether the model performs the task. That needs a
+simulator and closed-loop rollouts (§5). The model does **not** need to have
+been trained or finetuned on the dataset we feed it — `smolvla_base` is a
+general pretrained model, it will accept any real observation, and the action
+quality being poor is irrelevant to a numerical check.
 
-**Recommendation: (a).** The question being asked is "does the BFP16 bias grow
-under realistic activation dynamic range?" — that needs realistic pixels, not a
-coherent robot state. Option (a) answers it for a few lines of code, and closes
-limits 1 and 2 from §2 at once.
+**Not doing either:** inventing inputs. No duplicated camera feeds, no
+synthesised pixels. Renaming a dataset's camera key to the key the checkpoint
+expects is *not* invention — it wires a real camera to a real slot.
+
+### 4.2 The one number that matters is a delta
+
+Reporting "cosine on real images = X" is close to meaningless on its own —
+there is nothing to compare X against. The output of this work is:
+
+```
+Δ = cosine(real images) − cosine(all-zero images)
+```
+
+which answers the actual question: **does the BFP16 bias grow when the
+activations have realistic dynamic range?** Every real-input run therefore
+needs a matching all-zero control at the *same camera count* (§4.4).
+
+Report, for each configuration:
+
+| Metric | Why |
+|---|---|
+| cosine **distribution** — median, worst, P10 | A single mean hides the tail; the worst frame is the risk |
+| **per-dimension** error, worst dimension named | Cosine is scale-blind on a physical output — a limitation already recorded in §2 |
+| Δ against the all-zero control | The result. Without it there is no baseline |
+
+Keep the noise pinned (`fixed_noise()` → `torch.zeros`). Flow matching starts
+from noise; if it varies, CPU and NPU no longer share a starting point and the
+comparison collapses. **This is non-negotiable.**
+
+### 4.3 Camera count does not reach the NPU — verified
+
+The NPU port encodes **one image at a time**. Every ELF is compiled for a
+single 512x512 image = seq 1024 (`smolvla_vision_npu.py:24-29`, default
+`seq_len=1024`), and `SmolVlaVisionRuntime.encode()` loops over however many
+images it is handed (`smolvla_runtime.py:194-197`):
+
+```python
+out = np.empty((len(arrs), 64, self.cfg.connector_out), np.float32)
+for i, a in enumerate(patch_embeds):
+    res = run_vit_encoder(a, ...)
+```
+
+The prefix is assembled *after* vision, on the CPU, by lerobot. Grepping the
+whole example for `241` / `177` / `113` returns nothing — no prefix length is
+hardcoded anywhere.
+
+**Consequence: 1, 2 and 3 cameras all work with the ELFs already built.** The
+camera count only changes how many times the host loop runs.
+
+Measured end to end with `smolvla_base` (`predict_action_chunk`, real call):
+
+| Cameras fed | SigLIP passes | Visual tokens | **prefix** | Result |
+|---|---|---|---|---|
+| 1 | 1 | 64 | **113** | chunk (1,50,6), finite |
+| 2 | 2 | 128 | **177** | chunk (1,50,6), finite |
+| 3 | 3 | 192 | **241** | chunk (1,50,6), finite |
+
+Only a batch with *every* camera missing raises
+(`modeling_smolvla.py:411-414`); a partial set is legal.
+
+### 4.4 Step-by-step
+
+Synthetic first, and not merely as a warm-up — it serves two distinct purposes.
+It is a **smoke test** for the claim in §4.3 (which was derived by reading the
+loop, and is only *proven* by running 1 and 2 cameras on real hardware), and it
+produces the **all-zero control** that §4.2's delta is measured against. The
+3-camera control already exists: cosine 0.9990.
+
+| Step | What | Download | NPU |
+|---|---|---|---|
+| **1** | All-zero batch at 1 / 2 / 3 cameras, CPU vs NPU | no | yes |
+| 2 | Pick a 3-camera dataset, fetch a few dozen frames | small | no |
+| 3 | Real frames, 3 cameras → Δ₃ | — | yes |
+| 4 | Same dataset, feed 1 and 2 of its cameras → Δ₁, Δ₂ | — | yes |
+| 5 | Optional: a second dataset, to check the conclusion holds | yes | yes |
+
+**Step 4 deliberately reuses one dataset rather than picking a different
+dataset per camera count.** Three datasets differ in scene, resolution and
+image statistics, so Δ₁/Δ₂/Δ₃ across them would confound camera count with
+dataset identity. Feeding a subset of one dataset's cameras makes camera count
+the only variable — and is not invention, since the model natively supports it.
+
+### 4.5 Which dataset
+
+No dataset uses the key names `camera1/camera2/camera3` — those are a
+normalisation SmolVLA's pretraining applied across its 481 community datasets,
+so **`smolvla_base` has no single "native" evaluation dataset**. Any dataset
+needs its camera keys mapped. All of the below were verified by pulling
+`meta/info.json`:
+
+| Dataset | Cams | Keys | Resolution | Size | state→action |
+|---|---|---|---|---|---|
+| `lerobot/pusht` | 1 | `image` | 96² | 206 ep | 2→2 |
+| `lerobot/berkeley_mvp` | 1 | `hand_image` | 480x640 | 480 ep | 15→8 |
+| `lerobot/aloha_sim_insertion_human` | 1 | `top` | 480x640 | 50 ep | 14→14 |
+| `lerobot/libero` | 2 | `image`, `image2` | 256² | 1693 ep | 8→7 |
+| `lerobot/libero_plus` | 2 | `front`, `wrist` | 256² | **14347 ep / 2.24M fr** | 8→7 |
+| `lerobot/austin_buds_dataset` | 2 | `image`, `wrist_image` | 128² | 50 ep | 24→7 |
+| **`lerobot/droid_100`** | **3** | `exterior_image_1_left`, `exterior_image_2_left`, `wrist_image_left` | 180x320 | 100 ep / 32212 fr | 7→7 |
+| **`lerobot/abc_130k_v3_smoke`** | **3** | `top`, `left_wrist`, `right_wrist` | 224² | 85 ep / 313094 fr | 14→14 |
+| **`lerobot/aloha_mobile_wipe_wine`** | **3** | `cam_high`, `cam_left_wrist`, `cam_right_wrist` | 480x640 | 50 ep / 65000 fr | 14→14 |
+
+**Recommendation: a 3-camera dataset**, for two reasons — prefix stays 241, so
+the numbers are directly comparable to the published cosine 0.9990 / 1.19x per
+image; and the NPU carries the largest share of the work, so any BFP16 effect
+shows up most strongly.
+
+Between the three, **`lerobot/aloha_mobile_wipe_wine`** is the better default:
+at 480x640 it is closest to the 512x512 the model resizes everything to, so it
+is upscaled least. Low-resolution sources are upscaled more, which smooths away
+exactly the outlier structure that drives the BFP16 bias — `droid_100` at
+180x320 is enlarged nearly 3x. `droid_100`'s advantage is scene diversity (47
+tasks vs 1) and that it is real-world DROID data.
+
+> If a 1-camera cross-check against a *different* dataset is ever wanted,
+> `aloha_sim_insertion_human` (1 cam) and `aloha_mobile_wipe_wine` (3 cam) share
+> a robot, a resolution and their state/action dims — the most controlled pair
+> available.
+
+**All three 3-camera datasets store images as `video` (MP4), not PNG-in-parquet
+like the cached LIBERO copy.** Decoding goes through LeRobot's video path;
+confirm the decode dependencies are present before committing to one.
+**Unverified — no video-backed dataset has been read on this machine.**
+
+### 4.6 Dimensions do not match, and it does not matter
+
+`smolvla_base` expects 3x `[3,256,256]`, state `[6]`, action `[6]`. None of the
+3-camera datasets match:
+
+| | base | droid_100 | abc_130k | aloha_wipe |
+|---|---|---|---|---|
+| Image | 256² | 180x320 | 224² | 480x640 |
+| **state** | **6** | **7** | **14** | **14** |
+| action | 6 | 7 | 14 | 14 |
+
+Two mechanisms absorb this, and the result was confirmed by running all four
+configurations end to end:
+
+- **Resolution** — `resize_imgs_with_padding=(512,512)` sends everything through
+  `resize_with_pad` (`modeling_smolvla.py:418-419`). The NPU always sees seq
+  1024 regardless of source resolution.
+- **State** — `pad_vector(state, max_state_dim=32)` pads any width to 32 before
+  `state_proj[960,32]` (`:474-480`, `:570-574`). The device-side tensor is
+  identical.
+
+```
+droid_100    img180x320 state[ 7] -> OK chunk(1,50,6) finite=True
+abc_130k     img224x224 state[14] -> OK chunk(1,50,6) finite=True
+aloha_wipe   img480x640 state[14] -> OK chunk(1,50,6) finite=True
+base-native  img256x256 state[ 6] -> OK chunk(1,50,6) finite=True
+```
+
+⚠️ State is numerically legal but **semantically meaningless** when a 14-dim
+Aloha state is fed to a model trained on 6-dim SO-100 state. Irrelevant to a
+numerical check; must be stated plainly in any writeup.
+
+### 4.7 Reproducing the claims above
+
+Camera-count support and dimension tolerance (CPU only, no NPU, ~2 min each on
+the lerobot venv at `~/Projects/smolvla_playground/.venv`):
+
+```python
+import torch
+from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
+from lerobot.utils.constants import OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS
+
+p = SmolVLAPolicy.from_pretrained("lerobot/smolvla_base").eval()
+cfg = p.config
+tok = p.model.vlm_with_expert.processor.tokenizer(
+    ["put the bowl on the plate"], padding="max_length",
+    max_length=cfg.tokenizer_max_length, truncation=True, return_tensors="pt")
+noise = torch.zeros((1, cfg.chunk_size, cfg.max_action_dim))
+
+for n in (1, 2, 3):
+    b = {f"observation.images.camera{i}": torch.rand(1, 3, 256, 256)
+         for i in range(1, n + 1)}
+    b["observation.state"] = torch.zeros(1, 6)
+    b[OBS_LANGUAGE_TOKENS] = tok["input_ids"]
+    b[OBS_LANGUAGE_ATTENTION_MASK] = tok["attention_mask"].bool()
+    p.reset()
+    with torch.no_grad():
+        print(n, p.predict_action_chunk(b, noise=noise).shape)
+```
+
+Camera keys of any dataset, without downloading it:
+
+```python
+from huggingface_hub import hf_hub_download
+import json
+d = json.load(open(hf_hub_download("lerobot/droid_100", "meta/info.json",
+                                   repo_type="dataset")))
+print({k: v["shape"] for k, v in d["features"].items()
+       if v.get("dtype") in ("image", "video")})
+```
+
+### 4.8 Where to hook in
+
+`build_oracle_batch(policy, prompt)` in `smolvla_inference.py` is the single
+place the batch is constructed, and `verify_adapter.py:90` is its only caller
+on the gate path. Both the oracle dumper and the inference path go through it.
+
+**Leave the existing gate untouched.** Its value is precisely its degeneracy:
+fully deterministic, fast, reproducible — a regression detector. The real-input
+evaluation answers a different question (how much headroom the precision has)
+and is a characterisation, not a pass/fail. Add it alongside; do not replace.
 
 This still does not measure task quality. That is §5.
 
@@ -292,7 +500,18 @@ conclusion is easier to attack, and what it measures is softer than 2b's.
 - RoboMIND's license was not confirmed.
 - Tier-2b's claim that the ELF rebuild is the main cost assumes the 177-token
   prefix places without new tiling problems. Not attempted.
-- Nothing in §4 or §5 has been run. They are proposals.
+- **§4.3 / §4.6 were verified on CPU only.** `predict_action_chunk` really was
+  run at 1/2/3 cameras and at each dataset's native resolution and state width,
+  but with `torch.rand` images and **never through the NPU path**. That 1 and 2
+  cameras work on device is an inference from the host loop, which is exactly
+  what step 1 of §4.4 exists to prove.
+- Random images are not natural images. §4.3/§4.6 establish shape
+  compatibility, not anything about precision on real data.
+- No video-backed (MP4) dataset has been read on this machine; all three
+  3-camera candidates are video-backed.
+- Dataset sizes and camera keys in §4.5 come from `meta/info.json` only — no
+  frames of those datasets have been downloaded or decoded.
+- §5 has not been run, and neither has anything past step 1 of §4.4.
 
 ## Sources
 
