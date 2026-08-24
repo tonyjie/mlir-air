@@ -1,4 +1,4 @@
 {
-  "llvm-version": "23.0.0.2026071405+46fcb339",
-  "mlir-aie-version": "db06374df9bf83d9fc557001ca213368aed15788"
+  "llvm-version": "24.0.0.2026080106+56bcc187",
+  "mlir-aie-version": "7e00b57955e108fe9d8e9419f5828a0c7e650858"
 }
