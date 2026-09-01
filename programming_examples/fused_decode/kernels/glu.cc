@@ -8,6 +8,7 @@
 
 template <int L>
 void pseduo_glu(bf16 *y, const bf16 *x) {
+  aie_round_nearest_even();
   bf16 *gate_ptr = const_cast<bf16 *>(x) + (L / 2);
   bf16 *hid_ptr = const_cast<bf16 *>(x);
   bf16 *y_ptr = y;
@@ -38,7 +39,113 @@ extern "C" {
 void glu_aie(bf16 *restrict y, bf16 *restrict x, int _arm) {
   (void)_arm; // per-token RTP arm-gate operand (kept alive so AIR emits the arm
               // lock)
+#if defined(GLU_ROW_PROBE) && GLU_ROW_PROBE == 2
+  // The batch-1 half of the probe, so the two builds can be compared under it.
+  for (int i = 0; i < GLU_SLICE / 2; i += 16)
+    aie::store_v(y + i, aie::sub(aie::load_v<16>(x + i),
+                                 aie::load_v<16>(x + GLU_SLICE / 2 + i)));
+#elif defined(GLU_ROW_PROBE) && GLU_ROW_PROBE == 4
+  for (int i = 0; i < GLU_SLICE / 2; i += 16) {
+    aie::vector<bf16, 16> gate = aie::load_v<16>(x + GLU_SLICE / 2 + i);
+    aie::vector<bf16, 16> hid = aie::load_v<16>(x + i);
+    aie::vector<bf16, 16> o = aie::mul(gate, hid);
+    aie::store_v(y + i, o);
+  }
+#elif defined(GLU_ROW_PROBE) && GLU_ROW_PROBE == 5
+  // The batch-1 twin of the table probe. This is the control the whole
+  // diagnosis turns on: the SAME getActivationBf16, the same core, the same
+  // silicon, differing only in whether the build is batched.
+  for (int i = 0; i < GLU_SLICE / 2; i += 16) {
+    aie::vector<bf16, 16> gate = aie::load_v<16>(x + GLU_SLICE / 2 + i);
+    gate = getActivationBf16(gate);
+    aie::store_v(y + i, gate);
+  }
+#else
   pseduo_glu<GLU_SLICE>(y, x);
+#endif
+}
+
+// DECODE_BATCH > 1, LM HEAD arm: half a slice, copied. No math at all.
+//
+// This exists for a LOCK reason, not an arithmetic one. On the vocab arm this
+// core is a pure relay -- a slice of logits arrives on the gate-up dest and
+// leaves on the second MM2S -- and the obvious spelling sends the INPUT buffer
+// straight back out. That makes the input buffer both DMA-written and
+// DMA-read, and AIR then sizes its lock credit by the ratio of those two counts
+// (getLockValuePair), which across two arms comes out at 2 and stalls the port.
+// Copying into the output buffer keeps each buffer one-directional -- input
+// written only, output read only -- which is the case AIR gives credit 1
+// unconditionally, and is what the decode arm already looks like.
+//
+// The cost is one L1-to-L1 pass over the slice per relay, against a vocab GEMV
+// of 2048x512 MACs behind it.
+void glu_copy_aie(bf16 *restrict y, bf16 *restrict x, int off, int n,
+                  int _arm) {
+  (void)_arm; // per-token RTP arm-gate operand, as in glu_aie
+  const bf16 *src = x + off;
+  for (int i = 0; i < n; i += 16)
+    aie::store_v(y + i, aie::load_v<16>(src + i));
+}
+
+// DECODE_BATCH > 1: row t of a batched round. The gate-up projection egresses
+// (round, token), so one round arrives as [BATCH][GLU_SLICE] and leaves as
+// [BATCH][GLU_SLICE/2] -- the GLU itself is per token and unchanged, which is
+// the whole reason this is a row index rather than a new kernel.
+void glu_row_aie(bf16 *restrict y, bf16 *restrict x, int t, int _arm) {
+  (void)_arm; // per-token RTP arm-gate operand, as in glu_aie
+#ifdef GLU_ROW_PROBE
+  // Diagnostic builds only, and each answers ONE question about the batched
+  // gate-up egress that no descriptor check can:
+  //   1  swap the halves     -- did the two egress rounds land [gate|up]?
+  //   2  y = up - gate       -- antisymmetric and silu-free: reads BOTH halves,
+  //                             so a half landing in the wrong place shows, and
+  //                             a swap shows as an exact sign flip
+  //   3  y = up              -- the first half alone
+  //   4  y = gate*up         -- the real kernel with ONLY the LUT removed.
+  //                             Probe 2 clears the plumbing, but at ~13x the
+  //                             real GLU magnitude, so it cannot tell a fault
+  //                             that scales with the signal from one that does
+  //                             not. This has the same magnitude and the same
+  //                             multiply as the real thing and no table, so it
+  //                             separates getActivationBf16 from aie::mul.
+  //   5  y = silu(gate)      -- the LUT alone, no multiply. If 4 is clean and
+  //                             5 is not, the table is what is wrong.
+  bf16 *xr = x + t * GLU_SLICE;
+  bf16 *yr = y + t * (GLU_SLICE / 2);
+#if GLU_ROW_PROBE == 1
+  for (int i = 0; i < GLU_SLICE / 2; i += 16) {
+    aie::vector<bf16, 16> up = aie::load_v<16>(xr + i);
+    aie::vector<bf16, 16> gate = aie::load_v<16>(xr + GLU_SLICE / 2 + i);
+    up = getActivationBf16(up);
+    aie::vector<bf16, 16> o = aie::mul(up, gate);
+    aie::store_v(yr + i, o);
+  }
+#elif GLU_ROW_PROBE == 2
+  for (int i = 0; i < GLU_SLICE / 2; i += 16)
+    aie::store_v(yr + i, aie::sub(aie::load_v<16>(xr + i),
+                                  aie::load_v<16>(xr + GLU_SLICE / 2 + i)));
+#elif GLU_ROW_PROBE == 4
+  // pseduo_glu with getActivationBf16 deleted and nothing else changed.
+  for (int i = 0; i < GLU_SLICE / 2; i += 16) {
+    aie::vector<bf16, 16> gate = aie::load_v<16>(xr + GLU_SLICE / 2 + i);
+    aie::vector<bf16, 16> hid = aie::load_v<16>(xr + i);
+    aie::vector<bf16, 16> o = aie::mul(gate, hid);
+    aie::store_v(yr + i, o);
+  }
+#elif GLU_ROW_PROBE == 5
+  // The table alone. Same loads, same store, no multiply.
+  for (int i = 0; i < GLU_SLICE / 2; i += 16) {
+    aie::vector<bf16, 16> gate = aie::load_v<16>(xr + GLU_SLICE / 2 + i);
+    gate = getActivationBf16(gate);
+    aie::store_v(yr + i, gate);
+  }
+#else
+  for (int i = 0; i < GLU_SLICE / 2; i += 16)
+    aie::store_v(yr + i, aie::load_v<16>(xr + i));
+#endif
+#else
+  pseduo_glu<GLU_SLICE>(y + t * (GLU_SLICE / 2), x + t * GLU_SLICE);
+#endif
 }
 
 // Small-slice variant for the demux8 wire-up bisection (M=256 proj payload):
@@ -58,8 +165,13 @@ void glu_aie3072(bf16 *restrict y, bf16 *restrict x) { pseduo_glu<3072>(y, x); }
 // X keeps the uniform proj K=2048 (down = W_down @ [glu(1536) ++ zeros(512)]).
 void glu_aie3072_pad2048(bf16 *restrict y, bf16 *restrict x) {
   pseduo_glu<3072>(y, x);
-  for (int i = 1536; i < 2048; i++)
-    y[i] = (bf16)0.0f;
+  // Vectorised: Peano does not auto-vectorise a plain C loop (see the
+  // RMS_CHUNK_PROBE=2 comment in rms_residual.cc), so this pad cost 512 scalar
+  // stores where it needs 32 vector ones.
+  constexpr int vs = 16;
+  const auto z = aie::zeros<bf16, vs>();
+  for (int i = 1536; i < 2048; i += vs)
+    aie::store_v(y + i, z);
 }
 
 // Header-bearing variant for the PACKET x-feed (STAGE_MLP>=2 down-phase X):
@@ -69,8 +181,10 @@ void glu_aie3072_pad2048_hdr(bf16 *restrict y, bf16 *restrict x,
                              unsigned int pkt_id) {
   *reinterpret_cast<unsigned int *>(y + 14) = pkt_id;
   pseduo_glu<3072>(y + 16, x);
-  for (int i = 1536; i < 2048; i++)
-    y[16 + i] = (bf16)0.0f;
+  constexpr int vs = 16;
+  const auto z = aie::zeros<bf16, vs>();
+  for (int i = 1536; i < 2048; i += vs)
+    aie::store_v(y + 16 + i, z);
 }
 
 // MLP_REAL (Llama-3.2-1B real dims): gate/up proj output 16384 =

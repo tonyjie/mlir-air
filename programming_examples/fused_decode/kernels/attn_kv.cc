@@ -45,6 +45,7 @@ extern "C" {
 void attn_kv(bf16 *__restrict s_ping, bf16 *__restrict s_pong,
              bf16 *__restrict v_ping, bf16 *__restrict v_pong,
              bf16 *__restrict o_ping, bf16 *__restrict o_pong, int *L) {
+  aie_round_nearest_even();
   alignas(aie::vector_decl_align) static y_acc_dtype
       y[Q_HEADS_PADDED_PER_CU * DH] = {};
   alignas(aie::vector_decl_align) static bf16
@@ -111,6 +112,7 @@ __attribute__((noinline)) void passThrough_aie(T_in *restrict in0,
 ATTN_HOT
 void calculate_l(bf16 *__restrict pS, float *__restrict c,
                  float *__restrict l) {
+  aie_round_nearest_even();
   using MMUL = aie::mmul<8, 8, 8, bf16, bf16, accfloat>;
 
   bf16 *__restrict pS1 = pS;
@@ -212,21 +214,35 @@ ATTN_HOT void attn_fv(bf16 *__restrict pS, bf16 *__restrict pV,
         aie::concat(aie::filter_odd(S_up, 8), aie::filter_odd(S_down, 8));
     bf16 *__restrict pV1 = pV;
     bf16 *__restrict pV2 = pV + MMUL::size_B * colQ;
+    // Bench-only (aie_kernel_utils.h): serve every V tile from ONE hoisted
+    // load. V is the same for every token in a batch, so this is the strict
+    // upper bound on what putting tokens in the mmul's R dimension can save
+    // here -- a batch could hoist the V loads, and nothing else in this
+    // function, out of the per-token path.
+#ifdef ATTN_BENCH_NO_VLOAD
+    const aie::vector<bf16, MMUL::size_B> V_hoisted =
+        aie::load_v<MMUL::size_B>(pV1);
+#define ATTN_VLOAD(p) V_hoisted
+#else
+#define ATTN_VLOAD(p) aie::load_v<MMUL::size_B>(p)
+#endif
     // (1) correction pass (pure vector; CORRECT dies after this scope)
+#ifndef ATTN_BENCH_NO_CORRECT // bench-only; see aie_kernel_utils.h
     {
       aie::vector<y_acc_dtype, 64> CORRECT = aie::concat(
           aie::broadcast<float, 8>(c[0]), aie::broadcast<float, 8>(c[1]),
           aie::broadcast<float, 8>(c[2]), aie::broadcast<float, 8>(c[3]),
           aie::broadcast<float, 8>(c[4]), aie::broadcast<float, 8>(c[5]),
           aie::broadcast<float, 8>(c[6]), aie::broadcast<float, 8>(c[7]));
-      for (unsigned j = 0; j < colQ; j += 1) {
+      ATTN_Q_LOOP for (unsigned j = 0; j < colQ; j += 1) {
         y_acc_dtype *__restrict pYc = pY + j * MMUL::size_C;
         aie::store_v(pYc, aie::mul(CORRECT, aie::load_v<MMUL::size_C>(pYc))
                               .template to_vector<y_acc_dtype>());
       }
     }
+#endif
     // (2) mac pass, one accumulator live at a time (plane0 even ++ plane1 odd)
-    for (unsigned j = 0; j < colQ; j += 1) {
+    ATTN_Q_LOOP for (unsigned j = 0; j < colQ; j += 1) {
       y_acc_dtype *__restrict pYc = pY + j * MMUL::size_C;
       bf16 *__restrict pVa = pV1 + j * MMUL::size_B;
       bf16 *__restrict pVb = pV2 + j * MMUL::size_B;
@@ -240,22 +256,24 @@ ATTN_HOT void attn_fv(bf16 *__restrict pS, bf16 *__restrict pV,
           aie::load_v<MMUL::size_C>(pYc);
       aie::vector<bf16, MMUL::size_C> zc = aie::zeros<bf16, MMUL::size_C>();
       MMUL Y0(zc);
-      Y0.mac(S0, aie::load_v<MMUL::size_B>(pVa));
-      Y0.mac(S1, aie::load_v<MMUL::size_B>(pVa + MMUL::size_B * colQ * 2));
+      Y0.mac(S0, ATTN_VLOAD(pVa));
+      Y0.mac(S1, ATTN_VLOAD(pVa + MMUL::size_B * colQ * 2));
       auto Yeven = aie::filter_even(
           aie::add(Y0.template to_vector<y_acc_dtype>(), yprev), 32);
       MMUL Y1(zc);
-      Y1.mac(S0, aie::load_v<MMUL::size_B>(pVb));
-      Y1.mac(S1, aie::load_v<MMUL::size_B>(pVb + MMUL::size_B * colQ * 2));
+      Y1.mac(S0, ATTN_VLOAD(pVb));
+      Y1.mac(S1, ATTN_VLOAD(pVb + MMUL::size_B * colQ * 2));
       auto Yodd = aie::filter_odd(
           aie::add(Y1.template to_vector<y_acc_dtype>(), yprev), 32);
       aie::store_v(pYc, aie::concat(Yeven, Yodd));
     }
   }
 }
+#undef ATTN_VLOAD
 
 template <unsigned N>
 __attribute__((noinline)) void scale_div_aie(bf16 *a, bf16 *o, float *l) {
+  aie_round_nearest_even();
 
   constexpr int vec_factor = 64;
   const int F = N / vec_factor;
@@ -295,6 +313,7 @@ __attribute__((noinline)) void scale_div_aie(bf16 *a, bf16 *o, float *l) {
 
 void calculate_l(bf16 *__restrict pS, float *__restrict c,
                  float *__restrict l) {
+  aie_round_nearest_even();
   using MMUL = aie::mmul<GQA_R, GQA_S, GQA_T, bf16, bf16, accfloat>;
   bf16 *__restrict pS1 = pS;
 
@@ -332,6 +351,7 @@ typedef float y_acc_dtype;
 template <unsigned colQ, unsigned r, unsigned s, unsigned t>
 void attn_fv(bf16 *__restrict pS, bf16 *__restrict pV,
              y_acc_dtype *__restrict pY, float *__restrict c) {
+  aie_round_nearest_even();
 
   using MMUL = aie::mmul<r, s, t, bf16, bf16, accfloat>;
 
@@ -357,8 +377,10 @@ void attn_fv(bf16 *__restrict pS, bf16 *__restrict pV,
   bf16 *__restrict pV1 = pV;
   aie::vector<float, 16> zeros_float = aie::zeros<float, 16>();
 
-  AIE_PREPARE_FOR_PIPELINING AIE_LOOP_RANGE(2) for (unsigned j = 0; j < colQ;
-                                                    j += 4) {
+  AIE_PREPARE_FOR_PIPELINING
+  ATTN_Q_LOOP
+  AIE_LOOP_RANGE(2)
+  for (unsigned j = 0; j < colQ; j += 4) {
     // v0
     bf16 *__restrict pV01 = pV1 + (j + 0) * MMUL::size_B;
     bf16 *__restrict pV02 = pV1 + (j + 1) * MMUL::size_B;
@@ -446,6 +468,7 @@ void attn_fv(bf16 *__restrict pS, bf16 *__restrict pV,
 
 template <unsigned N>
 void scale_div_aie(bf16 *a, bf16 *o, float *l) {
+  aie_round_nearest_even();
 
   constexpr int vec_factor = 16;
   const int F = N / vec_factor;
@@ -476,6 +499,7 @@ __attribute__((noinline))
 #endif
 void calculate_l(bf16 *__restrict pS, float *__restrict c,
                  float *__restrict l) {
+  aie_round_nearest_even();
   using MMUL = aie::mmul<GQA_R, GQA_S, GQA_T, bf16, bf16, accfloat>;
   bf16 *__restrict pS1 = pS;
 
@@ -526,6 +550,7 @@ __attribute__((noinline))
 #endif
 void attn_fv(bf16 *__restrict pS, bf16 *__restrict pV,
              y_acc_dtype *__restrict pY, float *__restrict c) {
+  aie_round_nearest_even();
 
   using MMUL = aie::mmul<r, s, t, bf16, bf16, accfloat>;
 
@@ -548,20 +573,22 @@ void attn_fv(bf16 *__restrict pS, bf16 *__restrict pV,
     aie::vector<bf16, MMUL::size_A> S1 =
         aie::concat(aie::filter_odd(S_up, 8), aie::filter_odd(S_down, 8));
     // (1) correction pass
+#ifndef ATTN_BENCH_NO_CORRECT // bench-only; see aie_kernel_utils.h
     {
       aie::vector<y_acc_dtype, 64> CORRECT = aie::concat(
           aie::broadcast<float, 8>(c[0]), aie::broadcast<float, 8>(c[1]),
           aie::broadcast<float, 8>(c[2]), aie::broadcast<float, 8>(c[3]),
           aie::broadcast<float, 8>(c[4]), aie::broadcast<float, 8>(c[5]),
           aie::broadcast<float, 8>(c[6]), aie::broadcast<float, 8>(c[7]));
-      for (unsigned j = 0; j < colQ; j += 1) {
+      ATTN_Q_LOOP for (unsigned j = 0; j < colQ; j += 1) {
         y_acc_dtype *__restrict pYc = pY + j * MMUL::size_C;
         aie::store_v(pYc, aie::mul(CORRECT, aie::load_v<MMUL::size_C>(pYc))
                               .template to_vector<y_acc_dtype>());
       }
     }
+#endif
     // (2) mac pass, single accumulator
-    for (unsigned j = 0; j < colQ; j += 1) {
+    ATTN_Q_LOOP for (unsigned j = 0; j < colQ; j += 1) {
       y_acc_dtype *__restrict pYc = pY + j * MMUL::size_C;
       bf16 *__restrict pVp = pV1 + j * MMUL::size_B;
       aie::vector<bf16, MMUL::size_B> Vp = aie::load_v<MMUL::size_B>(pVp);
@@ -600,75 +627,77 @@ void attn_fv(bf16 *__restrict pS, bf16 *__restrict pV,
   aie::vector<y_acc_dtype, 64> CORRECT =
       aie::concat(c0, c1, c2, c3, c4, c5, c6, c7);
 
-  for (unsigned j = 0; j < colQ; j += 4)
-    chess_prepare_for_pipelining chess_loop_range(2, ) {
-      // v0
-      bf16 *__restrict pV01 = pV1 + (j + 0) * MMUL::size_B;
-      bf16 *__restrict pV02 = pV1 + (j + 1) * MMUL::size_B;
-      bf16 *__restrict pV03 = pV1 + (j + 2) * MMUL::size_B;
-      bf16 *__restrict pV04 = pV1 + (j + 3) * MMUL::size_B;
+  ATTN_Q_LOOP for (unsigned j = 0; j < colQ; j += 4)
+      chess_prepare_for_pipelining
+      chess_loop_range(2, ) {
+    // v0
+    bf16 *__restrict pV01 = pV1 + (j + 0) * MMUL::size_B;
+    bf16 *__restrict pV02 = pV1 + (j + 1) * MMUL::size_B;
+    bf16 *__restrict pV03 = pV1 + (j + 2) * MMUL::size_B;
+    bf16 *__restrict pV04 = pV1 + (j + 3) * MMUL::size_B;
 
-      aie::vector<bf16, MMUL::size_B> V00 = aie::load_v<MMUL::size_B>(pV01);
-      pV01 += MMUL::size_B * colQ;
-      aie::vector<bf16, MMUL::size_B> V01 = aie::load_v<MMUL::size_B>(pV02);
-      pV02 += MMUL::size_B * colQ;
-      aie::vector<bf16, MMUL::size_B> V02 = aie::load_v<MMUL::size_B>(pV03);
-      pV03 += MMUL::size_B * colQ;
-      aie::vector<bf16, MMUL::size_B> V03 = aie::load_v<MMUL::size_B>(pV04);
-      pV04 += MMUL::size_B * colQ;
+    aie::vector<bf16, MMUL::size_B> V00 = aie::load_v<MMUL::size_B>(pV01);
+    pV01 += MMUL::size_B * colQ;
+    aie::vector<bf16, MMUL::size_B> V01 = aie::load_v<MMUL::size_B>(pV02);
+    pV02 += MMUL::size_B * colQ;
+    aie::vector<bf16, MMUL::size_B> V02 = aie::load_v<MMUL::size_B>(pV03);
+    pV03 += MMUL::size_B * colQ;
+    aie::vector<bf16, MMUL::size_B> V03 = aie::load_v<MMUL::size_B>(pV04);
+    pV04 += MMUL::size_B * colQ;
 
-      aie::vector<y_acc_dtype, MMUL::size_C> acc_y00 =
-          aie::load_v<MMUL::size_C>(pY1);
-      aie::vector<y_acc_dtype, MMUL::size_C> acc_y01 =
-          aie::load_v<MMUL::size_C>(pY1 + MMUL::size_C);
-      aie::vector<y_acc_dtype, MMUL::size_C> acc_y02 =
-          aie::load_v<MMUL::size_C>(pY1 + MMUL::size_C * 2);
-      aie::vector<y_acc_dtype, MMUL::size_C> acc_y03 =
-          aie::load_v<MMUL::size_C>(pY1 + MMUL::size_C * 3);
+    aie::vector<y_acc_dtype, MMUL::size_C> acc_y00 =
+        aie::load_v<MMUL::size_C>(pY1);
+    aie::vector<y_acc_dtype, MMUL::size_C> acc_y01 =
+        aie::load_v<MMUL::size_C>(pY1 + MMUL::size_C);
+    aie::vector<y_acc_dtype, MMUL::size_C> acc_y02 =
+        aie::load_v<MMUL::size_C>(pY1 + MMUL::size_C * 2);
+    aie::vector<y_acc_dtype, MMUL::size_C> acc_y03 =
+        aie::load_v<MMUL::size_C>(pY1 + MMUL::size_C * 3);
 
-      aie::accum<accfloat, MMUL::size_C> ACC_Y00;
-      aie::accum<accfloat, MMUL::size_C> ACC_Y01;
-      aie::accum<accfloat, MMUL::size_C> ACC_Y02;
-      aie::accum<accfloat, MMUL::size_C> ACC_Y03;
-      ACC_Y00 = aie::mul(CORRECT, acc_y00);
-      ACC_Y01 = aie::mul(CORRECT, acc_y01);
-      ACC_Y02 = aie::mul(CORRECT, acc_y02);
-      ACC_Y03 = aie::mul(CORRECT, acc_y03);
+    aie::accum<accfloat, MMUL::size_C> ACC_Y00;
+    aie::accum<accfloat, MMUL::size_C> ACC_Y01;
+    aie::accum<accfloat, MMUL::size_C> ACC_Y02;
+    aie::accum<accfloat, MMUL::size_C> ACC_Y03;
+    ACC_Y00 = aie::mul(CORRECT, acc_y00);
+    ACC_Y01 = aie::mul(CORRECT, acc_y01);
+    ACC_Y02 = aie::mul(CORRECT, acc_y02);
+    ACC_Y03 = aie::mul(CORRECT, acc_y03);
 
-      MMUL Y00(ACC_Y00);
-      MMUL Y01(ACC_Y01);
-      MMUL Y02(ACC_Y02);
-      MMUL Y03(ACC_Y03);
+    MMUL Y00(ACC_Y00);
+    MMUL Y01(ACC_Y01);
+    MMUL Y02(ACC_Y02);
+    MMUL Y03(ACC_Y03);
 
-      Y00.mac(S0, V00);
-      Y01.mac(S0, V01);
-      Y02.mac(S0, V02);
-      Y03.mac(S0, V03);
+    Y00.mac(S0, V00);
+    Y01.mac(S0, V01);
+    Y02.mac(S0, V02);
+    Y03.mac(S0, V03);
 
-      V00 = aie::load_v<MMUL::size_B>(pV01);
-      V01 = aie::load_v<MMUL::size_B>(pV02);
-      V02 = aie::load_v<MMUL::size_B>(pV03);
-      V03 = aie::load_v<MMUL::size_B>(pV04);
+    V00 = aie::load_v<MMUL::size_B>(pV01);
+    V01 = aie::load_v<MMUL::size_B>(pV02);
+    V02 = aie::load_v<MMUL::size_B>(pV03);
+    V03 = aie::load_v<MMUL::size_B>(pV04);
 
-      Y00.mac(S1, V00);
-      Y01.mac(S1, V01);
-      Y02.mac(S1, V02);
-      Y03.mac(S1, V03);
+    Y00.mac(S1, V00);
+    Y01.mac(S1, V01);
+    Y02.mac(S1, V02);
+    Y03.mac(S1, V03);
 
-      aie::store_v(pY1, Y00.template to_vector<y_acc_dtype>());
-      pY1 += MMUL::size_C;
-      aie::store_v(pY1, Y01.template to_vector<y_acc_dtype>());
-      pY1 += MMUL::size_C;
-      aie::store_v(pY1, Y02.template to_vector<y_acc_dtype>());
-      pY1 += MMUL::size_C;
-      aie::store_v(pY1, Y03.template to_vector<y_acc_dtype>());
-      pY1 += MMUL::size_C;
-    }
+    aie::store_v(pY1, Y00.template to_vector<y_acc_dtype>());
+    pY1 += MMUL::size_C;
+    aie::store_v(pY1, Y01.template to_vector<y_acc_dtype>());
+    pY1 += MMUL::size_C;
+    aie::store_v(pY1, Y02.template to_vector<y_acc_dtype>());
+    pY1 += MMUL::size_C;
+    aie::store_v(pY1, Y03.template to_vector<y_acc_dtype>());
+    pY1 += MMUL::size_C;
+  }
 #endif
 }
 
 template <unsigned N>
 void scale_div_aie(bf16 *a, bf16 *o, float *l) {
+  aie_round_nearest_even();
 
   constexpr int vec_factor = 64;
   const int F = N / vec_factor;
@@ -745,6 +774,7 @@ ATTN_ENTRY
 void attn_kv_blk(bf16 *__restrict s_block, bf16 *__restrict v_block,
                  float *__restrict y_state, float *__restrict l_state, int blk,
                  int L) {
+  aie_round_nearest_even();
   if (blk == 0) {
     zero_vectorized<y_acc_dtype, Q_HEADS_PADDED_PER_CU * DH>(y_state);
     const aie::vector<float, 16> zero = aie::broadcast<float, 16>(0);
@@ -753,8 +783,55 @@ void attn_kv_blk(bf16 *__restrict s_block, bf16 *__restrict v_block,
   // Block fully beyond L: skip (pairs with attn_qk_blk's skip -- s_block/c are
   // not produced for this block, so they must not be consumed). No V
   // contribution, matching the runtime-L path.
-  if (L - blk * 16 <= 0)
+  const int rem = L - blk * 16;
+  if (rem <= 0)
     return;
+#ifndef ATTN_NO_VTAIL_ZERO
+  // THE V TILE'S OUT-OF-CONTEXT KEYS MUST BE ZEROED, EVEN THOUGH THEIR SCORES
+  // ALREADY ARE.
+  //
+  // S.V runs as a BFP16 mmul contracting over KEYS, and BFP16 shares ONE
+  // exponent across 8 elements of that dimension. Those groups are 8-key
+  // aligned, so whenever L % 8 != 0 the group straddling the context boundary
+  // also covers KV rows past L-1 -- and their exponents still enter the
+  // shared-exponent max, right-shifting the VALID rows' mantissas. The masked
+  // keys contribute no WEIGHT (attn_qk zeroes their scores, and a zero never
+  // raises a max, which is why the K side shows nothing); what they cost is
+  // PRECISION.
+  //
+  // Measured before this zeroing, on qwen3-4b decode, by writing a value into
+  // KV rows L..L+7 and re-dispatching: the output moved at every L except
+  // L % 8 == 0, where it was bit-identical -- and it depended ONLY on those
+  // rows' EXPONENT. Sign ignored (v and -v byte-identical), mantissa ignored
+  // (1.00/1.25/1.50/1.75 byte-identical), no dependence on how many rows
+  // carried it (a max, not a sum), and nothing at all once the valid rows'
+  // exponent was the larger one (valid 256 vs phantom 1/16/256 -> exactly 0).
+  //
+  // Invisible in ordinary decode, where the rows past L-1 are zero. NOT
+  // invisible in a speculative verify pass, where they hold the block's own
+  // later tokens: see docs/DFlashFeasibility.md section 3.8.
+  //
+  // Only the group containing the boundary can hurt -- a group entirely past L
+  // is its own BFP block -- but zeroing to the end of the tile is the same
+  // bounded cost and needs no second boundary to get right. Last block only.
+  //
+  // The in-kernel-lock `attn_kv` above has the same exposure and is NOT fixed:
+  // AIR declares and calls only attn_kv_blk / attn_kv_fin / attn_kv_fin_row
+  // (fused_decode.py `_set_attn_link`), so that path is the reference form and
+  // is unreachable from this engine. Fix it there too before reviving it.
+  if (rem < 16) {
+    // v_block is [2 key-halves][KV_HEADS_PER_CU*DH/8 chunks][8 keys][8 dh],
+    // which is the shape the toV memtile put lands (fused_decode.py: sizes
+    // [2, KVPC_DH//8, 8, 8]).
+    constexpr int NCH = (KV_HEADS_PER_CU * DH) / 8;
+    const aie::vector<bf16, 8> z8 = aie::zeros<bf16, 8>();
+    for (int k = rem; k < 16; ++k) {
+      bf16 *__restrict p = v_block + (k >> 3) * (NCH * 64) + (k & 7) * 8;
+      for (int ch = 0; ch < NCH; ++ch)
+        aie::store_v(p + ch * 64, z8);
+    }
+  }
+#endif
   float *c = (float *)(s_block + Q_HEADS_PADDED_PER_CU * 16);
 #ifndef SKIP_CALC_L
   calculate_l(s_block, c, l_state);
@@ -766,9 +843,41 @@ void attn_kv_blk(bf16 *__restrict s_block, bf16 *__restrict v_block,
 
 void attn_kv_fin(float *__restrict y_state, float *__restrict l_state,
                  bf16 *__restrict o) {
+  aie_round_nearest_even();
   alignas(aie::vector_decl_align) bf16 y_bf16[Q_HEADS_PADDED_PER_CU * DH];
   passThrough_aie<y_acc_dtype, bf16, Q_HEADS_PADDED_PER_CU * DH>(y_state,
                                                                  y_bf16);
   scale_div_aie<Q_HEADS_PADDED_PER_CU * DH>(y_bf16, o, l_state);
 }
+
+// DECODE_BATCH > 1: row t of a [BATCH][Q_HEADS_PADDED_PER_CU*DH] output.
+//
+// The batched CU holds every token's o and emits the block in ONE transfer at
+// the end of its token loop, rather than one per token. That is a DEADLOCK fix,
+// not a batching convenience: the o-gather memtile daisy-chains its four
+// per-CU landings, so CU c+1's data cannot arrive until CU c's whole transfer
+// has -- and with a transfer per token, CU 0 would have to finish all B tokens
+// while CU 1 has not started one, which the shared KV re-block memtile forbids
+// (it hands both CUs of a column their block together). One transfer per CU,
+// issued after every token is done, removes the interleaving the chain cannot
+// express.
+//
+// BEHIND -DATTN_BATCH, like proj_qmm.cc's batched entry points, and for a
+// sharper reason than compile time: merely ADDING this function costs
+// attn_kv_fin an instruction at -O1, whether it calls it or not. A batch-only
+// addition that changes shipping code is not inert, and check_kernels_inert.py
+// says so. Compiled out, the shipping build is byte-identical.
+#ifdef ATTN_BATCH
+void attn_kv_fin_row(float *__restrict y_state, float *__restrict l_state,
+                     bf16 *__restrict o, int t) {
+  // attn_kv_blk has always run first on this core, so the mode is already set;
+  // this is here so the entry point does not depend on that to be right.
+  aie_round_nearest_even();
+  alignas(aie::vector_decl_align) bf16 y_bf16[Q_HEADS_PADDED_PER_CU * DH];
+  passThrough_aie<y_acc_dtype, bf16, Q_HEADS_PADDED_PER_CU * DH>(y_state,
+                                                                 y_bf16);
+  scale_div_aie<Q_HEADS_PADDED_PER_CU * DH>(
+      y_bf16, o + t * (Q_HEADS_PADDED_PER_CU * DH), l_state);
+}
+#endif
 }
