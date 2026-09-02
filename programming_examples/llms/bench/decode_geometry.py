@@ -110,7 +110,15 @@ def _rope_w_elems(fd):
     """
     if not fd.MULTIBLK:
         return 0
-    return (fd.UNI_DEC if fd.ROPE_W_PER_LAYER else 1) * fd.ROPE_W_LEN
+    # PER POSITION, so a DECODE_BATCH block of B tokens needs B of them. The
+    # builder scales this slab the same way; getting it wrong here sizes the BO
+    # short and the device reads past the end of it, which is how the qwen2.5-7b
+    # ROPE_W_LEN bug above presented.
+    return (
+        (fd.UNI_DEC if fd.ROPE_W_PER_LAYER else 1)
+        * fd.ROPE_W_LEN
+        * getattr(fd, "BATCH", 1)
+    )
 
 
 def _head_elems(fd):
@@ -212,17 +220,76 @@ def geometry(model, vocab_chunk_i2, ctx, w_elems=None, n_layers=None, env_extra=
             f"weight split for {model} sums to {sum(w_parts)}, not {w_elems}"
         )
 
-    decode_y = (fd.HOST_ROUNDS + fd.LAYER_RNDS) * fd.PAYLOAD
+    # DECODE_BATCH: X is B token embeddings and every drained PAYLOAD row
+    # becomes B rows. The KV cache does NOT scale -- it is indexed by POSITION,
+    # and B tokens occupy B positions of the window that already exists.
+    _b = getattr(fd, "BATCH", 1)
+    decode_y = (fd.HOST_ROUNDS + fd.LAYER_RNDS) * fd.PAYLOAD * _b
+    # DECODE_PROBE lays its mid-layer taps after that region; the total is 0
+    # unless the build asked for them, so the shipping numbers do not move.
+    decode_y += getattr(fd, "PROBE_TOTAL", 0)
     return dict(
-        k=fd.K,
+        # X_SLOTS is 1 unless DECODE_HIDDEN_TAPS keeps every layer boundary.
+        k=fd.X_SLOTS * fd.K * _b,
         w_elems=w_elems,
         **({"w_parts": w_parts} if w_parts else {}),
-        rms_size=fd.UNI_DEC * fd.RMS_LAYER + _rope_w_elems(fd) + fd.K,
-        ny=decode_y + fd.UNI_LM * fd.VOCAB_SIZE_PADDED,
+        # RMS_TAIL_SLACK is 0 for every shipping build. RMS_BAND_STREAM>=3 at
+        # BATCH>1 carries the norm weights on @rmsX as band-shaped transfers, so
+        # each weight is read BATCH*STG_W wide from its own base -- and the last
+        # of them (the vocab arm's final norm) sits at the end of this buffer.
+        # The slack is that overhang; fused_decode.py exports it so the host BO
+        # and the descriptor that reads it cannot disagree. getattr keeps this
+        # working against a fused_decode.py that predates the symbol.
+        rms_size=fd.UNI_DEC * fd.RMS_LAYER
+        + _rope_w_elems(fd)
+        + fd.K
+        + getattr(fd, "RMS_TAIL_SLACK", 0),
+        # RMS_SCRATCH is 0 for every shipping build. RMS_BAND_STREAM>=3 at
+        # BATCH>1 keeps `h` -- one whole block of hidden states -- in DDR
+        # between residual1 and residual2, and parks it at the end of this
+        # buffer rather than adding a fifth DDR argument. It is device scratch,
+        # not an output: nothing reads it back. Without the term the drain runs
+        # off the end of the Y BO and into whatever is mapped next (measured: it
+        # landed in the KV cache).
+        ny=decode_y
+        + fd.UNI_LM * fd.VOCAB_SIZE_PADDED * _b
+        + getattr(fd, "RMS_SCRATCH", 0),
         kv_elems=fd.UNI_DEC * fd.ATTN_MAXL * fd.KVSZ_TOK,
         decode_y=decode_y,
-        voc_n=fd.UNI_LM * fd.VOCAB_SIZE_PADDED,
+        # B tokens' logits per wave, token-major within the wave: token t's
+        # chunk w is at decode_y + w*B*VOCAB_SIZE_PADDED + t*VOCAB_SIZE_PADDED.
+        voc_n=fd.UNI_LM * fd.VOCAB_SIZE_PADDED * _b,
+        voc_chunk=fd.VOCAB_SIZE_PADDED,
+        # The wave counts, so a caller can size the weight BO for the WHOLE
+        # sequence without restating UNI_DEC. It matters: the lm-head waves read
+        # their weights at UNI_DEC*W_LAYER, so a BO sized for n_layers=1 is not
+        # merely small -- the head reads past the end of it and every logit
+        # comes back zero, with the dispatch reporting COMPLETED.
+        uni_dec=fd.UNI_DEC,
+        uni_lm=fd.UNI_LM,
         rms_lut_off=fd.UNI_DEC * fd.RMS_LAYER,
+        # ONE token's rope/qk-norm/qkv-bias block. The region at rms_lut_off
+        # holds `batch` of these back to back, one per POSITION, because a block
+        # of B tokens spans B positions -- so a host that writes one LUT and
+        # dispatches B tokens gives every one of them position P's rotation.
+        # Nothing in rms_size says that; this is how a caller finds the stride.
+        rope_w_len=fd.ROPE_W_LEN,
+        batch=_b,
+        # Region-major DDR KV layout, so a caller can find token t's K or V.
+        # (region width, region stride, groups, this build's L).
+        kv_region=(fd.REGION_W, fd.REGION_STRIDE, fd.NGRP, fd.ATTN_L),
+        # DECODE_PROBE tap regions in Y, per token. Empty unless the build asked
+        # for them. Keyed by tap; the length is ONE token's slice, so a caller
+        # compares slice t of a batched run against slice 0 of a batch-1 one.
+        probe=(
+            {
+                k: (fd.PROBE_OFF[k], fd.PROBE_LEN[k] // _b)
+                for k in fd.PROBE_LEN
+                if fd.PROBE_LEN[k]
+            }
+            if getattr(fd, "PROBE_TOTAL", 0)
+            else {}
+        ),
     )
 
 
