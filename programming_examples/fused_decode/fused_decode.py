@@ -2850,7 +2850,17 @@ def build_module():
         # its own diagnoseBDChain calls out of step, and rather than only
         # refusing it, spreadCollapsedPacketChannels peels one flow onto the
         # channel that was sitting idle.
-        channel_decl("xnorm", size=[1], channel_type="npu_dma_packet")
+        _xn = channel_decl("xnorm", size=[1], channel_type="npu_dma_packet")
+        if RMS_BAND_STREAM >= 3 and BATCH > 1:
+            # ... except at band-stream level 3, where it does not. Measured on
+            # the emitted AIE dialect: the rms core carries MM2S0, MM2S1, S2MM0
+            # and S2MM1 at level 0 and only MM2S0, S2MM0, S2MM1 at level 3 --
+            # the two outputs collapsed back onto one channel, which is the
+            # packing the pin above was written for. Restore the pin for this
+            # level only, so level 0 keeps taking the derived placement.
+            _xn.operation.attributes["air.tile_dma_channel"] = IntegerAttr.get(
+                T.i32(), 1
+            )
 
         # ---- DECODE_BATCH: the @xnorm stream order ----
         # Every producer on @xnorm (rms, the attn-O memtile, the down/GLU
