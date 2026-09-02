@@ -171,6 +171,29 @@ def AIRLinalgToFunc : Pass<"air-linalg-to-func", "ModuleOp"> {
   ];
 }
 
+def AIRVerifyDmaRouting : Pass<"air-verify-dma-routing", "ModuleOp"> {
+  let summary = "Reject memtile DMA programs no flow routes";
+  let constructor = "xilinx::air::createAIRVerifyDmaRoutingPass()";
+  let description = [{
+    A dma_start names a physical stream port; a flow (or packet_flow) is what
+    routes that port somewhere. A memtile BD chain emitted without one pushes
+    into a switchbox port nothing reads: the BD never retires, its lock is
+    never released, and every consumer behind it waits forever. On device that
+    is a dispatch timeout with nothing written and no diagnostic anywhere.
+
+    AIR reaches this by giving a channel that already has a producer a second
+    one whose buffer lands on another tile -- the second producer takes its own
+    channel there and no flow is built for it.
+
+    RUN IT AFTER aie-place-tiles. Before that a memtile is an
+    aie.logical_tile with no coordinates, and a tile is not reliably one SSA
+    value, so neither key identifies a port.
+
+    Memtiles only: a core tile's channel is routinely fed from or drained to
+    L3, and that connection is an aie.shim_dma_allocation rather than a flow.
+  }];
+}
+
 def AIRToAIE : Pass<"air-to-aie", "ModuleOp"> {
   let summary = "Lower air.launch_herd to AIE dialect";
   let constructor = "xilinx::air::createAIRToAIEPass()";

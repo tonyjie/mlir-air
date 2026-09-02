@@ -28,6 +28,8 @@ class SegmentOp;
 mlir::FailureOr<mlir::ModuleOp> convertAIRToAIE(mlir::RewriterBase &rewriter,
                                                 air::SegmentOp segment);
 std::unique_ptr<mlir::Pass> createAIRToAIEPass();
+// Run AFTER aie-place-tiles: it keys on physical tile coordinates.
+std::unique_ptr<mlir::Pass> createAIRVerifyDmaRoutingPass();
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
 createAIRToAIEPass(const AIRToAIEOptions &options);
 

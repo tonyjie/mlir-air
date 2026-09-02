@@ -8659,6 +8659,108 @@ createAIRToAIEPass(const AIRToAIEOptions &options) {
   return std::make_unique<AIRToAIEPass>(options);
 }
 
+// A MEMTILE BD CHAIN NEEDS A FLOW TO CARRY IT. A dma_start names a physical
+// stream port; a flow (or packet_flow) is what routes that port somewhere. Emit
+// the chain without one and the DMA pushes into a switchbox port nothing reads:
+// the BD never retires, its lock is never released, and every consumer behind
+// it waits forever. On device that is a dispatch timeout with nothing written
+// and no diagnostic anywhere -- the only way to see it today is to read the
+// emitted AIE dialect and cross the dma_starts against the flows by hand.
+//
+// Reachable from AIR by giving a channel that already has a producer a SECOND
+// one whose buffer lands on another tile: that producer takes its own channel
+// there and no flow is built for it.
+//
+// MEMTILES ONLY, and that is not laziness. A core tile's channel is routinely
+// fed from or drained to L3, and that connection is an aie.shim_dma_allocation
+// rather than a flow; applied to core tiles this fires on nine existing lit
+// tests, all of them correct designs.
+//
+// WHAT IS DELIBERATELY NOT CHECKED: "one BD chain per channel". That is the
+// rule programming_examples/fused_decode's check_dma_alloc.py enforces, and it
+// is a rule about THAT design rather than an invariant of the dialect --
+// packet multiplexing puts several dma_starts on one channel on purpose, and
+// six lit tests (mm2s_flows_program_order among them) do so correctly. Whether
+// a shared ring is in step is what diagnoseBDChain and isHazard already decide;
+// a bare count cannot.
+class AIRVerifyDmaRoutingPass
+    : public air::impl::AIRVerifyDmaRoutingBase<AIRVerifyDmaRoutingPass> {
+public:
+  AIRVerifyDmaRoutingPass() = default;
+  AIRVerifyDmaRoutingPass(const AIRVerifyDmaRoutingPass &pass) {}
+
+  void runOnOperation() override {
+    getOperation().walk([&](AIE::DeviceOp device) {
+      if (failed(verifyDevice(device)))
+        signalPassFailure();
+    });
+  }
+
+private:
+  // Coordinates, not SSA values: run this after aie-place-tiles and a tile is
+  // an aie.tile with a column and a row. Before it a memtile is an
+  // aie.logical_tile carrying neither, and it is not reliably one value either
+  // -- a draft of this check keyed on the value, matched a different one than
+  // the flows used, and reported correct designs as broken.
+  static std::optional<std::pair<int, int>> coordsOf(Value tile) {
+    if (auto t = dyn_cast_if_present<AIE::TileOp>(tile.getDefiningOp()))
+      return std::make_pair(t.colIndex(), t.rowIndex());
+    return std::nullopt;
+  }
+
+  static LogicalResult verifyDevice(AIE::DeviceOp device) {
+    // Ports some flow routes. A DMA source port feeds an MM2S chain; a DMA
+    // destination port drains an S2MM one.
+    llvm::DenseSet<std::tuple<int, int, int>> routedSrc, routedDst;
+    auto note = [&](llvm::DenseSet<std::tuple<int, int, int>> &set, Value tile,
+                    AIE::WireBundle bundle, int chan) {
+      if (bundle != AIE::WireBundle::DMA || !tile)
+        return;
+      if (auto c = coordsOf(tile))
+        set.insert({c->first, c->second, chan});
+    };
+
+    for (auto flow : device.getOps<AIE::FlowOp>()) {
+      note(routedSrc, flow.getSource(), flow.getSourceBundle(),
+           flow.getSourceChannel());
+      note(routedDst, flow.getDest(), flow.getDestBundle(),
+           flow.getDestChannel());
+    }
+    device.walk([&](AIE::PacketSourceOp s) {
+      note(routedSrc, s.getTile(), s.getBundle(), s.getChannel());
+    });
+    device.walk([&](AIE::PacketDestOp d) {
+      note(routedDst, d.getTile(), d.getBundle(), d.getChannel());
+    });
+
+    bool ok = true;
+    for (auto memtile : device.getOps<AIE::MemTileDMAOp>()) {
+      auto c = coordsOf(memtile.getTile());
+      if (!c)
+        continue;
+      memtile.walk([&](AIE::DMAStartOp start) {
+        bool isMM2S = start.getChannelDir() == AIE::DMAChannelDir::MM2S;
+        int chan = start.getChannelIndex();
+        const auto &routed = isMM2S ? routedSrc : routedDst;
+        if (routed.count({c->first, c->second, chan}))
+          return;
+        start.emitOpError()
+            << "no flow " << (isMM2S ? "carries" : "feeds") << " "
+            << (isMM2S ? "MM2S" : "S2MM") << " channel " << chan
+            << " of memtile (" << c->first << ", " << c->second
+            << "); the BD chain would never retire and the dispatch would hang "
+               "with nothing written";
+        ok = false;
+      });
+    }
+    return success(ok);
+  }
+};
+
+std::unique_ptr<mlir::Pass> createAIRVerifyDmaRoutingPass() {
+  return std::make_unique<AIRVerifyDmaRoutingPass>();
+}
+
 std::unique_ptr<mlir::Pass> createAIRSplitDevicesPass() {
   return std::make_unique<SplitAIEDevicesPass>();
 }

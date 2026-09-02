@@ -42,6 +42,7 @@ using namespace mlir;
 #define GEN_PASS_DEF_AIRRTTOLLVM
 #define GEN_PASS_DEF_AIRSPLITDEVICES
 #define GEN_PASS_DEF_AIRTOAIE
+#define GEN_PASS_DEF_AIRVERIFYDMAROUTING
 #endif
 
 #include "air/Conversion/Passes.h.inc"

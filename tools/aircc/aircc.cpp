@@ -1275,6 +1275,10 @@ static LogicalResult runAieCompilation() {
     // merge-logical-tiles=false keeps the placer from collapsing AIR's
     // pre-aggregated logical tiles onto shared physical tiles.
     os << ",aie.device(aie-place-tiles{merge-logical-tiles=false})";
+    // After the placer, so memtiles are physical aie.tiles with coordinates to
+    // key on. Refuses a memtile BD chain no flow carries -- on device that is a
+    // dispatch timeout with nothing written and no diagnostic.
+    os << ",air-verify-dma-routing";
 #endif
     os << ")";
   }
