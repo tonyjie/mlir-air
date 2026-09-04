@@ -1762,6 +1762,32 @@ RMS_TILE = _tile_for(K)  # rms in/out/weight
 ROPE_TILE = _tile_for(M, DQ_PADDED)  # qkv_l1 is the binding one
 GLU_TILE = _tile_for(GLU_SLICE)
 
+# DIAGNOSTIC ONLY: cap ROPE_TILE below what L1 allows.
+#
+# The phases tile INDEPENDENTLY -- see _tile_for's docstring -- so a model whose
+# rope width is more than twice its K runs rope in two sub-tiles while rms runs
+# in one. llama-3.2-1B never does (M/K = 1.5, every tile lands on 8); qwen3-4b
+# does (6144/2560 = 2.4 -> RMS 8, ROPE 4) and its batch-8 decode hangs.
+#
+# Forcing the same asymmetry on llama by raising DECODE_STACK is not possible:
+# RMS_TILE 8 needs a budget of at least 32768 and ROPE_TILE 4 needs one below
+# 30720. This caps the one number instead, so a llama build can be made to
+# sub-tile rope exactly the way qwen3-4b's does with every buffer size and every
+# other phase left alone.
+# DIAGNOSTIC: restore the four air.tile_dma_channel pins upstream #1862 removed
+# (ropeQ -> 0, appendK/appendV -> 1, layerOut -> 0). See the ropeQ site for what
+# the measurement says. Default off, so every shipping build keeps taking the
+# derived placement.
+PIN_ROPE_CHANNELS = int(_os.environ.get("DECODE_PIN_ROPE", "0"))
+
+_ROPE_TILE_CAP = int(_os.environ.get("DECODE_ROPE_TILE", "0"))
+if _ROPE_TILE_CAP:
+    assert 1 <= _ROPE_TILE_CAP <= ROPE_TILE, (
+        f"DECODE_ROPE_TILE={_ROPE_TILE_CAP} must be in [1, {ROPE_TILE}]; it can "
+        f"only make the tile SMALLER than what L1 allows"
+    )
+    ROPE_TILE = _ROPE_TILE_CAP
+
 # ---- the rms core's batched residency -------------------------------------
 # The rms core is the ONE place a row loop is not enough, and it is worth
 # spelling out because the shape of the whole batched pass follows from it.
@@ -2930,7 +2956,23 @@ def build_module():
             channel_decl("toRope", size=[1])
         # S3a flash-attn dataflow: rope q -> qk tile (direct); rope k|v -> KV
         # staging memtile (rope's single k/v MM2S) which splits k->qk, v->kv.
-        channel_decl("ropeQ", size=[1])  # rope q (whole 2048) -> q broadcast memtile
+        _ropeQ = channel_decl(
+            "ropeQ", size=[1]
+        )  # rope q (whole 2048) -> q broadcast memtile
+        if PIN_ROPE_CHANNELS:
+            # DIAGNOSTIC: put back the four KV_APPEND pins #1862 removed.
+            #
+            # Measured on the emitted AIE dialect: WITHOUT them the derivation
+            # gives BOTH llama-3.2-1B and qwen3-4b the same rope-core layout --
+            # the packet appends on MM2S0 and the circuit ropeQ shoved to MM2S1,
+            # which is exactly the assignment the pin's original comment says
+            # "deadlocks the front-end". llama runs anyway; qwen3-4b batch 8
+            # hangs. Its rope core is the tighter one (ROPE_TILE 4 against 8),
+            # so the same assignment being tolerable there and fatal here is the
+            # hypothesis this knob exists to test.
+            _ropeQ.operation.attributes["air.tile_dma_channel"] = IntegerAttr.get(
+                T.i32(), 0
+            )
         # Q used to be pinned to rope MM2S0 here, to keep the packet K/V append
         # off the channel carrying this circuit flow. The compiler derives that
         # now: a DMA channel's port is either statically connected or packet-
@@ -2965,11 +3007,19 @@ def build_module():
                 # independent packet readbacks over distinct shim tiles, keeping
                 # the append off rope's own col2 (whose congestion deadlocks the
                 # front-end) without air.shim_col.
-                channel_decl("appendK", size=[1], channel_type="npu_dma_packet")
+                _apK = channel_decl("appendK", size=[1], channel_type="npu_dma_packet")
+                if PIN_ROPE_CHANNELS:
+                    _apK.operation.attributes["air.tile_dma_channel"] = IntegerAttr.get(
+                        T.i32(), 1
+                    )
                 # Only appendK names a channel. It is what holds the pair on
                 # rope's second MM2S, clear of the circuit ropeQ; appendV joins
                 # it there on its own.
-                channel_decl("appendV", size=[1], channel_type="npu_dma_packet")
+                _apV = channel_decl("appendV", size=[1], channel_type="npu_dma_packet")
+                if PIN_ROPE_CHANNELS:
+                    _apV.operation.attributes["air.tile_dma_channel"] = IntegerAttr.get(
+                        T.i32(), 1
+                    )
             if KV_SPLIT:
                 # the reference mem_3_1: K and V on SEPARATE shim->memtile flows (one each per
                 # col group of 2 CUs), so their memtile S2MM fills are independent.
@@ -3057,7 +3107,13 @@ def build_module():
             # and AIRToAIE gives them a channel each: collapsed onto one they
             # form a ring its diagnoseBDChain oracle calls out of step, and
             # spreadCollapsedPacketChannels peels one onto the idle channel.
-            channel_decl("layerOut", size=[1])
+            _layerOut = channel_decl("layerOut", size=[1])
+            if PIN_ROPE_CHANNELS and KV_APPEND:
+                # Keep layerOut on rms MM2S0 (circuit) so xnorm does not share
+                # it and flip it to packet -- the other half of the same pin set.
+                _layerOut.operation.attributes["air.tile_dma_channel"] = (
+                    IntegerAttr.get(T.i32(), 0)
+                )
         # GLU path: id-demux delivers gate-up DIRECTLY to the GLU herd (no relay);
         # GLU -> gluOut -> down memtile accumulate (8192). FAITHFUL: that 8192 is
         # fed back on-chip as the DOWN phase X by the down_buffer re-broadcasting it
