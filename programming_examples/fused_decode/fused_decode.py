@@ -1201,6 +1201,12 @@ assert UNI_LM == N_VOCAB_CHUNKS, (
     f"(VOCAB_CHUNK_I2={VOCAB_I2}); their product covers the padded vocab"
 )
 UNI_WAVES = UNI_DEC + UNI_LM
+# Optional layer-boundary capture for DFlash and target diagnostics. Slot 0
+# contains the input embedding; slot i+1 contains decoder layer i's output.
+# This changes only host buffer addresses, not the compute-tile program.
+HIDDEN_TAPS = int(_os.environ.get("DECODE_HIDDEN_TAPS", "0"))
+assert HIDDEN_TAPS in (0, 1)
+X_SLOTS = UNI_DEC + 1 if HIDDEN_TAPS else 1
 # ATTN_LAYERS indexes DECODE waves, and the unified sequence continues past them
 # into UNI_LM lm-head waves. A SHORT bisect build (DECODE_UNI_DEC below the
 # model's depth) therefore leaves schedule entries pointing at wave indices that
@@ -1405,7 +1411,7 @@ def build_module():
         # NLAYERS. The weight / rms / KV DDR buffers hold NLAYERS successive per-layer
         # slabs (offset iv*SLAB), so they scale by NLAYERS. At NLAYERS=1 every size is
         # identical to the single-layer design.
-        x_l3 = MemRefType.get([K], bf16)  # RAW input activation (in-place chain)
+        x_l3 = MemRefType.get([X_SLOTS * K], bf16)  # input / layer boundaries
         # LM_HEAD build carries the vocab weights (VOCAB_W_BLOCKS q4k blocks) instead
         # of the decode phase weights. Separate compile-time size -> decode IR is
         # byte-identical; the device (CDO) is unchanged (only this DDR memref size +
@@ -2048,6 +2054,14 @@ def build_module():
                         return idx(base + extra)
                     return arith.addi(base, idx(extra)) if extra else base
 
+                def _x_in():
+                    return _lb(K) if HIDDEN_TAPS else 0
+
+                def _x_out():
+                    return _lo(_lb(K), K) if HIDDEN_TAPS else 0
+
+                _x_final = UNI_DEC * K if HIDDEN_TAPS else 0
+
                 def _slot_off():
                     """(L-1) * REGION_W: this token's slot within a KV region.
 
@@ -2290,7 +2304,7 @@ def build_module():
                             # weights; drain VOCAB_SIZE_PADDED logits into Y. No attn/rope/
                             # glu/KV feeds (those herds are parked -- RTP-unarmed -- so they
                             # need no input; feeding them would only back-pressure).
-                            ChannelPut("rmsX", X, offsets=[0], sizes=[K], strides=[1])
+                            ChannelPut("rmsX", X, offsets=[_x_final], sizes=[K], strides=[1])
                             # real-lm-head final norm (model.norm.weight): a DEDICATED slot
                             # after the [in|post]*UNI_DEC rms slabs + 64-wide rope LUT, so the
                             # vocab rmsnorm uses the true final norm -- NOT layer-0's in_LN
@@ -2382,7 +2396,7 @@ def build_module():
                             # raw X (@xy) + rms weight (@rmsin) to the rms producer core; the
                             # on-chip rms normalizes + re-feeds X (see refeed()). X is
                             # in-place (offset 0 every layer -- the chained hidden state).
-                            ChannelPut("rmsX", X, offsets=[0], sizes=[K], strides=[1])
+                            ChannelPut("rmsX", X, offsets=[_x_in()], sizes=[K], strides=[1])
                             if N_NORMS >= 4:
                                 # Gemma: pack two norms per 2K channel -- rmsW =
                                 # [input | post_attn] (slab 0..2K), rmsW2 = [pre_ffn |
@@ -2794,7 +2808,7 @@ def build_module():
                             # The next layer's rmsX read (above) is program-ordered after this
                             # write (air.preserve_shim_dma_order) -> layer chaining.
                             _out_bo = X
-                            _out_base = 0
+                            _out_base = _x_out()
                             # BD-COMPACTION: single full-size drain (matches the rms single
                             # layerOut put) instead of LAYER_RNDS per-round gets.
                             ChannelGet(

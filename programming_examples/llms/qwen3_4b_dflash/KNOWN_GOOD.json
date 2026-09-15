@@ -1,0 +1,114 @@
+{
+  "schema": "qwen3_4b_dflash_npu_delivery.v1",
+  "implementation_commit": "2494543d67441c254f21c907ed462e990c5e9773",
+  "selected_parent_commit": "3d7bfc3d3b5e6f19f0ccb195edb2dc0ae0ad407c",
+  "configuration": {
+    "target": "Qwen/Qwen3-4B",
+    "draft": "z-lab/Qwen3-4B-DFlash-b16",
+    "draft_revision": "b74e3a329c4d963783143b1e970d95b002be72bd",
+    "batch": 8,
+    "capacity": 4096,
+    "target_layers": 36,
+    "draft_layers": 5,
+    "thinking": false,
+    "target_attention": "causal",
+    "draft_attention": "bidirectional",
+    "weight_format": "Q4NX packed four-bit",
+    "activation_format": "BF16",
+    "matrix_compute": "BFP16 mmul<8,8,8>"
+  },
+  "fresh_build": {
+    "target_manifest_sha256": "39d1e4a568db10e6a32730184b60ec7993be3cf67bda80c0833c1f24bf1f556b",
+    "target_xclbin_sha256": "354d4572a33bbcb6fe64aeb38a0c5a668db92cf833c73b350bb18fd3932412a1",
+    "target_txn_sha256": "095a137204386352eea6f1dfa0e5069a3561f80db606f09a1268e0c79ccfb65f",
+    "draft_manifest_sha256": "1c930186bb20f1320b8786d2b3588a02789d5d1708d77b6cefd5e4bffd1bcb51",
+    "draft_xclbin_sha256": "70a9e0a108beb1c73c930e93c69872c194405bd6e8ec6d6a956efacf2c012740",
+    "draft_txn_sha256": "79da6f7a6c370f1ef4ac2a5f4c686f158d5f92f34972c5fa5fd8475557e63cfc",
+    "selected_config_exact": true,
+    "selected_abi_exact": true,
+    "selected_transaction_headers_exact": true,
+    "selected_xclbin_sizes_exact": true,
+    "route_fix_shim_arbiter": true,
+    "route_isolate_main_output": true,
+    "compute_tiles_per_model": 30
+  },
+  "weights": {
+    "target_cache_sha256": "3c5cd33ade5cf623f5bf0f2d789cb9f65a51976b7992b00d33bbfffdc8b9ada4",
+    "target_cache_bytes": 2516951908,
+    "draft_cache_sha256": "4a709505843747c4572d15e0ad5bd2250a8e96e6549306fce86a266b84dc61a4",
+    "draft_cache_bytes": 581684188,
+    "draft_runtime_arrays_match_selected_cache": true
+  },
+  "focused_verification": {
+    "passed": true,
+    "host_acceptance_cases": 440,
+    "output": "The capital of France is Paris.",
+    "dflash_repeats_exact": true,
+    "same_b8_oracle_output_exact": true,
+    "committed_target_kv_exact": true
+  },
+  "broader_benchmark": {
+    "prompts": 80,
+    "baseline_pooled_tps": 19.310728654866903,
+    "dflash_pooled_tps": 34.998885663787625,
+    "pooled_speedup": 1.8124062685209354,
+    "macro_equal_request_speedup": 1.8639600536156782,
+    "macro_mean_acceptance_length": 4.578755216334691,
+    "accepted_proposed_fraction": 0.4753275966722605,
+    "emitted_tokens_per_round": 4.31054736315921
+  },
+  "toolchain": {
+    "air_install": "build_dflash/install_weight_prefetch from the selected development lineage",
+    "mlir_aie": "1.4.3.dev55+g10767b5",
+    "peano": "22.0.0.2026090201+a36c62b9",
+    "external_llvm_link": "21.0.0",
+    "host_llvm_mlir": "24",
+    "xrt": "2.21 runtime family"
+  },
+  "scope": "Compiled artifacts and weight caches remain outside Git under build/ and the configured cache directories. Their identities are recorded here.",
+  "npu_prefill": {
+    "padded_length": 2048,
+    "shared_driver": "../qwen3_4b_q4nx/qwen3_4b_q4nx_prefill.py",
+    "tap_slots": [
+      2,
+      10,
+      18,
+      26,
+      34
+    ],
+    "kernel_elf_sha256": {
+      "rms_qkv_qknorm_rope": "5758110b7da957922eae435462c9bf9799803ad86db8f652eb9e83a914e294d1",
+      "o_res_norm": "48d53fe9b4d401fb18416cd8b83078d05667bc54c3b01249a55a95661b4ab31b",
+      "gate": "b75372579d0cdb9519327609672749018e3bf9ed569aecc13ee768103114774b",
+      "up": "863ebdc3bea20c381926ce582d483326a3b6e92ef0b584bd909190e8bcb14908",
+      "swiglu": "469b703900701ef21628da3f9cc5fbeea3563312a1cb9dfd0038727304a40abb",
+      "down_add": "ef1138430bf633a0110f41ad4d5ac5de55a3f9553f693c55a78ba2163fbaba72",
+      "flash_attn": "bc7010a503bd8337cc3dca6e7b5c9e531d55f427b6feeb1c96f93075c85ae1d9",
+      "lm_head_gemv": "b94c8b0a927a0b739002b4bb5eb552cf93bc30a0b5175e7353a85d15042b02b2"
+    },
+    "toolchain": {
+      "llvm-aie": "22.0.0.2026090201+a36c62b9",
+      "mlir_aie": "1.4.3.dev55+g10767b5",
+      "peano_clang": "225896:1788921023",
+      "aie_opt": "210455832:1788921028",
+      "air_lib": "_air.cpython-312-x86_64-linux-gnu.so:29888:1788921238;_airRt.cpython-312-x86_64-linux-gnu.so:21264:1788921238;_air.cpython-312-x86_64-linux-gnu.so:29904:1789186497;_airRt.cpython-312-x86_64-linux-gnu.so:21280:1789186497"
+    },
+    "validation": {
+      "npu_prefill_repeats_exact": true,
+      "completed_exponent_groups_prefix_exact": true,
+      "complete_attention_tile_prefix_exact": true,
+      "partial_exponent_group_prefix_bit_exact": false,
+      "dflash_same_b8_oracle_exact": true,
+      "dflash_committed_kv_exact": true,
+      "dflash_repeated_trace_exact": true,
+      "checked_output_tokens": [
+        8,
+        64
+      ],
+      "live_run_and_two_prompt_chat_pass": true,
+      "benchmark_smoke_historical_prefix_matches": 5,
+      "wrong_prefill_cache_shape_rejected": true
+    },
+    "scope": "Standard op-by-op Q4NX prefill, with BFP16 shared-exponent numerical differences; decode benchmark retains frozen CPU-prefilled states."
+  }
+}

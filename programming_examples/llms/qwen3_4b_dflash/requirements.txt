@@ -1,0 +1,6 @@
+# Additional packages beyond the standard MLIR-AIR Python environment.
+huggingface_hub
+ml_dtypes
+numpy
+safetensors
+transformers

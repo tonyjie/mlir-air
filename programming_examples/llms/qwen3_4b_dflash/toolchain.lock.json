@@ -1,0 +1,15 @@
+{
+  "schema": "dflash.reviewer.toolchain.v1",
+  "air_upstream_base": "6746658f74200feb957f99ad4163297f3185739c",
+  "selected_delivery": "ce1e6fb463647c6fe7d264782a9a139cd34ebaf2",
+  "upstream_checked": "46288593bcee72e738251a29b7da7ad677e3d5b3",
+  "python": "3.12",
+  "mlir_aie": "1.4.3.dev55+g10767b5",
+  "llvm_aie": "22.0.0.2026090201+a36c62b9",
+  "mlir": "24.0.0.2026080106+56bcc187",
+  "llvm_link_wheel": "mlir-21.0.0.2025073017+77914c96-py3-none-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+  "cmake_modules_commit": "d1b317cae9f96462faafc6583c26a2ea6693ddc9",
+  "device": "NPU2 / AIE2P; selected 30-core graph",
+  "tested_host": "Ubuntu 24.04, clang/lld 18, XRT 2.21 family",
+  "note": "AIR must be built from this branch. Dependency pins match upstream_checked; this branch is not rebased onto that commit."
+}

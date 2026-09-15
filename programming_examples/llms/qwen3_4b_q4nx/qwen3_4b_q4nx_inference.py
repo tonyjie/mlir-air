@@ -181,6 +181,7 @@ class FusedDecoder:
         self.UNI_DEC = fd.UNI_DEC
         self.UNI_LM = fd.UNI_LM
         self.K = fd.K
+        self.X_SLOTS = fd.X_SLOTS
         self.DH = fd.DH
         self.RMS_LAYER = fd.RMS_LAYER
         self.ROPE_W_LEN = fd.ROPE_W_LEN
@@ -238,7 +239,7 @@ class FusedDecoder:
         self.kern = self._kern[self.cur_maxl][1]
         g = self.kern.group_id
         HO = xrt.bo.host_only
-        self.x_bo = xrt.bo(self.dev, self.K * 2, HO, g(3))
+        self.x_bo = xrt.bo(self.dev, self.X_SLOTS * self.K * 2, HO, g(3))
         # DECODE_WGROUP: only relevant if explicitly forced on (see module
         # docstring -- 4B's total weight is under the 4 GiB one-BO limit).
         # Taken from the engine, not the environment, so the host slicing cannot
@@ -315,6 +316,21 @@ class FusedDecoder:
             self.kvc.write(self.KV[Lyr, :_lreg].view(np.int16), boff)
             self.kvc.sync(TO, _lreg * 2, boff)
         self._kv_dirty = False
+
+    def read_hidden(self):
+        """Copy [embedding, layer0 output, ...] from an artifact built with taps.
+
+        Boundary i+1 is the residual after decoder layer i, before final RMS.
+        These bytes are diagnostic/state outputs, excluded from normal decode
+        timing unless the caller explicitly requests them.
+        """
+        if self.X_SLOTS != self.UNI_DEC + 1:
+            raise RuntimeError("read_hidden requires DECODE_HIDDEN_TAPS=1 artifacts")
+        FROM = self.xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE
+        self.x_bo.sync(FROM)
+        return self.np.frombuffer(self.x_bo.map(), dtype=self.bf16).reshape(
+            self.X_SLOTS, self.K
+        ).copy()
 
     def _rope_slab(self, p):
         """Build the UNI_DEC per-layer rope_w slabs for position p (single-theta cos/sin +

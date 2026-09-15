@@ -1,0 +1,13 @@
+# Tested Python 3.12 versions; AIR/AIE/Peano are handled by setup_toolchain.py.
+numpy==2.5.3
+ml_dtypes==0.6.0
+transformers==5.3.0
+huggingface_hub==1.6.0
+safetensors==0.8.0
+filelock==3.13.1
+cmake==4.4.3
+ninja==1.13.2
+nanobind==2.12.0
+pybind11==3.1.0
+lit==23.1.1
+psutil==7.2.2
