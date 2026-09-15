@@ -92,6 +92,11 @@ constexpr StringLiteral LaunchWave = "air.launch_wave";
 // lowered away by the time AIRToAIE reads it); propagated onto the lowered
 // AIE::BufferOp so air::isChainLockCandidate can exclude it.
 constexpr StringLiteral NoChainLock = "air.no_chain_lock";
+// Keep a shared L2 buffer single-slot while retaining the v2 chain locks.
+// Unlike NoChainLock, this only suppresses AIRToAIE's late twin-buffer
+// synthesis. The earlier ping-pong pass must also be omitted for single-slot
+// execution. Carried from memref.alloc to the lowered AIE buffer.
+constexpr StringLiteral NoChainPingPong = "air.no_chain_pingpong";
 // Opt-out (unit attr) on a shared-L2 memref.alloc (or its enclosing
 // air.execute): leave this L2 buffer intact instead of partitioning it. Used by
 // hand-written aggregator patterns where splitting would multiply the

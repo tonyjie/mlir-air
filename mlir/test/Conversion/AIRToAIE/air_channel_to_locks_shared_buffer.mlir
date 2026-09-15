@@ -9,7 +9,7 @@
 
 // Two outbound channel.put ops sharing the same L1 staging buffer on the same
 // DMA channel. Unlike ping-pong (where different buffers alternate), here the
-// SAME buffer is reused for consecutive sends. Verifies that acquire/release
+// SAME buffer is rewritten by opaque calls before consecutive sends. Verifies that acquire/release
 // are interleaved per-put (not batched at block start/end) to prevent the
 // second put from overwriting the buffer before the DMA reads the first.
 
@@ -38,12 +38,16 @@
 // Core body: interleaved acquire(wlock)/release(rlock) per put, NOT batched
 // CHECK:    aie.core(%[[TILE]])  {
 // CHECK:           aie.use_lock(%[[WLOCK]], AcquireGreaterEqual, %{{.*}})
+// CHECK-NEXT:      func.call @produce0(%[[BUF]])
 // CHECK-NEXT:      aie.use_lock(%[[RLOCK]], Release, %{{.*}})
 // CHECK-NEXT:      aie.use_lock(%[[WLOCK]], AcquireGreaterEqual, %{{.*}})
+// CHECK-NEXT:      func.call @produce1(%[[BUF]])
 // CHECK-NEXT:      aie.use_lock(%[[RLOCK]], Release, %{{.*}})
 // CHECK:           aie.end
 // CHECK:         }
 
+func.func private @produce0(memref<32x32xbf16, 2>)
+func.func private @produce1(memref<32x32xbf16, 2>)
 air.channel @channel_0 [1, 1]
 func.func @shared_buffer_sequential_puts() {
   %c1 = arith.constant 1 : index
@@ -67,8 +71,14 @@ func.func @shared_buffer_sequential_puts() {
         // Two consecutive puts from the same buffer on the same channel.
         // Without the fix, both acquires would be placed at block start,
         // causing the second acquire to deadlock (wlock consumed by first).
-        %tok_1 = air.channel.put async [%async_token_2] @channel_0[] (%buf[] [] []) : (memref<32x32xbf16, 2>)
-        %tok_2 = air.channel.put async [%tok_1] @channel_0[] (%buf[] [] []) : (memref<32x32xbf16, 2>)
+        %prod0 = air.execute [%async_token_2] {
+          func.call @produce0(%buf) : (memref<32x32xbf16, 2>) -> ()
+        }
+        %tok_1 = air.channel.put async [%prod0] @channel_0[] (%buf[] [] []) : (memref<32x32xbf16, 2>)
+        %prod1 = air.execute [%tok_1] {
+          func.call @produce1(%buf) : (memref<32x32xbf16, 2>) -> ()
+        }
+        %tok_2 = air.channel.put async [%prod1] @channel_0[] (%buf[] [] []) : (memref<32x32xbf16, 2>)
         %async_token_3 = air.execute [%tok_2] {
           memref.dealloc %buf : memref<32x32xbf16, 2>
         }

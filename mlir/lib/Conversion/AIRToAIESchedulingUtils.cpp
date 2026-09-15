@@ -3095,11 +3095,37 @@ air::MemTileDMAAllocator::simpleDmaChannelAlloc(air::MemcpyInterface &memcpyOp,
     isPacketFlowOp = chanTypeRes.value() == "npu_dma_packet";
   }
 
-  // Search for existing dma channel allocation
+  // A refed source needs a lock-driven, count-free reader ring. Multiplexing
+  // it with another logical packet stream can create finite sequential tasks
+  // (or an interleaved ring), neither of which preserves its per-fill replay.
+  // Repeated invocations of the SAME logical endpoint must still collapse.
+  bool refedSource = isMM2S.value() &&
+                     air::getRefeedCount(buffer.value().getOperation()) > 1;
+  auto allocationHasRefedSource = [&](const allocation_info_t &allocation) {
+    if (!isMM2S.value())
+      return false;
+    return llvm::any_of(allocation.memcpyOps, [&](Operation *op) {
+      auto copy = dyn_cast<air::MemcpyInterface>(op);
+      if (!copy)
+        return false;
+      auto source = getBuffer(dummy, /*tile=*/nullptr, copy);
+      return succeeded(source) &&
+             air::getRefeedCount(source.value().getOperation()) > 1;
+    });
+  };
+
+  // Search for existing dma channel allocation.
   unsigned num_allocs = 0;
+  bool hasRefedAllocation = false;
+  llvm::SmallDenseSet<int> usedChannels;
   for (auto &t : *allocs) {
-    if (t.foundAlloc(tile))
+    bool existingRefedSource = false;
+    if (t.foundAlloc(tile)) {
       num_allocs++;
+      usedChannels.insert(t.dma_channel.channel);
+      existingRefedSource = allocationHasRefedSource(t);
+      hasRefedAllocation |= existingRefedSource;
+    }
     if (t.foundAlloc(tile, memcpyOp)) {
       t.memcpyOps.push_back(memcpyOp.getOperation());
       return t;
@@ -3124,7 +3150,8 @@ air::MemTileDMAAllocator::simpleDmaChannelAlloc(air::MemcpyInterface &memcpyOp,
     {
       bool canCollapse =
           isMM2S.value()
-              ? ((isPacketFlowOp && t.foundPacketFlowAllocInTile(tile)) ||
+              ? ((isPacketFlowOp && !refedSource && !existingRefedSource &&
+                  t.foundPacketFlowAllocInTile(tile)) ||
                  t.foundSameLogicalFlowInTile(tile, memcpyOp))
               : t.foundSameLogicalFlowInTile(tile, memcpyOp);
       if (canCollapse) {
@@ -3140,8 +3167,22 @@ air::MemTileDMAAllocator::simpleDmaChannelAlloc(air::MemcpyInterface &memcpyOp,
   int memtile_dma_channels =
       isMM2S.value() ? tile.getNumSourceConnections(AIE::WireBundle::DMA)
                      : tile.getNumDestConnections(AIE::WireBundle::DMA);
-  if (chan == -1)
-    chan = num_allocs % memtile_dma_channels;
+  if (chan == -1) {
+    if (refedSource || hasRefedAllocation) {
+      // Do not wrap around onto a resident replay channel when all ports are
+      // occupied. Leave the ordinary, non-refeed allocation policy unchanged.
+      for (int candidate = 0; candidate < memtile_dma_channels; ++candidate)
+        if (!usedChannels.count(candidate)) {
+          chan = candidate;
+          break;
+        }
+      if (chan == -1)
+        return memcpyOp.emitOpError(
+            "no free memory-tile DMA channel for independent replay stream");
+    } else {
+      chan = num_allocs % memtile_dma_channels;
+    }
+  }
   return air::DMAAllocator::allocNewDmaChannel(memcpyOp, tile, chan);
 }
 

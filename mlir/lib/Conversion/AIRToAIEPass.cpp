@@ -2566,6 +2566,8 @@ struct AllocL2BuffersPattern : public OpRewritePattern<memref::AllocOp> {
     // the v2 daisy-chain, which over-serializes independent readers.
     if (alloc->hasAttr(air::attrs::NoChainLock))
       buffer->setAttr(air::attrs::NoChainLock, rewriter.getUnitAttr());
+    if (alloc->hasAttr(air::attrs::NoChainPingPong))
+      buffer->setAttr(air::attrs::NoChainPingPong, rewriter.getUnitAttr());
 
     rewriter.replaceOp(alloc, buffer->getResults());
     bufferToMemtileMap[buffer] = tile;
@@ -6362,10 +6364,36 @@ public:
     else if (!tileInbound.value() &&
              isa<AIE::BufferOp>(alloc.getDefiningOp())) {
       if (sharedStagingBuffer) {
-        // Interleaved mode: acquire immediately before this specific put, so
-        // the core waits for the DMA to finish reading the previous put's
-        // data before overwriting the buffer.
-        builder.setInsertionPoint(memcpyOpIf);
+        // Protect the writes that PREPARE this send, not just the put. A
+        // put lowers to a DMA handoff, so acquiring immediately before it is
+        // too late: an opaque kernel may already have overwritten the buffer
+        // while the previous DMA is still reading it. Scan only this block
+        // and stop at a preceding DMA access (including one in a region), so
+        // consecutive sends remain separate critical sections. Opaque calls
+        // conservatively count as accesses regardless of argument order.
+        llvm::SmallDenseSet<Value> aliases;
+        air::collectBufferAliases(alloc, aliases);
+        Operation *firstAccess = memcpyOpIf.getOperation();
+        for (Operation *op = memcpyOpIf->getPrevNode(); op;
+             op = op->getPrevNode()) {
+          bool hasAccess = false;
+          bool hasDmaAccess = false;
+          op->walk([&](Operation *nested) {
+            if (air::isPure(nested))
+              return;
+            for (Value operand : nested->getOperands()) {
+              if (!aliases.contains(operand))
+                continue;
+              hasAccess = true;
+              hasDmaAccess |= isa<air::MemcpyInterface>(nested);
+            }
+          });
+          if (hasDmaAccess)
+            break;
+          if (hasAccess)
+            firstAccess = op;
+        }
+        builder.setInsertionPoint(firstAccess);
       } else {
         auto br = dyn_cast_if_present<cf::BranchOp>(
             memcpyOpIf->getBlock()->getTerminator());
@@ -6573,6 +6601,7 @@ public:
                 // when the producer emits a single token. Keep refeed buffers
                 // single-buffer.
                 if (cls->pp_slots == 1 &&
+                    !primaryBuf->hasAttr(air::attrs::NoChainPingPong) &&
                     air::getRefeedCount(primaryBuf.getOperation()) <= 1) {
                   AIE::BufferOp twin = allocateBufferOp(
                       this->BufferId, primaryBuf.getType(), tile,

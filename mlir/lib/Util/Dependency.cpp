@@ -2525,7 +2525,13 @@ dependencyCanonicalizer::traceOpFromToken(Operation *op, Value dep_token) {
   // return an empty source list for an index_switch, dropping the dependency.
   else if (dep_token.getDefiningOp() &&
            isa<scf::IfOp, scf::IndexSwitchOp>(dep_token.getDefiningOp())) {
+    // Scalar results can accompany the completion token. Only the requested
+    // token result names an asynchronous dependency; other yielded values
+    // (in particular constants) are not vertices in this graph.
+    if (!isa<air::AsyncTokenType>(dep_token.getType()))
+      return output;
     auto *branchop = dep_token.getDefiningOp();
+    unsigned resultIndex = cast<OpResult>(dep_token).getResultNumber();
     for (auto &region : branchop->getRegions()) {
       if (region.empty())
         continue;
@@ -2533,9 +2539,13 @@ dependencyCanonicalizer::traceOpFromToken(Operation *op, Value dep_token) {
         if (!block.mightHaveTerminator())
           continue;
         auto *terminator = block.getTerminator();
-        for (auto operand : terminator->getOperands())
-          if (auto op = operand.getDefiningOp())
-            output.push_back(op);
+        Value yielded = terminator->getOperand(resultIndex);
+        if (auto source = yielded.getDefiningOp())
+          output.push_back(source);
+        else {
+          auto sources = traceOpFromToken(op, yielded);
+          output.insert(output.end(), sources.begin(), sources.end());
+        }
       }
     }
     return output;
@@ -2820,7 +2830,10 @@ void dependencyCanonicalizer::fillAIRDepListUsingGraphTR(
         }
         if (src_op->isAncestor(async_op))
           continue; // Avoid depending on its ancestor.
-        async_op.addAsyncDependency(src_op->getResult(0));
+        // A branch may have scalar results before its completion token.
+        // Use the same token-by-type convention as the terminator path.
+        if (auto token = getAsyncTokenFromOp(src_op))
+          async_op.addAsyncDependency(token);
       }
     }
   }

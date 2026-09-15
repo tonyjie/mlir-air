@@ -1019,6 +1019,23 @@ struct DmaToNpuPattern : public OpConversionPattern<airrt::DmaMemcpyNdOp> {
       return arith::TruncIOp::create(rewriter, op.getLoc(),
                                      rewriter.getI32Type(), v);
     };
+    // A runtime dimension supplies only part of the address. Keep the static
+    // dimensions too, including the group displacement introduced when stride
+    // legalization splits a KV append into multiple BDs. Combine in i64 before
+    // narrowing, at the operand's definition for the same dominance reason as
+    // above.
+    if (dynOffset && totalOffset != 0) {
+      OpBuilder::InsertionGuard g(rewriter);
+      if (Operation *def = dynOffset.getDefiningOp())
+        rewriter.setInsertionPointAfter(def);
+      else
+        rewriter.setInsertionPointToStart(
+            cast<BlockArgument>(dynOffset).getOwner());
+      Value bias = arith::ConstantOp::create(
+          rewriter, op.getLoc(), rewriter.getI64IntegerAttr(totalOffset));
+      dynOffset =
+          arith::AddIOp::create(rewriter, op.getLoc(), dynOffset, bias);
+    }
     Value dynLenI32 = narrowToI32(dynLen);
     Value dynOffsetI32 = narrowToI32(dynOffset);
 
