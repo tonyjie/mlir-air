@@ -12,7 +12,7 @@ import numpy as np
 from ml_dtypes import bfloat16
 
 from target_config import HERE
-from model_paths import TARGET_MODEL
+from model_paths import TARGET_MODEL, resolve_target_model
 sys.path.insert(0, str(HERE.parent / 'qwen3_4b_q4nx'))
 from qwen3_4b_q4nx_weights import Q4nxModel
 from prefill_reference import forward_prompt_with_taps
@@ -53,7 +53,7 @@ def main():
     if destination.exists() and json.loads(destination.read_text()) != manifest:
         raise ValueError('Cannot change a frozen case manifest')
     destination.write_text(json.dumps(manifest, indent=2)+'\n')
-    model = Q4nxModel(manifest['target_source'])
+    model = Q4nxModel(resolve_target_model(manifest['target_source']))
     model.layer_weights = functools.lru_cache(maxsize=36)(model.layer_weights)
     model.embed_norm_lmhead = functools.lru_cache(maxsize=1)(model.embed_norm_lmhead)
     for case in cases:

@@ -18,6 +18,8 @@ from model_paths import (
     DRAFT_MODEL,
     DRAFT_REVISION,
     TARGET_MODEL,
+    TARGET_REVISION,
+    resolve_target_model,
     default_draft_cache,
     default_draft_snapshot,
     default_target_cache,
@@ -159,10 +161,11 @@ def main() -> None:
     from qwen3_4b_q4nx_weights import Q4nxModel
     from qwen3_4b_q4nx_requant import build_requant_cache
 
-    target_model = Q4nxModel(args.target_model)
+    source_model = resolve_target_model(args.target_model, offline=args.offline)
+    target_model = Q4nxModel(source_model)
     if not target_cache.exists():
         target_cache.parent.mkdir(parents=True, exist_ok=True)
-        build_requant_cache(args.target_model, load_geometry(selected_config("target")), target_cache)
+        build_requant_cache(source_model, load_geometry(selected_config("target")), target_cache)
 
     snapshot = (args.draft_snapshot or default_draft_snapshot()).expanduser().resolve()
     if not (snapshot / "config.json").is_file() or not (snapshot / "model.safetensors").is_file():
@@ -180,6 +183,8 @@ def main() -> None:
 
     result = {
         "target_model": args.target_model,
+        "target_revision": TARGET_REVISION if args.target_model == TARGET_MODEL else None,
+        "target_source_sha256": sha(Path(source_model)),
         "draft_model": DRAFT_MODEL,
         "draft_revision": DRAFT_REVISION,
         "draft_snapshot": str(snapshot),

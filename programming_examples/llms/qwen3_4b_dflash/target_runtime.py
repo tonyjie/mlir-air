@@ -16,7 +16,7 @@ import numpy as np
 from ml_dtypes import bfloat16
 
 from target_config import ABI_VERSION, HERE, FUSED, TargetConfig
-from model_paths import TARGET_MODEL, default_target_cache
+from model_paths import TARGET_MODEL, default_target_cache, resolve_target_model
 
 
 @dataclass
@@ -78,7 +78,7 @@ class TargetDecoder:
         self.timeout_ms=10000
         if self.config.role == 'drafter' and model_weights is None:
             raise ValueError('The drafter requires an explicit weight provider')
-        self.model=model_weights if model_weights is not None else weights.Q4nxModel(model_source)
+        self.model=model_weights if model_weights is not None else weights.Q4nxModel(resolve_target_model(model_source))
         embed,final_norm,_=self.model.embed_norm_lmhead()
         self.embed=np.asarray(embed,dtype=bfloat16).reshape(-1,self.hidden_size)
         self.qk=[self.model.layer_qk_norm(i) for i in range(self.layers)]

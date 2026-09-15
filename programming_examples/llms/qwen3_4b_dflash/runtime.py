@@ -13,6 +13,7 @@ from context_prepass import ContextPrepass
 from draft_weights import DraftWeights
 from model_paths import (
     TARGET_MODEL,
+    load_tokenizer,
     TOKENIZER_MODEL,
     default_draft_cache,
     default_draft_snapshot,
@@ -55,9 +56,7 @@ def load_pair(
 
 def tokenize_prompt(prompt: str, tokenizer_model=TOKENIZER_MODEL, *, tokenizer=None):
     if tokenizer is None:
-        from transformers import AutoTokenizer
-
-        tokenizer = AutoTokenizer.from_pretrained(tokenizer_model)
+        tokenizer = load_tokenizer(tokenizer_model)
     text = tokenizer.apply_chat_template(
         [{"role": "user", "content": prompt}],
         tokenize=False,

@@ -9,14 +9,9 @@ from ml_dtypes import bfloat16
 
 DRAFT_ID = 'z-lab/Qwen3-4B-DFlash-b16'
 DRAFT_REVISION = 'b74e3a329c4d963783143b1e970d95b002be72bd'
-SNAPSHOT = Path(os.environ.get(
-    'DFLASH_DRAFT_SNAPSHOT',
-    Path.home()/'.cache/huggingface/hub/models--z-lab--Qwen3-4B-DFlash-b16/snapshots'/DRAFT_REVISION,
-)).expanduser()
-PACKED_CACHE = Path(os.environ.get(
-    'DFLASH_DRAFT_CACHE',
-    Path.home()/'.cache/qwen3_4b_dflash_npu/draft_requant_w2ch.npz',
-)).expanduser()
+from model_paths import default_draft_snapshot, default_draft_cache
+SNAPSHOT = default_draft_snapshot()
+PACKED_CACHE = default_draft_cache()
 
 
 class DraftWeights:

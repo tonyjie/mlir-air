@@ -19,7 +19,12 @@ N_TOKENS ?= 64
 STREAM ?= 1
 CHAT_LOG ?= $(BUILD_DIR)/chat.jsonl
 PROMPT ?= Explain why speculative decoding can improve latency.
-INPUTS ?=
+BENCHMARK_BUNDLE ?= $(BUILD_DIR)/benchmark_bundle
+STUDY_DIR ?= $(BUILD_DIR)/study
+STUDY_TOKENS ?= 2048
+STUDY_LABEL ?= reviewer
+BASELINE_ARTIFACTS ?= $(BUILD_DIR)/baseline
+INPUTS ?= $(BENCHMARK_BUNDLE)/inputs
 OUTPUT ?= $(BUILD_DIR)/benchmark.jsonl
 MODE ?= spec
 
@@ -60,6 +65,10 @@ help:
 	@echo "  make chat             Prepare once, then stream independent prompts"
 	@echo "  make verify-host      Test acceptance/bonus/EOS logic without the NPU"
 	@echo "  make verify           Repeatability + same-B8 oracle + committed-KV gate"
+	@echo "  make compile-study    Build selected B8 pair and the historical B1 baseline"
+	@echo "  make benchmark-data   Download and verify the frozen 80-prompt study"
+	@echo "  make benchmark-study  One paired B1/DFlash pass; STUDY_TOKENS=2048"
+	@echo "  make study-report     Summarize STUDY_DIR again"
 	@echo "  make benchmark INPUTS=/path/to/prepared_inputs N_TOKENS=2048"
 	@echo "  make benchmark-report OUTPUT=/path/to/results.jsonl"
 	@echo ""
@@ -125,7 +134,7 @@ verify:
 benchmark:
 	@test -n "$(INPUTS)" || (echo "Set INPUTS=/path/to/prepared_inputs" >&2; exit 2)
 	$(NPU_RUN) $(srcdir)/run_benchmark.py --inputs $(INPUTS) --output $(OUTPUT) \
-	  --mode $(MODE) --target $(TARGET_ARTIFACTS) \
+	  --mode $(MODE) --target $(if $(filter baseline,$(MODE)),$(BASELINE_ARTIFACTS),$(TARGET_ARTIFACTS)) \
 	  $(if $(filter spec,$(MODE)),--draft $(DRAFT_ARTIFACTS),) \
 	  --tokens $(N_TOKENS) --per-dataset $(PER_DATASET) $(if $(filter 1,$(RESUME)),--resume,)
 	$(RUN) $(srcdir)/benchmark_summary.py "$(OUTPUT)"
@@ -135,3 +144,30 @@ benchmark-report:
 
 clean:
 	rm -rf $(BUILD_DIR)
+
+# Reviewer study: original GEMV baseline plus the selected B8 pair.
+.PHONY: compile-baseline compile-study benchmark-data benchmark-study study-report
+compile-baseline:
+	@if [ -f "$(BASELINE_ARTIFACTS)/manifest.json" ]; then \
+	  echo "using existing $(BASELINE_ARTIFACTS)"; \
+	else \
+	  $(NPU_RUN) $(srcdir)/build_target.py --output "$(BASELINE_ARTIFACTS)" \
+	    --role target --capacity 4096 --batch 1 --layers 36 --no-taps \
+	    --causal --stack-bytes 10240 --l2-pingpong --chain-pingpong \
+	    --activation-memtile-col 2 --gather-mode packet --dynamic-context \
+	    --vector-attention-norm; \
+	fi
+
+compile-study: compile-target compile-draft compile-baseline
+
+benchmark-data:
+	$(RUN) $(srcdir)/benchmark_data.py --destination "$(BENCHMARK_BUNDLE)" $(if $(ARCHIVE),--archive "$(ARCHIVE)",)
+
+benchmark-study:
+	$(NPU_RUN) $(srcdir)/run_study.py --inputs "$(INPUTS)" --output "$(STUDY_DIR)" \
+	  --baseline "$(BASELINE_ARTIFACTS)" --target "$(TARGET_ARTIFACTS)" --draft "$(DRAFT_ARTIFACTS)" \
+	  --tokens $(STUDY_TOKENS) --per-dataset $(PER_DATASET) --label "$(STUDY_LABEL)" \
+	  $(if $(filter 1,$(RESUME)),--resume,)
+
+study-report:
+	$(RUN) $(srcdir)/study_report.py "$(STUDY_DIR)"

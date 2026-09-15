@@ -58,6 +58,10 @@ class NpuPrefill(Qwen3Q4nxPrefill):
         finally:
             os.chdir(previous)
 
+    def load_weights(self, model=None):
+        from model_paths import TARGET_MODEL, resolve_target_model
+        return super().load_weights(model=resolve_target_model(model or TARGET_MODEL))
+
     def _run_layer(self, x, layer, real_length):
         output = super()._run_layer(x, layer, real_length)
         if layer + 1 in self.tap_slots:

@@ -164,7 +164,8 @@ def main() -> None:
 
     started = time.perf_counter()
     print("Loading tokenizer, target, drafter, and CPU context projection...", flush=True)
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_model)
+    from model_paths import load_tokenizer
+    tokenizer = load_tokenizer(args.tokenizer_model)
     loop = load_pair(
         args.target_artifacts,
         args.draft_artifacts,
