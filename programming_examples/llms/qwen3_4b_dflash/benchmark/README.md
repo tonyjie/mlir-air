@@ -38,5 +38,5 @@ The archive SHA-256 is pinned in `download.json`; each prefill checksum is also
 tracked in `cases.json`. `make benchmark-data` verifies both. The original
 source manifest hash is retained as provenance; machine-local paths were
 removed from the portable manifest. Output tokens and prefill arrays were not
-changed. Use the [reviewer guide](../docs/reviewer.md) for commands and timing
+changed. Use the [reviewer guide](https://github.com/tonyjie/mlir-air/blob/dflash-npu-review-20260915-v1/programming_examples/llms/qwen3_4b_dflash/docs/reviewer.md) for commands and timing
 boundaries.

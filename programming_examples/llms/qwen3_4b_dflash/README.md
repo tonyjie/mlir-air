@@ -130,6 +130,7 @@ which replays the original saved prompt states with a 2,048-token output cap.
 | [Usage](docs/usage.md) | Environment, weights, build, run, verify, benchmark, cleanup |
 | [Validation](docs/validation.md) | Correctness boundary, measured performance, known limitations |
 | [Toolchain](docs/toolchain.md) | Compatible LLVM linker, known-good stack, fresh-build evidence |
+| [Source review map](docs/review_changes.md) | Included compiler fixes, regression tests, and shared-source changes |
 
 ## Source map
 

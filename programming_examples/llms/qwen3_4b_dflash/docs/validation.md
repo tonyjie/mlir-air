@@ -109,6 +109,38 @@ The prior four-prompt-per-dataset cohort measured 39.191 DFlash token/s and
 slightly lower, while emitted tokens per round fall 13.57%. The broader result
 therefore replaces the small cohort as the more representative local estimate.
 
+## Clean reviewer-checkout reproduction
+
+The reviewer branch was rebuilt and measured from an independent clone on
+September 15. Both packed model caches reproduced the historical files exactly;
+the rebuilt target and drafter each matched all 30 per-core ELF hashes, as well
+as the selected configuration, ABI, and transaction headers. AIR was built from
+this branch with both reused and newly installed upstream dependencies. Six
+focused compiler regressions and the host/device gates passed.
+
+The full one-pass paired study completed in 48.38 minutes:
+
+| Metric | Historical study | Clean reviewer checkout |
+|---|---:|---:|
+| B1 pooled throughput | 19.3107 token/s | 19.3062 token/s |
+| DFlash pooled throughput | 34.9989 token/s | 35.0198 token/s |
+| Pooled speedup | 1.8124x | 1.8139x |
+| Macro equal-request speedup | 1.8640x | 1.8679x |
+| Mean request acceptance length | 4.5788 | 4.5788 |
+| Accepted/proposed drafts | 47.5328% | 47.5328% |
+
+All 80 B1 outputs match the historical B1 outputs, and all 80 DFlash outputs
+match the historical DFlash outputs. All 8,002 DFlash round records are identical
+after removing their timing fields, including proposals, verifier token choices,
+acceptance, emitted tokens, and EOS behavior. This comparison is within each
+mode; it does not assert B1/B8 output equality.
+
+The benchmark ran at source `7945cfda944c9cf8e3c04359ad43ae18e641e195`.
+Later release changes add documentation, the measured summary, and more complete
+runtime-version reporting; inference code and the benchmark protocol are unchanged.
+See [the measured summary](../benchmark/reproduced_summary.json) and the release's
+reproduction-evidence archive for all request records and machine identities.
+
 ## Comparison boundaries
 
 - The NPU target and drafter use Q4NX packed weights, BF16 activations, and

@@ -9,13 +9,19 @@ token/s DFlash**, or **1.812x pooled speedup**. Mean request acceptance length i
 4.579; accepted/proposed draft tokens is 47.53%. These numbers describe the
 fixed cohort below, not a minimum speed for arbitrary prompts.
 
+A fresh reviewer checkout reproduced **19.306 token/s B1 versus 35.020 token/s
+DFlash (1.814x)** on the development machine. All 160 outputs and all 8,002
+DFlash non-timing round traces match the historical records. See the
+[reproduction validation](validation.md#clean-reviewer-checkout-reproduction).
+
 ## Machine and software prerequisites
 
 - Linux x86-64, tested on Ubuntu 24.04 with Python 3.12 and clang/lld 18.
 - AMD NPU2 / AIE2P with the resources needed by the selected 30-compute-tile
   graph. Confirm the Kraken device and its driver expose this topology.
 - Working AMD XDNA driver, firmware, and XRT NPU runtime with Python 3.12
-  bindings. The original machine uses the XRT 2.21 family. Driver installation
+  bindings. The original machine uses XRT 2.21.0, NPU firmware 1.1.2.64, and
+  Turbo power mode. Driver installation
   and firmware are machine-specific; this example does not replace them.
 - Git, a C/C++ toolchain, Python venv support, and development dependencies for
   the normal MLIR-AIR build. See the repository's main installation guide.
@@ -84,7 +90,8 @@ The exact versions and upstream base are in [toolchain.lock.json](../toolchain.l
 As checked against upstream `46288593` on September 15, the dependency pins
 match upstream. Our AIR base is `6746658f` plus the included fixes; the eight
 newer upstream commits, including the fused-decode `air.api` migration, are not
-part of this reproduction. See [toolchain.md](toolchain.md).
+part of this reproduction. See [toolchain.md](toolchain.md) and the
+[compiler/source review map](review_changes.md).
 
 ## Prepare models, kernels, and frozen inputs
 

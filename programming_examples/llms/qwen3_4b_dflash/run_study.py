@@ -48,7 +48,8 @@ def system_info():
     for name, command in {
         "cpu": ["lscpu"], "memory": ["free", "-h"],
         "xrt_platform": ["/opt/xilinx/xrt/bin/xrt-smi", "examine", "-r", "platform"],
-        "runtime_packages": ["dpkg-query", "-W", "xrt", "xrt_plugin-amdxdna"],
+        "xrt_version": ["/opt/xilinx/xrt/bin/xrt-smi", "--version"],
+        "runtime_packages": ["dpkg-query", "-W", "xrt-base", "xrt_plugin-amdxdna"],
     }.items():
         try:
             p = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30)

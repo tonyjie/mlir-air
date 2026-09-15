@@ -50,3 +50,10 @@ artifacts have the exact selected configuration and ABI. Their transaction
 headers are byte-identical to the preserved selected artifacts, and their
 xclbin containers have the same size. Xclbin hashes differ because a fresh
 container is packaged during each build; device behavior is checked separately.
+
+The reviewer preparation also rebuilt AIR in a new Python environment with
+freshly downloaded AIE, Peano, host LLVM, and cmakeModules. The default LLVM 21
+download/extraction path was checked separately through compiler configuration.
+The full paired study ran in the isolated environment; its B8 artifacts were
+built with the fresh AIR compiler and the existing identically pinned AIE/Peano
+installations. All 30 core ELF hashes per model matched the selected programs.
