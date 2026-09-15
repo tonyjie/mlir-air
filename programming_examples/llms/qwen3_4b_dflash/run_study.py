@@ -84,6 +84,10 @@ def main():
                 "source_commit": subprocess.check_output(["git", "-C", HERE, "rev-parse", "HEAD"], text=True).strip(),
                 "artifacts": {name: artifact(path, 1 if name == "baseline" else 8) for name, path in paths.items()},
                 "weight_caches": {"target": sha(default_target_cache()), "draft": sha(default_draft_cache())}}
+    expected_weights = json.loads((HERE / "KNOWN_GOOD.json").read_text())["weights"]
+    for role in ("target", "draft"):
+        if identity["weight_caches"][role] != expected_weights[role + "_cache_sha256"]:
+            raise ValueError(f"{role} packed cache differs from the measured study; use the pinned environment and a fresh make weights cache")
     if dest.exists() and not args.resume:
         raise FileExistsError(f"{dest}; use a new STUDY_DIR or RESUME=1")
     dest.mkdir(parents=True, exist_ok=True)

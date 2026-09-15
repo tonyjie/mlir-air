@@ -2,6 +2,6 @@
   "schema": "dflash.reviewer.download.v1",
   "url": "https://github.com/tonyjie/mlir-air/releases/download/dflash-npu-review-20260915-v1/dflash-benchmark-16x5-v1.tar.gz",
   "archive": "dflash-benchmark-16x5-v1.tar.gz",
-  "sha256": "9898d18f9a9ff8e63bb7bd17d8c34155ea4caee59f9e65cdc307f881ebb82a42",
-  "bytes": 1118750172
+  "sha256": "9272a6a7d1796ae2a83921cd94ecbb6993d636387ca112bf634d0bcec07895df",
+  "bytes": 1118750674
 }

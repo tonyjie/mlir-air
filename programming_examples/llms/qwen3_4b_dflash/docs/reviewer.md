@@ -69,6 +69,10 @@ This installs into `build_dflash_toolchain/`. Optional `--build-dir`,
 Without `--llvm-link`, it downloads the pinned LLVM 21 wheel and extracts that
 one executable. The host LLVM 24 tools and Peano LLVM 22 remain separate.
 
+The example only uses Transformers for tokenization; PyTorch is not required.
+Transformers may print a notice about unavailable PyTorch models in a fresh
+environment. The inference engines here are the NPU programs.
+
 Both paths finish by writing a new environment file:
 
 ```bash
@@ -103,6 +107,9 @@ Both models use Q4NX packed weights, BF16 activations, and the original NPU
 arithmetic. The official drafter is trained at block size 16; this delivery
 executes B8 (one anchor plus seven proposals). Model and tokenizer revisions
 are pinned in `model_paths.py`. `make weights` records source/cache checksums.
+The paired study requires the measured packed-cache checksums. This was checked
+by rebuilding both caches from the pinned model files. A stale cache from another
+configuration is rejected before timing.
 
 `make benchmark-data` downloads the release archive, checks its SHA-256, and
 verifies every extracted prefill state. To transfer the archive manually:
