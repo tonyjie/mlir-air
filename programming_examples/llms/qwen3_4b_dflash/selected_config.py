@@ -55,3 +55,10 @@ def require_selected(config: TargetConfig, role: str) -> None:
             if expected[key] != observed[key]
         }
         raise ValueError(f"Artifact is not the selected {role} configuration: {differences}")
+
+
+def baseline_config() -> TargetConfig:
+    """Historical C4096 B1 GEMV performance denominator, without hidden taps."""
+    return TargetConfig(capacity=4096, batch=1, layers=36, taps=False,
+                        stack_bytes=10240, dynamic_context=True,
+                        vector_attention_norm=True)

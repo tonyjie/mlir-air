@@ -1,5 +1,9 @@
 # Toolchain and reproducibility
 
+The [reviewer setup](reviewer.md) builds AIR from this branch in a separate
+installation. `setup_toolchain.py` records compiler source and binary hashes in
+`install/dflash-build.json`; `toolchain.lock.json` pins its dependencies.
+
 The selected implementation uses the MLIR-AIR, MLIR-AIE, Peano, LLVM, and XRT
 environment exposed through the repository's standard `utils/env_setup.sh`.
 `env.sh` checks that the four install-directory variables are present and adds
@@ -26,7 +30,7 @@ would shadow Peano's `clang`, `opt`, and `llc`. `make compile` runs the shared
 The known-good local environment used for this delivery was:
 
 ```text
-AIR install:  build_dflash/install_weight_prefetch
+AIR install:  built from this branch; historical install was install_weight_prefetch
 MLIR-AIE:     1.4.3.dev55+g10767b5
 Peano:        22.0.0.2026090201+a36c62b9
 External llvm-link: LLVM 21.0.0
@@ -35,7 +39,8 @@ XRT:          2.21 runtime family
 ```
 
 The AIR source branch contains the earlier dynamic-offset and scheduling fixes
-used by the selected artifacts. This is not an unmodified upstream-main build.
+used by the selected artifacts. This is not an unmodified upstream-main build. Dependency pins match upstream
+`46288593` as checked September 15, but the source base remains `6746658f`.
 Model and compiler identities are written into every artifact manifest.
 
 ## Fresh-build evidence

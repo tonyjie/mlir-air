@@ -43,6 +43,7 @@ def main():
         if counts[case['dataset']] >= args.per_dataset:
             continue
         counts[case['dataset']] += 1
+        case = {key: value for key, value in case.items() if key != 'cache_sha256'}
         cases.append(dict(case, cache_file=f'prefill/{len(cases):02d}.npz',
                           dataset_ordinal=counts[case['dataset']]-1))
     manifest = {k: v for k, v in source.items() if k != 'cases'}

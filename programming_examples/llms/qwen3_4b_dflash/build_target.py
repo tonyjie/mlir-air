@@ -79,6 +79,16 @@ def main():
               'toolchain':{k:os.environ[k] for k in ('MLIR_AIR_INSTALL_DIR','MLIR_AIE_INSTALL_DIR','PEANO_INSTALL_DIR','LLVM_INSTALL_DIR')},
               'status':'building','commands':[],'artifacts':{}}
     air_opt=Path(shutil.which('air-opt')).resolve()
+    provenance = Path(os.environ['MLIR_AIR_INSTALL_DIR']) / 'dflash-build.json'
+    if not provenance.is_file():
+        raise RuntimeError('Build this branch with setup_toolchain.py first: AIR provenance is missing')
+    compiler_build = json.loads(provenance.read_text())
+    if compiler_build['air_opt_sha256'] != sha(air_opt):
+        raise RuntimeError('air-opt differs from the recorded reviewer compiler build')
+    for name, expected in compiler_build['compiler_sources'].items():
+        if sha(REPO / name) != expected:
+            raise RuntimeError('AIR source differs from installed compiler: ' + name)
+    manifest['air_build_manifest_sha256'] = sha(provenance)
     compiler_source=REPO/'mlir/lib/Conversion/AIRToAIEPass.cpp'
     manifest['compiler']={'air_opt':str(air_opt),'air_opt_sha256':sha(air_opt),
                           'air_to_aie_source_sha256':sha(compiler_source),

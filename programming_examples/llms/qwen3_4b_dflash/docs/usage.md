@@ -188,65 +188,43 @@ request length matter: the measured dataset averages ranged from 20.96 token/s
 for MT-Bench to 43.33 token/s for MATH-500. The earlier 39.19 token/s result used
 a smaller, different 20-prompt cohort.
 
-On this development machine, all 80 original prompt states are already prepared.
-To run one DFlash pass with the same cohort and 2,048-token cap:
+The portable frozen inputs and paired B1/DFlash study are described in the
+[reviewer guide](reviewer.md). From a configured environment:
 
 ```bash
-make benchmark \
-  INPUTS=/home/jiajli/apps/dflash/results/npu/benchmark_validity_16x5_20260914/inputs \
-  N_TOKENS=2048 PER_DATASET=16 MODE=spec \
-  OUTPUT=build/benchmark_80_spec.jsonl
+make benchmark-data
+make compile-study
+make benchmark-study STUDY_DIR=build/study_80
+make study-report STUDY_DIR=build/study_80
 ```
 
-This prints per-request results as they finish and a per-dataset/overall summary
-at the end. Pooled throughput is the sum of decoded tokens divided by the sum
-of decode seconds; it is not the arithmetic average of request throughputs.
-The earlier DFlash pass spent about 17 minutes in timed decoding. Allow extra
-time for loading and warmup; timings vary with current system conditions.
+`benchmark-study` defaults to one pass, 16 prompts per dataset and a 2,048-token
+cap. Use `PER_DATASET=1 STUDY_TOKENS=256 STUDY_DIR=build/study_smoke` for a quick
+paired smoke test. Use `RESUME=1` with unchanged options to resume.
 
-A quicker pipeline check uses one example per dataset and a shorter output cap:
+For the original single-mode interface:
 
 ```bash
-make benchmark \
-  INPUTS=/home/jiajli/apps/dflash/results/npu/benchmark_validity_16x5_20260914/inputs \
-  N_TOKENS=256 PER_DATASET=1 OUTPUT=build/benchmark_smoke.jsonl
-```
-
-That shorter run does not reproduce the published aggregate. Output files are
-not overwritten. Set `RESUME=1` with the same options and output path to resume
-an interrupted run. Show the summary again without using the NPU:
-
-```bash
+make benchmark MODE=spec N_TOKENS=2048 OUTPUT=build/benchmark_80_spec.jsonl
+make benchmark MODE=baseline N_TOKENS=2048 OUTPUT=build/benchmark_80_b1.jsonl
 make benchmark-report OUTPUT=build/benchmark_80_spec.jsonl
 ```
 
-The benchmark replays **frozen CPU-prefilled KV, hidden taps, and first tokens**
-for comparison with the original study. `PREFILL=npu` controls live `run`, `chat`,
-and `verify`; it does not change these saved benchmark inputs. Decode timing
-excludes initialization, warmup, prefill, the first output token, and initial KV
-reset. It includes the CPU context projection, NPU draft/verify calls, transfers,
-and acceptance in every DFlash round. This command reproduces the DFlash side
-of the study; it does not rerun the alternating B1/DFlash process schedule.
+`INPUTS` defaults to `build/benchmark_bundle/inputs`. It can still point to a
+separately prepared input directory. `MODE=control` runs sequential row zero of
+the B8 target and is a correctness oracle, not the B1 performance denominator.
 
-For portable input preparation, `prepare_inputs.py` converts a frozen JSON
-prompt/token manifest into the same cache format:
+The benchmark replays **frozen CPU-prefilled KV, hidden taps, and first tokens**.
+`PREFILL=npu` controls live run/chat/verify; it does not change saved benchmark
+inputs. Decode excludes initialization, warmup, prefill, the first output token,
+and initial target KV reset. It includes CPU context projection, transfers, NPU
+draft/verify calls and acceptance. The paired study alternates process order
+across eight shards; two separate `make benchmark` commands do not.
 
-```bash
-./env.sh python3 prepare_inputs.py \
-  --cases /path/to/source_cases.json --output build/benchmark_inputs \
-  --per-dataset 16
-
-make benchmark INPUTS=build/benchmark_inputs MODE=spec \
-  OUTPUT=build/benchmark_spec.jsonl N_TOKENS=2048
-
-make benchmark INPUTS=build/benchmark_inputs MODE=control \
-  OUTPUT=build/benchmark_control.jsonl N_TOKENS=2048
-```
-
-The `control` mode uses sequential row zero of the same B8 target arithmetic and
-is the exact correctness oracle. It is not the B1 performance denominator.
-Building the separate B1 GEMV performance denominator is outside this minimal
-selected-pair target.
+`prepare_inputs.py --cases benchmark/cases.json --output build/new_inputs
+--per-dataset 16` can regenerate CPU-prefilled states, but those are a separate
+numerical fixture until their array values have been compared. For the machine
+comparison, use the verified release bundle.
 
 ## Cleanup
 

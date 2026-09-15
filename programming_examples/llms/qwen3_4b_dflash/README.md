@@ -25,6 +25,13 @@ acceptance length is 4.58 when every request has equal weight. See
 [Validation and measured scope](docs/validation.md) before comparing this number
 with the paper or another backend.
 
+## Reproduce on another NPU machine
+
+Start with the [reviewer guide](docs/reviewer.md). It includes a pinned AIR
+compiler build, the downloadable frozen 80-prompt bundle, the historical B1
+performance baseline, and a one-pass paired study. The setup is validated from
+a clean clone; all required source files, including `build_target.py`, are tracked.
+
 ## Prerequisites
 
 1. An MLIR-AIR checkout built for NPU2, including the compiler fixes present in

@@ -26,6 +26,15 @@ def artifact(path, batch):
     manifest = json.loads((path / "manifest.json").read_text())
     if manifest["status"] != "compiled" or manifest["config"]["batch"] != batch or manifest["config"]["capacity"] != 4096:
         raise ValueError(f"Wrong artifact configuration: {path}")
+    from dataclasses import asdict
+    from selected_config import baseline_config, require_selected
+    from target_config import TargetConfig
+    cfg = TargetConfig(**manifest["config"])
+    if batch == 1:
+        if asdict(cfg) != asdict(baseline_config()):
+            raise ValueError("B1 configuration differs from the historical baseline")
+    else:
+        require_selected(cfg, cfg.role)
     for name, expected in manifest["artifacts"].items():
         if sha(path / name) != expected:
             raise ValueError(f"Artifact checksum mismatch: {path / name}")
