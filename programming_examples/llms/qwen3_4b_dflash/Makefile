@@ -170,4 +170,4 @@ benchmark-study:
 	  $(if $(filter 1,$(RESUME)),--resume,)
 
 study-report:
-	$(RUN) $(srcdir)/study_report.py "$(STUDY_DIR)"
+	$(RUN) $(srcdir)/study_report.py "$(STUDY_DIR)" $(if $(REFERENCE),--reference "$(REFERENCE)",)

@@ -162,6 +162,10 @@ The study records:
 - `runs/`: per-request output tokens, acceptance traces, component timings, and
   process logs. Keep the whole study directory when sharing results.
 
+A copied study can be summarized without the original machine paths. If needed,
+set `REFERENCE=/path/to/benchmark_bundle/reference` on `make study-report`; the
+default also looks for the locally downloaded reference bundle.
+
 Record the machine's DDR data rate/channel configuration and power mode beside
 these files if the platform report does not expose them. Higher DDR bandwidth
 can improve B1 as well as DFlash; compare each machine's own B1/DFlash ratio.

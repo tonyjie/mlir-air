@@ -122,11 +122,16 @@ def print_report(result):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("study", type=Path)
+    ap.add_argument("--reference", type=Path, help="Reference directory when summarizing a study copied from another machine")
     args = ap.parse_args()
     config = json.loads((args.study / "study.json").read_text())
     cases = config["cases"]
     rows = {mode: [row for p in sorted((args.study / "runs").glob(f"shard_*_{mode}.jsonl")) for row in read_rows(p)] for mode in ("baseline", "spec")}
-    result = report(rows["baseline"], rows["spec"], cases, config["identity"]["tokens"], config.get("reference"))
+    reference = args.reference
+    if reference is None:
+        candidates = [config.get("reference"), HERE / "build/benchmark_bundle/reference"]
+        reference = next((Path(p) for p in candidates if p and (Path(p) / "spec.jsonl").is_file()), None)
+    result = report(rows["baseline"], rows["spec"], cases, config["identity"]["tokens"], reference)
     (args.study / "summary.json").write_text(json.dumps(result, indent=2) + "\n")
     print_report(result)
 
